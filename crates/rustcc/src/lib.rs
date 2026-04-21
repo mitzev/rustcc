@@ -31,7 +31,7 @@ mod shims;
 /// within this binary that each run the importer would race. All
 /// `#[cfg(feature = "libclang")]` tests lock this before invoking
 /// `parse_headers` (or anything else that ends up at `Clang::new`).
-#[cfg(test)]
+#[cfg(all(test, feature = "libclang"))]
 pub(crate) static LIBCLANG: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub use manifest::{
