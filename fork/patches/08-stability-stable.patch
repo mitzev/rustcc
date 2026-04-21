@@ -1,0 +1,12 @@
+diff --git a/compiler/rustc_ast_lowering/src/stability.rs b/compiler/rustc_ast_lowering/src/stability.rs
+index d185cc91..daaeaeb6 100644
+--- a/compiler/rustc_ast_lowering/src/stability.rs
++++ b/compiler/rustc_ast_lowering/src/stability.rs
+@@ -69,6 +69,7 @@ pub fn extern_abi_stability(abi: ExternAbi) -> Result<(), UnstableAbi> {
+         // stable ABIs
+         ExternAbi::Rust
+         | ExternAbi::C { .. }
++        | ExternAbi::Cpp { .. }
+         | ExternAbi::Cdecl { .. }
+         | ExternAbi::Stdcall { .. }
+         | ExternAbi::Fastcall { .. }

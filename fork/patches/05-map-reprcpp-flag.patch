@@ -1,0 +1,20 @@
+Wire `ReprAttr::ReprCpp` to `ReprFlags::IS_CPP | IS_C` during
+`ReprOptions::from_attrs`.
+
+Setting both bits makes every `repr.c()` check (dozens throughout
+the compiler) answer true for `repr(cpp)` types — correct behavior
+at the layout-level (no Rust reordering, defined ABI). The small
+set of callers that need the C-vs-C++ distinction use `repr.cpp()`
+added by P04.
+
+diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
+--- a/compiler/rustc_middle/src/ty/mod.rs
++++ b/compiler/rustc_middle/src/ty/mod.rs
+@@ -1452,6 +1452,7 @@ impl<'tcx> TyCtxt<'tcx> {
+                 flags.insert(match *r {
+                     attr::ReprRust => ReprFlags::empty(),
+                     attr::ReprC => ReprFlags::IS_C,
++                    attr::ReprCpp => ReprFlags::IS_CPP | ReprFlags::IS_C,
+                     attr::ReprPacked(pack) => {
+                         min_pack = Some(if let Some(min_pack) = min_pack {
+                             min_pack.min(pack)

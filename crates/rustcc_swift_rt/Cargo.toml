@@ -1,0 +1,13 @@
+[package]
+name = "rustcc_swift_rt"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.64"
+
+# Runtime helpers for rustcc's Swift interop. Phase 2b.1 ships
+# this as a user-visible library; Phase 2b.2 will add compiler-
+# side auto-synthesis that hides these calls behind the `#[repr
+# (swift)]` attribute.
+
+[dependencies]

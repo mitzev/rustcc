@@ -1,0 +1,71 @@
+diff --git a/compiler/rustc_abi/src/layout/ty.rs b/compiler/rustc_abi/src/layout/ty.rs
+index 7698a406..43d419a6 100644
+--- a/compiler/rustc_abi/src/layout/ty.rs
++++ b/compiler/rustc_abi/src/layout/ty.rs
+@@ -122,6 +122,15 @@ fn ty_and_layout_pointee_info_at(
+     fn is_scalable_vector(this: TyAndLayout<'a, Self>) -> bool;
+     /// See [`TyAndLayout::pass_indirectly_in_non_rustic_abis`] for details.
+     fn is_pass_indirectly_in_non_rustic_abis_flag_set(this: TyAndLayout<'a, Self>) -> bool;
++    /// True when this type is "non-trivial for C++ calls" per the
++    /// Itanium ABI: it's a `#[repr(cpp)]` ADT with a user-declared
++    /// `Drop` (or non-trivial copy/move). The C++ calling
++    /// convention passes such types by invisible reference rather
++    /// than in registers, regardless of their size.
++    fn is_cxx_non_trivial_for_calls(
++        this: TyAndLayout<'a, Self>,
++        cx: &C,
++    ) -> bool;
+ }
+ 
+ impl<'a, Ty> TyAndLayout<'a, Ty> {
+@@ -245,6 +254,17 @@ pub fn pass_indirectly_in_non_rustic_abis<C>(self, cx: &C) -> bool
+         Ty::is_pass_indirectly_in_non_rustic_abis_flag_set(base)
+     }
+ 
++    /// True when this `#[repr(cpp)]` type has a user-declared
++    /// destructor and therefore must be passed / returned by
++    /// invisible reference under the Itanium C++ ABI. See
++    /// [`TyAbiInterface::is_cxx_non_trivial_for_calls`].
++    pub fn is_cxx_non_trivial_for_calls<C>(self, cx: &C) -> bool
++    where
++        Ty: TyAbiInterface<'a, C> + Copy,
++    {
++        Ty::is_cxx_non_trivial_for_calls(self, cx)
++    }
++
+     /// Recursively peel away transparent wrappers, returning the inner value.
+     ///
+     /// The return value is not `repr(transparent)` and/or does
+diff --git a/compiler/rustc_middle/src/ty/layout.rs b/compiler/rustc_middle/src/ty/layout.rs
+index 53706cc8..fb343e16 100644
+--- a/compiler/rustc_middle/src/ty/layout.rs
++++ b/compiler/rustc_middle/src/ty/layout.rs
+@@ -1173,6 +1173,20 @@ fn is_scalable_vector(this: TyAndLayout<'tcx>) -> bool {
+     fn is_pass_indirectly_in_non_rustic_abis_flag_set(this: TyAndLayout<'tcx>) -> bool {
+         matches!(this.ty.kind(), ty::Adt(def, _) if def.repr().flags.contains(ReprFlags::PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS))
+     }
++
++    /// True when this type is a `#[repr(cpp)]` ADT that has a
++    /// user-declared destructor. Itanium's C++ ABI passes such
++    /// types by invisible reference; P09 uses this to force
++    /// `PassMode::Indirect` in `ExternAbi::Cpp` fn signatures
++    /// regardless of size.
++    fn is_cxx_non_trivial_for_calls(this: TyAndLayout<'tcx>, cx: &C) -> bool {
++        match this.ty.kind() {
++            ty::Adt(def, _) => {
++                def.repr().cpp() && def.destructor(cx.tcx()).is_some()
++            }
++            _ => false,
++        }
++    }
+ }
+ 
+ /// Calculates whether a function's ABI can unwind or not.
+@@ -1252,6 +1266,7 @@ pub fn fn_can_unwind(tcx: TyCtxt<'_>, fn_def_id: Option<DefId>, abi: ExternAbi)
+     use ExternAbi::*;
+     match abi {
+         C { unwind }
++        | Cpp { unwind }
+         | System { unwind }
+         | Cdecl { unwind }
+         | Stdcall { unwind }

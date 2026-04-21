@@ -1,0 +1,12 @@
+[package]
+name = "rustc_abi_cxx"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Itanium C++ ABI layout, name mangling, and vtable construction."
+
+[dependencies]
+
+[dev-dependencies]
+test_support = { path = "../test_support" }

@@ -1,0 +1,37 @@
+diff --git a/compiler/rustc_target/src/callconv/aarch64.rs b/compiler/rustc_target/src/callconv/aarch64.rs
+index ce69427c..bdd06409 100644
+--- a/compiler/rustc_target/src/callconv/aarch64.rs
++++ b/compiler/rustc_target/src/callconv/aarch64.rs
+@@ -183,3 +183,32 @@ pub(crate) fn compute_rust_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty
+         softfloat_float_abi(cx.target_spec(), arg);
+     }
+ }
++
++/// P09 — Itanium C++ ABI overlay for AArch64 (AAPCS + DarwinPCS).
++///
++/// Runs the AAPCS64 / Darwin PCS C-path `compute_abi_info` first,
++/// then applies the Itanium rule: any type that is
++/// "non-trivial for C++ calls" (a `#[repr(cpp)]` ADT with a user
++/// `Drop` impl) is passed / returned by invisible reference
++/// regardless of its size. Mirrors the x86_64 overlay.
++pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>, kind: AbiKind)
++where
++    Ty: TyAbiInterface<'a, C> + Copy,
++    C: HasDataLayout + HasTargetSpec,
++{
++    compute_abi_info(cx, fn_abi, kind);
++
++    if !fn_abi.ret.is_ignore()
++        && fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++    {
++        fn_abi.ret.force_indirect();
++    }
++    for arg in fn_abi.args.iter_mut() {
++        if arg.is_ignore() {
++            continue;
++        }
++        if arg.layout.is_cxx_non_trivial_for_calls(cx) {
++            arg.force_indirect();
++        }
++    }
++}

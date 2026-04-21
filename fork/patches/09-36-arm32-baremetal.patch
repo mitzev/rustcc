@@ -1,0 +1,143 @@
+# P09.36 — Bare-metal 32-bit ARM (Cortex-M / STM32) support.
+#
+# Documentation-only patch. No source changes.
+#
+# # The investigation
+#
+# Opened as "what do we need to add to support STM32-class
+# targets?" The answer surprised me: nothing on the compiler
+# side. After P09.35's cross-compilation fix, the existing
+# Itanium-ABI machinery was already target-aware enough to
+# emit correct ARM32 code. The only integration question is
+# how to link the output on a bare-metal target that doesn't
+# ship libc++abi.
+#
+# # The probe
+#
+# `/tmp/p09-39-arm32/` — a minimum-viable `#[no_std]`
+# staticlib with a single polymorphic `#[repr(cpp)]` class:
+#
+# ```rust
+# #![no_std]
+# #![feature(rustc_attrs)]
+#
+# pub class Widget {
+#     v: i32,
+#     #[constructor]  pub fn new(v: i32) -> Self { Widget { v } }
+#     #[cpp_virtual]  pub fn foo(&self) -> i32 { self.v + 100 }
+# }
+# ```
+#
+# Build:
+#
+# ```
+# RUSTC=/path/to/stage1/bin/rustc RUSTC_BOOTSTRAP=1 \
+# cargo +nightly build --target thumbv7em-none-eabihf \
+#   -Zbuild-std=core,compiler_builtins
+# ```
+#
+# (Cargo-version quirk: the stage-1 cargo is older than the
+# `library/std/Cargo.toml`'s edition-2024 requirement, so we
+# drive the build with a nightly cargo and override `RUSTC`
+# to the fork's stage-1 binary.)
+#
+# # What came out
+#
+# LLVM IR:
+#
+# - `target triple = "thumbv7em-unknown-none-eabihf"` ✓
+# - `target datalayout = "...p:32:32..."` ✓ 32-bit pointers
+# - Ctor: `define void @_ZN6WidgetC1Ei(ptr sret([8 x i8])
+#   align 4 %_0, i32 %v)` — Itanium-style void-return sret.
+# - Vtable: `{ i32, ptr, ptr }` = offset_to_top + RTTI +
+#   1 fn pointer, 4-byte-pointer-sized slots.
+# - Vptr GEP: `getelementptr inbounds (i8, ptr @_ZTV6Widget,
+#   i32 8)` — 8-byte address-point offset (2 × 4-byte ptrs).
+# - All symbols mangled to Itanium spec.
+#
+# Cross-compiler verification via `arm-none-eabi-g++ 15.2.0`
+# (Homebrew):
+#
+# - C++ `Widget::Widget(int32_t)` mangles to `_ZN6WidgetC1Ei`,
+#   identical to Rust.
+# - Call site disassembly: `bl _ZN6WidgetC1Ei` with `r0 = this`,
+#   `r1 = v`, return value ignored. Matches Rust's sret+void
+#   calling convention byte-for-byte.
+# - Virtual dispatch: `ldr r3, [obj, #0]; ldr r3, [r3, #0];
+#   blx r3` — loads vptr from object offset 0 (our vtable
+#   address point), reads first fn pointer, calls. Matches
+#   our emission exactly.
+#
+# # The only link-time knob
+#
+# `_ZTVN10__cxxabiv117__class_type_infoE` appears as an
+# undefined reference in the Rust static archive (the
+# typeinfo struct's RTTI-base vtable pointer). On hosted
+# systems this is provided by libc++abi; on bare-metal ARM
+# users don't normally link it.
+#
+# The workaround is a 3-line C stub:
+#
+# ```c
+# __attribute__((weak))
+# void* _ZTVN10__cxxabiv117__class_type_infoE[4] = { 0 };
+# ```
+#
+# This satisfies the linker; runtime RTTI (`typeid`,
+# `dynamic_cast`) requires real libc++abi but virtual
+# dispatch through the vtable does NOT consult typeinfo, so
+# all `#[cpp_virtual]` calls work with just the stub.
+# Alternative: link against `libsupc++-nano` shipped with
+# `arm-none-eabi-gcc`.
+#
+# # Link verification
+#
+# Partial-relocatable link:
+#
+# ```
+# arm-none-eabi-g++ -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 \
+#   -mfloat-abi=hard -mthumb -c caller.cpp -o caller.o
+# arm-none-eabi-gcc ... -c rtti_stub.c -o rtti_stub.o
+# arm-none-eabi-ld -r caller.o rtti_stub.o \
+#   --whole-archive libp09_39_arm32.a -o probe.o
+# ```
+#
+# Result: `probe.o: ELF 32-bit LSB relocatable, ARM, EABI5
+# version 1`. Zero unresolved symbols.
+#
+# # Other ARM Cortex-M targets
+#
+# The fork's C++ ABI paths don't touch target-specific
+# instruction selection, so the recipe extends to any
+# Itanium-ABI 32-bit ARM variant:
+#
+# - `thumbv7m-none-eabi` — Cortex-M3.
+# - `thumbv7em-none-eabi` — Cortex-M4 (no FPU).
+# - `thumbv7em-none-eabihf` — Cortex-M4F (tested).
+# - `thumbv8m.base-none-eabi` — Cortex-M23.
+# - `thumbv8m.main-none-eabihf` — Cortex-M33F.
+#
+# If a specific triple produces different mangling vs the
+# toolchain's own C++ compiler, file an issue with the exact
+# ABI fact that mismatches.
+#
+# # What changed in v1
+#
+# - `getting-started.html` §16 documents the build recipe,
+#   RTTI stub, and known ABI facts.
+# - Feature matrix adds "Bare-metal ARM Cortex-M" as
+#   supported, with the libc++abi stub requirement noted.
+# - Targets list expanded to include
+#   `thumbv7em-*`, `thumbv7m-*`, `thumbv8m.*`.
+#
+# No compiler or workspace code changes. The probe at
+# `/tmp/p09-39-arm32/` serves as the integration test.
+#
+# # Takeaway saved to memory
+#
+# Before estimating a "new target support" effort, build the
+# minimum-viable probe first. What looked like a 2-4 day
+# project (ARM32 ABI overlay) turned out to be zero-code
+# after P09.35 made `CxxTarget` target-aware. The v1 fork
+# was already more portable than the earlier documentation
+# admitted.

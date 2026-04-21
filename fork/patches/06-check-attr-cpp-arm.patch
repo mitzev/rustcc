@@ -1,0 +1,37 @@
+Add `ReprCpp` arm to the `check_attr` exhaustive match.
+
+Without this, P02's addition of `ReprAttr::ReprCpp` breaks the
+`check_repr` validator in rustc_passes — it's an exhaustive match
+on every `ReprAttr` variant. The new arm mirrors `ReprC`'s
+behavior: accept on structs/unions/enums, reject elsewhere with
+the same `StructEnumUnion` diagnostic. Extended Itanium semantics
+(sret / this / mangling) kick in at layout and codegen, not at
+attribute validation.
+
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -1328,6 +1328,23 @@ fn check_repr(
+                         }
+                     }
+                 }
++                ReprAttr::ReprCpp => {
++                    // #[repr(cpp)] carries the same attribute-level
++                    // constraints as #[repr(C)] — valid on structs,
++                    // unions, and enums only. The extended Itanium
++                    // ABI semantics (sret, this-pointer, mangling)
++                    // kick in at layout + codegen time, not here.
++                    is_c = true;
++                    match target {
++                        Target::Struct | Target::Union | Target::Enum => continue,
++                        _ => {
++                            self.dcx().emit_err(errors::AttrApplication::StructEnumUnion {
++                                hint_span: *repr_span,
++                                span,
++                            });
++                        }
++                    }
++                }
+                 ReprAttr::ReprAlign(..) => match target {
+                     Target::Struct | Target::Union | Target::Enum => {}
+                     Target::Fn | Target::Method(_) if self.tcx.features().fn_align() => {

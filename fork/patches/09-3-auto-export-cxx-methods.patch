@@ -1,0 +1,27 @@
+diff --git a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+index 820436bb..3c68be2d 100644
+--- a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
++++ b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+@@ -357,6 +357,22 @@ fn apply_overrides(tcx: TyCtxt<'_>, did: LocalDefId, codegen_fn_attrs: &mut Code
+         codegen_fn_attrs.flags |= CodegenFnAttrFlags::TRACK_CALLER;
+     }
+ 
++    // Tier 1 inferred-C++ methods: an assoc fn on an `impl` whose
++    // self-type is a `#[repr(cpp)]` ADT needs external linkage so
++    // the Itanium-mangled symbol is visible to C++ linkers. Setting
++    // NO_MANGLE gives the right visibility side-effect; the actual
++    // symbol name is still overridden by
++    // `rustc_symbol_mangling::itanium::mangle` which runs earlier
++    // in `compute_symbol_name` and wins.
++    if tcx.def_kind(did) == DefKind::AssocFn
++        && let Some(impl_did) = tcx.opt_parent(did.to_def_id())
++        && matches!(tcx.def_kind(impl_did), DefKind::Impl { .. })
++        && let ty::Adt(adt_def, _) = tcx.type_of(impl_did).skip_binder().kind()
++        && adt_def.repr().cpp()
++    {
++        codegen_fn_attrs.flags |= CodegenFnAttrFlags::NO_MANGLE;
++    }
++
+     // Foreign items by default use no mangling for their symbol name.
+     if tcx.is_foreign_item(did) {
+         codegen_fn_attrs.flags |= CodegenFnAttrFlags::FOREIGN_ITEM;

@@ -1,0 +1,1095 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rustcc — Getting Started</title>
+<style>
+  body { font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         max-width: 780px; margin: 2em auto; padding: 0 1em; color: #222; }
+  h1, h2, h3 { font-weight: 600; line-height: 1.2; }
+  h1 { font-size: 1.8em; border-bottom: 1px solid #ddd; padding-bottom: .3em; }
+  h2 { font-size: 1.4em; margin-top: 2em; border-bottom: 1px solid #eee; padding-bottom: .2em; }
+  h3 { font-size: 1.1em; margin-top: 1.6em; }
+  code { font: 13px/1.4 "SF Mono", "Menlo", "Consolas", monospace;
+         background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
+  pre { background: #f8f8f8; border: 1px solid #e5e5e5; border-radius: 4px;
+        padding: .8em 1em; overflow-x: auto; font: 12.5px/1.5 "SF Mono", "Menlo", monospace; }
+  pre code { background: none; padding: 0; border-radius: 0; }
+  table { border-collapse: collapse; margin: 1em 0; }
+  td, th { border: 1px solid #ddd; padding: .3em .6em; text-align: left; font-size: 14px; }
+  th { background: #f4f4f4; }
+  .caveat { background: #fff8e1; border-left: 3px solid #e0a800; padding: .6em .9em; margin: 1em 0; }
+  .note { background: #eef6ff; border-left: 3px solid #337ab7; padding: .6em .9em; margin: 1em 0; }
+  hr { border: 0; border-top: 1px solid #ddd; margin: 2em 0; }
+  .small { color: #666; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>rustcc v1</h1>
+
+<p><em>Native C++ and Swift interop for Rust — no <code>bindgen</code>, no
+<code>cxx</code> shim crate, no build-script voodoo.</em></p>
+
+<p><code>rustcc</code> is a fork of <code>rustc</code> that teaches the
+compiler to emit <strong>Itanium-C++-ABI-compatible symbols and
+layouts</strong> for items tagged <code>#[repr(cpp)]</code>, and
+<strong>Swift-ABI-compatible calls and metadata-driven
+witnesses</strong> for items tagged <code>#[repr(swift)]</code>. Rust
+code written in the fork links directly against Clang-compiled C++
+and <code>swiftc</code>-compiled Swift modules — including virtual
+dispatch, constructors, destructors, single inheritance,
+<code>dynamic_cast</code>, ARC, and Swift value-witness tables.</p>
+
+<h2>Why this project exists</h2>
+
+<p>Rust has excellent FFI for <em>C</em> APIs. Everything else (C++
+classes, Swift <code>class</code> / <code>struct</code> types, vtable
+dispatch across language boundaries) today requires a translation
+layer: <code>cxx</code>, <code>bindgen</code> + hand-written shims,
+<code>autocxx</code>, or custom build scripts. Every layer leaks
+incidental complexity: build steps, stubs, lifetime bookkeeping that
+doesn't match either language's native semantics.</p>
+
+<p>rustcc's thesis is that the <em>right</em> place to handle
+this is the compiler itself, because the compiler already knows
+everything needed — type layout, calling conventions, symbol
+mangling, drop semantics. A modest set of targeted changes to
+<code>rustc</code> lets Rust programs speak C++ and Swift natively,
+without any intermediate representation or runtime shim.</p>
+
+<p>If you've written <code>impl Drop for Widget { fn drop(&amp;mut
+self) { unsafe { cxx_widget_destroy(self); } } }</code> before, this
+project is for you.</p>
+
+<h2>v1 feature matrix</h2>
+
+<p>As of the v1 milestone (2026-04-21), rustcc supports:</p>
+
+<table>
+  <tr><th>Capability</th><th>v1 status</th><th>Notes</th></tr>
+  <tr><td><code>#[repr(cpp)]</code> struct layout</td><td>✓ supported</td><td>Itanium rules: empty-class size, <code>alignas</code>, inheritance subobject placement</td></tr>
+  <tr><td><code>extern "C++"</code> free functions</td><td>✓ supported</td><td>Itanium mangling including nested module → namespace</td></tr>
+  <tr><td>Inherent methods on <code>#[repr(cpp)]</code></td><td>✓ supported</td><td>Automatic C++ member-function mangling + calling convention</td></tr>
+  <tr><td>C++ constructors</td><td>✓ supported</td><td><code>#[constructor]</code> on Rust impl methods or foreign-fn decls</td></tr>
+  <tr><td>C++ destructors</td><td>✓ supported</td><td>Via <code>impl Drop</code>. D0/D1/D2 variants all auto-emitted</td></tr>
+  <tr><td>Virtual methods / vtables</td><td>✓ supported</td><td><code>#[cpp_virtual]</code>; compiler emits <code>_ZTV</code>/<code>_ZTI</code>/<code>_ZTS</code> and auto-initializes vptr in ctors</td></tr>
+  <tr><td>Single inheritance</td><td>✓ supported</td><td><code>class Derived : Base { ... }</code>; <code>__si_class_type_info</code> chain</td></tr>
+  <tr><td>Virtual method override</td><td>✓ supported</td><td>Derived virtual with the same name as a base virtual replaces the base's vtable slot (P09.34)</td></tr>
+  <tr><td><code>dynamic_cast</code> across inheritance</td><td>✓ supported</td><td>Via libc++abi's runtime typeinfo walk</td></tr>
+  <tr><td>Parser-level <code>class</code> keyword</td><td>✓ supported</td><td>Weak keyword, desugars to <code>#[repr(cpp)]</code> struct + impl</td></tr>
+  <tr><td>Cross-crate polymorphic classes</td><td>✓ supported</td><td>Ctor/wrapper/virtual attributes encode correctly</td></tr>
+  <tr><td>C++ operator overloading</td><td>✓ supported</td><td><code>#[operator = "Plus"]</code> and friends</td></tr>
+  <tr><td><code>extern "Swift"</code> calling convention</td><td>✓ supported</td><td>swiftcc ABI + Swift symbol mangling for structs and classes</td></tr>
+  <tr><td>Swift <code>#[repr(swift)]</code> value types</td><td>✓ supported</td><td>Layout, retain/release semantics via VWT</td></tr>
+  <tr><td>Swift class bindings</td><td>✓ supported</td><td>ARC via <code>swift_retain</code>/<code>swift_release</code></td></tr>
+  <tr><td><code>swift_value!</code> macro</td><td>✓ supported</td><td>Auto-generates <code>impl Drop</code> + <code>impl Clone</code> for <code>#[repr(swift)]</code></td></tr>
+  <tr><td>Cross-compilation</td><td>✓ supported</td><td>P09.35. Per-invocation target parameters flow into the C++ ABI paths; requires building target std via <code>./x.py build --stage 1 library --target &lt;triple&gt;</code></td></tr>
+  <tr><td>Bare-metal ARM Cortex-M</td><td>✓ supported</td><td>P09.36. <code>thumbv7em-none-eabihf</code>, <code>thumbv7m-none-eabi</code>, <code>thumbv8m.*</code> — zero compiler changes needed; link-time RTTI stub (3 lines of C) required unless <code>libsupc++-nano</code> is linked. See §16</td></tr>
+  <tr><td>Targets</td><td colspan="2"><code>x86_64-apple-darwin</code>, <code>x86_64-unknown-linux-gnu</code>, <code>aarch64-apple-darwin</code>, <code>aarch64-unknown-linux-gnu</code>, <code>i686-*</code> (non-Windows), bare-metal <code>thumbv7em-*</code> / <code>thumbv7m-*</code> / <code>thumbv8m.*</code>. Cross-builds across these are supported.</td></tr>
+</table>
+
+<h2>v2 roadmap</h2>
+
+<p>Not yet in v1, targeted for the next milestone:</p>
+
+<ul>
+  <li><strong>Multi-inheritance and virtual bases</strong> —
+      secondary vtable sub-tables, this-adjusting thunks,
+      virtual-base offset slots.</li>
+  <li><strong>True compiler auto-synthesis for
+      <code>#[repr(swift)]</code></strong> — today's path uses the
+      <code>swift_value!</code> proc macro; a HIR-level
+      trait-impl synthesis would let users drop the wrapper.</li>
+  <li><strong>Multi-field class-backed Swift bindings with
+      non-POD extra fields</strong> — e.g. a class handle that
+      carries another class handle as a sibling field.</li>
+  <li><strong>Const generics on class headers</strong> — <code>class
+      Array&lt;T, const N: usize&gt; { ... }</code>. v1 accepts type
+      and lifetime params only.</li>
+  <li><strong>Windows MSVC ABI</strong> — out of scope for the
+      Itanium-focused fork; would be a separate targeting
+      effort.</li>
+</ul>
+
+<h2>Install the forked compiler</h2>
+
+<pre><code>git clone &lt;rustcc-repo&gt; rustcc
+cd rustcc/fork
+./build.sh              # applies patches, builds stage-1 rustc
+# ~30-90 min on a dev laptop
+</code></pre>
+
+<p>After the build, the toolchain lives at
+<code>rust-lang-rust/build/host/stage1/bin/rustc</code>. Either invoke it
+directly or register it with <code>rustup</code>:</p>
+
+<pre><code>rustup toolchain link rustcc /path/to/rust-lang-rust/build/host/stage1
+rustup default rustcc
+</code></pre>
+
+<h2>Quick start — "Hello from C++"</h2>
+
+<p>Three files: a C++ source, a Rust source, a C runner. Rust calls
+into C++.</p>
+
+<p><b>hello.cpp</b></p>
+<pre><code>#include &lt;cstdint&gt;
+
+extern "C++" {
+    uint64_t cpp_double(uint64_t x) { return x * 2; }
+}
+</code></pre>
+
+<p><b>probe.rs</b></p>
+<pre><code>#![crate_type = "staticlib"]
+
+extern "C++" {
+    fn cpp_double(x: u64) -&gt; u64;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_entry() -&gt; u64 {
+    unsafe { cpp_double(21) }
+}
+</code></pre>
+
+<p><b>runner.c</b></p>
+<pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+extern uint64_t rust_entry(void);
+int main(void) { return (int)rust_entry(); }
+</code></pre>
+
+<p><b>Build &amp; run</b></p>
+<pre><code>rustc probe.rs                        # emits libprobe.a with _Z9cpp_doubley referenced
+clang++ -c hello.cpp -o hello.o
+clang   -c runner.c -o runner.o
+clang++ runner.o hello.o libprobe.a -o demo
+./demo; echo $?                        # prints 42
+</code></pre>
+
+<p>No <code>bindgen</code>, no manual mangling — the Rust-side <code>extern "C++"</code>
+block produces the exact Itanium symbol Clang emits on the C++ side.</p>
+
+<h2>Example gallery</h2>
+
+<p>Five short end-to-end examples covering the v1 features.
+Detailed docs for each feature are in the <a href="#feature-reference">Feature reference</a> below.</p>
+
+<h3>1. A polymorphic class defined in Rust, called from C++</h3>
+
+<p>Rust declares a class with a virtual method and a constructor.
+The fork's compiler emits the Itanium vtable, typeinfo, and
+auto-initializes the vptr. C++ sees a Rust-defined type indistinguishable
+from one written in C++.</p>
+
+<pre><code>// widget.rs
+#![feature(rustc_attrs)]
+
+pub class Widget {
+    v: i32,
+
+    #[constructor]
+    pub fn new(v: i32) -&gt; Self { Widget { v } }
+
+    #[cpp_virtual]
+    pub fn foo(&amp;self) -&gt; i32 { self.v + 100 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn make_widget(v: i32) -&gt; *mut Widget {
+    Box::into_raw(Box::new(Widget::new(v)))
+}
+</code></pre>
+
+<pre><code>// caller.cpp
+struct Widget {
+    virtual int32_t foo();
+    int32_t v;
+};
+
+extern "C" Widget* make_widget(int32_t v);
+
+int main(void) {
+    Widget* w = make_widget(7);
+    return w-&gt;foo();   // dispatches into Rust's `foo` — returns 107
+}
+</code></pre>
+
+<h3>2. Single inheritance and dynamic_cast</h3>
+
+<p>Derived classes embed the base subobject at offset 0. The
+compiler emits an <code>__si_class_type_info</code> chain so
+<code>dynamic_cast</code> works across the boundary.</p>
+
+<pre><code>pub class Animal {
+    name_len: u32,
+    #[constructor] pub fn new(n: u32) -&gt; Self { Animal { name_len: n } }
+    #[cpp_virtual] pub fn legs(&amp;self) -&gt; u32 { 4 }
+}
+
+pub class Dog : Animal {
+    volume: u32,
+    #[constructor]
+    pub fn new(n: u32, v: u32) -&gt; Self {
+        Dog { __base: Animal::new(n), volume: v }
+    }
+    #[cpp_virtual] pub fn bark(&amp;self) -&gt; u32 { self.volume * 10 }
+}
+</code></pre>
+
+<pre><code>// caller.cpp
+Dog* d = make_dog(7, 3);
+Animal* a = static_cast&lt;Animal*&gt;(d);      // upcast
+a-&gt;legs();                                 // dispatches to Animal::legs via Dog's vtable
+dynamic_cast&lt;Dog*&gt;(a);                     // recovers Dog* — libc++abi walks the chain
+</code></pre>
+
+<h3>3. C++ constructor + destructor written in Rust</h3>
+
+<p>Tag the constructor with <code>#[constructor]</code> and the
+destructor via a regular <code>impl Drop</code>. The compiler
+emits Itanium <code>_ZN&lt;class&gt;C1E&lt;args&gt;</code> and
+<code>D0/D1/D2</code> symbols — byte-identical to Clang.</p>
+
+<pre><code>#[repr(cpp)]
+pub struct Texture { handle: u64 }
+
+impl Texture {
+    #[constructor]
+    pub fn new(h: u64) -&gt; Self { Texture { handle: h } }
+}
+
+impl Drop for Texture {
+    fn drop(&amp;mut self) {
+        // C++ callers see this as `~Texture()`
+        println!("freeing texture {}", self.handle);
+    }
+}
+</code></pre>
+
+<h3>4. Calling a Swift class from Rust</h3>
+
+<p>The <code>swift_value!</code> macro auto-generates
+<code>impl Drop</code> and <code>impl Clone</code> with the right
+retain/release semantics.</p>
+
+<pre><code>rustcc_macros::swift_value! {
+    #[swift_type = "MyLib.Counter:class"]
+    pub struct Counter { pub handle: *mut core::ffi::c_void }
+}
+
+unsafe extern "Swift" {
+    #[swift_symbol = "MyLib"]
+    fn make_counter() -&gt; Counter;
+}
+
+// Usage — Drop releases, Clone retains, everything native.
+let a = unsafe { make_counter() };
+let b = a.clone();              // retains
+drop(b);                        // releases
+drop(a);                        // releases — Swift deinit fires
+</code></pre>
+
+<h3>5. Cross-crate polymorphism</h3>
+
+<p>A polymorphic class defined in one crate is fully usable from
+another — the compiler-emitted attributes flow across crate
+boundaries so call-site mangling matches the definer's.</p>
+
+<pre><code>// crate_a/src/lib.rs
+pub class Widget {
+    v: i32,
+    #[constructor]   pub fn new(v: i32) -&gt; Self { Widget { v } }
+    #[cpp_virtual] pub fn foo(&amp;self) -&gt; i32 { self.v + 100 }
+}
+
+// crate_b/src/lib.rs
+use crate_a::Widget;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn make_widget(v: i32) -&gt; *mut Widget {
+    Box::into_raw(Box::new(Widget::new(v)))
+}
+</code></pre>
+
+<h2 id="feature-reference">Feature reference</h2>
+
+<h3>1. <code>#[repr(cpp)]</code> structs</h3>
+
+<p>Tag a Rust struct to opt into Itanium layout rules. The layout
+matches what Clang computes for a C++ class with the same field
+sequence, so records pass fields at the same offsets as C++
+expects.</p>
+
+<pre><code>#[repr(cpp)]
+pub struct Widget {
+    pub handle: u64,
+    pub count: u32,
+}
+</code></pre>
+
+<p>Differences from <code>#[repr(C)]</code>: empty structs have size ≥ 1 (so
+distinct instances have distinct addresses, matching C++); empty
+structs with <code>alignas(N)</code> get size N (preserving the
+<code>size % align == 0</code> invariant).</p>
+
+<h3>2. Free-function extern blocks</h3>
+
+<pre><code>extern "C++" {
+    fn cpp_add(a: i32, b: i32) -&gt; i32;
+    fn cpp_process(p: *const u8, len: u64) -&gt; bool;
+}
+</code></pre>
+
+<p>Scope nesting: if the <code>extern "C++"</code> block lives inside a
+<code>mod</code>, the Rust module path mirrors into C++ namespaces:</p>
+
+<pre><code>pub mod gfx {
+    extern "C++" {
+        pub fn render(x: i32) -&gt; i32;   // mangles as _ZN3gfx6renderEi
+    }
+}
+</code></pre>
+
+<p>C++ side: <code>namespace gfx { int32_t render(int32_t x); }</code>.</p>
+
+<h3>3. Methods on <code>#[repr(cpp)]</code> types</h3>
+
+<p>Any method declared in an <code>impl</code> block on a <code>#[repr(cpp)]</code>
+type automatically gets the Itanium member-function calling
+convention and mangling. No <code>extern "C++"</code> ABI annotation needed.</p>
+
+<pre><code>#[repr(cpp)]
+pub struct Widget { pub handle: u64 }
+
+impl Widget {
+    pub fn area(&amp;self) -&gt; u64 {           // _ZNK6Widget4areaEv  (const-this)
+        self.handle * 2
+    }
+    pub fn bump(&amp;mut self, by: u64) {      // _ZN6Widget4bumpEy   (non-const-this)
+        self.handle += by;
+    }
+}
+</code></pre>
+
+<p>C++ side:</p>
+
+<pre><code>struct Widget {
+    uint64_t handle;
+    uint64_t area() const;
+    void bump(uint64_t by);
+};
+// Methods defined on the Rust side — C++ just declares and calls.
+</code></pre>
+
+<div class="note"><b>Note:</b> methods are auto-exported with external linkage. The
+<code>#[unsafe(no_mangle)]</code> annotation is <i>not</i> required.</div>
+
+<h3>4. Constructors</h3>
+
+<p>Mark a method with <code>#[constructor]</code> to emit it as the C++
+<code>C1</code> complete-object constructor. Two directions work:</p>
+
+<p><b>Rust implements the ctor</b> (C++ callers link against Rust):</p>
+
+<pre><code>#![feature(rustc_attrs)]
+
+impl Widget {
+    #[constructor]
+    pub fn new(h: u64) -&gt; Self {            // _ZN6WidgetC1Ey
+        Widget { handle: h }
+    }
+}
+</code></pre>
+
+<p><b>C++ implements the ctor</b> (Rust callers link against C++) — since P09.22:</p>
+
+<pre><code>#![feature(rustc_attrs)]
+
+unsafe extern "C++" {
+    #[constructor]
+    pub fn new(h: u64) -&gt; Widget;           // _ZN6WidgetC1Ey
+}
+
+// usage: let w = unsafe { new(42) };
+</code></pre>
+
+<p>The compiler reads the class name off the return type (must
+be a <code>#[repr(cpp)]</code> ADT) and emits the Itanium
+<code>_ZN&lt;class&gt;C1E&lt;args&gt;</code> symbol — byte-identical to Clang.
+No <code>#[link_name]</code> needed.</p>
+
+<h3>5. Destructors</h3>
+
+<p>Implementing <code>Drop</code> on a <code>#[repr(cpp)]</code> type automatically
+emits the <code>D1</code> complete-object destructor:</p>
+
+<pre><code>impl Drop for Widget {                       // _ZN6WidgetD1Ev
+    fn drop(&amp;mut self) {
+        // runs on C++ scope exit, `delete`, or Rust scope exit
+    }
+}
+</code></pre>
+
+<p>No attribute needed — the destructor association is inferred
+from the Drop trait impl.</p>
+
+<h3>6. Passing records by value</h3>
+
+<p>A <code>#[repr(cpp)]</code> struct with <code>Drop</code> <i>or</i> <code>!Copy</code> is
+"non-trivial for calls" per Itanium: passed and returned by
+invisible reference (sret on return, ptr on args), regardless of
+size. Trivial POD-like types pass in registers.</p>
+
+<pre><code>#[repr(cpp)]
+#[derive(Copy, Clone)]
+pub struct Point { pub x: f32, pub y: f32 }    // trivial → passed in xmm registers
+
+#[repr(cpp)]
+pub struct Handle { pub raw: u64 }              // !Copy → passed indirectly
+</code></pre>
+
+<h3>7. References in signatures</h3>
+
+<pre><code>impl Widget {
+    pub fn combine(&amp;self, other: &amp;Widget) -&gt; u64 {   // _ZNK6Widget7combineERKS_
+        self.handle + other.handle
+    }
+}
+</code></pre>
+
+<p>Rust <code>&amp;T</code> maps to C++ <code>const T&amp;</code>, <code>&amp;mut T</code> to
+<code>T&amp;</code>. Itanium type-substitution (<code>S_</code>, <code>S0_</code>, ...) is
+applied where appropriate.</p>
+
+<h3>8. Arrays</h3>
+
+<pre><code>impl Widget {
+    pub fn checksum(&amp;self, counts: &amp;[u64; 4]) -&gt; u64 {
+        // _ZNK6Widget8checksumERA4_Ky
+        counts.iter().sum::&lt;u64&gt;() + self.handle
+    }
+}
+</code></pre>
+
+<p>C++ side: <code>uint64_t checksum(const uint64_t (&amp;counts)[4]) const</code>.</p>
+
+<h3>9. C-like enums</h3>
+
+<pre><code>#[repr(cpp, i32)]
+pub enum Color {
+    Red   = 1,
+    Green = 2,
+    Blue  = 4,
+}
+
+extern "C++" {
+    fn paint(c: Color) -&gt; u32;              // _Z5paint5Color
+}
+</code></pre>
+
+<p>Equivalent C++: <code>enum class Color : int32_t { Red = 1, Green = 2, Blue = 4 };</code>
+plus <code>uint32_t paint(Color c);</code>.</p>
+
+<p>Restrictions (enforced at compile time):</p>
+<ul>
+  <li>An integer repr hint is required (<code>i8</code>/<code>i16</code>/<code>i32</code>/<code>i64</code>/<code>i128</code> or
+      unsigned counterpart). <code>#[repr(cpp)] enum</code> alone is rejected.</li>
+  <li>No data-carrying variants — C++ <code>enum class</code> has no
+      tagged-union form.</li>
+</ul>
+
+<h3>10. C++ operator overloading</h3>
+
+<p>Mark a method with <code>#[operator = "Kind"]</code>
+to emit it with the C++ operator mangling. Supported:</p>
+
+<pre><code>impl Point {
+    #[operator = "Plus"]
+    pub fn op_add(&amp;self, other: &amp;Point) -&gt; Point { ... }
+    #[operator = "Eq"]
+    pub fn op_eq(&amp;self, other: &amp;Point) -&gt; bool { ... }
+    #[operator = "Lt"]
+    pub fn op_lt(&amp;self, other: &amp;Point) -&gt; bool { ... }
+    #[operator = "Index"]
+    pub fn op_index(&amp;self, i: u32) -&gt; i32 { ... }
+}
+</code></pre>
+
+<p>Emits <code>_ZNK5PointplERKS_</code>,
+<code>_ZNK5PointeqERKS_</code>, <code>_ZNK5PointltERKS_</code>,
+<code>_ZNK5PointixEj</code> — byte-identical to Clang's output
+for the equivalent C++ <code>operator+</code>,
+<code>operator==</code>, <code>operator&lt;</code>,
+<code>operator[]</code>.</p>
+
+<p>Kinds: <code>Plus</code>, <code>Minus</code>, <code>Mul</code>,
+<code>Div</code>, <code>Mod</code>, <code>Eq</code>,
+<code>Ne</code>, <code>Lt</code>, <code>Le</code>,
+<code>Gt</code>, <code>Ge</code>, <code>Assign</code>,
+<code>PlusAssign</code>, <code>Index</code>, <code>Deref</code>,
+<code>Call</code>, <code>PreIncr</code>, <code>PreDecr</code>.</p>
+
+<h3>11. Swift <code>extern "Swift"</code> interop</h3>
+
+<p>Declare Swift module + type bindings via
+<code>#[swift_symbol]</code> /
+<code>#[swift_type]</code> on <code>#[repr(swift)]</code>
+struct bodies:</p>
+
+<pre><code>#[repr(swift)]
+#[swift_type = "MyLib.Point"]
+pub struct Point { pub x: f32, pub y: f32 }
+
+unsafe extern "Swift" {
+    #[swift_symbol = "MyLib"]
+    fn magnitude(p: Point) -&gt; f32;
+}
+</code></pre>
+
+<p>Rust's side uses <code>swiftcc</code> calling convention for
+<code>extern "Swift"</code> items and spreads POD struct args
+field-by-field to match <code>swiftc</code>'s ABI.</p>
+
+<p>Swift classes (reference types) — add <code>:class</code>
+suffix:</p>
+
+<pre><code>#[repr(swift)]
+#[swift_type = "MyLib.Counter:class"]
+pub struct Counter { __ptr: *mut core::ffi::c_void }
+
+impl Drop for Counter {
+    fn drop(&amp;mut self) {
+        if !self.__ptr.is_null() {
+            unsafe { rustcc_swift_rt::swift_release(self.__ptr); }
+        }
+    }
+}
+</code></pre>
+
+<p>Swift's ARC is bridged via <code>swift_retain</code> /
+<code>swift_release</code> declared in the
+<code>rustcc_swift_rt</code> helper crate.</p>
+
+<h3>12. <code>native_cpp_class!</code> macro (fork-only)</h3>
+
+<p>For projects that want the ergonomic
+<code>class Widget { ... }</code> syntax without parser-level
+support, <code>rustcc_macros::native_cpp_class!</code>
+(added in P09.22) rides the compiler's unified
+<code>#[constructor]</code> path so declarations are minimal:</p>
+
+<pre><code>use rustcc_macros::native_cpp_class;
+
+native_cpp_class! {
+    #[size = 16] #[align = 8]
+    pub class Texture {
+        #[ctor] fn new(w: u64, h: u64) -&gt; Self;
+        fn area(&amp;self) -&gt; u64;
+        fn scale(&amp;mut self, by: u64);
+    }
+}
+
+// usage:
+let t = Texture::new(4, 5);          // _ZN7TextureC1Eyy
+let a = t.area();                     // _ZNK7Texture4areaEv
+</code></pre>
+
+<p>Differences vs the stable-rustc-compatible
+<code>cxx_class!</code>:</p>
+
+<ul>
+  <li>Struct emits <code>#[repr(cpp)]</code>, block emits
+      <code>extern "C++"</code>.</li>
+  <li>Ctors use <code>#[constructor]</code> — no sret
+      trampoline, no hand-mangled <code>#[link_name]</code>.</li>
+  <li>Inherent method wrappers carry
+      <code>#[rustc_cxx_wrapper]</code> so P09.3 doesn't
+      auto-export them (they'd otherwise collide with the
+      C++ side's definition).</li>
+  <li>Auto-generated <code>impl Drop</code> that forwards to the
+      C++ destructor (<code>_ZN&lt;class&gt;D1Ev</code>). Added
+      in P09.23 via the new
+      <code>#[rustc_cxx_drop_wrapper]</code> attribute — the
+      trait-impl analogue of <code>#[rustc_cxx_wrapper]</code>.
+      It opts <code>Drop::drop</code> out of P09.15's D0/D1/D2
+      auto-export so the C++ side is the sole definer and the
+      Rust body just forwards. Users no longer need
+      <code>ManuallyDrop</code>.</li>
+</ul>
+
+<p>Because the expansion uses fork-only features, this macro
+only compiles under the rustcc stage-1 compiler. Stable-rustc
+users stay on <code>cxx_class!</code>.</p>
+
+<h3>13. Rust-defined polymorphic classes (fork-only, P09.24 + P09.25)</h3>
+
+<p>Rust can define a C++ class with virtual methods and have C++
+callers dispatch through the vtable — Rust is the sole definer of
+<code>_ZTV&lt;class&gt;</code>, <code>_ZTI&lt;class&gt;</code>, and
+<code>_ZTS&lt;class&gt;</code>. Scope: single-inheritance,
+Itanium ABI, v1.</p>
+
+<p>As of P09.25 no boilerplate is required. Just tag the virtual
+methods and write an ordinary ctor:</p>
+
+<pre><code>#![feature(rustc_attrs)]
+
+#[repr(cpp)]
+pub struct Widget { pub v: i32 }
+
+impl Widget {
+    #[constructor]
+    pub fn new(v: i32) -&gt; Self { Widget { v } }
+
+    #[cpp_virtual]
+    pub fn foo(&amp;self) -&gt; i32 { self.v + 100 }
+
+    #[cpp_virtual]
+    pub fn bar(&amp;self) -&gt; i32 { self.v * 2 }
+}
+</code></pre>
+
+<p>What the compiler does under the hood:</p>
+
+<ul>
+  <li><b>Layout</b>: reserves <code>ptr_bytes</code> at offset 0
+      for the vptr. User fields shift behind it. The struct's
+      reported size includes the vptr slot.</li>
+  <li><b>Vtable / RTTI</b>: emits
+      <code>_ZTV&lt;class&gt;</code>,
+      <code>_ZTI&lt;class&gt;</code>,
+      <code>_ZTS&lt;class&gt;</code> as
+      <code>linkonce_odr</code> constants.</li>
+  <li><b>Ctor vptr init</b>: stores
+      <code>&amp;_ZTV&lt;class&gt;[2]</code> (the address point)
+      into offset 0 at the start of every
+      <code>#[constructor]</code> method, before user MIR runs.</li>
+</ul>
+
+<p>C++ side declares the class layout and virtual signatures; the
+definitions come from the Rust side via Itanium mangling:</p>
+
+<pre><code>struct Widget {
+    virtual int32_t foo();
+    virtual int32_t bar();
+    int32_t v;
+};
+
+extern "C" Widget* make_widget(int32_t v);  // Rust-defined
+</code></pre>
+
+<p>C++ calls like <code>w-&gt;foo()</code> load
+<code>w-&gt;vptr</code>, index slot 0 of the address-point view,
+and dispatch into Rust's <code>foo</code>.</p>
+
+<div class="caveat"><b>v1 rules.</b> (1) Single inheritance
+supported; multi-inheritance / virtual bases are v2 work. (2)
+Virtual method order = sort by (impl DefId, method DefId); user
+must keep the C++ header's virtual declaration order in sync.
+(3) Derived class may <em>add</em> new virtuals (go into vtable
+slots after base's) and may <em>override</em> a base virtual
+by declaring a derived virtual with the same method name
+(P09.34; matched by name only — mismatched signatures are user
+error). (4) <code>dynamic_cast</code> across inheritance works
+via libc++abi's runtime typeinfo chain walk. (5) Non-generic
+methods only.</div>
+
+<h3>15. Single inheritance — <code>class Derived : Base</code></h3>
+
+<p>The fork's <code>class</code> keyword (see §14) accepts a
+C++-style inheritance clause. The parser synthesizes a first
+field <code>__base: Base</code> marked <code>#[rustc_cxx_base]</code>.
+Layout places the base subobject at offset 0 (so its vptr is
+also Derived's vptr slot), the vtable emitter combines base's
+virtual slots with derived's new virtuals, and the typeinfo
+chain uses <code>__si_class_type_info</code> so
+<code>dynamic_cast</code> walks the inheritance chain.</p>
+
+<pre><code>pub class Animal {
+    name_len: u32,
+    #[constructor] pub fn new(n: u32) -&gt; Self { Animal { name_len: n } }
+    #[cpp_virtual] pub fn legs(&amp;self) -&gt; u32 { 4 }
+}
+
+pub class Dog : Animal {
+    volume: u32,
+
+    #[constructor]
+    pub fn new(n: u32, v: u32) -&gt; Self {
+        // User writes base init explicitly; compiler rewrites
+        // the base's vptr to point at Derived's vtable at
+        // return, so `static_cast<Animal*>(dog)->legs()` still
+        // dispatches correctly.
+        Dog { __base: Animal::new(n), volume: v }
+    }
+
+    #[cpp_virtual] pub fn bark(&amp;self) -&gt; u32 { self.volume * 10 }
+}
+</code></pre>
+
+<p>C++ side mirrors the inheritance:</p>
+
+<pre><code>struct Animal {
+    virtual uint32_t legs();
+    uint32_t name_len;
+};
+
+struct Dog : Animal {
+    virtual uint32_t bark();
+    uint32_t volume;
+};
+
+extern "C" Dog* make_dog(uint32_t n, uint32_t v);
+</code></pre>
+
+<p>Calls through <code>Dog*</code> dispatch to both base and
+derived virtuals; upcasts to <code>Animal*</code> preserve
+dispatch; <code>dynamic_cast&lt;Dog*&gt;(animal_ptr)</code>
+recovers the derived pointer when the runtime type is Dog and
+returns <code>nullptr</code> otherwise.</p>
+
+<div class="caveat"><b>v1 restrictions on inheritance.</b> (1)
+Single inheritance only (multi-inheritance / virtual bases
+are v2). (2) Override matches by method name only — a derived
+virtual with the same name as a base virtual replaces the
+base's vtable slot, but a derived method whose signature
+doesn't match what C++ callers expect through the base
+pointer is user error (no lint for this in v1). (3) The
+<code>__base</code> field is synthesized by the parser; users
+reference it by name in struct literals but shouldn't redeclare
+it.</div>
+
+<h3>14. <code>class</code> keyword (fork-only, P09.30)</h3>
+
+<p>As of P09.30 the fork accepts the <code>class</code> keyword at
+item position. It parses identically to a
+<code>#[repr(cpp)]</code> struct plus an inherent
+<code>impl</code>, so everything downstream — §13's auto vptr
+slot, virtual dispatch, ctor mangling — carries over. The
+keyword is purely syntactic sugar with no additional semantics.</p>
+
+<p>Example:</p>
+
+<pre><code>#![feature(rustc_attrs)]
+
+pub class Widget {
+    v: i32,
+
+    #[constructor]
+    pub fn new(v: i32) -&gt; Self { Widget { v } }
+
+    #[cpp_virtual]
+    pub fn foo(&amp;self) -&gt; i32 { self.v + 100 }
+}
+</code></pre>
+
+<p>is parsed as if the user had written:</p>
+
+<pre><code>#[repr(cpp)]
+pub struct Widget { v: i32 }
+
+impl Widget {
+    #[constructor]
+    pub fn new(v: i32) -&gt; Self { Widget { v } }
+
+    #[cpp_virtual]
+    pub fn foo(&amp;self) -&gt; i32 { self.v + 100 }
+}
+</code></pre>
+
+<div class="caveat"><b>v1 rules.</b> (1) Fields must come before
+methods inside the class body. (2) Fields don't support outer
+attributes — anything starting with <code>#</code> is parsed
+as a method. (3) <code>class</code> is a <em>weak</em>
+keyword, so <code>let class = 5;</code> still parses as a
+normal binding. (4) No generics on the class header in v1.
+(5) The fork-specific compiler attributes
+(<code>#[constructor]</code>,
+<code>#[cpp_virtual]</code>) still apply on methods
+inside a class — they aren't auto-inferred from context.</div>
+
+<h3>16. Bare-metal / STM32 targets (fork, P09.36)</h3>
+
+<p>The fork compiles cleanly for bare-metal 32-bit ARM targets
+like <code>thumbv7em-none-eabihf</code> (Cortex-M4F — the
+STM32F4 / L4 / G4 families). The existing Itanium-ABI machinery
+is target-aware enough that <strong>no ABI-specific compiler
+changes are needed</strong> for ARM Cortex-M; the only
+link-time knob is providing a stub for libc++abi's RTTI vtable
+since bare-metal builds typically don't link
+<code>libc++abi</code>.</p>
+
+<p><b>Minimal probe</b> (see <code>/tmp/p09-39-arm32/</code>):</p>
+
+<pre><code>// src/lib.rs
+#![no_std]
+#![feature(rustc_attrs)]
+
+pub class Widget {
+    v: i32,
+    #[constructor]  pub fn new(v: i32) -&gt; Self { Widget { v } }
+    #[cpp_virtual]  pub fn foo(&amp;self) -&gt; i32 { self.v + 100 }
+}
+
+// Bare-metal boilerplate
+#[panic_handler]
+fn panic(_: &amp;core::panic::PanicInfo) -&gt; ! { loop {} }
+</code></pre>
+
+<p><b>Build</b> — use a nightly cargo as the driver (so
+<code>-Zbuild-std</code> is accepted), but override
+<code>RUSTC</code> to point at the fork's stage-1:</p>
+
+<pre><code>RUSTC=/path/to/rust-lang-rust/build/host/stage1/bin/rustc \
+RUSTC_BOOTSTRAP=1 \
+cargo +nightly build --target thumbv7em-none-eabihf \
+  -Zbuild-std=core,compiler_builtins
+</code></pre>
+
+<p>The output under
+<code>target/thumbv7em-none-eabihf/debug/</code> contains
+correctly-mangled Itanium symbols with 32-bit pointer widths
+throughout:</p>
+
+<ul>
+  <li><code>_ZN6WidgetC1Ei</code> — ctor, sret-style (void return
+      with hidden <code>this</code> arg). Matches
+      <code>arm-none-eabi-g++</code>'s expectations for
+      <code>thumbv7em</code>.</li>
+  <li><code>_ZNK6Widget3fooEv</code> — const-this virtual.</li>
+  <li><code>_ZTV6Widget</code> — vtable of shape
+      <code>{ i32, ptr, ptr }</code>: 4-byte offset-to-top, 4-byte
+      typeinfo pointer, 4-byte fn pointer.</li>
+  <li><code>_ZTI6Widget</code> / <code>_ZTS6Widget</code> —
+      typeinfo and typeinfo-name.</li>
+</ul>
+
+<p><b>Link-time stub</b> for the libc++abi RTTI vtable:</p>
+
+<pre><code>// rtti_stub.c — 3 lines satisfy the only external reference.
+__attribute__((weak))
+void* _ZTVN10__cxxabiv117__class_type_infoE[4] = { 0 };
+</code></pre>
+
+<p>Compile with <code>arm-none-eabi-gcc -mcpu=cortex-m4
+-mthumb</code>. This stub is enough for virtual dispatch to
+work at runtime — the typeinfo pointer in the vtable exists so
+the linker is happy, but <code>dynamic_cast</code> and
+<code>typeid</code> won't do anything meaningful without real
+libc++abi. Users who want full RTTI can link against
+<code>libsupc++-nano</code> (shipped with
+<code>arm-none-eabi-gcc</code>) or an equivalent instead of the
+stub.</p>
+
+<p><b>End-to-end partial link</b>:</p>
+
+<pre><code>arm-none-eabi-g++ -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 \
+  -mfloat-abi=hard -mthumb -c caller.cpp -o caller.o -std=c++17
+
+arm-none-eabi-gcc -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 \
+  -mfloat-abi=hard -mthumb -c rtti_stub.c -o rtti_stub.o
+
+arm-none-eabi-ld -r caller.o rtti_stub.o \
+  --whole-archive libp09_39_arm32.a -o probe.o
+# probe.o: ELF 32-bit LSB relocatable, ARM, EABI5 version 1
+# All symbols resolved, no undefined references.
+</code></pre>
+
+<div class="caveat"><b>Other ARM Cortex-M targets.</b>
+<code>thumbv7m-none-eabi</code> (Cortex-M3),
+<code>thumbv8m.base-none-eabi</code> (M23),
+<code>thumbv8m.main-none-eabihf</code> (M33F), etc. should all
+work by the same recipe — the fork's C++ ABI paths don't touch
+target-specific instruction selection, so any Itanium-ABI
+32-bit ARM variant is eligible. If a specific triple produces
+different mangling vs <code>arm-none-eabi-g++</code>, open an
+issue with the ABI fact that mismatches.</div>
+
+<h2>What's still limited in v1</h2>
+
+<table>
+  <tr><th>Feature</th><th>v1 status</th><th>Workaround</th></tr>
+  <tr><td>Virtual methods / vtables</td><td>Supported</td><td>—</td></tr>
+  <tr><td>Single inheritance</td><td>Supported</td><td>—</td></tr>
+  <tr><td><code>dynamic_cast</code> across inheritance</td><td>Supported</td><td>—</td></tr>
+  <tr><td>Virtual method override</td><td>Supported</td><td>Derived class methods with the same name as a base virtual replace the base's vtable slot (P09.34)</td></tr>
+  <tr><td>Multi-inheritance / virtual bases</td><td>v2</td><td>Use composition-over-inheritance at the C++ API boundary</td></tr>
+  <tr><td>Virtual-override signature-compat lint</td><td>v2</td><td>Name-match today; mismatched sigs are user error. A lint is future polish.</td></tr>
+  <tr><td>Windows MSVC ABI</td><td>Out of scope</td><td>Itanium-only; use a different build for Windows</td></tr>
+  <tr><td><code>isize</code> / <code>usize</code> in C++ sigs</td><td>Rejected (target-dependent mangling)</td><td>Use explicit <code>i64</code>/<code>u64</code></tr>
+  <tr><td>Tuples, slices, <code>&amp;str</code>, fn pointers in C++ sigs</td><td>Rejected</td><td>Pass as struct / ptr+len / raw fn ptr</td></tr>
+  <tr><td>Non-trivial move ctors (move-only C++ types)</td><td>Partial — covered by <code>!Copy</code> heuristic</td><td>Verify with a probe if precise move semantics matter</td></tr>
+  <tr><td>Const generics on <code>class</code> header</td><td>v2</td><td>Use type / lifetime params for v1; const generics parse but aren't tested</td></tr>
+</table>
+
+<div class="caveat"><b>Error early, not at link time.</b> If you write a C++ signature
+with a type the fork can't mangle, you get a compile error pointing
+at the offending type — not a mystery "undefined symbol" from the
+linker.</div>
+
+<h2>Minimum working end-to-end example</h2>
+
+<p>A full round trip: C++ defines a class, Rust implements methods on
+it, C++ uses those methods.</p>
+
+<p><b>widget.hpp</b> (C++ declares the class shape)</p>
+<pre><code>#pragma once
+#include &lt;cstdint&gt;
+struct Widget {
+    uint64_t handle;
+    Widget(uint64_t h);
+    ~Widget();
+    uint64_t area() const;
+};
+</code></pre>
+
+<p><b>widget.rs</b> (Rust provides the implementation)</p>
+<pre><code>#![crate_type = "staticlib"]
+#![feature(rustc_attrs)]
+
+#[repr(cpp)]
+pub struct Widget { pub handle: u64 }
+
+impl Widget {
+    #[constructor]
+    pub fn new(h: u64) -&gt; Self { Widget { handle: h } }
+
+    pub fn area(&amp;self) -&gt; u64 { self.handle * 2 }
+}
+
+impl Drop for Widget {
+    fn drop(&amp;mut self) { /* D1 runs on scope exit */ }
+}
+</code></pre>
+
+<p><b>main.cpp</b> (C++ uses the class)</p>
+<pre><code>#include "widget.hpp"
+#include &lt;cstdio&gt;
+
+int main() {
+    Widget w(21);
+    std::printf("area = %llu\n", (unsigned long long)w.area());
+    return 0;
+}
+</code></pre>
+
+<p><b>Build</b></p>
+<pre><code>rustc widget.rs
+clang++ -c main.cpp -o main.o
+clang++ main.o libwidget.a -o demo
+./demo                  # prints: area = 42
+</code></pre>
+
+<p>Three symbols resolve at link time:
+<code>_ZN6WidgetC1Ey</code> (ctor), <code>_ZNK6Widget4areaEv</code> (method),
+<code>_ZN6WidgetD1Ev</code> (dtor) — all from the Rust staticlib.</p>
+
+<h2>Troubleshooting</h2>
+
+<h3>"undefined symbol <code>_ZN6Widget...</code>" at link time</h3>
+
+<p>The C++ side references a symbol the Rust side didn't define (or
+vice versa). Check:</p>
+
+<ul>
+  <li>Method signatures match on both sides (including
+      <code>const</code> vs non-const).</li>
+  <li>The Rust impl method is defined with a body (declarations
+      without bodies don't emit a symbol).</li>
+  <li>Namespace nesting matches between Rust <code>mod</code> hierarchy and
+      C++ <code>namespace</code> hierarchy.</li>
+</ul>
+
+<p>Inspect what Rust emitted:</p>
+<pre><code>nm libwidget.a | grep -i widget
+# or: rustc --emit=llvm-ir widget.rs &amp;&amp; grep -E "^define" widget.ll
+</code></pre>
+
+<p>Inspect what C++ expects:</p>
+<pre><code>clang++ -S -emit-llvm main.cpp -o main.ll &amp;&amp; grep '@_Z' main.ll | head
+</code></pre>
+
+<h3>"type <code>X</code> cannot appear in an <code>extern "C++"</code> signature"</h3>
+
+<p>The Rust→C++ type mapper doesn't know how to mangle <code>X</code>. The
+error points at the fn item that's involved. Common cases:</p>
+<ul>
+  <li><code>&amp;str</code> / slices / tuples → pass as <code>*const u8 + u64</code> or a
+      <code>#[repr(cpp)]</code> struct.</li>
+  <li><code>isize</code> / <code>usize</code> → use explicit <code>i64</code> / <code>u64</code>.</li>
+  <li>Non-repr(cpp) Rust structs in a C++ signature → either add
+      <code>#[repr(cpp)]</code> to the struct or pass as a pointer.</li>
+</ul>
+
+<h3>"<code>#[repr(cpp)]</code> enum requires an explicit integer repr hint"</h3>
+
+<p>Add one: <code>#[repr(cpp, i32)]</code>.</p>
+
+<h3>"<code>#[repr(cpp)]</code> enum cannot have variants with data"</h3>
+
+<p>C++ <code>enum class</code> has no tagged-union form. If you need
+variants with payload, use a <code>#[repr(cpp)]</code> struct +
+discriminant manually, or declare a C++ <code>union</code>.</p>
+
+<h3>ABI mismatch between Rust and C++ calls</h3>
+
+<p>For records, check triviality:</p>
+<ul>
+  <li>Rust side has <code>impl Drop</code> or is <code>!Copy</code> → passed
+      indirectly.</li>
+  <li>C++ side has a user-declared destructor, copy ctor, or move
+      ctor → Clang also passes indirectly. Consistent.</li>
+</ul>
+
+<p>If the C++ class is trivial but the Rust type isn't (or vice
+versa), the ABIs diverge. Make both sides trivial (Rust:
+<code>#[derive(Copy, Clone)]</code>, no <code>Drop</code>) or both non-trivial.</p>
+
+<h2>Internals — where the work happens</h2>
+
+<table>
+  <tr><th>Concern</th><th>File</th></tr>
+  <tr><td>Attribute parsing (<code>repr(cpp)</code>, <code>constructor</code>)</td>
+      <td><code>compiler/rustc_attr_parsing/src/attributes/</code></td></tr>
+  <tr><td>Layout</td><td><code>compiler/rustc_abi_cxx/</code>,
+      <code>compiler/rustc_ty_utils/src/layout/cxx_bridge.rs</code></td></tr>
+  <tr><td>Itanium symbol mangling</td>
+      <td><code>compiler/rustc_symbol_mangling/src/itanium.rs</code></td></tr>
+  <tr><td>Calling convention (sret / indirect-arg promotion)</td>
+      <td><code>compiler/rustc_target/src/callconv/{x86_64,aarch64,x86}.rs</code></td></tr>
+  <tr><td>Non-trivial-for-calls detection</td>
+      <td><code>compiler/rustc_middle/src/ty/layout.rs</code></td></tr>
+</table>
+
+<p>All fork changes are captured as individual patches in
+<code>fork/patches/</code>. See <code>PATCHES.md</code> for the full patch series and
+per-patch rationale.</p>
+
+<h2>Reference probes</h2>
+
+<p>The fork ships with standalone probes that demonstrate each
+feature against Clang's reference output. These double as smoke
+tests for validating a stage-1 build:</p>
+
+<table>
+  <tr><th>Probe</th><th>What it exercises</th></tr>
+  <tr><td><code>/tmp/p09-probe/</code></td><td>Free-fn extern block, scalar round-trip</td></tr>
+  <tr><td><code>/tmp/p09-runtime/</code></td><td>Record pass-by-value with sret</td></tr>
+  <tr><td><code>/tmp/p09-methods/</code></td><td>Methods called from C++</td></tr>
+  <tr><td><code>/tmp/p09-refs/</code></td><td>References in method sigs</td></tr>
+  <tr><td><code>/tmp/p09-ns/</code></td><td>Module → namespace mangling</td></tr>
+  <tr><td><code>/tmp/p09-tier2/</code></td><td>Arrays, enums, diagnostics, aarch64 IR</td></tr>
+  <tr><td><code>/tmp/p09-tier3/</code></td><td>Ctor/dtor, non-trivial <code>!Copy</code></td></tr>
+</table>
+
+<hr>
+
+<p class="small">rustcc — a fork of rustc adding Swift-style C++ interop.
+Last updated 2026-04-20 (P01–P09.12). See <code>fork/PATCHES.md</code> and
+<code>fork/README.md</code> for the canonical project documentation.</p>
+
+</body>
+</html>

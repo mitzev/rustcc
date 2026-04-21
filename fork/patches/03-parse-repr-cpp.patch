@@ -1,0 +1,26 @@
+Teach `parse_repr` to recognize `#[repr(cpp)]`.
+
+Mirror the `sym::C` handling: accept the no-args form, reject the
+name-value form with the same diagnostic path. Downstream
+attribute-check code will enforce that `#[repr(cpp)]` can only
+appear on structs/unions/enums (same constraints as `#[repr(C)]`).
+
+diff --git a/compiler/rustc_attr_parsing/src/attributes/repr.rs b/compiler/rustc_attr_parsing/src/attributes/repr.rs
+--- a/compiler/rustc_attr_parsing/src/attributes/repr.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/repr.rs
+@@ -143,6 +143,7 @@ fn parse_repr<S: Stage>(cx: &AcceptContext<'_, '_, S>, param: &MetaItemParser) -
+
+         (Some(sym::Rust), ArgParser::NoArgs) => Some(ReprRust),
+         (Some(sym::C), ArgParser::NoArgs) => Some(ReprC),
++        (Some(sym::cpp), ArgParser::NoArgs) => Some(ReprCpp),
+         (Some(sym::simd), ArgParser::NoArgs) => Some(ReprSimd),
+         (Some(sym::transparent), ArgParser::NoArgs) => Some(ReprTransparent),
+         (Some(name @ int_pat!()), ArgParser::NoArgs) => {
+@@ -154,6 +155,7 @@ fn parse_repr<S: Stage>(cx: &AcceptContext<'_, '_, S>, param: &MetaItemParser) -
+             Some(
+                 name @ sym::Rust
+                 | name @ sym::C
++                | name @ sym::cpp
+                 | name @ sym::simd
+                 | name @ sym::transparent
+                 | name @ int_pat!(),

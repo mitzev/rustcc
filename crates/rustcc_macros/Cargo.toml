@@ -1,0 +1,24 @@
+[package]
+name = "rustcc_macros"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Proc-macro shim so user crates that use rustcc's C++ interop types
+# build under **stable** rustc, without waiting for the forked
+# compiler. `#[cpp_class]` expands to `#[repr(C)]` + the original
+# struct, preserving layout and letting the rustcc driver's
+# source-text scanner still find the interop types.
+#
+# When the rustc fork lands, the macro will additionally emit
+# `#[repr(cpp)]` (accepted by the fork) and wire richer validation
+# that today lives in `rustcc_attr`.
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits", "parsing"] }
+proc-macro2 = "1"
+quote = "1"

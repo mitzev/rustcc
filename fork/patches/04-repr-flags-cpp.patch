@@ -1,0 +1,37 @@
+Add `ReprFlags::IS_CPP` bit and the `ReprOptions::cpp()` accessor.
+
+P05 flips the bit when `ReprAttr::ReprCpp` is encountered during
+`ReprOptions::from_attrs`. Callers that need to distinguish C from
+C++ semantics (P06 layout delegation, P07 mangler override) check
+`repr.cpp()` explicitly; callers that just want C-compatible
+layout continue to check `repr.c()`, which is also true for
+repr(cpp) types (set alongside IS_CPP in P05).
+
+diff --git a/compiler/rustc_abi/src/lib.rs b/compiler/rustc_abi/src/lib.rs
+--- a/compiler/rustc_abi/src/lib.rs
++++ b/compiler/rustc_abi/src/lib.rs
+@@ -96,6 +96,7 @@ impl ReprFlags: u8 {
+         /// See [`TyAndLayout::pass_indirectly_in_non_rustic_abis`] for details.
+         const PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS = 1 << 5;
+         const IS_SCALABLE        = 1 << 6;
++        const IS_CPP             = 1 << 7;
+          // Any of these flags being set prevent field reordering optimisation.
+         const FIELD_ORDER_UNOPTIMIZABLE = ReprFlags::IS_C.bits()
+                                  | ReprFlags::IS_SIMD.bits()
+@@ -188,6 +189,16 @@ pub fn c(&self) -> bool {
+         self.flags.contains(ReprFlags::IS_C)
+     }
+
++    /// True when `#[repr(cpp)]` is present. Implies C-compatible
++    /// layout semantics *plus* the extended constraints of the
++    /// Itanium C++ ABI (sret for non-trivial-for-calls classes,
++    /// explicit `this`-pointer, Itanium mangling). The layout
++    /// query delegates to `rustc_abi_cxx` when this is set.
++    #[inline]
++    pub fn cpp(&self) -> bool {
++        self.flags.contains(ReprFlags::IS_CPP)
++    }
++
+     #[inline]
+     pub fn packed(&self) -> bool {
+         self.pack.is_some()

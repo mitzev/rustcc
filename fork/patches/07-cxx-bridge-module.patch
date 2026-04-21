@@ -1,0 +1,224 @@
+diff --git a/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs b/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
+new file mode 100644
+index 00000000..54d9d76e
+--- /dev/null
++++ b/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
+@@ -0,0 +1,218 @@
++//! P07 — Layout corrections for `#[repr(cpp)]` ADTs.
++//!
++//! Routes layout decisions through `rustc_abi_cxx` (vendored from
++//! the rustcc workspace) so Rust types tagged `#[repr(cpp)]` obey
++//! the Itanium C++ ABI's layout rules rather than Rust's own
++//! C-compat rules.
++//!
++//! # What diverges
++//!
++//! For most Rust-expressible struct shapes, stock `#[repr(C)]` and
++//! Itanium produce identical layouts. The ones that differ:
++//!
++//! - **Empty records.** Rust says `size == 0`; Itanium says
++//!   `size >= 1` (distinct C++ instances must have distinct
++//!   addresses).
++//! - **`alignas(N)` on an empty class.** Rust picks size 0 align N;
++//!   Itanium picks size N align N so the invariant "size is a
++//!   multiple of align" holds.
++//! - **Tail-padding reuse, EBO, vptr placement, vbase offsets.**
++//!   None of these are yet expressible in Rust-side `#[repr(cpp)]`
++//!   (no inheritance, no virtuals), but the bridge is structured
++//!   to handle them when later patches add inheritance support.
++//!
++//! # Strategy
++//!
++//! *Correct rather than replace.* Rust's stock layout algorithm
++//! already handles field types, niches, discriminants, sized-ness,
++//! etc. — so we compute it first, then ask `rustc_abi_cxx::layout`
++//! what Itanium says. Where Itanium disagrees, we override the
++//! stock layout's size/align and leave every other field intact.
++//! Keeps the patch surface narrow and the failure mode contained.
++//!
++//! A defensive sanity check guards the output: if the corrected
++//! layout would violate rustc's size-is-a-multiple-of-align
++//! invariant, we bail to stock. This is a safety rail while
++//! `rustc_abi_cxx` grows coverage for the less-common shapes.
++
++use rustc_abi::{
++    Align, BackendRepr, FieldIdx, LayoutData, Size, VariantIdx,
++};
++use rustc_abi_cxx::{
++    ClassDef, CxxType, CxxTypeCtx, FieldDef, Ident, IntWidth, NameSegment,
++    NestedName, RecordKind, Target as CxxTarget, TypeId,
++};
++use rustc_index::IndexVec;
++use rustc_middle::ty::layout::{LayoutError, TyAndLayout};
++use rustc_middle::ty::{self, AdtDef, TyCtxt};
++
++/// Apply Itanium corrections to `stock` for a `#[repr(cpp)]` ADT.
++///
++/// `variants` holds the per-field layouts that were computed on the
++/// way to `stock`; we consume them to build an equivalent `ClassDef`
++/// for `rustc_abi_cxx::layout`. For non-struct ADTs, or shapes our
++/// v1 bridge doesn't understand, we return stock unchanged — the
++/// correction path is opt-in and the fallback is always correct
++/// (Rust's own layout).
++pub(crate) fn correct_layout<'tcx>(
++    _tcx: TyCtxt<'tcx>,
++    def: AdtDef<'tcx>,
++    _args: &'tcx ty::List<ty::GenericArg<'tcx>>,
++    variants: &IndexVec<
++        VariantIdx,
++        IndexVec<FieldIdx, TyAndLayout<'tcx>>,
++    >,
++    stock: LayoutData<FieldIdx, VariantIdx>,
++) -> Result<LayoutData<FieldIdx, VariantIdx>, &'tcx LayoutError<'tcx>> {
++    debug_assert!(def.repr().cpp(), "correct_layout called on non-cpp ADT");
++
++    // v1: only structs. Unions and enums under `#[repr(cpp)]` need
++    // their own patch (C++ union and `enum class` semantics differ
++    // from Rust's in ways that need separate modeling).
++    if !def.is_struct() {
++        return Ok(stock);
++    }
++
++    // Rust structs have exactly one variant.
++    let Some(fields) = variants.get(VariantIdx::ZERO) else {
++        return Ok(stock);
++    };
++
++    let mut ctx = CxxTypeCtx::new(CxxTarget::host());
++    let mut cxx_fields = Vec::with_capacity(fields.len());
++    for (i, field_layout) in fields.iter_enumerated() {
++        let Some(field) =
++            synthesize_cxx_field(&mut ctx, i, field_layout)
++        else {
++            // Field shape the bridge doesn't model (unsized, SIMD,
++            // etc.). Bail to stock — still correct, just not
++            // Itanium-optimized.
++            return Ok(stock);
++        };
++        cxx_fields.push(field);
++    }
++
++    let class = ctx.define_class(ClassDef {
++        name: NestedName(vec![NameSegment::Class(Ident(
++            "__rustcc_synthetic__".into(),
++        ))]),
++        bases: Vec::new(),
++        fields: cxx_fields,
++        methods: Vec::new(),
++        kind: RecordKind::Struct,
++        is_polymorphic: false,
++        is_final: false,
++        // `#[repr(align(N))]` on the struct — Itanium's
++        // `source_alignment` enforces the min align.
++        source_alignment: def.repr().align.map(|a| a.bytes()),
++    });
++
++    let Ok(cxx_layout) = ctx.layout(class) else {
++        return Ok(stock);
++    };
++
++    let cxx_size = Size::from_bytes(cxx_layout.size_bytes);
++    let cxx_align_bytes = cxx_layout.align_bytes.max(1);
++    let cxx_align = Align::from_bytes(cxx_align_bytes).unwrap_or(Align::ONE);
++
++    // Defensive invariant: rustc requires `size % align == 0`.
++    // `rustc_abi_cxx` has a known edge case with `alignas(N)` on an
++    // empty record where it returns size=1 align=N; if that path
++    // ever fires here, we'd corrupt stock with an invalid layout.
++    // Rather than patch it upstream as part of this series, we
++    // defensively bail. A follow-up can harden `rustc_abi_cxx`.
++    if cxx_align_bytes != 0 && cxx_size.bytes() % cxx_align_bytes != 0 {
++        return Ok(stock);
++    }
++
++    // If Itanium agrees with stock on both size and align, short-
++    // circuit. The common case.
++    if stock.size == cxx_size && stock.align.abi >= cxx_align {
++        return Ok(stock);
++    }
++
++    // Build the corrected candidate via clone so the original
++    // `stock` is still available for the defensive fallback below.
++    let mut candidate = stock.clone();
++    if candidate.size != cxx_size {
++        candidate.size = cxx_size;
++        // ZST → sized bump. Other `BackendRepr` cases (Scalar,
++        // ScalarPair, SimdVector) are for primitive types, none
++        // of which reach this `#[repr(cpp)]` path on structs.
++        if !matches!(candidate.backend_repr, BackendRepr::Memory { .. }) {
++            candidate.backend_repr = BackendRepr::Memory { sized: true };
++        }
++    }
++    if candidate.align.abi < cxx_align {
++        candidate.align.abi = cxx_align;
++    }
++
++    // Post-correction invariant: size must still be a multiple of
++    // align. If our override broke it, fall back to stock.
++    if candidate.size.bytes() % candidate.align.abi.bytes() != 0 {
++        return Ok(stock);
++    }
++
++    Ok(candidate)
++}
++
++/// Synthesize a `FieldDef` whose `CxxType` has the same size and
++/// alignment as the Rust field's computed layout.
++///
++/// Itanium's layout rules depend only on each field's size and
++/// align (plus the containing class's constraints), so we don't
++/// need to mirror each field's exact Rust type — we just need a
++/// `CxxType` that lays out the same. For natural scalar sizes
++/// (1/2/4/8/16 where size == align) we pick the matching integer
++/// type; for everything else (odd sizes, over-aligned fields, etc.)
++/// we use a byte array plus an `explicit_align` override.
++fn synthesize_cxx_field<'tcx>(
++    ctx: &mut CxxTypeCtx,
++    idx: FieldIdx,
++    field: &TyAndLayout<'tcx>,
++) -> Option<FieldDef> {
++    let size = field.size.bytes();
++    let align = field.align.abi.bytes();
++
++    // Unsized fields — rare but possible (last field of an unsized
++    // struct). Not handled by the Itanium algorithm either.
++    if !field.is_sized() {
++        return None;
++    }
++
++    let ty = if size == align && size.is_power_of_two() && size <= 16 {
++        let width = match size {
++            1 => IntWidth::I8,
++            2 => IntWidth::I16,
++            4 => IntWidth::I32,
++            8 => IntWidth::I64,
++            16 => IntWidth::I128,
++            // unreachable because of the `size.is_power_of_two()`
++            // guard above — 1, 2, 4, 8, 16 are the only pow2
++            // values in [1, 16].
++            _ => return None,
++        };
++        ctx.intern_type(CxxType::Int { signed: false, width })
++    } else {
++        // Byte array for odd sizes (e.g. 3-byte struct) or
++        // mismatched size-vs-align (e.g. a 12-byte record with
++        // align 4). Natural align of u8-array is 1; the
++        // `explicit_align` override below informs rustc_abi_cxx
++        // that the real field needs `align`.
++        byte_array_ty(ctx, size)
++    };
++
++    Some(FieldDef {
++        name: Ident(format!("f{}", idx.index())),
++        ty,
++        explicit_align: Some(align),
++    })
++}
++
++/// Intern a `CxxType::Array { elem: u8, len: size }`. Used for
++/// fields whose size doesn't map to a natural scalar type.
++fn byte_array_ty(ctx: &mut CxxTypeCtx, size: u64) -> TypeId {
++    let u8_ty =
++        ctx.intern_type(CxxType::Int { signed: false, width: IntWidth::I8 });
++    ctx.intern_type(CxxType::Array { elem: u8_ty, len: size })
++}

@@ -1,0 +1,26 @@
+# Rust / Cargo build artifacts
+/target
+**/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Bootstrap / stage-N build output
+/build
+**/build/
+
+# macOS Finder cruft
+.DS_Store
+**/.DS_Store
+
+# Editor / swap files
+*.swp
+*.swo
+*~
+
+# Local tooling state
+.claude/
+.cargo/config.toml.local
+
+# OS / IDE
+.idea/
+.vscode/

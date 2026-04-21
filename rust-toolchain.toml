@@ -1,0 +1,7 @@
+[toolchain]
+# The installed stable channel is pinned to rustc 1.64 (2022), which is
+# too old for the `libc` crate transitively pulled in by `clang-sys`.
+# Pin to the nightly that's already in the rustup store on this machine
+# so the workspace compiles without a toolchain reinstall. Replace with
+# a current stable once `rustup update stable` becomes viable.
+channel = "nightly-2025-10-03"

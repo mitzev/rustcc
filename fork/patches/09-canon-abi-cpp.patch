@@ -1,0 +1,35 @@
+diff --git a/compiler/rustc_abi/src/canon_abi.rs b/compiler/rustc_abi/src/canon_abi.rs
+index fd45f0ea..729e1a6a 100644
+--- a/compiler/rustc_abi/src/canon_abi.rs
++++ b/compiler/rustc_abi/src/canon_abi.rs
+@@ -25,6 +25,14 @@ pub enum CanonAbi {
+     // allowing a `match` to easily exhaustively ignore these subcategories of variants.
+     // Otherwise it is very tempting to avoid matching exhaustively!
+     C,
++    /// The Itanium C++ ABI. Today every codegen-side code path
++    /// treats it identically to `C` — the two calling conventions
++    /// agree for scalar/pointer arguments on SysV AMD64. The
++    /// variant exists as a hook point for P09+ work that will
++    /// add sret/this-pointer/record-by-value handling specific
++    /// to Itanium, without retroactively corrupting the plain
++    /// `extern "C"` path.
++    Cpp,
+     Rust,
+     RustCold,
+     RustPreserveNone,
+@@ -57,6 +65,7 @@ pub fn is_rustic_abi(self) -> bool {
+         match self {
+             CanonAbi::Rust | CanonAbi::RustCold | CanonAbi::RustPreserveNone => true,
+             CanonAbi::C
++            | CanonAbi::Cpp
+             | CanonAbi::Custom
+             | CanonAbi::Arm(_)
+             | CanonAbi::GpuKernel
+@@ -73,6 +82,7 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         // that we need to generate error messages.
+         let erased_abi = match self {
+             CanonAbi::C => ExternAbi::C { unwind: false },
++            CanonAbi::Cpp => ExternAbi::Cpp { unwind: false },
+             CanonAbi::Rust => ExternAbi::Rust,
+             CanonAbi::RustCold => ExternAbi::RustCold,
+             CanonAbi::RustPreserveNone => ExternAbi::RustPreserveNone,

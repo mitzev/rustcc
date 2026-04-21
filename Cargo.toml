@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustc_abi_cxx",
+    "crates/cxx_importer",
+    "crates/cxx",
+    "crates/rustcc",
+    "crates/rustcc_attr",
+    "crates/rustcc_codegen",
+    "crates/rustcc_macros",
+    "crates/test_support",
+    "examples/cpp_class_demo",
+    "xtask",
+]
+# `crates/rustcc_swift_rt` intentionally excluded from the
+# workspace: it uses the fork's `extern "Swift"` ABI, which
+# stable rustc rejects. Probes that need it depend on it via
+# path-based `Cargo.toml` entries and build with the fork rustc.
+exclude = [
+    "crates/rustcc_swift_rt",
+    # Fork-syntax examples — require the rustcc `rustc` fork to
+    # compile. Kept out of the stable-rustc workspace build.
+    "examples/virtual_override",
+    "examples/bare_metal_arm",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.64"
+license = "MIT OR Apache-2.0"

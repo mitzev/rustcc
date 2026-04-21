@@ -1,0 +1,108 @@
+# P09.29 — Cross-crate C++ interop fixes: encode ctor/wrapper
+# attributes downstream + tighten static-method mangling.
+#
+# Fixes two gaps that surfaced when a polymorphic `#[repr(cpp)]`
+# class was split across two crates (defined in crate_a, used in
+# crate_b). Ships as a bundle because both bugs were on the same
+# failing probe and need to be fixed together for cross-crate
+# dispatch to work.
+#
+# # Bug 1 — ctor attribute dropped at crate boundaries
+#
+# `#[rustc_cxx_ctor]`, `#[rustc_cxx_wrapper]`, and
+# `#[rustc_cxx_drop_wrapper]` were declared `No` in
+# `encode_cross_crate`. When crate_b imports crate_a's `Widget`
+# and calls `Widget::new(v)`, crate_b's mangler doesn't see the
+# ctor attribute and mangles the call as a regular static method.
+# Crate_a's body is mangled as `_ZN6WidgetC1Ei` (ctor); crate_b
+# calls `_ZN6Widget3newEi` — undefined symbol at link time.
+#
+# The wrapper attributes have the same cross-crate semantics —
+# without them encoded, auto-export opt-outs don't transfer to
+# downstream crates that re-codegen wrapper methods.
+#
+# Fix: bump all three to `Yes`.
+#
+# # Bug 2 — static methods on `#[repr(cpp)]` classes strip arg 0
+#
+# In `rustc_symbol_mangling::itanium::mangle`, `input_skip` was
+# set to 1 for any impl method on a `#[repr(cpp)]` class (to skip
+# the implicit `self` in the Itanium arg-list mangling). That
+# assumption broke for static methods (no `self`) with at least
+# one user arg: the user's arg 0 got stripped, producing
+# `Widget::fn_name()` (void) where Itanium wanted
+# `Widget::fn_name(int)` or similar.
+#
+# This didn't surface in same-crate probes because the only
+# static method exercised so far is `#[rustc_cxx_ctor] fn new`,
+# whose is_ctor check already short-circuits `input_skip` to 0.
+# Cross-crate, with Bug 1 making crate_b misread `new` as a
+# non-ctor static method, this bug also fired and contributed
+# to the "`Widget::new()` unresolved" linker error.
+#
+# Fix: check whether the fn actually has a self param (via
+# `tcx.associated_item(def_id).is_method()`) before deciding to
+# strip arg 0. Ctors and foreign-fn ctors aren't affected (their
+# `is_ctor` branch fires first).
+#
+# # Files
+#
+# - `compiler/rustc_hir/src/attrs/encode_cross_crate.rs` —
+#   three variants flipped from `No` to `Yes`, with a shared
+#   rationale comment.
+# - `compiler/rustc_symbol_mangling/src/itanium.rs` —
+#   `input_skip` now checks `is_method()` on top of the existing
+#   `class_adt.is_some() && !is_ctor` conditions.
+#
+# # Validation
+#
+# - `/tmp/p09-crosscrate/` — two-crate probe. `crate_a` defines
+#   a polymorphic `#[repr(cpp)]` Widget with `#[rustc_cxx_ctor]`
+#   + two `#[rustc_cxx_virtual]` methods. `crate_b` imports
+#   Widget, builds a staticlib exposing `make_widget` /
+#   `free_widget`. `caller.cpp` calls `foo()` / `bar()` through a
+#   Widget base pointer. Before: link error (`Widget::new()`
+#   unresolved). After: `foo() = 107, bar() = 14 — OK
+#   (cross-crate), exit 0`.
+# - `/tmp/p09-25-auto-vptr/` regression — same-crate polymorphic
+#   path still passes (the `is_method()` tightening doesn't
+#   reclassify any existing case).
+# - `cargo test --workspace` → 235/0 preserved.
+
+diff --git a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+--- a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
++++ b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+@@ -176,9 +176,15 @@
+-            RustcCxxCtor(..) => No,
++            // P09.29: `#[rustc_cxx_ctor]` / `_wrapper` /
++            // `_drop_wrapper` must flow cross-crate. Downstream
++            // crates need to see the ctor attribute so they mangle
++            // calls as `_ZN<class>C1E<args>` instead of treating
++            // the method as a plain static fn. Similarly the
++            // wrapper opt-outs prevent double auto-export when a
++            // macro-expanded type crosses a crate boundary.
++            RustcCxxCtor(..) => Yes,
+             RustcCxxOperator { .. } => Yes,
+-            RustcCxxWrapper(..) => No,
+-            RustcCxxDropWrapper(..) => No,
++            RustcCxxWrapper(..) => Yes,
++            RustcCxxDropWrapper(..) => Yes,
+             RustcCxxVirtual(..) => Yes,
+
+diff --git a/compiler/rustc_symbol_mangling/src/itanium.rs b/compiler/rustc_symbol_mangling/src/itanium.rs
+--- a/compiler/rustc_symbol_mangling/src/itanium.rs
++++ b/compiler/rustc_symbol_mangling/src/itanium.rs
+@@ -377,7 +377,20 @@
+-    let input_skip = if class_adt.is_some() && !is_ctor { 1 } else { 0 };
++    // P09.29: skip arg 0 only when the fn actually has a self
++    // param. Previously we skipped for any inherent-method-on-cpp
++    // shape, which mis-mangled static methods with args as
++    // zero-arg (void) — their first user arg was being stripped.
++    // Ctors never have Rust self, so `is_ctor` still short-
++    // circuits the check. For foreign-fn ctor signatures
++    // (`#[rustc_cxx_ctor]` on an `extern "C++" fn new(v: i32) -> Widget`)
++    // there's also no self, and `is_ctor` handles them.
++    let has_self = class_adt.is_some()
++        && tcx.def_kind(def_id) == DefKind::AssocFn
++        && tcx.associated_item(def_id).is_method();
++    let input_skip = if has_self && !is_ctor { 1 } else { 0 };

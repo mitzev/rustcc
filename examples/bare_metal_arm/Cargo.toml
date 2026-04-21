@@ -1,0 +1,14 @@
+[package]
+name = "bare_metal_arm"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+# STM32-style bare-metal defaults.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

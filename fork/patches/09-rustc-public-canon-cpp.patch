@@ -1,0 +1,16 @@
+diff --git a/compiler/rustc_public/src/unstable/convert/stable/abi.rs b/compiler/rustc_public/src/unstable/convert/stable/abi.rs
+index d8c4cee7..a1999c92 100644
+--- a/compiler/rustc_public/src/unstable/convert/stable/abi.rs
++++ b/compiler/rustc_public/src/unstable/convert/stable/abi.rs
+@@ -122,6 +122,11 @@ impl<'tcx> Stable<'tcx> for CanonAbi {
+     fn stable(&self, _: &mut Tables<'_, BridgeTys>, _: &CompilerCtxt<'_, BridgeTys>) -> Self::T {
+         match self {
+             CanonAbi::C => CallConvention::C,
++            // P09 scaffold: stable-API clients see CanonAbi::Cpp
++            // as C until the public API grows its own variant.
++            // Mirrors how ExternAbi::Cpp is lowered in the
++            // matching ExternAbi conversion.
++            CanonAbi::Cpp => CallConvention::C,
+             CanonAbi::Rust => CallConvention::Rust,
+             CanonAbi::RustCold => CallConvention::Cold,
+             CanonAbi::RustPreserveNone => CallConvention::PreserveNone,

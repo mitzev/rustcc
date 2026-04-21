@@ -1,0 +1,245 @@
+# P09.30 — Parser-level `class` keyword (Option B:
+# parse-time desugaring).
+#
+# Closes backlog item #8 with the small-scope half of the
+# design trade-off: `class` is recognized at item position in
+# the parser and desugared in place into a `#[repr(cpp)]`
+# struct + an inherent `impl`. Downstream passes (HIR, resolve,
+# typeck, codegen, pretty-print, visitors) never see a distinct
+# `class` AST variant — there's nothing to teach them about.
+#
+# # Syntax
+#
+# ```rust
+# pub class Widget {
+#     v: i32,
+#
+#     #[rustc_cxx_ctor]
+#     pub fn new(v: i32) -> Self { Widget { v } }
+#
+#     #[rustc_cxx_virtual]
+#     pub fn foo(&self) -> i32 { self.v + 100 }
+# }
+# ```
+#
+# Desugars to:
+#
+# ```rust
+# #[repr(cpp)]
+# pub struct Widget { v: i32 }
+#
+# impl Widget {
+#     #[rustc_cxx_ctor]
+#     pub fn new(v: i32) -> Self { Widget { v } }
+#
+#     #[rustc_cxx_virtual]
+#     pub fn foo(&self) -> i32 { self.v + 100 }
+# }
+# ```
+#
+# # Scope (v1)
+#
+# - **Fields must precede methods.** Matches the shape a
+#   human-written struct + impl would have.
+# - **Fields carry no outer attributes.** Any `#`-prefixed member
+#   is routed to the method path. A future patch can relax this.
+# - **Fields support `pub` / `pub(...)` visibility.** Methods
+#   also pass through vis + attrs via the normal
+#   `parse_assoc_item` machinery.
+# - **No generics on the class header yet.** (The parser calls
+#   `parse_generics()` so `class Widget<T> { ... }` would tokenize,
+#   but type parameters and bounds aren't exercised; v1 doesn't
+#   test them.)
+# - **`class` remains usable as a regular identifier** (weak
+#   keyword — `let class = 5;` still parses).
+#
+# # How it works
+#
+# - `rustc_span/src/symbol.rs`: `class` added to the weak-keyword
+#   list (same bucket as `union`, `auto`, `raw`, etc.).
+# - `rustc_parse/src/parser/mod.rs`: new field
+#   `pending_injected_item: Option<Box<ast::Item>>` on
+#   `Parser<'a>`. Size assert bumped from 288 to 304. Used to
+#   stash the synthesized impl between successive calls to
+#   `parse_item`.
+# - `rustc_parse/src/parser/item.rs`:
+#   - `parse_item` returns `pending_injected_item` if set, before
+#     consuming more input.
+#   - `parse_item_kind` gains a branch
+#     `is_kw_followed_by_ident(kw::Class)` that calls
+#     `parse_cxx_class_item`.
+#   - `parse_cxx_class_item` consumes the `class Ident { body }`
+#     syntax. For each member: peeks at the leading token to
+#     route either to `parse_assoc_item` (methods — full attr
+#     and vis handling via the usual machinery) or to a manual
+#     `pub? ident : ty ,?` field parse. Builds the inherent impl
+#     and stashes it in `pending_injected_item`; returns the
+#     struct's `ItemKind` so the outer `parse_item_common` wraps
+#     it with the user's outer attrs, visibility, and a prepended
+#     `#[repr(cpp)]`.
+#
+# # Validation
+#
+# - `/tmp/p09-30-class-kw/` — pure parser probe.
+#   `pub class Widget { v: i32, ... }` with no macro wrapper, no
+#   explicit `#[repr(cpp)]`, no separate impl block. C++ calls
+#   virtual methods through a `Widget*`.
+#   Result: `foo() = 109, bar() = 18 — OK (class keyword),
+#   exit 0`.
+# - `/tmp/p09-30-class-ident/` — `class` still usable as an
+#   identifier in non-item positions. `let class = 42;` parses
+#   and runs.
+# - `/tmp/p09-25-auto-vptr/` — regression, same-crate polymorphic
+#   dispatch still passes.
+# - `cargo test --workspace` → 235/0 preserved.
+#
+# # Files touched
+#
+# - `compiler/rustc_span/src/symbol.rs` — add `Class: "class"` as
+#   a weak keyword.
+# - `compiler/rustc_parse/src/parser/mod.rs` — new
+#   `pending_injected_item` field; `static_assert_size!` bumped.
+# - `compiler/rustc_parse/src/parser/item.rs` —
+#   `parse_item` pending check, `parse_item_kind` class branch,
+#   new `parse_cxx_class_item` function (~120 LOC).
+
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ (weak-keywords block, after Catch)
++        // P09.30: `class` is a fork-only weak keyword. In item
++        // position it starts a `class Name { ... }` sugar for a
++        // `#[repr(cpp)]` struct + inherent impl. Elsewhere it
++        // remains a regular identifier.
++        Class:              "class",
+
+diff --git a/compiler/rustc_parse/src/parser/mod.rs b/compiler/rustc_parse/src/parser/mod.rs
+--- a/compiler/rustc_parse/src/parser/mod.rs
++++ b/compiler/rustc_parse/src/parser/mod.rs
+@@ (at end of Parser<'a> struct fields)
++    /// P09.30: when parsing a `class` item, the parser builds
++    /// two items — the `#[repr(cpp)]` struct and the inherent
++    /// `impl`. `parse_item_kind` returns the struct's
++    /// `ItemKind`; the impl is pre-built and parked here so the
++    /// next call to `parse_item` returns it verbatim without
++    /// re-entering `parse_item_kind`.
++    pending_injected_item: Option<Box<ast::Item>> = None,
+@@ (static_assert_size)
+-rustc_data_structures::static_assert_size!(Parser<'_>, 288);
++rustc_data_structures::static_assert_size!(Parser<'_>, 304);
+
+diff --git a/compiler/rustc_parse/src/parser/item.rs b/compiler/rustc_parse/src/parser/item.rs
+--- a/compiler/rustc_parse/src/parser/item.rs
++++ b/compiler/rustc_parse/src/parser/item.rs
+@@ (parse_item — pending check)
+     pub fn parse_item(
+         &mut self,
+         force_collect: ForceCollect,
+         allow_const_block_items: AllowConstBlockItems,
+     ) -> PResult<'a, Option<Box<Item>>> {
++        if let Some(pending) = self.pending_injected_item.take() {
++            return Ok(Some(pending));
++        }
+         let fn_parse_mode = ...;
+         self.parse_item_(fn_parse_mode, force_collect, allow_const_block_items)
+             .map(|i| i.map(Box::new))
+     }
+
+@@ (parse_item_kind — new else-if branch after the `union` one)
+         } else if self.is_kw_followed_by_ident(kw::Union) {
+             self.bump(); self.parse_item_union()?
++        } else if self.is_kw_followed_by_ident(kw::Class) {
++            // P09.30: `class Name { ... }` sugar.
++            self.parse_cxx_class_item(attrs, lo)?
+
+@@ (new function parse_cxx_class_item — placed right above parse_item_union)
++    fn parse_cxx_class_item(
++        &mut self,
++        struct_attrs: &mut AttrVec,
++        lo: Span,
++    ) -> PResult<'a, ItemKind> {
++        self.bump();
++        let ident = self.parse_ident()?;
++        let mut generics = self.parse_generics()?;
++        generics.where_clause = self.parse_where_clause()?;
++        self.expect(exp!(OpenBrace))?;
++
++        let mut fields: ThinVec<FieldDef> = ThinVec::new();
++        let mut methods: ThinVec<Box<AssocItem>> = ThinVec::new();
++        let mut saw_method = false;
++
++        while self.token != token::CloseBrace {
++            // Decide field vs method by peeking at the leading
++            // token(s). `#`-prefixed ⇒ method; `pub`+modifier
++            // tokens ⇒ method; `fn`/`unsafe`/`const`/`async`
++            // keywords ⇒ method; otherwise ⇒ field.
++            let looks_like_method = ... ;
++            if looks_like_method {
++                let fn_parse_mode = FnParseMode {
++                    req_name: |_, _| true,
++                    context: FnContext::Impl,
++                    req_body: true,
++                };
++                let assoc = self.parse_assoc_item(fn_parse_mode, ForceCollect::No)?;
++                if let Some(Some(item)) = assoc { methods.push(item); saw_method = true; }
++            } else {
++                if saw_method { /* error: fields before methods */ }
++                let vis = self.parse_visibility(FollowedByType::No)?;
++                let field_ident = self.parse_ident()?;
++                self.expect(exp!(Colon))?;
++                let ty = self.parse_ty()?;
++                fields.push(FieldDef {
++                    attrs: AttrVec::new(),
++                    id: DUMMY_NODE_ID,
++                    span: ...,
++                    vis,
++                    safety: Safety::Default,
++                    ident: Some(field_ident),
++                    ty,
++                    default: None,
++                    is_placeholder: false,
++                });
++                let _ = self.eat(exp!(Comma));
++            }
++        }
++        self.expect(exp!(CloseBrace))?;
++
++        // Prepend `#[repr(cpp)]` on the struct's outer attrs.
++        struct_attrs.push(rustc_ast::attr::mk_attr_nested_word(
++            &self.psess.attr_id_generator,
++            ast::AttrStyle::Outer,
++            ast::Safety::Default,
++            sym::repr, sym::cpp, lo,
++        ));
++
++        // Build the inherent `impl Ident { methods }` and park.
++        let self_ty = Box::new(Ty {
++            id: DUMMY_NODE_ID,
++            kind: TyKind::Path(None, ast::Path::from_ident(ident)),
++            span: ident.span,
++            tokens: None,
++        });
++        self.pending_injected_item = Some(Box::new(Item {
++            attrs: AttrVec::new(),
++            id: DUMMY_NODE_ID,
++            span: lo.to(self.prev_token.span),
++            vis: Visibility {
++                kind: VisibilityKind::Inherited,
++                span: ident.span.shrink_to_lo(),
++                tokens: None,
++            },
++            kind: ItemKind::Impl(Impl {
++                generics: generics.clone(),
++                constness: Const::No,
++                of_trait: None,
++                self_ty,
++                items: methods,
++            }),
++            tokens: None,
++        }));
++
++        Ok(ItemKind::Struct(
++            ident, generics,
++            VariantData::Struct { fields, recovered: Recovered::No },
++        ))
++    }

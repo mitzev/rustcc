@@ -1,0 +1,96 @@
+diff --git a/compiler/rustc_target/src/callconv/mod.rs b/compiler/rustc_target/src/callconv/mod.rs
+index f8c82faa..104404eb 100644
+--- a/compiler/rustc_target/src/callconv/mod.rs
++++ b/compiler/rustc_target/src/callconv/mod.rs
+@@ -398,6 +398,17 @@ pub fn new(
+         ArgAbi { layout, mode }
+     }
+ 
++    /// Force the arg into `Indirect` mode regardless of current
++    /// state. Used by P09's Itanium overlay after the C-path
++    /// `compute_abi_info` has already transitioned some args to
++    /// `Cast` — the regular `make_indirect` asserts `Direct|Pair`
++    /// and would panic. This bypass is safe because we're
++    /// deliberately overriding the C classification for types
++    /// the Itanium ABI treats differently.
++    pub(crate) fn force_indirect(&mut self) {
++        self.mode = Self::indirect_pass_mode(&self.layout);
++    }
++
+     fn indirect_pass_mode(layout: &TyAndLayout<'a, Ty>) -> PassMode {
+         let mut attrs = ArgAttributes::new();
+ 
+@@ -664,6 +675,19 @@ pub fn adjust_for_foreign_abi<C>(&mut self, cx: &C, abi: ExternAbi)
+                 ExternAbi::Win64 { .. } | ExternAbi::Vectorcall { .. } => {
+                     x86_win64::compute_abi_info(cx, self)
+                 }
++                // P09: Itanium C++ ABI gets the C-path lowering
++                // plus Itanium-specific overrides (sret for non-
++                // trivial-for-calls returns, caller-destroys for
++                // non-trivial params).
++                ExternAbi::Cpp { .. } => {
++                    if cx.target_spec().is_like_windows {
++                        // MSVC ABI is a separate animal — out of
++                        // scope for the Itanium fork.
++                        x86_win64::compute_abi_info(cx, self)
++                    } else {
++                        x86_64::compute_cxx_abi_info(cx, self)
++                    }
++                }
+                 _ => {
+                     if cx.target_spec().is_like_windows {
+                         x86_win64::compute_abi_info(cx, self)
+diff --git a/compiler/rustc_target/src/callconv/x86_64.rs b/compiler/rustc_target/src/callconv/x86_64.rs
+index 3055d18f..8eb4af66 100644
+--- a/compiler/rustc_target/src/callconv/x86_64.rs
++++ b/compiler/rustc_target/src/callconv/x86_64.rs
+@@ -263,3 +263,49 @@ pub(crate) fn compute_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
+         x86_64_arg_or_ret(arg, true);
+     }
+ }
++
++/// P09 — Itanium C++ ABI overlay for SysV AMD64.
++///
++/// Runs the standard C-path `compute_abi_info` first (scalars,
++/// pointers, and plain POD aggregates already agree between C
++/// and C++). Then applies the Itanium-specific rule: any type
++/// that is **non-trivial for C++ calls** (a `#[repr(cpp)]` ADT
++/// with a user `Drop` impl) is passed / returned by invisible
++/// reference regardless of its size.
++///
++/// This diverges from the stock C path for the narrow case of
++/// small non-POD records — an 8-byte `#[repr(cpp)]` struct with
++/// `impl Drop` would fit in rax under `extern "C"`, but Clang
++/// returns it via sret under `extern "C++"`. The fork has to
++/// match Clang so linkers agree.
++pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
++where
++    Ty: TyAbiInterface<'a, C> + Copy,
++    C: HasDataLayout + HasTargetSpec,
++{
++    // First: regular C-path lowering. Handles everything the two
++    // ABIs agree on.
++    compute_abi_info(cx, fn_abi);
++
++    // Itanium override: promote non-trivial-for-calls types to
++    // indirect. Uses `force_indirect` rather than `make_indirect`
++    // because the C path may have already transitioned the arg
++    // to `Cast` (small aggregates fitting in registers), and
++    // `make_indirect` asserts a `Direct|Pair` starting state.
++    // `force_indirect` bypasses that assertion — correct because
++    // we're deliberately overriding the C classification to
++    // match Clang's Itanium output.
++    if !fn_abi.ret.is_ignore()
++        && fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++    {
++        fn_abi.ret.force_indirect();
++    }
++    for arg in fn_abi.args.iter_mut() {
++        if arg.is_ignore() {
++            continue;
++        }
++        if arg.layout.is_cxx_non_trivial_for_calls(cx) {
++            arg.force_indirect();
++        }
++    }
++}

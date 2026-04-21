@@ -1,0 +1,249 @@
+# P09.22 — Foreign-fn ctor mangling + `#[rustc_cxx_wrapper]` opt-out.
+#
+# Builds on P09.3 (auto-export), P09.13 (`#[rustc_cxx_ctor]`),
+# and P08b (Itanium mangler). Two compiler-side wins:
+#
+# 1. `#[rustc_cxx_ctor]` is now legal on foreign fns in
+#    `extern "C++"` blocks. The Itanium mangler reads the class
+#    name off the return type and emits `_ZN<class>C1E<args>`
+#    — same output as the impl-method path. The
+#    `cxx_class_native!` macro uses this to declare ctors
+#    without a hand-rolled sret trampoline or `#[link_name]`.
+#
+# 2. `#[rustc_cxx_wrapper]` is a new attribute that opts an
+#    inherent method on a `#[repr(cpp)]` type OUT of P09.3's
+#    auto-export. Used by `cxx_class_native!` for thin wrapper
+#    methods that forward to an `extern "C++"` decl of the same
+#    method — the auto-export would otherwise collide with the
+#    C++ side's definition (or self-recurse via Rust linking
+#    back into itself).
+#
+# 3. Bonus: `compute_symbol_name` now checks `attrs.symbol_name`
+#    BEFORE the Itanium auto-mangle path, so `#[link_name]` on
+#    `extern "C++"` fns is actually respected. Prior ordering
+#    silently swallowed the override.
+
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -1720,6 +1720,7 @@
+         rustc_cxx_ctor,
+         rustc_cxx_operator,
++        rustc_cxx_wrapper,
+         rustc_deallocator,
+
+diff --git a/compiler/rustc_feature/src/builtin_attrs.rs b/compiler/rustc_feature/src/builtin_attrs.rs
+--- a/compiler/rustc_feature/src/builtin_attrs.rs
++++ b/compiler/rustc_feature/src/builtin_attrs.rs
+@@ -320,6 +320,14 @@
+     rustc_attr!(rustc_cxx_operator, "marks a method as a C++ operator overload; value names the operator kind (Plus, Minus, Eq, Ne, Lt, Le, Gt, Ge, Mul, Div, Mod, Assign, PlusAssign, Index, Deref, Call, PreIncr, PreDecr)"),
++    // P09.22: opt an inherent method on a `#[repr(cpp)]` type
++    // OUT of P09.3's auto-export path so the method does not
++    // receive external linkage under its Itanium-mangled name.
++    // Used by `cxx_class_native!` for thin wrappers that forward
++    // to an `extern "C++"` decl of the same method — the
++    // auto-export would otherwise make the wrapper recursively
++    // call itself.
++    rustc_attr!(rustc_cxx_wrapper, "opts an inherent method on a `#[repr(cpp)]` type out of P09.3's auto-export (used by wrapper methods that call through to `extern \"C++\"` decls)"),
+
+diff --git a/compiler/rustc_hir/src/attrs/data_structures.rs b/compiler/rustc_hir/src/attrs/data_structures.rs
+--- a/compiler/rustc_hir/src/attrs/data_structures.rs
++++ b/compiler/rustc_hir/src/attrs/data_structures.rs
+@@ -1567,6 +1567,12 @@
+     RustcCxxOperator { kind: Symbol, span: Span },
++
++    /// Represents `#[rustc_cxx_wrapper]` — opts an inherent
++    /// method on a `#[repr(cpp)]` type out of P09.3's
++    /// auto-export path. Used for thin wrappers that forward
++    /// to an `extern "C++"` decl of the same method.
++    RustcCxxWrapper(Span),
+
+diff --git a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+--- a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
++++ b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+@@ -177,6 +177,7 @@
+             RustcCxxOperator { .. } => Yes,
++            RustcCxxWrapper(..) => No,
+
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -364,6 +364,7 @@
+                     | AttributeKind::RustcCxxOperator { .. }
++                    | AttributeKind::RustcCxxWrapper(..)
+
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -710,10 +710,30 @@
+ impl<S: Stage> NoArgsAttributeParser<S> for RustcCxxCtorParser {
+     const PATH: &[Symbol] = &[sym::rustc_cxx_ctor];
+-    const ALLOWED_TARGETS: AllowedTargets =
+-        AllowedTargets::AllowList(&[Allow(Target::Method(MethodKind::Inherent))]);
++    // P09.22: also allow on `ForeignFn`. Lets `cxx_class!` and
++    // hand-written `extern "C++" { #[rustc_cxx_ctor] fn new(...) -> Self; }`
++    // share a single ctor-mangling path, retiring the macro's
++    // sret trampoline + manual `#[link_name]`.
++    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
++        Allow(Target::Method(MethodKind::Inherent)),
++        Allow(Target::ForeignFn),
++    ]);
+     const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcCxxCtor;
+ }
++
++/// P09.22: `#[rustc_cxx_wrapper]` — opts an inherent method on a
++/// `#[repr(cpp)]` type out of P09.3's auto-export path. Used for
++/// thin wrappers that forward to an `extern "C++"` decl of the
++/// same method.
++pub(crate) struct RustcCxxWrapperParser;
++
++impl<S: Stage> NoArgsAttributeParser<S> for RustcCxxWrapperParser {
++    const PATH: &[Symbol] = &[sym::rustc_cxx_wrapper];
++    const ALLOWED_TARGETS: AllowedTargets =
++        AllowedTargets::AllowList(&[Allow(Target::Method(MethodKind::Inherent))]);
++    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcCxxWrapper;
++}
+
+diff --git a/compiler/rustc_attr_parsing/src/context.rs b/compiler/rustc_attr_parsing/src/context.rs
+--- a/compiler/rustc_attr_parsing/src/context.rs
++++ b/compiler/rustc_attr_parsing/src/context.rs
+@@ -329,6 +329,7 @@
+         Single<WithoutArgs<RustcCxxCtorParser>>,
++        Single<WithoutArgs<RustcCxxWrapperParser>>,
+         Single<RustcCxxOperatorParser>,
+
+diff --git a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+--- a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
++++ b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+@@ -366,10 +366,16 @@
+     // `rustc_symbol_mangling::itanium::mangle` which runs earlier
+     // in `compute_symbol_name` and wins.
++    //
++    // P09.22: `#[rustc_cxx_wrapper]` opts out. Used by wrapper
++    // methods that forward to an `extern "C++"` decl under the
++    // same Itanium name — auto-exporting them would produce a
++    // self-recursive symbol.
+     if tcx.def_kind(did) == DefKind::AssocFn
+         && let Some(impl_did) = tcx.opt_parent(did.to_def_id())
+         && matches!(tcx.def_kind(impl_did), DefKind::Impl { .. })
+         && let ty::Adt(adt_def, _) = tcx.type_of(impl_did).skip_binder().kind()
+         && adt_def.repr().cpp()
++        && !rustc_hir::find_attr!(tcx, did.to_def_id(), RustcCxxWrapper(..))
+     {
+         codegen_fn_attrs.flags |= CodegenFnAttrFlags::NO_MANGLE;
+     }
+
+diff --git a/compiler/rustc_symbol_mangling/src/lib.rs b/compiler/rustc_symbol_mangling/src/lib.rs
+--- a/compiler/rustc_symbol_mangling/src/lib.rs
++++ b/compiler/rustc_symbol_mangling/src/lib.rs
+@@ -205,14 +205,26 @@
+-    // P08b: `extern "C++"` items get Itanium-mangled names via
+-    // the rustcc mangler. Runs before the wasm/NO_MANGLE early
+-    // returns because foreign items in extern blocks look like
+-    // NO_MANGLE from the default codegen's perspective — they'd
+-    // otherwise emit the raw item name and miss C++ linkage.
+-    // Falls back to the default path if the signature uses a
+-    // type the Itanium translator doesn't yet handle.
++    // P08b / P09.22: `extern "C++"` items get Itanium-mangled
++    // names via the rustcc mangler. BUT an explicit
++    // `#[link_name]` or `#[export_name]` takes precedence so
++    // users can override per-item (e.g. a C++ fn exposed under
++    // a non-Itanium name, or an internal rename). The previous
++    // ordering ran the Itanium path unconditionally, silently
++    // swallowing `#[link_name]` on `extern "C++"` fns — that
++    // broke `cxx_class_native!`'s method-wrapper pattern.
++    //
++    // Runs before the wasm/NO_MANGLE early returns because
++    // foreign items in extern blocks look like NO_MANGLE from
++    // the default codegen's perspective. Falls back to the
++    // default path if the signature uses a type the Itanium
++    // translator doesn't yet handle.
+     if itanium::is_cpp_abi(tcx, def_id) {
++        if let Some(name) = attrs.symbol_name {
++            return name.to_string();
++        }
+         if let Some(mangled) = itanium::mangle(tcx, instance) {
+             return mangled;
+         }
+     }
+
+diff --git a/compiler/rustc_symbol_mangling/src/itanium.rs b/compiler/rustc_symbol_mangling/src/itanium.rs
+--- a/compiler/rustc_symbol_mangling/src/itanium.rs
++++ b/compiler/rustc_symbol_mangling/src/itanium.rs
+@@ -71,6 +71,38 @@
+ fn has_cxx_ctor_attr<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+     rustc_hir::find_attr!(tcx, def_id, RustcCxxCtor(..))
+ }
++
++/// If `def_id` is a foreign fn inside `extern "C++" { ... }`
++/// carrying `#[rustc_cxx_ctor]` and returning a `#[repr(cpp)]`
++/// ADT by value, returns that ADT's `DefId`. The return type
++/// directly names the class being constructed.
++///
++/// P09.22: this mirrors the Rust-impl ctor path
++/// (`impl Widget { #[rustc_cxx_ctor] fn new() -> Self }`)
++/// for foreign declarations, unifying the ctor emission so the
++/// `cxx_class!` macro can drop its sret-trampoline workaround.
++fn cxx_foreign_ctor_class<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<DefId> {
++    if tcx.def_kind(def_id) != DefKind::Fn {
++        return None;
++    }
++    let parent = tcx.opt_parent(def_id)?;
++    if tcx.def_kind(parent) != DefKind::ForeignMod {
++        return None;
++    }
++    if !has_cxx_ctor_attr(tcx, def_id) {
++        return None;
++    }
++    let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
++    let ty::Adt(adt_def, _) = sig.output().kind() else {
++        return None;
++    };
++    if !adt_def.repr().cpp() {
++        return None;
++    }
++    Some(adt_def.did())
++}
+@@ -200,6 +232,14 @@
+ pub(crate) fn is_cpp_abi<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+@@ -212,7 +252,16 @@
+     if matches!(sig.abi(), ExternAbi::Cpp { .. }) {
+         return true;
+     }
+     if cxx_impl_class(tcx, def_id).is_some() {
++        // P09.22: methods tagged `#[rustc_cxx_wrapper]` are
++        // skipped — they are thin forwarders to an
++        // `extern "C++"` decl of the same method, and
++        // auto-mangling them would collide with the decl's
++        // link name (and also produce self-recursive calls via
++        // P09.3's auto-export).
++        if rustc_hir::find_attr!(tcx, def_id, RustcCxxWrapper(..)) {
++            return false;
++        }
+         return true;
+     }
+@@ -239,9 +289,15 @@
+-    let class_adt = cxx_impl_class(tcx, def_id);
++    let impl_class = cxx_impl_class(tcx, def_id);
++    let foreign_ctor_class = cxx_foreign_ctor_class(tcx, def_id);
+     let is_dtor = is_cxx_drop_impl(tcx, def_id);
+-    let is_ctor = class_adt.is_some() && has_cxx_ctor_attr(tcx, def_id);
++    // Ctor fires from either (a) an `impl` method tagged
++    // `#[rustc_cxx_ctor]`, or (b) a foreign fn inside
++    // `extern "C++"` tagged `#[rustc_cxx_ctor]` whose return
++    // type names the class.
++    let is_ctor =
++        (impl_class.is_some() && has_cxx_ctor_attr(tcx, def_id)) || foreign_ctor_class.is_some();
++    let class_adt = impl_class.or(foreign_ctor_class);
+@@ -288,10 +346,11 @@
+-    let cv = if class_adt.is_some() {
+-        // Derive const-this from `&self` vs `&mut self` / `self`.
+-        // By-value `self` produces no CV qualifier.
++    let cv = if class_adt.is_some() && !is_ctor {
++        // Regular member fn: derive const-this from `&self` vs
++        // `&mut self` / `self`. By-value `self` → no CV qualifier.
++        // Ctors have no `this` in the Rust sig, so no cv derivation.
+         match fn_sig.inputs().first().map(|t| t.kind()) {
+
+# See the corresponding narrative in fork/PATCHES.md under
+# "### P09.22 — Foreign-fn ctor mangling + `#[rustc_cxx_wrapper]`".

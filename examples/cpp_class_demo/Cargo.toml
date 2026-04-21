@@ -1,0 +1,57 @@
+# Stable-rustc-compatible demo of the rustcc C++ interop surface.
+#
+# Unlike `examples/point_demo`, this crate uses the `#[cpp_class]`
+# proc-macro from `rustcc_macros` to declare interop types. The
+# macro expands to `#[repr(C)]` at compile time, so `cargo build
+# -p cpp_class_demo` works on stable rustc today. The rustcc driver
+# still scans the source text and recognizes `#[cpp_class]` as an
+# interop entry marker, so the generated hpp + stubs flow is
+# identical to the #[repr(cpp)] form.
+#
+# This double-recognition ("either #[repr(cpp)] or #[cpp_class]")
+# lets users pick:
+#
+# - `#[cpp_class]` — shippable today under stable rustc, opt-in.
+# - `#[repr(cpp)]` — works once the rustc fork lands, which is the
+#   eventual canonical form.
+#
+# Both paths converge on the same IR, so swapping later is a syntax
+# change with no semantic consequence.
+
+[package]
+name = "cpp_class_demo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+# staticlib so the resulting archive can be linked directly by a C++
+# binary (pulling in the forwarder symbols alongside Rust bodies).
+# rlib preserved so `cargo test --workspace` keeps working for any
+# Rust code that depends on this crate.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+rustcc_macros = { path = "../../crates/rustcc_macros" }
+
+# `rustcc_forwarders` is set by the rustcc driver when
+# `emit-forwarders = true`. Declaring it here tells rustc's
+# check-cfg lint that the name is intentional, silencing the
+# "unexpected_cfgs" warning under stock cargo builds.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(rustcc_forwarders)'] }
+
+# Cargo-blessed location for custom tooling metadata. `cargo build`
+# doesn't warn about keys under `package.metadata`; the rustcc
+# driver's manifest parser recognizes both this form and the legacy
+# top-level `[cpp-interop]` section.
+[package.metadata.cpp-interop]
+headers = ["cpp/empty.hpp"]
+header-search-paths = []
+clang-flags = []
+# emit-forwarders produces a .rs file with Itanium-mangled extern-C
+# thunks that delegate to the user's real methods. The user's crate
+# pulls it in via `include!(env!("RUSTCC_FORWARDERS_PATH"))` under
+# `#[cfg(rustcc_forwarders)]`. This is the pre-fork path to real
+# working Rust bodies callable from C++.
+emit-forwarders = true

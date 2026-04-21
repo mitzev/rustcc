@@ -1,0 +1,21 @@
+[package]
+name = "rustcc_attr"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# `rustcc_attr` recognizes rustcc-specific attributes on Rust items and
+# lowers the affected items into `rustc_abi_cxx` IR. It is the same
+# surface the rustc fork will invoke from its HIR attr pass, and the
+# same surface a standalone build driver uses when scanning a crate
+# without the fork (today's path).
+
+[dependencies]
+rustc_abi_cxx = { path = "../rustc_abi_cxx" }
+syn = { version = "2", features = ["full", "extra-traits", "parsing"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+
+[dev-dependencies]
+cxx_importer = { path = "../cxx_importer" }

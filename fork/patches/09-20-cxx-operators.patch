@@ -1,0 +1,445 @@
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+index 357be2f4..85ed67e1 100644
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -702,6 +702,146 @@ impl<S: Stage> NoArgsAttributeParser<S> for RustcPassIndirectlyInNonRusticAbisPa
+     const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcPassIndirectlyInNonRusticAbis;
+ }
+ 
++/// P09 Tier 3: `#[rustc_cxx_ctor]` — marks a method on a
++/// `#[repr(cpp)]` impl as a C++ constructor. Mangling routes
++/// through `Symbol::Ctor` producing `_ZN<class>C1E<args>`.
++pub(crate) struct RustcCxxCtorParser;
++
++impl<S: Stage> NoArgsAttributeParser<S> for RustcCxxCtorParser {
++    const PATH: &[Symbol] = &[sym::rustc_cxx_ctor];
++    const ALLOWED_TARGETS: AllowedTargets =
++        AllowedTargets::AllowList(&[Allow(Target::Method(MethodKind::Inherent))]);
++    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcCxxCtor;
++}
++
++/// P09.20: `#[rustc_cxx_operator = "Plus"]` — marks a method on
++/// a `#[repr(cpp)]` impl as a C++ operator overload. The string
++/// value names the operator kind (matches the variants of
++/// `rustc_abi_cxx::OperatorKind`).
++pub(crate) struct RustcCxxOperatorParser;
++
++impl<S: Stage> SingleAttributeParser<S> for RustcCxxOperatorParser {
++    const PATH: &[Symbol] = &[sym::rustc_cxx_operator];
++    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
++    const ALLOWED_TARGETS: AllowedTargets =
++        AllowedTargets::AllowList(&[Allow(Target::Method(MethodKind::Inherent))]);
++    const TEMPLATE: AttributeTemplate = template!(NameValueStr: "Plus");
++
++    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
++        let Some(nv) = args.name_value() else {
++            let attr_span = cx.attr_span;
++            cx.adcx().expected_name_value(attr_span, None);
++            return None;
++        };
++        let Some(kind) = nv.value_as_str() else {
++            cx.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
++            return None;
++        };
++        Some(AttributeKind::RustcCxxOperator { kind, span: cx.attr_span })
++    }
++}
++
++/// P09.16: `#[rustc_swift_symbol = "ModuleName"]` — binds an
++/// `extern "Swift"` fn to a Swift module so its link name can
++/// be mangled as `$s<module><name>...F`.
++pub(crate) struct RustcSwiftSymbolParser;
++
++impl<S: Stage> SingleAttributeParser<S> for RustcSwiftSymbolParser {
++    const PATH: &[Symbol] = &[sym::rustc_swift_symbol];
++    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
++    const ALLOWED_TARGETS: AllowedTargets =
++        AllowedTargets::AllowList(&[Allow(Target::ForeignFn)]);
++    const TEMPLATE: AttributeTemplate = template!(NameValueStr: "ModuleName");
++
++    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
++        let Some(nv) = args.name_value() else {
++            let attr_span = cx.attr_span;
++            cx.adcx().expected_name_value(attr_span, None);
++            return None;
++        };
++        let Some(module) = nv.value_as_str() else {
++            cx.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
++            return None;
++        };
++        Some(AttributeKind::RustcSwiftSymbol { module, span: cx.attr_span })
++    }
++}
++
++/// P09.17: `#[rustc_swift_type = "Module.TypeName"]` — binds a
++/// Rust struct to a Swift value-type qualified name for Swift
++/// ABI mangling. Format is `<module>.<name>`; kind defaults to
++/// value type (struct).
++pub(crate) struct RustcSwiftTypeParser;
++
++impl<S: Stage> SingleAttributeParser<S> for RustcSwiftTypeParser {
++    const PATH: &[Symbol] = &[sym::rustc_swift_type];
++    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
++    const ALLOWED_TARGETS: AllowedTargets =
++        AllowedTargets::AllowList(&[Allow(Target::Struct)]);
++    const TEMPLATE: AttributeTemplate = template!(NameValueStr: "Module.TypeName");
++
++    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
++        let Some(nv) = args.name_value() else {
++            let attr_span = cx.attr_span;
++            cx.adcx().expected_name_value(attr_span, None);
++            return None;
++        };
++        let Some(s) = nv.value_as_str() else {
++            cx.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
++            return None;
++        };
++        // Format: "Module.Name" (defaults to struct/V kind) or
++        // "Module.Name:class" (reference-type/C kind). Split off
++        // an optional trailing `:class` suffix first.
++        let raw = s.as_str();
++        let (body, is_class) = match raw.rsplit_once(':') {
++            Some((b, "class")) => (b, true),
++            Some((b, "struct")) => (b, false),
++            // No colon, or unrecognized tail — treat whole
++            // string as "Module.Name" with default kind.
++            _ => (raw, false),
++        };
++        let Some((module_str, name_str)) = body.rsplit_once('.') else {
++            cx.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
++            return None;
++        };
++        if module_str.is_empty() || name_str.is_empty() {
++            cx.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
++            return None;
++        }
++        let module = Symbol::intern(module_str);
++        let name = Symbol::intern(name_str);
++        Some(AttributeKind::RustcSwiftType { module, name, is_class, span: cx.attr_span })
++    }
++}
++
++/// P09.17: `#[rustc_swift_labels = "_, by"]` — Swift parameter
++/// labels for a fn in an `extern "Swift"` block. Tokens are
++/// comma-separated; `_` means unnamed, any other token is the
++/// label name as it appears on the Swift side.
++pub(crate) struct RustcSwiftLabelsParser;
++
++impl<S: Stage> SingleAttributeParser<S> for RustcSwiftLabelsParser {
++    const PATH: &[Symbol] = &[sym::rustc_swift_labels];
++    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
++    const ALLOWED_TARGETS: AllowedTargets =
++        AllowedTargets::AllowList(&[Allow(Target::ForeignFn)]);
++    const TEMPLATE: AttributeTemplate = template!(NameValueStr: "_, by, from");
++
++    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
++        let Some(nv) = args.name_value() else {
++            let attr_span = cx.attr_span;
++            cx.adcx().expected_name_value(attr_span, None);
++            return None;
++        };
++        let Some(labels) = nv.value_as_str() else {
++            cx.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
++            return None;
++        };
++        Some(AttributeKind::RustcSwiftLabels { labels, span: cx.attr_span })
++    }
++}
++
+ pub(crate) struct RustcEiiForeignItemParser;
+ 
+ impl<S: Stage> NoArgsAttributeParser<S> for RustcEiiForeignItemParser {
+diff --git a/compiler/rustc_attr_parsing/src/context.rs b/compiler/rustc_attr_parsing/src/context.rs
+index becdaee0..96490dd2 100644
+--- a/compiler/rustc_attr_parsing/src/context.rs
++++ b/compiler/rustc_attr_parsing/src/context.rs
+@@ -325,6 +325,11 @@ mod late {
+         Single<WithoutArgs<RustcParenSugarParser>>,
+         Single<WithoutArgs<RustcPassByValueParser>>,
+         Single<WithoutArgs<RustcPassIndirectlyInNonRusticAbisParser>>,
++        Single<WithoutArgs<RustcCxxCtorParser>>,
++        Single<RustcCxxOperatorParser>,
++        Single<RustcSwiftSymbolParser>,
++        Single<RustcSwiftTypeParser>,
++        Single<RustcSwiftLabelsParser>,
+         Single<WithoutArgs<RustcPreserveUbChecksParser>>,
+         Single<WithoutArgs<RustcProcMacroDeclsParser>>,
+         Single<WithoutArgs<RustcPubTransparentParser>>,
+diff --git a/compiler/rustc_feature/src/builtin_attrs.rs b/compiler/rustc_feature/src/builtin_attrs.rs
+index 053caee2..b9e2963a 100644
+--- a/compiler/rustc_feature/src/builtin_attrs.rs
++++ b/compiler/rustc_feature/src/builtin_attrs.rs
+@@ -311,6 +311,24 @@ pub struct BuiltinAttribute {
+     ungated!(naked),
+     // See `TyAndLayout::pass_indirectly_in_non_rustic_abis` for details.
+     rustc_attr!(rustc_pass_indirectly_in_non_rustic_abis, "types marked with `#[rustc_pass_indirectly_in_non_rustic_abis]` are always passed indirectly by non-Rustic ABIs"),
++    // P09 Tier 3: mark a fn as a C++ constructor so its symbol
++    // mangles as `_ZN<class>C1E<args>` rather than a member fn.
++    rustc_attr!(rustc_cxx_ctor, "marks an impl method on a `#[repr(cpp)]` type as a C++ constructor (mangled with the `C1` complete-object variant)"),
++    // P09.20: marks an impl method on a `#[repr(cpp)]` type as
++    // a C++ operator overload (e.g. `operator+`, `operator==`).
++    // The kind string names which operator (Plus, Eq, Lt, ...).
++    rustc_attr!(rustc_cxx_operator, "marks a method as a C++ operator overload; value names the operator kind (Plus, Minus, Eq, Ne, Lt, Le, Gt, Ge, Mul, Div, Mod, Assign, PlusAssign, Index, Deref, Call, PreIncr, PreDecr)"),
++    // P09.16: marks a fn in an `extern "Swift"` block as living
++    // in a named Swift module; the Swift mangler uses the module
++    // to produce `$s<module><name>...` link names.
++    rustc_attr!(rustc_swift_symbol, "names the Swift module hosting an `extern \"Swift\"` function, driving Swift ABI name mangling"),
++    // P09.17: marks a Rust struct as representing a Swift value
++    // type — used by the Swift mangler when the Rust struct
++    // appears in an `extern "Swift"` signature.
++    rustc_attr!(rustc_swift_type, "binds a Rust type to a Swift value-type qualified name (e.g. `\"MyLib.Point\"`) for Swift ABI mangling"),
++    // P09.17: Swift parameter labels for an `extern "Swift"` fn.
++    // Comma-separated; `_` for unnamed, `<label>` for named.
++    rustc_attr!(rustc_swift_labels, "Swift parameter labels for an `extern \"Swift\"` function (comma-separated, `_` for unnamed)"),
+ 
+     // Limits:
+     ungated!(recursion_limit),
+diff --git a/compiler/rustc_hir/src/attrs/data_structures.rs b/compiler/rustc_hir/src/attrs/data_structures.rs
+index 05f39805..4218be56 100644
+--- a/compiler/rustc_hir/src/attrs/data_structures.rs
++++ b/compiler/rustc_hir/src/attrs/data_structures.rs
+@@ -170,6 +170,19 @@ pub enum ReprAttr {
+     ReprInt(IntType),
+     ReprRust,
+     ReprC,
++    /// `#[repr(cpp)]`. Implies C-compatible layout plus the
++    /// extended Itanium C++ ABI rules: sret for non-trivial-for-
++    /// calls classes, explicit `this`-pointer on methods, and
++    /// Itanium-style name mangling for items whose `extern` is
++    /// `"C++"`. See `rustcc`'s `fork/PATCHES.md`.
++    ReprCpp,
++    /// `#[repr(swift)]` — like `ReprC` at the attribute-layer
++    /// level (valid on structs / enums / unions), but marks the
++    /// type as representing a Swift value type for Swift ABI
++    /// mangling. Phase 2a uses it as a gate alongside
++    /// `#[rustc_swift_type]`; Phase 2b will grow layout handling
++    /// tied to Swift type metadata.
++    ReprSwift,
+     ReprPacked(Align),
+     ReprSimd,
+     ReprTransparent,
+@@ -1542,6 +1555,38 @@ pub enum AttributeKind {
+     /// Represents `#[rustc_pass_indirectly_in_non_rustic_abis]`
+     RustcPassIndirectlyInNonRusticAbis(Span),
+ 
++    /// Represents `#[rustc_cxx_ctor]` — marks a method as a C++
++    /// constructor for Itanium mangling (`_ZN<class>C1E<args>`).
++    RustcCxxCtor(Span),
++
++    /// Represents `#[rustc_cxx_operator = "Plus"]` — marks a
++    /// method as a C++ operator overload. `kind` names the
++    /// operator (Plus, Minus, Eq, Ne, Lt, Le, Gt, Ge, Mul, Div,
++    /// Mod, Assign, PlusAssign, Index, Deref, Call, PreIncr,
++    /// PreDecr).
++    RustcCxxOperator { kind: Symbol, span: Span },
++
++    /// Represents `#[rustc_swift_symbol = "ModuleName"]` — names
++    /// the Swift module hosting an `extern "Swift"` function so
++    /// the Swift mangler can produce `$s<module><name>...F`.
++    RustcSwiftSymbol { module: Symbol, span: Span },
++
++    /// Represents `#[rustc_swift_type = "Module.TypeName"]` —
++    /// binds a Rust struct to a Swift value-type qualified name.
++    /// The Swift mangler uses this when the Rust type appears in
++    /// an `extern "Swift"` signature (emits `$s<m><t>V` for
++    /// value types, `$s<m><t>C` for classes).
++    ///
++    /// Format: `"Module.Name"` (defaults to struct/value kind)
++    /// or `"Module.Name:class"` (reference-type class).
++    RustcSwiftType { module: Symbol, name: Symbol, is_class: bool, span: Span },
++
++    /// Represents `#[rustc_swift_labels = "_, by"]` — per-param
++    /// Swift labels for a fn in an `extern "Swift"` block.
++    /// Comma-separated tokens; `_` means unnamed, any other token
++    /// is the label name.
++    RustcSwiftLabels { labels: Symbol, span: Span },
++
+     /// Represents `#[rustc_preserve_ub_checks]`
+     RustcPreserveUbChecks,
+ 
+diff --git a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+index ad4d0728..d0e76232 100644
+--- a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
++++ b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+@@ -173,6 +173,11 @@ pub fn encode_cross_crate(&self) -> EncodeCrossCrate {
+             RustcParenSugar(..) => No,
+             RustcPassByValue(..) => Yes,
+             RustcPassIndirectlyInNonRusticAbis(..) => No,
++            RustcCxxCtor(..) => No,
++            RustcCxxOperator { .. } => Yes,
++            RustcSwiftSymbol { .. } => Yes,
++            RustcSwiftType { .. } => Yes,
++            RustcSwiftLabels { .. } => Yes,
+             RustcPreserveUbChecks => No,
+             RustcProcMacroDecls => No,
+             RustcPubTransparent(..) => Yes,
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+index 10a805a1..660e4ff3 100644
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -360,6 +360,11 @@ fn check_attributes(
+                     | AttributeKind::RustcParenSugar(..)
+                     | AttributeKind::RustcPassByValue (..)
+                     | AttributeKind::RustcPassIndirectlyInNonRusticAbis(..)
++                    | AttributeKind::RustcCxxCtor(..)
++                    | AttributeKind::RustcCxxOperator { .. }
++                    | AttributeKind::RustcSwiftSymbol { .. }
++                    | AttributeKind::RustcSwiftType { .. }
++                    | AttributeKind::RustcSwiftLabels { .. }
+                     | AttributeKind::RustcPreserveUbChecks
+                     | AttributeKind::RustcProcMacroDecls
+                     | AttributeKind::RustcReallocator
+@@ -1301,6 +1306,11 @@ fn check_repr(
+         let mut is_c = false;
+         let mut is_simd = false;
+         let mut is_transparent = false;
++        // P09.10: track `#[repr(cpp)]` sightings so we can enforce
++        // the "enum requires explicit integer repr + no data
++        // variants" rule after the loop (int_reprs and data-variant
++        // info aggregate across the whole repr block).
++        let mut is_cpp = false;
+ 
+         for (repr, repr_span) in reprs {
+             match repr {
+@@ -1328,6 +1338,54 @@ fn check_repr(
+                         }
+                     }
+                 }
++                ReprAttr::ReprCpp => {
++                    // #[repr(cpp)] carries the same attribute-level
++                    // constraints as #[repr(C)] — valid on structs,
++                    // unions, and enums only. The extended Itanium
++                    // ABI semantics (sret, this-pointer, mangling)
++                    // kick in at layout + codegen time, not here.
++                    is_c = true;
++                    is_cpp = true;
++                    match target {
++                        Target::Struct | Target::Union => continue,
++                        Target::Enum => {
++                            // P09.10: `#[repr(cpp)]` enums must also
++                            // carry an explicit integer repr (so
++                            // mangling and layout pick a concrete
++                            // underlying type) and cannot have
++                            // data-carrying variants (modeled as
++                            // C++ `enum class`). The checks happen
++                            // after this loop completes because
++                            // `int_reprs` aggregates across the
++                            // whole `#[repr(...)]` block.
++                            continue;
++                        }
++                        _ => {
++                            self.dcx().emit_err(errors::AttrApplication::StructEnumUnion {
++                                hint_span: *repr_span,
++                                span,
++                            });
++                        }
++                    }
++                }
++                ReprAttr::ReprSwift => {
++                    // P09.17: `#[repr(swift)]` — marks a Rust
++                    // type as representing a Swift value type.
++                    // Attribute-layer constraints mirror
++                    // `#[repr(C)]`: valid on structs, unions,
++                    // enums. Binding info (Swift module + name)
++                    // comes from `#[rustc_swift_type]`.
++                    is_c = true;
++                    match target {
++                        Target::Struct | Target::Union | Target::Enum => continue,
++                        _ => {
++                            self.dcx().emit_err(errors::AttrApplication::StructEnumUnion {
++                                hint_span: *repr_span,
++                                span,
++                            });
++                        }
++                    }
++                }
+                 ReprAttr::ReprAlign(..) => match target {
+                     Target::Struct | Target::Union | Target::Enum => {}
+                     Target::Fn | Target::Method(_) if self.tcx.features().fn_align() => {
+@@ -1446,11 +1504,45 @@ fn check_repr(
+             let hint_spans = hint_spans.clone().collect();
+             self.dcx().emit_err(errors::ReprConflicting { hint_spans });
+         }
+-        // Warn on repr(u8, u16), repr(C, simd), and c-like-enum-repr(C, u8)
++        // P09.10: `#[repr(cpp)]` enum enforcement — matches C++
++        // `enum class E : T`. Reject:
++        //   1. missing explicit integer repr (`#[repr(cpp)]` alone
++        //      on an enum gives us no underlying int to mangle /
++        //      lay out against, unlike structs where the layout
++        //      is field-driven);
++        //   2. variants with data payloads (C-like enums only,
++        //      because C++ `enum class` has no tagged-union form).
++        if is_cpp && target == Target::Enum {
++            if int_reprs == 0 {
++                self.dcx().span_err(
++                    span,
++                    "`#[repr(cpp)]` enum requires an explicit integer \
++                     repr hint like `#[repr(cpp, i32)]` — the integer \
++                     type names the C++ `enum class E : T` underlying \
++                     type",
++                );
++            }
++            if let Some(ItemLike::Item(item)) = item
++                && !is_c_like_enum(item)
++            {
++                self.dcx().span_err(
++                    span,
++                    "`#[repr(cpp)]` enum cannot have variants with \
++                     data — C++ `enum class` has no tagged-union form. \
++                     Use a `#[repr(cpp)]` struct or a union instead.",
++                );
++            }
++        }
++        // Warn on repr(u8, u16), repr(C, simd), and c-like-enum-repr(C, u8).
++        // The c-like-enum case specifically excludes `#[repr(cpp, I)]` —
++        // for Itanium enum mangling we *require* the integer hint to
++        // name the `enum class E : T` underlying type, so it's not a
++        // conflict there.
+         if (int_reprs > 1)
+             || (is_simd && is_c)
+             || (int_reprs == 1
+                 && is_c
++                && !is_cpp
+                 && item.is_some_and(|item| {
+                     if let ItemLike::Item(item) = item { is_c_like_enum(item) } else { false }
+                 }))
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 981bfed3..cf29ac9c 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -725,6 +725,7 @@
+         count,
+         coverage,
+         coverage_attribute,
++        cpp,
+         cr,
+         crate_in_paths,
+         crate_local,
+@@ -1716,6 +1717,8 @@
+         rustc_const_stable_indirect,
+         rustc_const_unstable,
+         rustc_conversion_suggestion,
++        rustc_cxx_ctor,
++        rustc_cxx_operator,
+         rustc_deallocator,
+         rustc_default_body_unstable,
+         rustc_delayed_bug_from_inside_query,
+@@ -1800,6 +1803,9 @@
+         rustc_skip_during_method_dispatch,
+         rustc_specialization_trait,
+         rustc_std_internal_symbol,
++        rustc_swift_labels,
++        rustc_swift_symbol,
++        rustc_swift_type,
+         rustc_strict_coherence,
+         rustc_test_marker,
+         rustc_then_this_would_need,
+@@ -2000,6 +2006,8 @@
+         sve_tuple_create4,
+         sve_tuple_get,
+         sve_tuple_set,
++        // P09.17: `#[repr(swift)]` marker.
++        swift,
+         sym,
+         sync,
+         synthetic,

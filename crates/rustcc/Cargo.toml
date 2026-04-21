@@ -1,0 +1,33 @@
+[package]
+name = "rustcc"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "rustc-compatible driver that layers C++ interop on top of rustc."
+
+[[bin]]
+name = "rustcc"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rustc_abi_cxx = { path = "../rustc_abi_cxx" }
+cxx_importer = { path = "../cxx_importer" }
+rustcc_attr = { path = "../rustcc_attr" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = []
+# Enables libclang-backed header parsing (M3+). Off by default so the
+# `rustcc` binary builds on machines without libclang; interop-mode
+# invocations error out with a clear message until the feature is on.
+libclang = ["cxx_importer/libclang"]

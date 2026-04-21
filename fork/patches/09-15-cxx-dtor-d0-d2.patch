@@ -1,0 +1,145 @@
+diff --git a/compiler/rustc_codegen_llvm/src/mono_item.rs b/compiler/rustc_codegen_llvm/src/mono_item.rs
+index 2c0a6ff0..3f3a1984 100644
+--- a/compiler/rustc_codegen_llvm/src/mono_item.rs
++++ b/compiler/rustc_codegen_llvm/src/mono_item.rs
+@@ -71,6 +71,12 @@ fn predefine_fn(
+             self.predefine_without_aliases(instance, &attrs, linkage, visibility, symbol_name);
+         self.add_function_aliases(instance, lldecl, &attrs, &attrs.foreign_item_symbol_aliases);
+ 
++        // P09.15: emit D0 (deleting) and D2 (base-object) Itanium
++        // destructor variants as siblings of the D1 we just
++        // predefined. Required so virtual dispatch of `delete p`
++        // through a C++ base pointer lands in Rust's Drop impl.
++        self.maybe_add_cxx_dtor_variants(instance, lldecl, linkage, visibility);
++
+         self.instances.borrow_mut().insert(instance, lldecl);
+     }
+ }
+@@ -159,6 +165,95 @@ fn add_static_aliases(&self, aliasee: &llvm::Value, aliases: &[(DefId, Linkage,
+         }
+     }
+ 
++    /// P09.15: For Rust `Drop` impls on `#[repr(cpp)]` types,
++    /// emit the Itanium D0 (deleting) and D2 (base-object)
++    /// destructor variants as trampolines alongside D1. Required
++    /// for virtual dispatch of `delete p` through a C++ base
++    /// pointer to land in Rust's Drop.
++    ///
++    /// - D2 is a plain forward to D1 (in single-inheritance
++    ///   without virtual bases, D1 and D2 run the same user code).
++    /// - D0 forwards to D1 then calls `operator delete(this)`
++    ///   (`_ZdlPv`), matching Clang's emission for
++    ///   `delete derived_obj`.
++    fn maybe_add_cxx_dtor_variants(
++        &self,
++        instance: Instance<'tcx>,
++        d1_decl: &'ll llvm::Value,
++        linkage: Linkage,
++        visibility: Visibility,
++    ) {
++        let def_id = instance.def_id();
++        if !rustc_symbol_mangling::itanium::is_cxx_drop_impl(self.tcx, def_id) {
++            return;
++        }
++
++        let fn_abi: &FnAbi<'tcx, Ty<'tcx>> =
++            self.fn_abi_of_instance(instance, ty::List::empty());
++        let fn_ty = fn_abi.llvm_type(self);
++        let attrs = self.tcx.codegen_instance_attrs(instance.def);
++
++        // Helper: emit a trampoline symbol named `name` whose body
++        // is `{ call D1(args); <tail>; ret }`. Returns the llvm
++        // decl so the caller can chain extra calls (for D0 which
++        // also calls `operator delete`).
++        let emit_trampoline = |name: &str, also_call_op_delete: bool| {
++            let trampoline = self.predefine_without_aliases(
++                instance, &attrs, linkage, visibility, name,
++            );
++            let start_llbb = Builder::append_block(self, trampoline, "start");
++            let mut bx = Builder::build(self, start_llbb);
++
++            let num_params = llvm::count_params(trampoline);
++            let mut args = Vec::with_capacity(num_params as usize);
++            for index in 0..num_params {
++                args.push(llvm::get_param(trampoline, index));
++            }
++
++            bx.call(
++                fn_ty, Some(&attrs), Some(fn_abi), d1_decl, &args, None, Some(instance),
++            );
++
++            if also_call_op_delete {
++                // Declare and call `operator delete(void*)` —
++                // `_ZdlPv`. Clang emits this in the D0 body when
++                // the dtor is virtual and `delete p` is reachable.
++                let op_delete_name = "_ZdlPv";
++                let void_ty = self.type_void();
++                let ptr_ty = self.type_ptr();
++                let op_delete_ty = self.type_func(&[ptr_ty], void_ty);
++                let op_delete = self.declare_cfn(
++                    op_delete_name,
++                    llvm::UnnamedAddr::Global,
++                    op_delete_ty,
++                );
++                // The first arg is `this` (a pointer). Rust's
++                // Drop fn's first arg is `&mut Self`, which has
++                // the same ABI — pass it through.
++                if !args.is_empty() {
++                    bx.call(
++                        op_delete_ty, None, None, op_delete, &args[..1], None, None,
++                    );
++                }
++            }
++
++            // Drop fns return `()`, so ret_void is correct
++            // regardless of which variant we're emitting.
++            bx.ret_void();
++        };
++
++        if let Some(d2_name) =
++            rustc_symbol_mangling::itanium::mangle_dtor_d2(self.tcx, def_id)
++        {
++            emit_trampoline(&d2_name, false);
++        }
++        if let Some(d0_name) =
++            rustc_symbol_mangling::itanium::mangle_dtor_d0(self.tcx, def_id)
++        {
++            emit_trampoline(&d0_name, true);
++        }
++    }
++
+     /// See [`add_static_aliases`](Self::add_static_aliases) for docs.
+     fn add_function_aliases(
+         &self,
+diff --git a/compiler/rustc_symbol_mangling/src/lib.rs b/compiler/rustc_symbol_mangling/src/lib.rs
+index c052037f..9884dafb 100644
+--- a/compiler/rustc_symbol_mangling/src/lib.rs
++++ b/compiler/rustc_symbol_mangling/src/lib.rs
+@@ -98,6 +98,7 @@
+ 
+ mod export;
+ mod hashed;
++pub mod itanium;
+ mod legacy;
+ mod v0;
+ 
+@@ -200,6 +201,19 @@ fn compute_symbol_name<'tcx>(
+         return v0::mangle_internal_symbol(tcx, name.as_str());
+     }
+ 
++    // P08b: `extern "C++"` items get Itanium-mangled names via
++    // the rustcc mangler. Runs before the wasm/NO_MANGLE early
++    // returns because foreign items in extern blocks look like
++    // NO_MANGLE from the default codegen's perspective — they'd
++    // otherwise emit the raw item name and miss C++ linkage.
++    // Falls back to the default path if the signature uses a
++    // type the Itanium translator doesn't yet handle.
++    if itanium::is_cpp_abi(tcx, def_id) {
++        if let Some(mangled) = itanium::mangle(tcx, instance) {
++            return mangled;
++        }
++    }
++
+     let wasm_import_module_exception_force_mangling = {
+         // * On the wasm32 targets there is a bug (or feature) in LLD [1] where the
+         //   same-named symbol when imported from different wasm modules will get

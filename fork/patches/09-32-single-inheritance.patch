@@ -1,0 +1,135 @@
+# P09.32 — Single inheritance of Rust polymorphic classes +
+# `dynamic_cast` across the inheritance chain.
+#
+# The v1 capstone. Enables `pub class Dog : Animal { … }` syntax
+# in the fork — derived classes embed the base subobject at
+# offset 0, emit a combined vtable, chain typeinfo via
+# `__si_class_type_info`, and get `dynamic_cast<Dog*>(animal*)`
+# working for free via libc++abi.
+#
+# # Scope
+#
+# v1 covers:
+#
+# - Single inheritance only (one base per derived class).
+# - Derived class MAY add new virtual methods (go into vtable
+#   slots after base's).
+# - Derived class MAY NOT override base virtuals. A method with
+#   the same name as a base virtual emits as a new distinct
+#   virtual, not as an override. Calls through a base pointer
+#   therefore reach the base's implementation. **Override
+#   support is deferred to v2.**
+# - `dynamic_cast<Derived*>(base_ptr)` and
+#   `dynamic_cast<Base*>(derived_ptr)` both work via libc++abi's
+#   runtime typeinfo-chain walk.
+#
+# # What's new
+#
+# ## Attribute plumbing (`#[rustc_cxx_base]`)
+#
+# 7-file pattern (same as prior rustc_cxx_* attrs):
+# - `rustc_span/src/symbol.rs` — new sym.
+# - `rustc_feature/src/builtin_attrs.rs` — rustc_attr entry.
+# - `rustc_hir/src/attrs/data_structures.rs` — AttributeKind.
+# - `rustc_hir/src/attrs/encode_cross_crate.rs` — `Yes`.
+# - `rustc_passes/src/check_attr.rs` — allowlist.
+# - `rustc_attr_parsing/src/attributes/codegen_attrs.rs` —
+#   parser (`Target::Field`).
+# - `rustc_attr_parsing/src/context.rs` — registered.
+#
+# ## Parser (`parse_cxx_class_item`)
+#
+# Accepts `class Name : Base { … }` syntax (C++-style
+# inheritance header). When present, synthesizes a first field
+# `__base: Base` carrying `#[rustc_cxx_base]`. The `__base`
+# name is added to `sym::` so it's pre-interned. Users
+# initialize it in ctors with the usual struct-literal syntax:
+# `Self { __base: Base::new(…), other_field: … }`.
+#
+# ## Layout (`cxx_bridge::correct_layout`)
+#
+# `has_polymorphic_base(tcx, def)` — helper checking if the
+# first field carries `#[rustc_cxx_base]`. When true, the
+# polymorphic-shift pathway (P09.25) is skipped because the
+# base subobject's first 8 bytes already ARE the vptr slot.
+# Derived classes now report `sizeof(Base) + sizeof(extra_fields)`
+# rather than re-adding a second vptr.
+#
+# ## Itanium mangler helpers (`rustc_symbol_mangling::itanium`)
+#
+# - `polymorphic_base_of_class(tcx, adt_did)` — returns
+#   `Option<DefId>` of the base ADT if the class is derived.
+# - `virtuals_on_chain(tcx, adt_did)` — recursive walk from
+#   root to `adt_did` collecting virtuals in vtable order
+#   (base first, derived last). Called by the vtable emitter.
+# - `is_polymorphic_cpp_class` now returns true for derived
+#   classes with no new virtuals of their own (they still
+#   inherit the vtable slot from the base).
+#
+# ## Vtable / typeinfo emission (`rustc_codegen_llvm::cxx_vtable`)
+#
+# - `emit_vtable` uses `virtuals_on_chain` so derived classes
+#   include base's slots first. Slot indices stay stable
+#   between base and derived, which is what lets a
+#   `static_cast<Animal*>(dog)` call Animal's virtuals at the
+#   same slot index Animal's own vtable uses.
+# - `emit_typeinfo` dispatches on
+#   `polymorphic_base_of_class`:
+#   - Root classes: 2-slot `__class_type_info` (as before).
+#   - Derived: 3-slot `__si_class_type_info` — RTTI vtable
+#     pointer (to `_ZTVN10__cxxabiv120__si_class_type_infoE`),
+#     typeinfo name, and base's `_ZTI<Base>` pointer. The
+#     third slot is what libc++abi's dynamic_cast walks to
+#     determine inheritance chain membership.
+#
+# ## Ctor vptr init at return (`rustc_codegen_ssa::mir::block`)
+#
+# The tricky bit. P09.25 injects a vptr store at function
+# entry. For derived classes, user code like
+# `Self { __base: Base::new(…), other_field: … }` writes
+# Base's bytes (including Base's vptr) into offset 0 of Self
+# AFTER our entry-point injection — clobbering our derived
+# vptr. Fix: also inject the store at each RETURN terminator
+# in `codegen_return_terminator`. For derived classes this is
+# the write that wins (it's last); for non-derived classes
+# it's redundant with the entry injection but harmless.
+#
+# # Files
+#
+# Compiler (~180 LOC across 10 files):
+#
+# - `rustc_span/src/symbol.rs` — `__base`, `rustc_cxx_base` syms.
+# - `rustc_feature/src/builtin_attrs.rs` — attr entry.
+# - `rustc_hir/src/attrs/data_structures.rs` — AttributeKind.
+# - `rustc_hir/src/attrs/encode_cross_crate.rs` — Yes.
+# - `rustc_passes/src/check_attr.rs` — allowlist.
+# - `rustc_attr_parsing/src/attributes/codegen_attrs.rs` —
+#   parser.
+# - `rustc_attr_parsing/src/context.rs` — registration.
+# - `rustc_parse/src/parser/item.rs` — `class Name : Base`
+#   parsing, __base field synthesis.
+# - `rustc_ty_utils/src/layout/cxx_bridge.rs` —
+#   `has_polymorphic_base` + layout skip.
+# - `rustc_symbol_mangling/src/itanium.rs` —
+#   `polymorphic_base_of_class`, `virtuals_on_chain`,
+#   updated `is_polymorphic_cpp_class`.
+# - `rustc_codegen_llvm/src/cxx_vtable.rs` — emit_typeinfo
+#   branches on base; emit_vtable uses chain walk.
+# - `rustc_codegen_ssa/src/mir/block.rs` — inject vptr write
+#   before return terminator.
+#
+# # Validation
+#
+# - `/tmp/p09-35-inherit/` — Dog inherits from Animal, C++
+#   calls `d->legs()`, `d->noise()`, `d->bark()` via `Dog*`,
+#   and `a->legs()`, `a->noise()` via upcast `Animal*`.
+#   `legs=4 noise=7 bark=30 up_legs=4 up_noise=7 — OK
+#   (inheritance), exit 0`.
+# - `/tmp/p09-36-dyncast/` — `dynamic_cast<Dog*>` on an
+#   `Animal*` that actually points at a Dog succeeds; on a
+#   plain Animal returns nullptr. Exit 0.
+# - `/tmp/p09-25-auto-vptr/` regression — same-crate
+#   polymorphic (no inheritance) still passes.
+# - `/tmp/p09-30-class-kw/` regression — class keyword still
+#   passes.
+# - `cargo test --workspace` → 235/0 preserved.

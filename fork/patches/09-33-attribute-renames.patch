@@ -1,0 +1,108 @@
+# P09.33 — v1 naming cleanup: shorter public attribute names
+# and macro renames.
+#
+# Public-facing rename pass. Shortens the five user-facing
+# attributes and the `cxx_class_native!` macro to names that
+# read naturally in user code. Internal attributes
+# (`rustc_cxx_wrapper`, `rustc_cxx_drop_wrapper`,
+# `rustc_cxx_base`) are left unchanged — users never write them.
+#
+# # Renames
+#
+# | Old | New |
+# |---|---|
+# | `#[rustc_cxx_ctor]`     | `#[constructor]` |
+# | `#[rustc_cxx_virtual]`  | `#[cpp_virtual]` |
+# | `#[rustc_cxx_operator]` | `#[operator]` |
+# | `#[rustc_swift_type]`   | `#[swift_type]` |
+# | `#[rustc_swift_symbol]` | `#[swift_symbol]` |
+# | `cxx_class_native!`     | `native_cpp_class!` |
+#
+# # Naming rationale
+#
+# - `constructor` — self-documenting, no collision with the
+#   `ctor` crate on crates.io.
+# - `cpp_virtual` — the `virtual` identifier alone is a reserved
+#   Rust keyword (can't be used as `#[virtual]` directly); the
+#   `cpp_` prefix disambiguates and matches the repr(cpp)
+#   naming convention.
+# - `operator` — no collisions; the attribute only applies to
+#   methods on `#[repr(cpp)]` impls so its scope is unambiguous.
+# - `swift_type` / `swift_symbol` — `#[type]` alone would be a
+#   parse error (reserved keyword). The `swift_` prefix keeps
+#   parity with the ABI these attrs target.
+# - `native_cpp_class!` — "native C++ class" reads better in
+#   English than "C++ native class"; also avoids semantic
+#   overlap with the `cpp` crate's `cpp_class!` macro.
+#
+# # What's not renamed
+#
+# - `rustc_cxx_wrapper`, `rustc_cxx_drop_wrapper`,
+#   `rustc_cxx_base` — these are emitted internally by the
+#   `native_cpp_class!` macro (and the `class` keyword's parser
+#   desugar) to mark methods / fields for compiler paths. Users
+#   don't write them, so shortening is cosmetic churn.
+# - `cxx_class!` — stable-rustc-compatible macro, untouched.
+# - `swift_value!` — macro name unchanged; only its *emission*
+#   updates to the new `#[swift_type]` attribute name.
+# - `#[repr(cpp)]`, `#[repr(swift)]`, `extern "C++"`,
+#   `extern "Swift"` — these are the fundamental type-system
+#   and ABI markers, not rename candidates.
+#
+# # Files touched
+#
+# Compiler (4 files):
+#
+# - `rustc_span/src/symbol.rs` — add `cpp_virtual`, `operator`,
+#   `swift_symbol`, `swift_type` syms. Drop `rustc_cxx_ctor`,
+#   `rustc_cxx_virtual`, `rustc_cxx_operator`,
+#   `rustc_swift_type`, `rustc_swift_symbol`. `constructor`
+#   was already interned elsewhere — reused, not duplicated.
+# - `rustc_feature/src/builtin_attrs.rs` — update 5
+#   `rustc_attr!` entries.
+# - `rustc_attr_parsing/src/attributes/codegen_attrs.rs` —
+#   update 5 `PATH` fields on the parser structs. The
+#   `AttributeKind` variant names (`RustcCxxCtor`,
+#   `RustcCxxVirtual`, etc.) stay unchanged; they're internal
+#   compiler identifiers that don't cross the API boundary.
+# - (symbol table ripple effects compile-checked at every stage.)
+#
+# Workspace (1 file):
+#
+# - `crates/rustcc_macros/src/lib.rs` — proc macro renamed
+#   (`pub fn cxx_class_native` → `pub fn native_cpp_class`).
+#   Macro-emitted attribute names all updated. `swift_value!`
+#   emission updated from `#[rustc_swift_type]` to
+#   `#[swift_type]`.
+#
+# # Validation
+#
+# All v1 capstone probes pass with the new syntax:
+#
+# ```
+# /tmp/p09-25-auto-vptr/   foo() = 107, bar() = 14 — OK
+# /tmp/p09-30-class-kw/    foo() = 109, bar() = 18 — OK (class keyword)
+# /tmp/p09-35-inherit/     legs=4 noise=7 bark=30 up_legs=4 up_noise=7 — OK
+# /tmp/p09-36-dyncast/     dynamic_cast<Dog*>(…) = <ptr>/nullptr — OK
+# /tmp/p09-35-virtsigs/    scaled=52 encloses=1 area_plus_point=17 — OK
+# /tmp/p09-small-poly/     kind() = 42 — OK
+# /tmp/p09-crosscrate/     foo() = 107, bar() = 14 — OK (cross-crate)
+# /tmp/p09-28-swift-auto/  OK (Clone retains, deinit fires at end)
+# ```
+#
+# `cargo test --workspace` → 235/0 preserved.
+#
+# # Migration note for any existing user code
+#
+# Mechanical rename. A `sed` pass covers the public attrs:
+#
+# ```
+# sed -i 's/#\[rustc_cxx_ctor\]/#[constructor]/g;
+#         s/#\[rustc_cxx_virtual\]/#[cpp_virtual]/g;
+#         s/#\[rustc_cxx_operator/\#[operator/g;
+#         s/#\[rustc_swift_type/\#[swift_type/g;
+#         s/#\[rustc_swift_symbol/\#[swift_symbol/g;
+#         s/cxx_class_native!/native_cpp_class!/g' FILE
+# ```
+#
+# No semantic changes — same AttributeKind variants, same codegen.

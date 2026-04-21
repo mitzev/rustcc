@@ -1,0 +1,28 @@
+# Demonstration crate for rustcc's Rust → C++ direction.
+#
+# The `[cpp-interop]` section opts the rustcc driver into its interop
+# pipeline: scan Rust source for `#[repr(cpp)]` types, emit
+# `<crate>-cxx.hpp`, emit `<crate>-cxx-stubs.cpp` (abort-ing placeholders
+# that stand in for fork-emitted bodies), and feed both into a C++
+# consumer binary.
+#
+# This crate intentionally does NOT build cleanly under stable `rustc`
+# — `#[repr(cpp)]` is not a recognized repr kind. The rustcc-fork's
+# HIR pass will accept it; pre-fork, the rustcc driver parses the
+# source directly via `rustcc_attr`. That's why this directory lives
+# under `examples/` rather than being a workspace member: workspace
+# members go through a plain `cargo build`.
+
+[package]
+name = "point_demo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[cpp-interop]
+headers = ["cpp/empty.hpp"]
+header-search-paths = []
+clang-flags = []
+emit-stubs = true

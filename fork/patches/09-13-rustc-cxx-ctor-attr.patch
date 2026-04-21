@@ -1,0 +1,217 @@
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+index 357be2f4..e69c06e8 100644
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -702,6 +702,18 @@ impl<S: Stage> NoArgsAttributeParser<S> for RustcPassIndirectlyInNonRusticAbisPa
+     const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcPassIndirectlyInNonRusticAbis;
+ }
+ 
++/// P09 Tier 3: `#[rustc_cxx_ctor]` — marks a method on a
++/// `#[repr(cpp)]` impl as a C++ constructor. Mangling routes
++/// through `Symbol::Ctor` producing `_ZN<class>C1E<args>`.
++pub(crate) struct RustcCxxCtorParser;
++
++impl<S: Stage> NoArgsAttributeParser<S> for RustcCxxCtorParser {
++    const PATH: &[Symbol] = &[sym::rustc_cxx_ctor];
++    const ALLOWED_TARGETS: AllowedTargets =
++        AllowedTargets::AllowList(&[Allow(Target::Method(MethodKind::Inherent))]);
++    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcCxxCtor;
++}
++
+ pub(crate) struct RustcEiiForeignItemParser;
+ 
+ impl<S: Stage> NoArgsAttributeParser<S> for RustcEiiForeignItemParser {
+diff --git a/compiler/rustc_attr_parsing/src/context.rs b/compiler/rustc_attr_parsing/src/context.rs
+index becdaee0..e7ad3894 100644
+--- a/compiler/rustc_attr_parsing/src/context.rs
++++ b/compiler/rustc_attr_parsing/src/context.rs
+@@ -325,6 +325,7 @@ mod late {
+         Single<WithoutArgs<RustcParenSugarParser>>,
+         Single<WithoutArgs<RustcPassByValueParser>>,
+         Single<WithoutArgs<RustcPassIndirectlyInNonRusticAbisParser>>,
++        Single<WithoutArgs<RustcCxxCtorParser>>,
+         Single<WithoutArgs<RustcPreserveUbChecksParser>>,
+         Single<WithoutArgs<RustcProcMacroDeclsParser>>,
+         Single<WithoutArgs<RustcPubTransparentParser>>,
+diff --git a/compiler/rustc_feature/src/builtin_attrs.rs b/compiler/rustc_feature/src/builtin_attrs.rs
+index 053caee2..00cda966 100644
+--- a/compiler/rustc_feature/src/builtin_attrs.rs
++++ b/compiler/rustc_feature/src/builtin_attrs.rs
+@@ -311,6 +311,9 @@ pub struct BuiltinAttribute {
+     ungated!(naked),
+     // See `TyAndLayout::pass_indirectly_in_non_rustic_abis` for details.
+     rustc_attr!(rustc_pass_indirectly_in_non_rustic_abis, "types marked with `#[rustc_pass_indirectly_in_non_rustic_abis]` are always passed indirectly by non-Rustic ABIs"),
++    // P09 Tier 3: mark a fn as a C++ constructor so its symbol
++    // mangles as `_ZN<class>C1E<args>` rather than a member fn.
++    rustc_attr!(rustc_cxx_ctor, "marks an impl method on a `#[repr(cpp)]` type as a C++ constructor (mangled with the `C1` complete-object variant)"),
+ 
+     // Limits:
+     ungated!(recursion_limit),
+diff --git a/compiler/rustc_hir/src/attrs/data_structures.rs b/compiler/rustc_hir/src/attrs/data_structures.rs
+index 05f39805..411d991e 100644
+--- a/compiler/rustc_hir/src/attrs/data_structures.rs
++++ b/compiler/rustc_hir/src/attrs/data_structures.rs
+@@ -170,6 +170,12 @@ pub enum ReprAttr {
+     ReprInt(IntType),
+     ReprRust,
+     ReprC,
++    /// `#[repr(cpp)]`. Implies C-compatible layout plus the
++    /// extended Itanium C++ ABI rules: sret for non-trivial-for-
++    /// calls classes, explicit `this`-pointer on methods, and
++    /// Itanium-style name mangling for items whose `extern` is
++    /// `"C++"`. See `rustcc`'s `fork/PATCHES.md`.
++    ReprCpp,
+     ReprPacked(Align),
+     ReprSimd,
+     ReprTransparent,
+@@ -1542,6 +1548,10 @@ pub enum AttributeKind {
+     /// Represents `#[rustc_pass_indirectly_in_non_rustic_abis]`
+     RustcPassIndirectlyInNonRusticAbis(Span),
+ 
++    /// Represents `#[rustc_cxx_ctor]` — marks a method as a C++
++    /// constructor for Itanium mangling (`_ZN<class>C1E<args>`).
++    RustcCxxCtor(Span),
++
+     /// Represents `#[rustc_preserve_ub_checks]`
+     RustcPreserveUbChecks,
+ 
+diff --git a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+index ad4d0728..5d96babd 100644
+--- a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
++++ b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+@@ -173,6 +173,7 @@ pub fn encode_cross_crate(&self) -> EncodeCrossCrate {
+             RustcParenSugar(..) => No,
+             RustcPassByValue(..) => Yes,
+             RustcPassIndirectlyInNonRusticAbis(..) => No,
++            RustcCxxCtor(..) => No,
+             RustcPreserveUbChecks => No,
+             RustcProcMacroDecls => No,
+             RustcPubTransparent(..) => Yes,
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+index 10a805a1..fd39b787 100644
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -360,6 +360,7 @@ fn check_attributes(
+                     | AttributeKind::RustcParenSugar(..)
+                     | AttributeKind::RustcPassByValue (..)
+                     | AttributeKind::RustcPassIndirectlyInNonRusticAbis(..)
++                    | AttributeKind::RustcCxxCtor(..)
+                     | AttributeKind::RustcPreserveUbChecks
+                     | AttributeKind::RustcProcMacroDecls
+                     | AttributeKind::RustcReallocator
+@@ -1301,6 +1302,11 @@ fn check_repr(
+         let mut is_c = false;
+         let mut is_simd = false;
+         let mut is_transparent = false;
++        // P09.10: track `#[repr(cpp)]` sightings so we can enforce
++        // the "enum requires explicit integer repr + no data
++        // variants" rule after the loop (int_reprs and data-variant
++        // info aggregate across the whole repr block).
++        let mut is_cpp = false;
+ 
+         for (repr, repr_span) in reprs {
+             match repr {
+@@ -1328,6 +1334,36 @@ fn check_repr(
+                         }
+                     }
+                 }
++                ReprAttr::ReprCpp => {
++                    // #[repr(cpp)] carries the same attribute-level
++                    // constraints as #[repr(C)] — valid on structs,
++                    // unions, and enums only. The extended Itanium
++                    // ABI semantics (sret, this-pointer, mangling)
++                    // kick in at layout + codegen time, not here.
++                    is_c = true;
++                    is_cpp = true;
++                    match target {
++                        Target::Struct | Target::Union => continue,
++                        Target::Enum => {
++                            // P09.10: `#[repr(cpp)]` enums must also
++                            // carry an explicit integer repr (so
++                            // mangling and layout pick a concrete
++                            // underlying type) and cannot have
++                            // data-carrying variants (modeled as
++                            // C++ `enum class`). The checks happen
++                            // after this loop completes because
++                            // `int_reprs` aggregates across the
++                            // whole `#[repr(...)]` block.
++                            continue;
++                        }
++                        _ => {
++                            self.dcx().emit_err(errors::AttrApplication::StructEnumUnion {
++                                hint_span: *repr_span,
++                                span,
++                            });
++                        }
++                    }
++                }
+                 ReprAttr::ReprAlign(..) => match target {
+                     Target::Struct | Target::Union | Target::Enum => {}
+                     Target::Fn | Target::Method(_) if self.tcx.features().fn_align() => {
+@@ -1446,11 +1482,45 @@ fn check_repr(
+             let hint_spans = hint_spans.clone().collect();
+             self.dcx().emit_err(errors::ReprConflicting { hint_spans });
+         }
+-        // Warn on repr(u8, u16), repr(C, simd), and c-like-enum-repr(C, u8)
++        // P09.10: `#[repr(cpp)]` enum enforcement — matches C++
++        // `enum class E : T`. Reject:
++        //   1. missing explicit integer repr (`#[repr(cpp)]` alone
++        //      on an enum gives us no underlying int to mangle /
++        //      lay out against, unlike structs where the layout
++        //      is field-driven);
++        //   2. variants with data payloads (C-like enums only,
++        //      because C++ `enum class` has no tagged-union form).
++        if is_cpp && target == Target::Enum {
++            if int_reprs == 0 {
++                self.dcx().span_err(
++                    span,
++                    "`#[repr(cpp)]` enum requires an explicit integer \
++                     repr hint like `#[repr(cpp, i32)]` — the integer \
++                     type names the C++ `enum class E : T` underlying \
++                     type",
++                );
++            }
++            if let Some(ItemLike::Item(item)) = item
++                && !is_c_like_enum(item)
++            {
++                self.dcx().span_err(
++                    span,
++                    "`#[repr(cpp)]` enum cannot have variants with \
++                     data — C++ `enum class` has no tagged-union form. \
++                     Use a `#[repr(cpp)]` struct or a union instead.",
++                );
++            }
++        }
++        // Warn on repr(u8, u16), repr(C, simd), and c-like-enum-repr(C, u8).
++        // The c-like-enum case specifically excludes `#[repr(cpp, I)]` —
++        // for Itanium enum mangling we *require* the integer hint to
++        // name the `enum class E : T` underlying type, so it's not a
++        // conflict there.
+         if (int_reprs > 1)
+             || (is_simd && is_c)
+             || (int_reprs == 1
+                 && is_c
++                && !is_cpp
+                 && item.is_some_and(|item| {
+                     if let ItemLike::Item(item) = item { is_c_like_enum(item) } else { false }
+                 }))
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 981bfed3..732b29a4 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -725,6 +725,7 @@
+         count,
+         coverage,
+         coverage_attribute,
++        cpp,
+         cr,
+         crate_in_paths,
+         crate_local,
+@@ -1716,6 +1717,7 @@
+         rustc_const_stable_indirect,
+         rustc_const_unstable,
+         rustc_conversion_suggestion,
++        rustc_cxx_ctor,
+         rustc_deallocator,
+         rustc_default_body_unstable,
+         rustc_delayed_bug_from_inside_query,

@@ -1,0 +1,20 @@
+diff --git a/compiler/rustc_target/src/spec/abi_map.rs b/compiler/rustc_target/src/spec/abi_map.rs
+index c0fdd946..86fe33cb 100644
+--- a/compiler/rustc_target/src/spec/abi_map.rs
++++ b/compiler/rustc_target/src/spec/abi_map.rs
+@@ -83,6 +83,15 @@ pub fn canonize_abi(&self, extern_abi: ExternAbi, has_c_varargs: bool) -> AbiMap
+         let canon_abi = match (extern_abi, arch) {
+             // infallible lowerings
+             (ExternAbi::C { .. }, _) => CanonAbi::C,
++            // P09 scaffold: Itanium C++ ABI gets its own CanonAbi
++            // variant. Today every per-target call-conv lowering
++            // treats `CanonAbi::Cpp` identically to `CanonAbi::C`
++            // (correct for scalar/pointer shapes on SysV AMD64).
++            // The distinct variant exists so future per-target
++            // patches can add sret / this-pointer / record-by-
++            // value handling for records without perturbing the
++            // plain `extern "C"` path.
++            (ExternAbi::Cpp { .. }, _) => CanonAbi::Cpp,
+             (ExternAbi::Rust | ExternAbi::RustCall, _) => CanonAbi::Rust,
+             (ExternAbi::Unadjusted, _) => CanonAbi::C,
+ 

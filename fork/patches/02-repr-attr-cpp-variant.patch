@@ -1,0 +1,26 @@
+Add `ReprAttr::ReprCpp` variant so the attribute survives from the
+parser all the way to layout / codegen.
+
+`ReprCpp` semantically implies the C layout constraints (field
+order preserved, no Rust-reordering) plus the extended Itanium C++
+ABI rules (sret for non-trivial-for-calls classes, this-pointer
+prepending). The actual behavior lives in P05 (ReprOptions flag
+threading) and P06 (layout delegation); this patch just lets the
+variant exist.
+
+diff --git a/compiler/rustc_hir/src/attrs/data_structures.rs b/compiler/rustc_hir/src/attrs/data_structures.rs
+--- a/compiler/rustc_hir/src/attrs/data_structures.rs
++++ b/compiler/rustc_hir/src/attrs/data_structures.rs
+@@ -169,6 +169,12 @@ pub enum ReprAttr {
+     ReprInt(IntType),
+     ReprRust,
+     ReprC,
++    /// `#[repr(cpp)]`. Implies C-compatible layout plus the
++    /// extended Itanium C++ ABI rules: sret for non-trivial-for-
++    /// calls classes, explicit `this`-pointer on methods, and
++    /// Itanium-style name mangling for items whose `extern` is
++    /// `"C++"`. See `rustcc`'s `fork/PATCHES.md`.
++    ReprCpp,
+     ReprPacked(Align),
+     ReprSimd,
+     ReprTransparent,

@@ -1,0 +1,17 @@
+Reserve `sym::cpp` for the `#[repr(cpp)]` attribute.
+
+Needed by later patches in the rustcc fork series:
+  - P02 ReprAttr::ReprCpp uses this via sym::cpp
+  - P03 parse_repr matches on Some(sym::cpp)
+
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -724,6 +724,7 @@ symbols! {
+         count,
+         coverage,
+         coverage_attribute,
++        cpp,
+         cr,
+         crate_in_paths,
+         crate_local,

@@ -1,0 +1,49 @@
+diff --git a/compiler/rustc_middle/src/ty/layout.rs b/compiler/rustc_middle/src/ty/layout.rs
+index 53706cc8..c21b8b68 100644
+--- a/compiler/rustc_middle/src/ty/layout.rs
++++ b/compiler/rustc_middle/src/ty/layout.rs
+@@ -1173,6 +1173,36 @@ fn is_scalable_vector(this: TyAndLayout<'tcx>) -> bool {
+     fn is_pass_indirectly_in_non_rustic_abis_flag_set(this: TyAndLayout<'tcx>) -> bool {
+         matches!(this.ty.kind(), ty::Adt(def, _) if def.repr().flags.contains(ReprFlags::PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS))
+     }
++
++    /// True when this type is "non-trivial for C++ calls" per
++    /// the Itanium ABI. Itanium passes such types by invisible
++    /// reference regardless of size. P09 uses this to force
++    /// `PassMode::Indirect` in `ExternAbi::Cpp` fn signatures.
++    ///
++    /// Triggers (both for `#[repr(cpp)]` ADTs):
++    /// - a user-declared `Drop` impl, or
++    /// - `!Copy`. A C++ class with any hand-rolled copy/move ctor
++    ///   is non-trivial, and Rust's closest proxy is "doesn't
++    ///   implement `Copy`": a trivially-copyable Rust type is
++    ///   `Copy`-safe, and a `#[repr(cpp)]` backed by a non-trivial
++    ///   C++ class will not be `Copy` (copying it would be a
++    ///   memcpy, but the C++ side's copy ctor wants to run).
++    fn is_cxx_non_trivial_for_calls(this: TyAndLayout<'tcx>, cx: &C) -> bool {
++        match this.ty.kind() {
++            ty::Adt(def, _) => {
++                if !def.repr().cpp() {
++                    return false;
++                }
++                if def.destructor(cx.tcx()).is_some() {
++                    return true;
++                }
++                // `!Copy` → non-trivial. `type_is_copy_modulo_regions`
++                // checks the `Copy` bound in the current typing env.
++                !cx.tcx().type_is_copy_modulo_regions(cx.typing_env(), this.ty)
++            }
++            _ => false,
++        }
++    }
+ }
+ 
+ /// Calculates whether a function's ABI can unwind or not.
+@@ -1252,6 +1282,7 @@ pub fn fn_can_unwind(tcx: TyCtxt<'_>, fn_def_id: Option<DefId>, abi: ExternAbi)
+     use ExternAbi::*;
+     match abi {
+         C { unwind }
++        | Cpp { unwind }
+         | System { unwind }
+         | Cdecl { unwind }
+         | Stdcall { unwind }

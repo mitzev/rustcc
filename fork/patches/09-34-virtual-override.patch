@@ -1,0 +1,125 @@
+# P09.34 — Virtual method override promoted into v1.
+#
+# The last missing piece from the v1 polymorphism story.
+# Derived classes can now override a base class's virtual at
+# the same vtable slot, so calls through an upcast base pointer
+# land in the derived implementation (normal C++ dispatch).
+#
+# # What changed
+#
+# One function in `rustc_symbol_mangling::itanium`:
+# `virtuals_on_chain` now resolves overrides during the walk
+# instead of appending every derived virtual as a new slot.
+#
+# Before:
+#
+# ```rust
+# // base chain → [Animal::speak, Animal::legs]
+# // derived contribution → appended
+# //   [Animal::speak, Animal::legs, Dog::speak, Dog::wag]
+# // (Dog::speak ends up at slot 4 — calls via Animal*
+# //  still reach Animal::speak)
+# ```
+#
+# After:
+#
+# ```rust
+# // base chain → [Animal::speak, Animal::legs]
+# // for each derived virtual:
+# //   if name matches an existing slot → replace in place
+# //   else → append
+# // result: [Dog::speak, Animal::legs, Dog::wag]
+# //          ↑ slot 0 is Dog's (override); legs still
+# //            points at Animal's; wag is a new slot.
+# ```
+#
+# # Matching rule (v1)
+#
+# Name-only match. Two virtuals with the same method name
+# collapse to one vtable slot — the derived one wins. Signature
+# compatibility is NOT checked: if a user writes a derived
+# virtual with the same name as a base virtual but different
+# params, the vtable slot ends up holding a method whose
+# signature doesn't match what C++ callers expect through the
+# base vtable. The linker can't detect this — it's user error,
+# diagnosed only at runtime as an ABI mismatch.
+#
+# A future patch could lint for signature compatibility. For v1
+# we document the restriction.
+#
+# # What v1 override supports
+#
+# - Single-level override: `Dog` overrides `Animal::speak`.
+# - Multi-level override: `Puppy` overrides what `Dog`
+#   overrode from `Animal`. The chain walk replaces at the
+#   base's slot index repeatedly.
+# - Mix of override + new virtuals: `Dog` can override some
+#   of `Animal`'s virtuals AND add its own new ones.
+# - `dynamic_cast` unaffected (the `__si_class_type_info` chain
+#   doesn't reference the vtable slots).
+#
+# # Files
+#
+# - `compiler/rustc_symbol_mangling/src/itanium.rs` —
+#   `virtuals_on_chain` rewrites the append-only loop into an
+#   override-resolving loop (~25 LOC of actual logic).
+#
+# No other files change. Vtable emission, typeinfo chain, and
+# ctor vptr init all reuse `virtuals_on_chain`'s output
+# unchanged.
+#
+# # Validation
+#
+# `/tmp/p09-37-override/` — new probe covering all four cases:
+#
+# - `speak()` on a Dog via `Animal*`: override fires. Expected
+#   1003 (Dog's `bark + 1000`), NOT 70 (Animal's `tag * 10`).
+# - `legs()` inherited: 4 (Animal's default, not overridden).
+# - `wag()` via `Dog*`: 6 (Dog's new virtual, no base
+#   collision).
+# - `speak()` on a plain Animal via `Animal*`: 50 (Animal's
+#   impl — no Dog instance, no override to apply).
+#
+# Output: `speak-on-Dog-via-Animal* = 1003 (override ✓);
+# legs-inherited = 4; wag-new = 6; speak-on-plain-Animal = 50 —
+# OK`, exit 0.
+#
+# Regressions: `/tmp/p09-35-inherit/` and `/tmp/p09-36-dyncast/`
+# still pass unchanged (neither probe uses overrides, so the
+# append path still fires for new virtuals only).
+# `cargo test --workspace` → 235/0 preserved.
+#
+# # v1 feature matrix update
+#
+# "Virtual method override" moves from v2 roadmap to v1
+# supported. v2 backlog for polymorphism now reduces to just
+# multi-inheritance / virtual bases.
+
+diff --git a/compiler/rustc_symbol_mangling/src/itanium.rs b/compiler/rustc_symbol_mangling/src/itanium.rs
+--- a/compiler/rustc_symbol_mangling/src/itanium.rs
++++ b/compiler/rustc_symbol_mangling/src/itanium.rs
+@@ (virtuals_on_chain body)
+ pub fn virtuals_on_chain<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> Vec<DefId> {
+-    let mut out = Vec::new();
++    let mut out: Vec<DefId> = Vec::new();
+     if let Some(base_did) = polymorphic_base_of_class(tcx, adt_did) {
+         out.extend(virtuals_on_chain(tcx, base_did));
+     }
+-    out.extend(virtual_methods_on_class(tcx, adt_did));
++    // P09.34: resolve overrides by matching names.
++    for derived_did in virtual_methods_on_class(tcx, adt_did) {
++        let derived_name = tcx.item_name(derived_did);
++        let mut replaced = false;
++        for slot in out.iter_mut() {
++            if tcx.item_name(*slot) == derived_name {
++                *slot = derived_did;
++                replaced = true;
++                break;
++            }
++        }
++        if !replaced {
++            out.push(derived_did);
++        }
++    }
+     out
+ }
