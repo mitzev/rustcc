@@ -1,29 +1,35 @@
 # Patches: upstream `rustc` → forked `rustcc`
 
+## How this document is organized
+
+`fork/patches/` contains an eight-file series that applies cleanly in
+order against `rust-lang/rust` at commit
+`e22c616e4e87914135c1db261a03e0437255335e` (the SHA pinned in
+`fork/build.sh`). Each file is the mechanical delivery for one
+semantic cluster:
+
+| File                                  | Scope                                                                |
+|---------------------------------------|----------------------------------------------------------------------|
+| `01-rustc-abi-cxx-crate.patch`        | Vendor `rustc_abi_cxx` into `compiler/`                              |
+| `02-abi-plumbing.patch`               | `ExternAbi::Cpp` + callconv lowering + rustc_public bridge           |
+| `03-attrs-and-repr.patch`             | `rustc_cxx_*` / `rustc_swift_*` attributes + `repr(cpp)` / `repr(swift)` |
+| `04-parser-class-keyword.patch`       | `class` keyword + body-attribute acceptance                          |
+| `05-middle-end-layout-bridge.patch`   | Middle-end layout bridge + ty hooks                                  |
+| `06-symbol-mangling.patch`            | Itanium + Swift mangling dispatch                                    |
+| `07-codegen.patch`                    | Codegen LLVM: vtable emission, ctor vptr-init, call lowering         |
+| `08-cargo-lock.patch`                 | `Cargo.lock` refresh                                                 |
+
+The **P01 … P09.36 sections below** are the authoritative design
+record. Each documents the intent, validation probe, and any
+compiler-internal trade-offs for one unit of work. The numbering is
+historical — it tracks the order the work was done, not the layout
+of the current eight-file delivery. Read the P-sections when you
+want to know *why* a change looks the way it does.
+
 Verified against `rust-lang/rust` master at ~2025-04 (structurally
 equivalent to nightly-2025-10-03, which our workspace pins). Line
 numbers are approximate — look for the anchor text in each hunk
 rather than trusting `:N:` if master has drifted.
-
-## Patch series
-
-Applied in order. Each is small on its own and survives code review
-independently. `P01..P04` unlock `#[repr(cpp)]` as a syntactic /
-type-system feature without changing codegen. `P05..P07` hand
-record layout, mangling, and the new ABI to `rustc_abi_cxx`. `P08`
-is the codegen wiring.
-
-| # | Purpose                                                         | Files touched                                                                      |
-|---|-----------------------------------------------------------------|------------------------------------------------------------------------------------|
-| 01 | Symbol `cpp`                                                   | `compiler/rustc_span/src/symbol.rs`                                                |
-| 02 | `ReprAttr::ReprCpp` variant                                    | `compiler/rustc_hir/src/attrs/data_structures.rs`                                  |
-| 03 | Parse `#[repr(cpp)]`                                           | `compiler/rustc_attr_parsing/src/attributes/repr.rs`                               |
-| 04 | `ReprFlags::IS_CPP` + `ReprOptions::cpp()`                     | `compiler/rustc_abi/src/lib.rs`                                                    |
-| 05 | Thread `ReprCpp` → `IS_CPP` through `ReprOptions::from_attrs`  | `compiler/rustc_middle/src/ty/mod.rs`                                              |
-| 06 | `ReprCpp` arm in `check_attr`'s exhaustive match               | `compiler/rustc_passes/src/check_attr.rs`                                          |
-| 07 | Layout delegation via vendored `rustc_abi_cxx` + bridge hook   | `compiler/rustc_abi_cxx/` (vendored), `compiler/rustc_ty_utils/src/layout/cxx_bridge.rs`, `compiler/rustc_ty_utils/src/layout.rs`, `compiler/rustc_ty_utils/Cargo.toml` |
-| 08 | `ExternAbi::Cpp` + mangler override                             | `compiler/rustc_abi/src/extern_abi.rs`, `compiler/rustc_symbol_mangling/src/lib.rs` |
-| 09 | `CXX` calling-convention in codegen                            | `compiler/rustc_target/src/callconv/*.rs`, `compiler/rustc_codegen_llvm/src/abi.rs` |
 
 ---
 

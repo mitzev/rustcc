@@ -1,0 +1,392 @@
+From df39374b9483ddc4cfb575aa48118f7fe2ff29c9 Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Tue, 21 Apr 2026 23:23:24 +0300
+Subject: [PATCH 4/8] Parser: class keyword + class-body attribute acceptance
+
+Teaches the parser to recognize `class` as a weak keyword that desugars
+to a #[repr(cpp)] struct plus an inherent impl with any body methods as
+members. Extends single-inheritance parsing (`class D : B { ... }`) and
+relaxes attribute gating so class fields accept #[doc] / #[cfg] / etc.
+AST validation learns the new shape; stability lowering recognizes the
+fork ABIs as accepted extern strings.
+---
+ compiler/rustc_ast_lowering/src/stability.rs  |   2 +
+ .../rustc_ast_passes/src/ast_validation.rs    |   2 +
+ compiler/rustc_parse/src/parser/item.rs       | 294 ++++++++++++++++++
+ compiler/rustc_parse/src/parser/mod.rs        |   9 +-
+ 4 files changed, 306 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/rustc_ast_lowering/src/stability.rs b/compiler/rustc_ast_lowering/src/stability.rs
+index d185cc91..05513a1b 100644
+--- a/compiler/rustc_ast_lowering/src/stability.rs
++++ b/compiler/rustc_ast_lowering/src/stability.rs
+@@ -69,6 +69,8 @@ pub fn extern_abi_stability(abi: ExternAbi) -> Result<(), UnstableAbi> {
+         // stable ABIs
+         ExternAbi::Rust
+         | ExternAbi::C { .. }
++        | ExternAbi::Cpp { .. }
++        | ExternAbi::Swift { .. }
+         | ExternAbi::Cdecl { .. }
+         | ExternAbi::Stdcall { .. }
+         | ExternAbi::Fastcall { .. }
+diff --git a/compiler/rustc_ast_passes/src/ast_validation.rs b/compiler/rustc_ast_passes/src/ast_validation.rs
+index 0541d393..ca3307e3 100644
+--- a/compiler/rustc_ast_passes/src/ast_validation.rs
++++ b/compiler/rustc_ast_passes/src/ast_validation.rs
+@@ -421,6 +421,8 @@ fn check_extern_fn_signature(&self, abi: ExternAbi, ctxt: FnCtxt, ident: &Ident,
+             AbiMapping::Direct(canon_abi) | AbiMapping::Deprecated(canon_abi) => {
+                 match canon_abi {
+                     CanonAbi::C
++                    | CanonAbi::Cpp
++                    | CanonAbi::Swift
+                     | CanonAbi::Rust
+                     | CanonAbi::RustCold
+                     | CanonAbi::RustPreserveNone
+diff --git a/compiler/rustc_parse/src/parser/item.rs b/compiler/rustc_parse/src/parser/item.rs
+index ccfc9438..6742a103 100644
+--- a/compiler/rustc_parse/src/parser/item.rs
++++ b/compiler/rustc_parse/src/parser/item.rs
+@@ -126,6 +126,13 @@ pub fn parse_item(
+         force_collect: ForceCollect,
+         allow_const_block_items: AllowConstBlockItems,
+     ) -> PResult<'a, Option<Box<Item>>> {
++        // P09.30: if a previous call parsed a `class` item, the
++        // synthesized inherent `impl` was stashed here. Return it
++        // now so the surrounding loop (usually in `parse_mod`)
++        // sees both the struct and the impl at module scope.
++        if let Some(pending) = self.pending_injected_item.take() {
++            return Ok(Some(pending));
++        }
+         let fn_parse_mode =
+             FnParseMode { req_name: |_, _| true, context: FnContext::Free, req_body: true };
+         self.parse_item_(fn_parse_mode, force_collect, allow_const_block_items)
+@@ -366,6 +373,14 @@ fn parse_item_kind(
+             // UNION ITEM
+             self.bump(); // `union`
+             self.parse_item_union()?
++        } else if self.is_kw_followed_by_ident(kw::Class) {
++            // P09.30: `class Name { fields; methods }` sugar
++            // for `#[repr(cpp)] struct Name { fields }` plus an
++            // inherent `impl Name { methods }`. Injects
++            // `#[repr(cpp)]` into `attrs` and parks the impl in
++            // `pending_injected_item` so the next `parse_item`
++            // returns it at the same module scope.
++            self.parse_cxx_class_item(attrs, lo)?
+         } else if self.is_builtin() {
+             // BUILTIN# ITEM
+             return self.parse_item_builtin();
+@@ -2010,6 +2025,285 @@ fn parse_item_struct(&mut self) -> PResult<'a, ItemKind> {
+     }
+ 
+     /// Parses `union Foo { ... }`.
++    /// P09.34: build a `Path` for the class's Self type with
++    /// generic args matching the header's params. For a plain
++    /// `class Widget { ... }` this is just `Widget`; for
++    /// `class Pair<A, B> { ... }` it's `Pair<A, B>` so the
++    /// synthesized `impl<A, B> Pair<A, B> { ... }` is well-formed.
++    fn build_cxx_class_self_path(ident: Ident, generics: &Generics) -> ast::Path {
++        if generics.params.is_empty() {
++            return ast::Path::from_ident(ident);
++        }
++        let args: ThinVec<ast::AngleBracketedArg> = generics
++            .params
++            .iter()
++            .map(|p| {
++                let arg = match &p.kind {
++                    GenericParamKind::Lifetime => ast::GenericArg::Lifetime(ast::Lifetime {
++                        id: DUMMY_NODE_ID,
++                        ident: p.ident,
++                    }),
++                    GenericParamKind::Type { .. } => ast::GenericArg::Type(Box::new(Ty {
++                        id: DUMMY_NODE_ID,
++                        kind: TyKind::Path(None, ast::Path::from_ident(p.ident)),
++                        span: p.ident.span,
++                        tokens: None,
++                    })),
++                    // Const generics aren't part of v1's `class`
++                    // header surface. Reference them as a bare
++                    // type path — if the user actually declares
++                    // a const generic, typeck will reject the
++                    // bogus GenericArg::Type, giving a targeted
++                    // error. Keeps this helper simple.
++                    GenericParamKind::Const { .. } => ast::GenericArg::Type(Box::new(Ty {
++                        id: DUMMY_NODE_ID,
++                        kind: TyKind::Path(None, ast::Path::from_ident(p.ident)),
++                        span: p.ident.span,
++                        tokens: None,
++                    })),
++                };
++                ast::AngleBracketedArg::Arg(arg)
++            })
++            .collect();
++        let seg_span = ident.span.to(generics.span);
++        let segment = ast::PathSegment {
++            ident,
++            id: DUMMY_NODE_ID,
++            args: Some(Box::new(ast::GenericArgs::AngleBracketed(ast::AngleBracketedArgs {
++                span: generics.span,
++                args,
++            }))),
++        };
++        ast::Path { span: seg_span, segments: thin_vec![segment], tokens: None }
++    }
++
++    /// P09.32: peek-only helper — return the 0-based distance
++    /// from `self.token` to the first token that's NOT part of
++    /// any leading outer-attribute groups (`#[...]`*). Used by
++    /// `parse_cxx_class_item` to decide whether a member is a
++    /// field or a method without consuming its attrs. Attrs are
++    /// tokenized as `Pound`, `OpenBracket`, ..., `CloseBracket`,
++    /// so we walk `[`/`]` in a balance loop.
++    ///
++    /// Bounded to 256 tokens of lookahead — longer attribute
++    /// groups are exotic and fall back to treating the class
++    /// member as a method (the conservative default).
++    fn skip_over_outer_attributes(&self) -> usize {
++        let mut dist = 0usize;
++        loop {
++            if dist >= 256 { return dist; }
++            let tok = self.look_ahead(dist, |t| t.clone());
++            if tok.kind != token::Pound { return dist; }
++            // `#` — expect `[...]` group next.
++            dist += 1;
++            // `#!` is an inner attr; outer parse should never see
++            // it here at member position, but we tolerate it.
++            let after_hash = self.look_ahead(dist, |t| t.clone());
++            if after_hash.kind == token::Bang {
++                dist += 1;
++            }
++            // Expect `[`.
++            if self.look_ahead(dist, |t| t.kind.clone()) != token::OpenBracket {
++                return dist;
++            }
++            dist += 1;
++            let mut depth = 1usize;
++            while depth > 0 {
++                if dist >= 256 { return dist; }
++                match self.look_ahead(dist, |t| t.kind.clone()) {
++                    token::OpenBracket => depth += 1,
++                    token::CloseBracket => depth -= 1,
++                    token::Eof => return dist,
++                    _ => {}
++                }
++                dist += 1;
++            }
++            // dist now points just past the `]` — loop checks
++            // if another `#` follows for consecutive attrs.
++        }
++    }
++
++    /// P09.30: parse a `class Name { fields; methods }` item.
++    /// Desugars to a `#[repr(cpp)] struct Name { fields }` plus
++    /// an inherent `impl Name { methods }`. Injects `#[repr(cpp)]`
++    /// into `struct_attrs` and parks the synthesized impl in
++    /// `self.pending_injected_item` so the surrounding item-list
++    /// loop picks it up on the next `parse_item` call.
++    fn parse_cxx_class_item(
++        &mut self,
++        struct_attrs: &mut AttrVec,
++        lo: Span,
++    ) -> PResult<'a, ItemKind> {
++        // Consume the `class` weak keyword.
++        self.bump();
++        let ident = self.parse_ident()?;
++        let mut generics = self.parse_generics()?;
++
++        // P09.35: optional `: Base` for single inheritance. The
++        // parser synthesizes a first field `__base: Base` with
++        // `#[rustc_cxx_base]` so downstream layout/vtable paths
++        // can detect the polymorphic base.
++        let base_ty: Option<Box<Ty>> = if self.eat(exp!(Colon)) {
++            Some(self.parse_ty()?)
++        } else {
++            None
++        };
++
++        generics.where_clause = self.parse_where_clause()?;
++
++        self.expect(exp!(OpenBrace))?;
++
++        let mut fields: ThinVec<FieldDef> = ThinVec::new();
++
++        // Inject `__base: Base` as the first field when derived.
++        if let Some(ty) = base_ty {
++            let base_attr = rustc_ast::attr::mk_attr_word(
++                &self.psess.attr_id_generator,
++                ast::AttrStyle::Outer,
++                ast::Safety::Default,
++                sym::rustc_cxx_base,
++                lo,
++            );
++            let base_ident = Ident::new(sym::__base, ident.span);
++            fields.push(FieldDef {
++                attrs: thin_vec![base_attr],
++                id: DUMMY_NODE_ID,
++                span: ident.span,
++                vis: Visibility {
++                    kind: VisibilityKind::Inherited,
++                    span: ident.span.shrink_to_lo(),
++                    tokens: None,
++                },
++                safety: Safety::Default,
++                ident: Some(base_ident),
++                ty,
++                default: None,
++                is_placeholder: false,
++            });
++        }
++
++        let mut methods: ThinVec<Box<AssocItem>> = ThinVec::new();
++        let mut saw_method = false;
++
++        while self.token != token::CloseBrace {
++            let _member_lo = self.token.span;
++            // Peek past outer attributes (`#[...]`*) to decide
++            // whether this member is a method (leading token is
++            // `fn` / fn-modifier / `pub`) or a field (leading
++            // token is an identifier). `class` accepts attrs on
++            // fields AND on methods as of P09.32.
++            let post_attrs = self.skip_over_outer_attributes();
++            let peek = |dist: usize| self.look_ahead(post_attrs + dist, |t| t.clone());
++            let first = peek(0);
++            let is_method_after_vis = |t: &token::Token| {
++                t.is_keyword(kw::Fn)
++                    || t.is_keyword(kw::Unsafe)
++                    || t.is_keyword(kw::Const)
++                    || t.is_keyword(kw::Async)
++            };
++            let looks_like_method = is_method_after_vis(&first)
++                || (first.is_keyword(kw::Pub)
++                    && {
++                        let next = peek(1);
++                        is_method_after_vis(&next)
++                            // `pub (crate) fn` — the `(` at look_ahead(1).
++                            || next.kind == token::OpenParen
++                    });
++
++            if looks_like_method {
++                // Delegate to the existing fn/assoc-item machinery
++                // so outer attributes and tokens are handled
++                // correctly (`collect_tokens` wraps everything via
++                // the standard `parse_item_` path).
++                let fn_parse_mode = FnParseMode {
++                    req_name: |_, _| true,
++                    context: FnContext::Impl,
++                    req_body: true,
++                };
++                let assoc = self.parse_assoc_item(fn_parse_mode, ForceCollect::No)?;
++                match assoc {
++                    Some(Some(item)) => {
++                        methods.push(item);
++                        saw_method = true;
++                    }
++                    Some(None) | None => {
++                        return Err(self.dcx().struct_span_err(
++                            self.token.span,
++                            "expected a method inside `class` body",
++                        ));
++                    }
++                }
++            } else {
++                // Field: `#[attrs]* pub? ident : ty ,?`.
++                if saw_method {
++                    return Err(self.dcx().struct_span_err(
++                        self.token.span,
++                        "fields must appear before methods inside a `class` body",
++                    ));
++                }
++                // Delegate to the existing field parser so
++                // outer attrs + vis + tokens are handled by
++                // `collect_tokens` in the usual way.
++                let field = self.parse_field_def("class", ident.span)?;
++                fields.push(field);
++            }
++        }
++        self.expect(exp!(CloseBrace))?;
++
++        // Prepend `#[repr(cpp)]` to the struct's outer attrs so
++        // the Itanium ABI overlay fires on this ADT. The span
++        // is the `class` keyword for diagnostic anchoring.
++        let repr_attr = rustc_ast::attr::mk_attr_nested_word(
++            &self.psess.attr_id_generator,
++            ast::AttrStyle::Outer,
++            ast::Safety::Default,
++            sym::repr,
++            sym::cpp,
++            lo,
++        );
++        struct_attrs.push(repr_attr);
++
++        // Build the inherent `impl Ident<args?> { methods }`. If
++        // the class has generic parameters (lifetimes, types,
++        // consts), the self-type path must reference each one as
++        // an argument so the impl reads `impl<T> Pair<T> { ... }`
++        // rather than `impl<T> Pair { ... }` (which would leave
++        // `Pair` under-applied).
++        let impl_span = lo.to(self.prev_token.span);
++        let self_path = Self::build_cxx_class_self_path(ident, &generics);
++        let self_ty = Box::new(Ty {
++            id: DUMMY_NODE_ID,
++            kind: TyKind::Path(None, self_path),
++            span: ident.span,
++            tokens: None,
++        });
++        let impl_item = Box::new(Item {
++            attrs: AttrVec::new(),
++            id: DUMMY_NODE_ID,
++            span: impl_span,
++            vis: Visibility {
++                kind: VisibilityKind::Inherited,
++                span: ident.span.shrink_to_lo(),
++                tokens: None,
++            },
++            kind: ItemKind::Impl(Impl {
++                generics: generics.clone(),
++                constness: Const::No,
++                of_trait: None,
++                self_ty,
++                items: methods,
++            }),
++            tokens: None,
++        });
++        self.pending_injected_item = Some(impl_item);
++
++        Ok(ItemKind::Struct(
++            ident,
++            generics,
++            VariantData::Struct { fields, recovered: Recovered::No },
++        ))
++    }
++
+     fn parse_item_union(&mut self) -> PResult<'a, ItemKind> {
+         let ident = self.parse_ident()?;
+ 
+diff --git a/compiler/rustc_parse/src/parser/mod.rs b/compiler/rustc_parse/src/parser/mod.rs
+index 8c1c3c70..46ec68d4 100644
+--- a/compiler/rustc_parse/src/parser/mod.rs
++++ b/compiler/rustc_parse/src/parser/mod.rs
+@@ -240,13 +240,20 @@ pub struct Parser<'a> {
+     in_fn_body: bool = false,
+     /// Whether we have detected a missing semicolon in function body.
+     pub fn_body_missing_semi_guar: Option<ErrorGuaranteed> = None,
++    /// P09.30: when parsing a `class` item (fork-only sugar), the
++    /// parser builds two items — the `#[repr(cpp)]` struct and an
++    /// inherent `impl` block holding the methods. `parse_item_kind`
++    /// returns the struct's `ItemKind`; the impl is pre-built and
++    /// parked here so the next call to `parse_item` returns it
++    /// verbatim without re-entering `parse_item_kind`.
++    pending_injected_item: Option<Box<ast::Item>> = None,
+ }
+ 
+ // This type is used a lot, e.g. it's cloned when matching many declarative macro rules with
+ // nonterminals. Make sure it doesn't unintentionally get bigger. We only check a few arches
+ // though, because `TokenTypeSet(u128)` alignment varies on others, changing the total size.
+ #[cfg(all(target_pointer_width = "64", any(target_arch = "aarch64", target_arch = "x86_64")))]
+-rustc_data_structures::static_assert_size!(Parser<'_>, 288);
++rustc_data_structures::static_assert_size!(Parser<'_>, 304);
+ 
+ /// Stores span information about a closure.
+ #[derive(Clone, Debug)]
+-- 
+2.52.0
+

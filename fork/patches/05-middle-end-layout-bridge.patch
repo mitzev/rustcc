@@ -1,0 +1,563 @@
+From d1b444bd67a01b56877b5d18b8a160b169c140ba Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Tue, 21 Apr 2026 23:23:34 +0300
+Subject: [PATCH 5/8] Middle-end: layout bridge + ty hooks for repr(cpp) /
+ repr(swift)
+
+rustc_ty_utils gains a `cxx_bridge` module that routes repr(cpp) /
+repr(swift) type-layout queries through rustc_abi_cxx for Itanium-correct
+empty-class size, subobject placement, and vptr slot allocation. Middle
+ty layout recognizes the new repr variants; typeck's call resolution
+handles constructor methods.
+---
+ compiler/rustc_hir_typeck/src/callee.rs       |   2 +
+ compiler/rustc_middle/src/ty/layout.rs        |  39 +++
+ compiler/rustc_middle/src/ty/mod.rs           |   7 +
+ compiler/rustc_ty_utils/Cargo.toml            |   1 +
+ compiler/rustc_ty_utils/src/abi.rs            |  39 ++-
+ compiler/rustc_ty_utils/src/layout.rs         |  12 +
+ .../rustc_ty_utils/src/layout/cxx_bridge.rs   | 329 ++++++++++++++++++
+ 7 files changed, 426 insertions(+), 3 deletions(-)
+ create mode 100644 compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
+
+diff --git a/compiler/rustc_hir_typeck/src/callee.rs b/compiler/rustc_hir_typeck/src/callee.rs
+index e5fcc68d..90e509ed 100644
+--- a/compiler/rustc_hir_typeck/src/callee.rs
++++ b/compiler/rustc_hir_typeck/src/callee.rs
+@@ -195,6 +195,8 @@ pub(crate) fn check_call_abi(&self, abi: ExternAbi, span: Span) {
+             }
+ 
+             CanonAbi::C
++            | CanonAbi::Cpp
++            | CanonAbi::Swift
+             | CanonAbi::Rust
+             | CanonAbi::RustCold
+             | CanonAbi::RustPreserveNone
+diff --git a/compiler/rustc_middle/src/ty/layout.rs b/compiler/rustc_middle/src/ty/layout.rs
+index 53706cc8..3067c2f5 100644
+--- a/compiler/rustc_middle/src/ty/layout.rs
++++ b/compiler/rustc_middle/src/ty/layout.rs
+@@ -1173,6 +1173,43 @@ fn is_scalable_vector(this: TyAndLayout<'tcx>) -> bool {
+     fn is_pass_indirectly_in_non_rustic_abis_flag_set(this: TyAndLayout<'tcx>) -> bool {
+         matches!(this.ty.kind(), ty::Adt(def, _) if def.repr().flags.contains(ReprFlags::PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS))
+     }
++
++    /// True when this type is "non-trivial for C++ calls" per
++    /// the Itanium ABI. Itanium passes such types by invisible
++    /// reference regardless of size. P09 uses this to force
++    /// `PassMode::Indirect` in `ExternAbi::Cpp` fn signatures.
++    ///
++    /// Triggers (both for `#[repr(cpp)]` ADTs):
++    /// - a user-declared `Drop` impl, or
++    /// - `!Copy`. A C++ class with any hand-rolled copy/move ctor
++    ///   is non-trivial, and Rust's closest proxy is "doesn't
++    ///   implement `Copy`": a trivially-copyable Rust type is
++    ///   `Copy`-safe, and a `#[repr(cpp)]` backed by a non-trivial
++    ///   C++ class will not be `Copy` (copying it would be a
++    ///   memcpy, but the C++ side's copy ctor wants to run).
++    fn is_cxx_non_trivial_for_calls(this: TyAndLayout<'tcx>, cx: &C) -> bool {
++        match this.ty.kind() {
++            ty::Adt(def, _) => {
++                if !def.repr().cpp() {
++                    return false;
++                }
++                if def.destructor(cx.tcx()).is_some() {
++                    return true;
++                }
++                // `!Copy` → non-trivial. `type_is_copy_modulo_regions`
++                // checks the `Copy` bound in the current typing env.
++                !cx.tcx().type_is_copy_modulo_regions(cx.typing_env(), this.ty)
++            }
++            _ => false,
++        }
++    }
++
++    fn is_swift_repr(this: TyAndLayout<'tcx>) -> bool {
++        match this.ty.kind() {
++            ty::Adt(def, _) => def.repr().swift(),
++            _ => false,
++        }
++    }
+ }
+ 
+ /// Calculates whether a function's ABI can unwind or not.
+@@ -1252,6 +1289,8 @@ pub fn fn_can_unwind(tcx: TyCtxt<'_>, fn_def_id: Option<DefId>, abi: ExternAbi)
+     use ExternAbi::*;
+     match abi {
+         C { unwind }
++        | Cpp { unwind }
++        | Swift { unwind }
+         | System { unwind }
+         | Cdecl { unwind }
+         | Stdcall { unwind }
+diff --git a/compiler/rustc_middle/src/ty/mod.rs b/compiler/rustc_middle/src/ty/mod.rs
+index 56a7abfa..31a2a383 100644
+--- a/compiler/rustc_middle/src/ty/mod.rs
++++ b/compiler/rustc_middle/src/ty/mod.rs
+@@ -1452,6 +1452,13 @@ pub fn repr_options_of_def(self, did: LocalDefId) -> ReprOptions {
+                 flags.insert(match *r {
+                     attr::ReprRust => ReprFlags::empty(),
+                     attr::ReprC => ReprFlags::IS_C,
++                    attr::ReprCpp => ReprFlags::IS_CPP | ReprFlags::IS_C,
++                    // `#[repr(swift)]` behaves like `#[repr(C)]`
++                    // at the layout level for Phase 2a (POD Swift
++                    // value types match C layout). The IS_SWIFT
++                    // flag marks the type for the Swift mangler
++                    // and future Phase 2b metadata-driven layout.
++                    attr::ReprSwift => ReprFlags::IS_SWIFT | ReprFlags::IS_C,
+                     attr::ReprPacked(pack) => {
+                         min_pack = Some(if let Some(min_pack) = min_pack {
+                             min_pack.min(pack)
+diff --git a/compiler/rustc_ty_utils/Cargo.toml b/compiler/rustc_ty_utils/Cargo.toml
+index 682cf941..5eeec823 100644
+--- a/compiler/rustc_ty_utils/Cargo.toml
++++ b/compiler/rustc_ty_utils/Cargo.toml
+@@ -7,6 +7,7 @@ edition = "2024"
+ # tidy-alphabetical-start
+ itertools = "0.12"
+ rustc_abi = { path = "../rustc_abi" }
++rustc_abi_cxx = { path = "../rustc_abi_cxx" }
+ rustc_data_structures = { path = "../rustc_data_structures" }
+ rustc_errors = { path = "../rustc_errors" }
+ rustc_hashes = { path = "../rustc_hashes" }
+diff --git a/compiler/rustc_ty_utils/src/abi.rs b/compiler/rustc_ty_utils/src/abi.rs
+index 2df336a5..99eee732 100644
+--- a/compiler/rustc_ty_utils/src/abi.rs
++++ b/compiler/rustc_ty_utils/src/abi.rs
+@@ -2,6 +2,7 @@
+ 
+ use rustc_abi::Primitive::Pointer;
+ use rustc_abi::{Align, BackendRepr, ExternAbi, PointerKind, Scalar, Size};
++use rustc_hir::def::DefKind;
+ use rustc_hir::lang_items::LangItem;
+ use rustc_hir::{self as hir, find_attr};
+ use rustc_middle::bug;
+@@ -545,6 +546,27 @@ fn fn_arg_sanity_check<'tcx>(
+     fn_arg_sanity_check(cx, fn_abi, spec_abi, &fn_abi.ret);
+ }
+ 
++/// True when `def_id` is an associated fn on an `impl` whose
++/// self-type is a `#[repr(cpp)]` ADT. Such methods get the
++/// Itanium C++ calling convention inferred from the impl target,
++/// without the user having to write `extern "C++"` on every
++/// method. Mirrors [`rustc_symbol_mangling::itanium::cxx_impl_class`];
++/// split rather than shared because the two callers live in
++/// different crates with no current dependency edge.
++fn is_cxx_inferred_method<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
++    if tcx.def_kind(def_id) != DefKind::AssocFn {
++        return false;
++    }
++    let Some(impl_did) = tcx.opt_parent(def_id) else { return false };
++    if !matches!(tcx.def_kind(impl_did), DefKind::Impl { .. }) {
++        return false;
++    }
++    let ty::Adt(adt_def, _) = tcx.type_of(impl_did).skip_binder().kind() else {
++        return false;
++    };
++    adt_def.repr().cpp()
++}
++
+ #[tracing::instrument(
+     level = "debug",
+     skip(cx, caller_location, determined_fn_def_id, is_virtual_call)
+@@ -561,8 +583,19 @@ fn fn_abi_new_uncached<'tcx>(
+ ) -> Result<&'tcx FnAbi<'tcx, Ty<'tcx>>, &'tcx FnAbiError<'tcx>> {
+     let tcx = cx.tcx();
+ 
++    // Tier 1 inferred `extern "C++"`: methods on `impl` blocks
++    // whose self-type is a `#[repr(cpp)]` ADT use the Itanium C++
++    // calling convention regardless of what their fn sig's
++    // nominal ABI is. This lets the user write
++    //     impl Widget { fn area(&self) -> u32 { ... } }
++    // and have the emitted symbol match what the C++ side expects.
++    let effective_abi = determined_fn_def_id
++        .filter(|&did| is_cxx_inferred_method(tcx, did))
++        .map(|_| ExternAbi::Cpp { unwind: false })
++        .unwrap_or_else(|| sig.abi());
++
+     let abi_map = AbiMap::from_target(&tcx.sess.target);
+-    let conv = abi_map.canonize_abi(sig.abi(), sig.c_variadic()).unwrap();
++    let conv = abi_map.canonize_abi(effective_abi, sig.c_variadic()).unwrap();
+ 
+     let mut inputs = sig.inputs();
+     let extra_args = if sig.abi() == ExternAbi::RustCall {
+@@ -645,9 +678,9 @@ fn fn_abi_new_uncached<'tcx>(
+             sig.abi(),
+         ),
+     };
+-    fn_abi_adjust_for_abi(cx, &mut fn_abi, sig.abi());
++    fn_abi_adjust_for_abi(cx, &mut fn_abi, effective_abi);
+     debug!("fn_abi_new_uncached = {:?}", fn_abi);
+-    fn_abi_sanity_check(cx, &fn_abi, sig.abi());
++    fn_abi_sanity_check(cx, &fn_abi, effective_abi);
+     Ok(tcx.arena.alloc(fn_abi))
+ }
+ 
+diff --git a/compiler/rustc_ty_utils/src/layout.rs b/compiler/rustc_ty_utils/src/layout.rs
+index 716ecf57..29087ea7 100644
+--- a/compiler/rustc_ty_utils/src/layout.rs
++++ b/compiler/rustc_ty_utils/src/layout.rs
+@@ -28,6 +28,7 @@
+ 
+ use crate::errors::NonPrimitiveSimdType;
+ 
++mod cxx_bridge;
+ mod invariant;
+ 
+ pub(crate) fn provide(providers: &mut Providers) {
+@@ -711,6 +712,17 @@ fn layout_of_uncached<'tcx>(
+                 bug!("got unsized layout for type that cannot be unsized {ty:?}: {layout:#?}");
+             }
+ 
++            // P07: #[repr(cpp)] ADTs route through the Itanium ABI
++            // corrector BEFORE the debug-only unsized-check block
++            // below, because that block shadow-moves `variants` in
++            // debug mode. Running our borrow here keeps both
++            // release and debug builds happy.
++            let layout = if def.repr().cpp() {
++                cxx_bridge::correct_layout(tcx, def, args, &variants, layout)?
++            } else {
++                layout
++            };
++
+             // If the struct tail is sized and can be unsized, check that unsizing doesn't move the fields around.
+             if cfg!(debug_assertions)
+                 && maybe_unsized
+diff --git a/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs b/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
+new file mode 100644
+index 00000000..30136684
+--- /dev/null
++++ b/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
+@@ -0,0 +1,329 @@
++//! P07 — Layout corrections for `#[repr(cpp)]` ADTs.
++//!
++//! Routes layout decisions through `rustc_abi_cxx` (vendored from
++//! the rustcc workspace) so Rust types tagged `#[repr(cpp)]` obey
++//! the Itanium C++ ABI's layout rules rather than Rust's own
++//! C-compat rules.
++//!
++//! # What diverges
++//!
++//! For most Rust-expressible struct shapes, stock `#[repr(C)]` and
++//! Itanium produce identical layouts. The ones that differ:
++//!
++//! - **Empty records.** Rust says `size == 0`; Itanium says
++//!   `size >= 1` (distinct C++ instances must have distinct
++//!   addresses).
++//! - **`alignas(N)` on an empty class.** Rust picks size 0 align N;
++//!   Itanium picks size N align N so the invariant "size is a
++//!   multiple of align" holds.
++//! - **Tail-padding reuse, EBO, vptr placement, vbase offsets.**
++//!   None of these are yet expressible in Rust-side `#[repr(cpp)]`
++//!   (no inheritance, no virtuals), but the bridge is structured
++//!   to handle them when later patches add inheritance support.
++//!
++//! # Strategy
++//!
++//! *Correct rather than replace.* Rust's stock layout algorithm
++//! already handles field types, niches, discriminants, sized-ness,
++//! etc. — so we compute it first, then ask `rustc_abi_cxx::layout`
++//! what Itanium says. Where Itanium disagrees, we override the
++//! stock layout's size/align and leave every other field intact.
++//! Keeps the patch surface narrow and the failure mode contained.
++//!
++//! A defensive sanity check guards the output: if the corrected
++//! layout would violate rustc's size-is-a-multiple-of-align
++//! invariant, we bail to stock. This is a safety rail while
++//! `rustc_abi_cxx` grows coverage for the less-common shapes.
++
++use rustc_abi::{
++    Align, BackendRepr, FieldIdx, FieldsShape, LayoutData, Size, VariantIdx,
++};
++use rustc_abi_cxx::{
++    ClassDef, CxxType, CxxTypeCtx, FieldDef, Ident, IntWidth, NameSegment,
++    NestedName, RecordKind, Target as CxxTarget, TypeId,
++};
++use rustc_index::IndexVec;
++use rustc_middle::ty::layout::{LayoutError, TyAndLayout};
++use rustc_middle::ty::{self, AdtDef, TyCtxt};
++
++/// Apply Itanium corrections to `stock` for a `#[repr(cpp)]` ADT.
++///
++/// `variants` holds the per-field layouts that were computed on the
++/// way to `stock`; we consume them to build an equivalent `ClassDef`
++/// for `rustc_abi_cxx::layout`. For non-struct ADTs, or shapes our
++/// v1 bridge doesn't understand, we return stock unchanged — the
++/// correction path is opt-in and the fallback is always correct
++/// (Rust's own layout).
++pub(crate) fn correct_layout<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    def: AdtDef<'tcx>,
++    _args: &'tcx ty::List<ty::GenericArg<'tcx>>,
++    variants: &IndexVec<
++        VariantIdx,
++        IndexVec<FieldIdx, TyAndLayout<'tcx>>,
++    >,
++    stock: LayoutData<FieldIdx, VariantIdx>,
++) -> Result<LayoutData<FieldIdx, VariantIdx>, &'tcx LayoutError<'tcx>> {
++    debug_assert!(def.repr().cpp(), "correct_layout called on non-cpp ADT");
++
++    // v1: only structs. Unions and enums under `#[repr(cpp)]` need
++    // their own patch (C++ union and `enum class` semantics differ
++    // from Rust's in ways that need separate modeling).
++    if !def.is_struct() {
++        return Ok(stock);
++    }
++
++    // Rust structs have exactly one variant.
++    let Some(fields) = variants.get(VariantIdx::ZERO) else {
++        return Ok(stock);
++    };
++
++    let mut ctx = CxxTypeCtx::new(CxxTarget::from_rustc_triple(
++        tcx.sess.opts.target_triple.tuple(),
++        tcx.sess.target.pointer_width as u32,
++    ));
++    let mut cxx_fields = Vec::with_capacity(fields.len());
++    for (i, field_layout) in fields.iter_enumerated() {
++        let Some(field) =
++            synthesize_cxx_field(&mut ctx, i, field_layout)
++        else {
++            // Field shape the bridge doesn't model (unsized, SIMD,
++            // etc.). Bail to stock — still correct, just not
++            // Itanium-optimized.
++            return Ok(stock);
++        };
++        cxx_fields.push(field);
++    }
++
++    let class = ctx.define_class(ClassDef {
++        name: NestedName(vec![NameSegment::Class(Ident(
++            "__rustcc_synthetic__".into(),
++        ))]),
++        bases: Vec::new(),
++        fields: cxx_fields,
++        methods: Vec::new(),
++        kind: RecordKind::Struct,
++        is_polymorphic: false,
++        is_final: false,
++        // `#[repr(align(N))]` on the struct — Itanium's
++        // `source_alignment` enforces the min align.
++        source_alignment: def.repr().align.map(|a| a.bytes()),
++    });
++
++    let Ok(cxx_layout) = ctx.layout(class) else {
++        return Ok(stock);
++    };
++
++    let cxx_size = Size::from_bytes(cxx_layout.size_bytes);
++    let cxx_align_bytes = cxx_layout.align_bytes.max(1);
++    let cxx_align = Align::from_bytes(cxx_align_bytes).unwrap_or(Align::ONE);
++
++    // Defensive invariant: rustc requires `size % align == 0`.
++    // `rustc_abi_cxx` has a known edge case with `alignas(N)` on an
++    // empty record where it returns size=1 align=N; if that path
++    // ever fires here, we'd corrupt stock with an invalid layout.
++    // Rather than patch it upstream as part of this series, we
++    // defensively bail. A follow-up can harden `rustc_abi_cxx`.
++    if cxx_align_bytes != 0 && cxx_size.bytes() % cxx_align_bytes != 0 {
++        return Ok(stock);
++    }
++
++    // P09.25: polymorphic classes always need the vptr shift,
++    // even when Itanium's size/align agrees with stock (which is
++    // computed WITHOUT the vptr reservation). Check polymorphism
++    // before the agree-and-shortcircuit path.
++    let polymorphic = is_polymorphic_cpp_class(tcx, def.did());
++
++    // If Itanium agrees with stock on both size and align AND the
++    // class isn't polymorphic (so no vptr shift is needed), short-
++    // circuit. The common case.
++    if !polymorphic && stock.size == cxx_size && stock.align.abi >= cxx_align {
++        return Ok(stock);
++    }
++
++    // Build the corrected candidate via clone so the original
++    // `stock` is still available for the defensive fallback below.
++    let mut candidate = stock.clone();
++    if candidate.size != cxx_size {
++        candidate.size = cxx_size;
++        // ZST → sized bump. Other `BackendRepr` cases (Scalar,
++        // ScalarPair, SimdVector) are for primitive types, none
++        // of which reach this `#[repr(cpp)]` path on structs.
++        if !matches!(candidate.backend_repr, BackendRepr::Memory { .. }) {
++            candidate.backend_repr = BackendRepr::Memory { sized: true };
++        }
++    }
++    if candidate.align.abi < cxx_align {
++        candidate.align.abi = cxx_align;
++    }
++
++    // Post-correction invariant: size must still be a multiple of
++    // align. If our override broke it, fall back to stock.
++    if candidate.size.bytes() % candidate.align.abi.bytes() != 0 {
++        return Ok(stock);
++    }
++
++    // P09.25: polymorphic classes have an invisible vptr at offset 0.
++    // Shift all user-field offsets by one pointer width so the vptr
++    // slot is reserved before them. Bump size and align accordingly.
++    // The vptr is initialized by the ctor (see `cxx_vtable`
++    // codegen hook) and never appears in Rust's type system — field
++    // access goes through the shifted offsets, so user code sees an
++    // ordinary `#[repr(cpp)]` struct whose size happens to include
++    // ptr_bytes of opaque leading bytes.
++    if polymorphic {
++        // P09.35: derived classes already inherit a vptr slot
++        // through their base subobject (offset 0 of __base IS
++        // the base's vptr). Skip the shift and don't re-touch
++        // size — base alone already includes ptr_bytes.
++        if has_polymorphic_base(tcx, def) {
++            candidate.backend_repr = BackendRepr::Memory { sized: true };
++            return Ok(candidate);
++        }
++
++        let ptr_bytes = tcx.data_layout.pointer_size().bytes();
++        let ptr_align = tcx.data_layout.pointer_align().abi;
++        // P09.31: for polymorphic classes with no user fields,
++        // rustc_abi_cxx reports size=1 (the Itanium empty-class
++        // rule — distinct instances need distinct addresses).
++        // That rule is redundant when there's a vptr: the vptr
++        // itself gives each instance a distinct address. Clang
++        // emits 8 bytes for such a class, not 9 or 16. Collapse
++        // the stale empty-bump before the vptr shift so our
++        // layout matches.
++        if stock.size.bytes() == 0 && candidate.size.bytes() == 1 {
++            candidate.size = Size::ZERO;
++        }
++        return Ok(shift_fields_for_vptr(candidate, ptr_bytes, ptr_align));
++    }
++
++    Ok(candidate)
++}
++
++/// P09.35: true iff the ADT's first declared field carries
++/// `#[rustc_cxx_base]`. That marker is inserted by the
++/// `class D : B { ... }` parser sugar and signals the layout
++/// path "don't add a second vptr slot — base already owns
++/// offset 0."
++fn has_polymorphic_base<'tcx>(tcx: TyCtxt<'tcx>, def: AdtDef<'tcx>) -> bool {
++    let Some(variant) = def.variants().get(VariantIdx::ZERO) else { return false };
++    let Some(first) = variant.fields.raw.first() else { return false };
++    rustc_hir::find_attr!(tcx, first.did, RustcCxxBase(..))
++}
++
++/// True iff any inherent method on `adt_did` carries
++/// `#[rustc_cxx_virtual]`. Duplicated from
++/// `rustc_symbol_mangling::itanium::is_polymorphic_cpp_class`
++/// because `rustc_ty_utils` can't depend on that crate (it's
++/// downstream). Kept tiny to minimize drift risk.
++fn is_polymorphic_cpp_class<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    adt_did: rustc_hir::def_id::DefId,
++) -> bool {
++    for &impl_did in tcx.inherent_impls(adt_did).iter() {
++        for &assoc in tcx.associated_item_def_ids(impl_did).iter() {
++            if tcx.def_kind(assoc) != rustc_hir::def::DefKind::AssocFn {
++                continue;
++            }
++            if rustc_hir::find_attr!(tcx, assoc, RustcCxxVirtual(..)) {
++                return true;
++            }
++        }
++    }
++    false
++}
++
++/// Shift every field offset in `Arbitrary` layouts by `ptr_bytes`,
++/// bump size by `ptr_bytes`, raise align to at least `ptr_align`.
++/// Non-`Arbitrary` field shapes for polymorphic classes shouldn't
++/// happen (they're always struct-shaped) — we leave them alone and
++/// let the defensive size/align bumps handle bookkeeping.
++fn shift_fields_for_vptr(
++    mut layout: LayoutData<FieldIdx, VariantIdx>,
++    ptr_bytes: u64,
++    ptr_align: Align,
++) -> LayoutData<FieldIdx, VariantIdx> {
++    if let FieldsShape::Arbitrary { ref mut offsets, .. } = layout.fields {
++        for offset in offsets.iter_mut() {
++            *offset = *offset + Size::from_bytes(ptr_bytes);
++        }
++    }
++    layout.size = layout.size + Size::from_bytes(ptr_bytes);
++    if layout.align.abi < ptr_align {
++        layout.align.abi = ptr_align;
++    }
++    // Size must remain a multiple of align.
++    let align_bytes = layout.align.abi.bytes();
++    let size_bytes = layout.size.bytes();
++    if align_bytes != 0 && size_bytes % align_bytes != 0 {
++        let padded = size_bytes.next_multiple_of(align_bytes);
++        layout.size = Size::from_bytes(padded);
++    }
++    // Classify as opaque memory — the stock Scalar / ScalarPair
++    // repr was valid for a struct with just user fields, but the
++    // vptr shift makes those reprs inconsistent with the new size.
++    // The x86_64 ABI classifier crashes on Scalar-at-size-16.
++    layout.backend_repr = BackendRepr::Memory { sized: true };
++    layout
++}
++
++/// Synthesize a `FieldDef` whose `CxxType` has the same size and
++/// alignment as the Rust field's computed layout.
++///
++/// Itanium's layout rules depend only on each field's size and
++/// align (plus the containing class's constraints), so we don't
++/// need to mirror each field's exact Rust type — we just need a
++/// `CxxType` that lays out the same. For natural scalar sizes
++/// (1/2/4/8/16 where size == align) we pick the matching integer
++/// type; for everything else (odd sizes, over-aligned fields, etc.)
++/// we use a byte array plus an `explicit_align` override.
++fn synthesize_cxx_field<'tcx>(
++    ctx: &mut CxxTypeCtx,
++    idx: FieldIdx,
++    field: &TyAndLayout<'tcx>,
++) -> Option<FieldDef> {
++    let size = field.size.bytes();
++    let align = field.align.abi.bytes();
++
++    // Unsized fields — rare but possible (last field of an unsized
++    // struct). Not handled by the Itanium algorithm either.
++    if !field.is_sized() {
++        return None;
++    }
++
++    let ty = if size == align && size.is_power_of_two() && size <= 16 {
++        let width = match size {
++            1 => IntWidth::I8,
++            2 => IntWidth::I16,
++            4 => IntWidth::I32,
++            8 => IntWidth::I64,
++            16 => IntWidth::I128,
++            // unreachable because of the `size.is_power_of_two()`
++            // guard above — 1, 2, 4, 8, 16 are the only pow2
++            // values in [1, 16].
++            _ => return None,
++        };
++        ctx.intern_type(CxxType::Int { signed: false, width })
++    } else {
++        // Byte array for odd sizes (e.g. 3-byte struct) or
++        // mismatched size-vs-align (e.g. a 12-byte record with
++        // align 4). Natural align of u8-array is 1; the
++        // `explicit_align` override below informs rustc_abi_cxx
++        // that the real field needs `align`.
++        byte_array_ty(ctx, size)
++    };
++
++    Some(FieldDef {
++        name: Ident(format!("f{}", idx.index())),
++        ty,
++        explicit_align: Some(align),
++    })
++}
++
++/// Intern a `CxxType::Array { elem: u8, len: size }`. Used for
++/// fields whose size doesn't map to a natural scalar type.
++fn byte_array_ty(ctx: &mut CxxTypeCtx, size: u64) -> TypeId {
++    let u8_ty =
++        ctx.intern_type(CxxType::Int { signed: false, width: IntWidth::I8 });
++    ctx.intern_type(CxxType::Array { elem: u8_ty, len: size })
++}
+-- 
+2.52.0
+

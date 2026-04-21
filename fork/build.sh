@@ -11,17 +11,16 @@
 # Prerequisites:
 #   - A linux or macOS host with enough disk (~10 GB).
 #   - git, python3, cmake, ninja, clang/clang++ on PATH.
-#   - The workspace this script lives in must already have the
-#     rustcc sub-crates built so far (rustc_abi_cxx etc.); the
-#     layout bridge (P06) pulls them in via path-dep.
 
 set -euo pipefail
 
 FORK_DIR="$(cd "$(dirname "$0")" && pwd)"
 WS_ROOT="$(cd "$FORK_DIR/.." && pwd)"
 
-# The nightly we ship against. Update when changing rust-toolchain.
-PINNED_COMMIT="${PINNED_COMMIT:-5c7ae0c7e}"
+# Full upstream SHA the patch series is authored against. GitHub's
+# uploadpack only resolves full 40-char SHAs for fetch-by-sha, so a short
+# prefix here will cause `git fetch` to fail.
+PINNED_COMMIT="${PINNED_COMMIT:-e22c616e4e87914135c1db261a03e0437255335e}"
 
 CLONE_DIR="${CLONE_DIR:-$HOME/rust-lang-rust-fork}"
 APPLY_ONLY=0
@@ -57,13 +56,6 @@ echo "==> applying rustcc patches"
     git apply "$patch"
   done
 )
-
-# 3. Vendor rustc_abi_cxx into compiler/ so P07's layout bridge can
-#    path-depend on it. Step is idempotent — re-vendors on every run
-#    so the two trees stay in sync during active development.
-if [[ -f "$FORK_DIR/patches/07-ty-utils-dep.patch" ]]; then
-  "$FORK_DIR/scripts/vendor_abi_cxx.sh" "$CLONE_DIR" "$WS_ROOT"
-fi
 
 if [[ $APPLY_ONLY -eq 1 ]]; then
   echo "==> --apply-only set; skipping stage-1 build"

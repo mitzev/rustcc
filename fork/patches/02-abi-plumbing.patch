@@ -1,0 +1,552 @@
+From 3b6d47d9d3dbc23b00d1427e257cceb3d731cd29 Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Tue, 21 Apr 2026 23:23:04 +0300
+Subject: [PATCH 2/8] ABI plumbing: ExternAbi::Cpp + callconv + stable-rustc
+ bridge
+
+Adds ExternAbi::Cpp and the matching canonicalization path in rustc_abi
+and rustc_target. Teaches x86, x86_64, and aarch64 callconv lowering to
+thread extern "C++" through the same C calling convention (scalar
+params), with the sret/this-pointer hooks reserved for later codegen
+commits. Updates rustc_public's stable-API bridge so external tools see
+the new variant.
+---
+ compiler/rustc_abi/src/canon_abi.rs           | 16 ++++
+ compiler/rustc_abi/src/extern_abi.rs          | 24 +++++
+ compiler/rustc_abi/src/layout/ty.rs           | 33 +++++++
+ compiler/rustc_abi/src/lib.rs                 | 24 ++++-
+ .../src/unstable/convert/stable/abi.rs        |  6 ++
+ .../src/unstable/convert/stable/ty.rs         |  7 ++
+ compiler/rustc_target/src/callconv/aarch64.rs | 29 ++++++
+ compiler/rustc_target/src/callconv/mod.rs     | 64 +++++++++++++-
+ compiler/rustc_target/src/callconv/x86.rs     | 28 ++++++
+ compiler/rustc_target/src/callconv/x86_64.rs  | 88 +++++++++++++++++++
+ compiler/rustc_target/src/spec/abi_map.rs     | 10 +++
+ 11 files changed, 326 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/rustc_abi/src/canon_abi.rs b/compiler/rustc_abi/src/canon_abi.rs
+index fd45f0ea..1e4ab07e 100644
+--- a/compiler/rustc_abi/src/canon_abi.rs
++++ b/compiler/rustc_abi/src/canon_abi.rs
+@@ -25,6 +25,18 @@ pub enum CanonAbi {
+     // allowing a `match` to easily exhaustively ignore these subcategories of variants.
+     // Otherwise it is very tempting to avoid matching exhaustively!
+     C,
++    /// The Itanium C++ ABI. Today every codegen-side code path
++    /// treats it identically to `C` — the two calling conventions
++    /// agree for scalar/pointer arguments on SysV AMD64. The
++    /// variant exists as a hook point for P09+ work that will
++    /// add sret/this-pointer/record-by-value handling specific
++    /// to Itanium, without retroactively corrupting the plain
++    /// `extern "C"` path.
++    Cpp,
++    /// The Swift ABI (Phase 1). Treated identically to `C` for
++    /// codegen today; distinct variant lets the symbol-mangling
++    /// path route to `swift::mangle` for `$s`-prefixed names.
++    Swift,
+     Rust,
+     RustCold,
+     RustPreserveNone,
+@@ -57,6 +69,8 @@ pub fn is_rustic_abi(self) -> bool {
+         match self {
+             CanonAbi::Rust | CanonAbi::RustCold | CanonAbi::RustPreserveNone => true,
+             CanonAbi::C
++            | CanonAbi::Cpp
++            | CanonAbi::Swift
+             | CanonAbi::Custom
+             | CanonAbi::Arm(_)
+             | CanonAbi::GpuKernel
+@@ -73,6 +87,8 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         // that we need to generate error messages.
+         let erased_abi = match self {
+             CanonAbi::C => ExternAbi::C { unwind: false },
++            CanonAbi::Cpp => ExternAbi::Cpp { unwind: false },
++            CanonAbi::Swift => ExternAbi::Swift { unwind: false },
+             CanonAbi::Rust => ExternAbi::Rust,
+             CanonAbi::RustCold => ExternAbi::RustCold,
+             CanonAbi::RustPreserveNone => ExternAbi::RustPreserveNone,
+diff --git a/compiler/rustc_abi/src/extern_abi.rs b/compiler/rustc_abi/src/extern_abi.rs
+index 95ba2ee3..642048a2 100644
+--- a/compiler/rustc_abi/src/extern_abi.rs
++++ b/compiler/rustc_abi/src/extern_abi.rs
+@@ -23,6 +23,24 @@ pub enum ExternAbi {
+     C {
+         unwind: bool,
+     },
++    /// The Itanium C++ ABI. Items in `extern "C++"` blocks get
++    /// Itanium-mangled symbol names via `rustc_abi_cxx::mangle`,
++    /// and (once P09 lands) sret/this-pointer/record-by-value
++    /// call-convention lowering. Valid on targets whose C++
++    /// runtime follows Itanium (Clang on Linux/Darwin/iOS).
++    Cpp {
++        unwind: bool,
++    },
++    /// The Swift ABI (Phase 1 — trivial-type subset). Items in
++    /// `extern "Swift"` blocks get Swift-mangled symbol names
++    /// (`$s` prefix) via the Swift mangler, and use the C
++    /// calling convention as an approximation (Swift's real CC
++    /// passes `self` in r13 and has context/error registers, but
++    /// for trivially-copyable scalars it degenerates to C). Full
++    /// VWT-aware support is Phase 2.
++    Swift {
++        unwind: bool,
++    },
+     /// ABI of the "system" interface, e.g. the Win32 API, always "aliasing"
+     System {
+         unwind: bool,
+@@ -172,6 +190,10 @@ fn from_str(s: &str) -> Result<$e_name, Self::Err> {
+     ExternAbi = {
+             C { unwind: false } =><= "C",
+             C { unwind: true } =><= "C-unwind",
++            Cpp { unwind: false } =><= "C++",
++            Cpp { unwind: true } =><= "C++-unwind",
++            Swift { unwind: false } =><= "Swift",
++            Swift { unwind: true } =><= "Swift-unwind",
+             Rust =><= "Rust",
+             Aapcs { unwind: false } =><= "aapcs",
+             Aapcs { unwind: true } =><= "aapcs-unwind",
+@@ -332,6 +354,8 @@ pub fn supports_guaranteed_tail_call(self) -> bool {
+                 false
+             }
+             Self::C { .. }
++            | Self::Cpp { .. }
++            | Self::Swift { .. }
+             | Self::System { .. }
+             | Self::Rust
+             | Self::RustCall
+diff --git a/compiler/rustc_abi/src/layout/ty.rs b/compiler/rustc_abi/src/layout/ty.rs
+index 7698a406..9027e313 100644
+--- a/compiler/rustc_abi/src/layout/ty.rs
++++ b/compiler/rustc_abi/src/layout/ty.rs
+@@ -122,6 +122,20 @@ fn ty_and_layout_pointee_info_at(
+     fn is_scalable_vector(this: TyAndLayout<'a, Self>) -> bool;
+     /// See [`TyAndLayout::pass_indirectly_in_non_rustic_abis`] for details.
+     fn is_pass_indirectly_in_non_rustic_abis_flag_set(this: TyAndLayout<'a, Self>) -> bool;
++    /// True when this type is "non-trivial for C++ calls" per the
++    /// Itanium ABI: it's a `#[repr(cpp)]` ADT with a user-declared
++    /// `Drop` (or non-trivial copy/move). The C++ calling
++    /// convention passes such types by invisible reference rather
++    /// than in registers, regardless of their size.
++    fn is_cxx_non_trivial_for_calls(
++        this: TyAndLayout<'a, Self>,
++        cx: &C,
++    ) -> bool;
++
++    /// True when this type is a `#[repr(swift)]` ADT — gate for
++    /// the Swift-specific ABI overlay which spreads small POD
++    /// structs across separate registers rather than packing.
++    fn is_swift_repr(this: TyAndLayout<'a, Self>) -> bool;
+ }
+ 
+ impl<'a, Ty> TyAndLayout<'a, Ty> {
+@@ -245,6 +259,25 @@ pub fn pass_indirectly_in_non_rustic_abis<C>(self, cx: &C) -> bool
+         Ty::is_pass_indirectly_in_non_rustic_abis_flag_set(base)
+     }
+ 
++    /// True when this `#[repr(cpp)]` type has a user-declared
++    /// destructor and therefore must be passed / returned by
++    /// invisible reference under the Itanium C++ ABI. See
++    /// [`TyAbiInterface::is_cxx_non_trivial_for_calls`].
++    pub fn is_cxx_non_trivial_for_calls<C>(self, cx: &C) -> bool
++    where
++        Ty: TyAbiInterface<'a, C> + Copy,
++    {
++        Ty::is_cxx_non_trivial_for_calls(self, cx)
++    }
++
++    /// True when the underlying type is `#[repr(swift)]`.
++    pub fn is_swift_repr<C>(self) -> bool
++    where
++        Ty: TyAbiInterface<'a, C> + Copy,
++    {
++        Ty::is_swift_repr(self)
++    }
++
+     /// Recursively peel away transparent wrappers, returning the inner value.
+     ///
+     /// The return value is not `repr(transparent)` and/or does
+diff --git a/compiler/rustc_abi/src/lib.rs b/compiler/rustc_abi/src/lib.rs
+index 450a93ee..c67c68a5 100644
+--- a/compiler/rustc_abi/src/lib.rs
++++ b/compiler/rustc_abi/src/lib.rs
+@@ -78,10 +78,10 @@
+     feature = "nightly",
+     derive(Encodable_NoContext, Decodable_NoContext, HashStable_Generic)
+ )]
+-pub struct ReprFlags(u8);
++pub struct ReprFlags(u16);
+ 
+ bitflags! {
+-    impl ReprFlags: u8 {
++    impl ReprFlags: u16 {
+         const IS_C               = 1 << 0;
+         const IS_SIMD            = 1 << 1;
+         const IS_TRANSPARENT     = 1 << 2;
+@@ -96,6 +96,8 @@ impl ReprFlags: u8 {
+         /// See [`TyAndLayout::pass_indirectly_in_non_rustic_abis`] for details.
+         const PASS_INDIRECTLY_IN_NON_RUSTIC_ABIS = 1 << 5;
+         const IS_SCALABLE        = 1 << 6;
++        const IS_CPP             = 1 << 7;
++        const IS_SWIFT           = 1 << 8;
+          // Any of these flags being set prevent field reordering optimisation.
+         const FIELD_ORDER_UNOPTIMIZABLE = ReprFlags::IS_C.bits()
+                                  | ReprFlags::IS_SIMD.bits()
+@@ -188,6 +190,24 @@ pub fn c(&self) -> bool {
+         self.flags.contains(ReprFlags::IS_C)
+     }
+ 
++    /// True when `#[repr(cpp)]` is present. Implies C-compatible
++    /// layout semantics *plus* the extended constraints of the
++    /// Itanium C++ ABI (sret for non-trivial-for-calls classes,
++    /// explicit `this`-pointer, Itanium mangling). The layout
++    /// query delegates to `rustc_abi_cxx` when this is set.
++    #[inline]
++    pub fn cpp(&self) -> bool {
++        self.flags.contains(ReprFlags::IS_CPP)
++    }
++
++    /// True when `#[repr(swift)]` is set. Acts like
++    /// `#[repr(C)]` for layout in Phase 2a; Phase 2b will use it
++    /// as the gate for Swift-metadata-driven layout.
++    #[inline]
++    pub fn swift(&self) -> bool {
++        self.flags.contains(ReprFlags::IS_SWIFT)
++    }
++
+     #[inline]
+     pub fn packed(&self) -> bool {
+         self.pack.is_some()
+diff --git a/compiler/rustc_public/src/unstable/convert/stable/abi.rs b/compiler/rustc_public/src/unstable/convert/stable/abi.rs
+index d8c4cee7..747106de 100644
+--- a/compiler/rustc_public/src/unstable/convert/stable/abi.rs
++++ b/compiler/rustc_public/src/unstable/convert/stable/abi.rs
+@@ -122,6 +122,12 @@ impl<'tcx> Stable<'tcx> for CanonAbi {
+     fn stable(&self, _: &mut Tables<'_, BridgeTys>, _: &CompilerCtxt<'_, BridgeTys>) -> Self::T {
+         match self {
+             CanonAbi::C => CallConvention::C,
++            // P09 scaffold: stable-API clients see CanonAbi::Cpp
++            // as C until the public API grows its own variant.
++            // Mirrors how ExternAbi::Cpp is lowered in the
++            // matching ExternAbi conversion.
++            CanonAbi::Cpp => CallConvention::C,
++            CanonAbi::Swift => CallConvention::C,
+             CanonAbi::Rust => CallConvention::Rust,
+             CanonAbi::RustCold => CallConvention::Cold,
+             CanonAbi::RustPreserveNone => CallConvention::PreserveNone,
+diff --git a/compiler/rustc_public/src/unstable/convert/stable/ty.rs b/compiler/rustc_public/src/unstable/convert/stable/ty.rs
+index 9a9576d4..303c9408 100644
+--- a/compiler/rustc_public/src/unstable/convert/stable/ty.rs
++++ b/compiler/rustc_public/src/unstable/convert/stable/ty.rs
+@@ -1020,6 +1020,13 @@ fn stable(&self, _: &mut Tables<'_, BridgeTys>, _: &CompilerCtxt<'_, BridgeTys>)
+         match *self {
+             ExternAbi::Rust => Abi::Rust,
+             ExternAbi::C { unwind } => Abi::C { unwind },
++            // P08: until `rustc_public` grows its own `Abi::Cpp`
++            // variant, stable-API clients see `extern "C++"` as the
++            // C ABI. Correct for the CanonAbi lowering this fork
++            // does today (extern "C++" uses CanonAbi::C); refine
++            // when the public API picks up a C++-specific variant.
++            ExternAbi::Cpp { unwind } => Abi::C { unwind },
++            ExternAbi::Swift { unwind } => Abi::C { unwind },
+             ExternAbi::Cdecl { unwind } => Abi::Cdecl { unwind },
+             ExternAbi::Stdcall { unwind } => Abi::Stdcall { unwind },
+             ExternAbi::Fastcall { unwind } => Abi::Fastcall { unwind },
+diff --git a/compiler/rustc_target/src/callconv/aarch64.rs b/compiler/rustc_target/src/callconv/aarch64.rs
+index ce69427c..bdd06409 100644
+--- a/compiler/rustc_target/src/callconv/aarch64.rs
++++ b/compiler/rustc_target/src/callconv/aarch64.rs
+@@ -183,3 +183,32 @@ pub(crate) fn compute_rust_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty
+         softfloat_float_abi(cx.target_spec(), arg);
+     }
+ }
++
++/// P09 — Itanium C++ ABI overlay for AArch64 (AAPCS + DarwinPCS).
++///
++/// Runs the AAPCS64 / Darwin PCS C-path `compute_abi_info` first,
++/// then applies the Itanium rule: any type that is
++/// "non-trivial for C++ calls" (a `#[repr(cpp)]` ADT with a user
++/// `Drop` impl) is passed / returned by invisible reference
++/// regardless of its size. Mirrors the x86_64 overlay.
++pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>, kind: AbiKind)
++where
++    Ty: TyAbiInterface<'a, C> + Copy,
++    C: HasDataLayout + HasTargetSpec,
++{
++    compute_abi_info(cx, fn_abi, kind);
++
++    if !fn_abi.ret.is_ignore()
++        && fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++    {
++        fn_abi.ret.force_indirect();
++    }
++    for arg in fn_abi.args.iter_mut() {
++        if arg.is_ignore() {
++            continue;
++        }
++        if arg.layout.is_cxx_non_trivial_for_calls(cx) {
++            arg.force_indirect();
++        }
++    }
++}
+diff --git a/compiler/rustc_target/src/callconv/mod.rs b/compiler/rustc_target/src/callconv/mod.rs
+index f8c82faa..f11280c1 100644
+--- a/compiler/rustc_target/src/callconv/mod.rs
++++ b/compiler/rustc_target/src/callconv/mod.rs
+@@ -398,6 +398,37 @@ pub fn new(
+         ArgAbi { layout, mode }
+     }
+ 
++    /// Force the arg into `Indirect` mode regardless of current
++    /// state. Used by P09's Itanium overlay after the C-path
++    /// `compute_abi_info` has already transitioned some args to
++    /// `Cast` — the regular `make_indirect` asserts `Direct|Pair`
++    /// and would panic. This bypass is safe because we're
++    /// deliberately overriding the C classification for types
++    /// the Itanium ABI treats differently.
++    pub(crate) fn force_indirect(&mut self) {
++        self.mode = Self::indirect_pass_mode(&self.layout);
++    }
++
++    /// P09.17: override the C-path's aggregate-packing for
++    /// Swift-ABI arg/ret. Swift's calling convention spreads a
++    /// small POD struct across its constituent registers rather
++    /// than packing into a single int/float wide enough to hold
++    /// all fields. When the layout is `ScalarPair` (two-scalar
++    /// aggregate — the common case for Swift POD structs), force
++    /// `PassMode::Pair` so LLVM + swiftcc lower each scalar
++    /// separately, matching what `swiftc` emits for its own
++    /// value-type args.
++    pub(crate) fn force_swift_pair(&mut self) {
++        if let BackendRepr::ScalarPair(a, b) = self.layout.backend_repr {
++            // Rebuild the same attrs `ArgAbi::new` would have
++            // produced originally — the C-path then overwrote
++            // them with a Cast. Default attributes are fine for
++            // POD scalars (no NoAlias / NonNull / etc.).
++            self.mode = PassMode::Pair(ArgAttributes::new(), ArgAttributes::new());
++            let _ = (a, b);
++        }
++    }
++
+     fn indirect_pass_mode(layout: &TyAndLayout<'a, Ty>) -> PassMode {
+         let mut attrs = ArgAttributes::new();
+ 
+@@ -655,6 +686,10 @@ pub fn adjust_for_foreign_abi<C>(&mut self, cx: &C, abi: ExternAbi)
+                 let opts = x86::X86Options { flavor, regparm, reg_struct_return };
+                 if spec.is_like_msvc {
+                     x86_win32::compute_abi_info(cx, self, opts);
++                } else if matches!(abi, ExternAbi::Cpp { .. }) {
++                    // P09.11: Itanium overlay for non-Windows i686.
++                    // MSVC x86 is a different ABI (out of scope).
++                    x86::compute_cxx_abi_info(cx, self, opts);
+                 } else {
+                     x86::compute_abi_info(cx, self, opts);
+                 }
+@@ -664,6 +699,25 @@ pub fn adjust_for_foreign_abi<C>(&mut self, cx: &C, abi: ExternAbi)
+                 ExternAbi::Win64 { .. } | ExternAbi::Vectorcall { .. } => {
+                     x86_win64::compute_abi_info(cx, self)
+                 }
++                // P09: Itanium C++ ABI gets the C-path lowering
++                // plus Itanium-specific overrides (sret for non-
++                // trivial-for-calls returns, caller-destroys for
++                // non-trivial params).
++                ExternAbi::Cpp { .. } => {
++                    if cx.target_spec().is_like_windows {
++                        // MSVC ABI is a separate animal — out of
++                        // scope for the Itanium fork.
++                        x86_win64::compute_abi_info(cx, self)
++                    } else {
++                        x86_64::compute_cxx_abi_info(cx, self)
++                    }
++                }
++                // P09.17: Swift overlay — spreads `#[repr(swift)]`
++                // POD structs across scalar-pair registers so
++                // LLVM's swiftcc matches `swiftc`'s lowering.
++                ExternAbi::Swift { .. } => {
++                    x86_64::compute_swift_abi_info(cx, self)
++                }
+                 _ => {
+                     if cx.target_spec().is_like_windows {
+                         x86_win64::compute_abi_info(cx, self)
+@@ -680,7 +734,15 @@ pub fn adjust_for_foreign_abi<C>(&mut self, cx: &C, abi: ExternAbi)
+                 } else {
+                     aarch64::AbiKind::AAPCS
+                 };
+-                aarch64::compute_abi_info(cx, self, kind)
++                // P09.6: Itanium overlay for non-Windows aarch64.
++                // Windows arm64 uses the MSVC ABI — out of scope
++                // for the Itanium fork (matches the x86_64
++                // stance).
++                if matches!(abi, ExternAbi::Cpp { .. }) && !cx.target_spec().is_like_windows {
++                    aarch64::compute_cxx_abi_info(cx, self, kind)
++                } else {
++                    aarch64::compute_abi_info(cx, self, kind)
++                }
+             }
+             Arch::AmdGpu => amdgpu::compute_abi_info(cx, self),
+             Arch::Arm => arm::compute_abi_info(cx, self),
+diff --git a/compiler/rustc_target/src/callconv/x86.rs b/compiler/rustc_target/src/callconv/x86.rs
+index 81ff1a2a..264a93bb 100644
+--- a/compiler/rustc_target/src/callconv/x86.rs
++++ b/compiler/rustc_target/src/callconv/x86.rs
+@@ -200,6 +200,34 @@ pub(crate) fn fill_inregs<'a, Ty, C>(
+     }
+ }
+ 
++/// P09 — Itanium C++ ABI overlay for i686 (32-bit x86).
++///
++/// Runs the stock x86 C-path classification first, then promotes
++/// any `is_cxx_non_trivial_for_calls` arg or return to indirect
++/// to match Clang's Itanium output. Same shape as the x86_64 and
++/// aarch64 overlays.
++pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>, opts: X86Options)
++where
++    Ty: TyAbiInterface<'a, C> + Copy,
++    C: HasDataLayout + HasTargetSpec,
++{
++    compute_abi_info(cx, fn_abi, opts);
++
++    if !fn_abi.ret.is_ignore()
++        && fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++    {
++        fn_abi.ret.force_indirect();
++    }
++    for arg in fn_abi.args.iter_mut() {
++        if arg.is_ignore() {
++            continue;
++        }
++        if arg.layout.is_cxx_non_trivial_for_calls(cx) {
++            arg.force_indirect();
++        }
++    }
++}
++
+ pub(crate) fn compute_rust_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
+ where
+     Ty: TyAbiInterface<'a, C> + Copy,
+diff --git a/compiler/rustc_target/src/callconv/x86_64.rs b/compiler/rustc_target/src/callconv/x86_64.rs
+index 3055d18f..1d4b2910 100644
+--- a/compiler/rustc_target/src/callconv/x86_64.rs
++++ b/compiler/rustc_target/src/callconv/x86_64.rs
+@@ -104,6 +104,16 @@ fn classify<'a, Ty, C>(
+ 
+     let mut cls = [None; MAX_EIGHTBYTES];
+     classify(cx, arg.layout, &mut cls, Size::ZERO)?;
++
++    // P09.25: if an eightbyte in the covered range is left
++    // unclassified, the aggregate has a hole (e.g. a
++    // `#[repr(cpp)]` polymorphic class with an invisible vptr
++    // slot at offset 0). Treat as Memory so the ABI lowers it
++    // via sret rather than register-component decomposition
++    // (`cast_target` would panic on `None` at slot 0).
++    if cls[..n].iter().any(|c| c.is_none()) {
++        return Err(Memory);
++    }
+     if n > 2 {
+         if cls[0] != Some(Class::Sse) {
+             return Err(Memory);
+@@ -263,3 +273,81 @@ pub(crate) fn compute_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
+         x86_64_arg_or_ret(arg, true);
+     }
+ }
++
++/// P09 — Itanium C++ ABI overlay for SysV AMD64.
++///
++/// Runs the standard C-path `compute_abi_info` first (scalars,
++/// pointers, and plain POD aggregates already agree between C
++/// and C++). Then applies the Itanium-specific rule: any type
++/// that is **non-trivial for C++ calls** (a `#[repr(cpp)]` ADT
++/// with a user `Drop` impl) is passed / returned by invisible
++/// reference regardless of its size.
++///
++/// This diverges from the stock C path for the narrow case of
++/// small non-POD records — an 8-byte `#[repr(cpp)]` struct with
++/// `impl Drop` would fit in rax under `extern "C"`, but Clang
++/// returns it via sret under `extern "C++"`. The fork has to
++/// match Clang so linkers agree.
++/// P09.17 — Swift ABI overlay for SysV AMD64.
++///
++/// Runs the C-path lowering first, then overrides aggregate
++/// handling for `#[repr(swift)]` ADTs: Swift spreads a small
++/// POD struct across its scalar fields (each in its own
++/// register) rather than packing into a single wide scalar.
++/// For a `Point { x: f32, y: f32 }` the C path would emit
++/// `double` (both floats packed into xmm0 upper+lower halves);
++/// Swift expects `(float, float)` in xmm0/xmm1 separately.
++/// `force_swift_pair` reverts the packing to `PassMode::Pair`.
++pub(crate) fn compute_swift_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
++where
++    Ty: TyAbiInterface<'a, C> + Copy,
++    C: HasDataLayout + HasTargetSpec,
++{
++    compute_abi_info(cx, fn_abi);
++
++    let is_swift_repr = |arg: &ArgAbi<'a, Ty>| arg.layout.is_swift_repr();
++
++    if !fn_abi.ret.is_ignore() && is_swift_repr(&fn_abi.ret) {
++        fn_abi.ret.force_swift_pair();
++    }
++    for arg in fn_abi.args.iter_mut() {
++        if arg.is_ignore() {
++            continue;
++        }
++        if is_swift_repr(arg) {
++            arg.force_swift_pair();
++        }
++    }
++}
++
++pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
++where
++    Ty: TyAbiInterface<'a, C> + Copy,
++    C: HasDataLayout + HasTargetSpec,
++{
++    // First: regular C-path lowering. Handles everything the two
++    // ABIs agree on.
++    compute_abi_info(cx, fn_abi);
++
++    // Itanium override: promote non-trivial-for-calls types to
++    // indirect. Uses `force_indirect` rather than `make_indirect`
++    // because the C path may have already transitioned the arg
++    // to `Cast` (small aggregates fitting in registers), and
++    // `make_indirect` asserts a `Direct|Pair` starting state.
++    // `force_indirect` bypasses that assertion — correct because
++    // we're deliberately overriding the C classification to
++    // match Clang's Itanium output.
++    if !fn_abi.ret.is_ignore()
++        && fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++    {
++        fn_abi.ret.force_indirect();
++    }
++    for arg in fn_abi.args.iter_mut() {
++        if arg.is_ignore() {
++            continue;
++        }
++        if arg.layout.is_cxx_non_trivial_for_calls(cx) {
++            arg.force_indirect();
++        }
++    }
++}
+diff --git a/compiler/rustc_target/src/spec/abi_map.rs b/compiler/rustc_target/src/spec/abi_map.rs
+index c0fdd946..4d913cce 100644
+--- a/compiler/rustc_target/src/spec/abi_map.rs
++++ b/compiler/rustc_target/src/spec/abi_map.rs
+@@ -83,6 +83,16 @@ pub fn canonize_abi(&self, extern_abi: ExternAbi, has_c_varargs: bool) -> AbiMap
+         let canon_abi = match (extern_abi, arch) {
+             // infallible lowerings
+             (ExternAbi::C { .. }, _) => CanonAbi::C,
++            // P09 scaffold: Itanium C++ ABI gets its own CanonAbi
++            // variant. Today every per-target call-conv lowering
++            // treats `CanonAbi::Cpp` identically to `CanonAbi::C`
++            // (correct for scalar/pointer shapes on SysV AMD64).
++            // The distinct variant exists so future per-target
++            // patches can add sret / this-pointer / record-by-
++            // value handling for records without perturbing the
++            // plain `extern "C"` path.
++            (ExternAbi::Cpp { .. }, _) => CanonAbi::Cpp,
++            (ExternAbi::Swift { .. }, _) => CanonAbi::Swift,
+             (ExternAbi::Rust | ExternAbi::RustCall, _) => CanonAbi::Rust,
+             (ExternAbi::Unadjusted, _) => CanonAbi::C,
+ 
+-- 
+2.52.0
+
