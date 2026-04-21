@@ -173,14 +173,15 @@ fn forwarders_compile_with_rustc_and_export_itanium_symbols() {
     );
     let symbols = String::from_utf8_lossy(&nm.stdout);
 
-    // macOS's `nm` reports symbols with a leading underscore. The
-    // Itanium name starts with `_Z`, so the symbol appears as
-    // `__Z...`.
+    // The Itanium mangled name starts with `_Z`. macOS's `nm`
+    // prepends an extra leading underscore (`__Z...`) while Linux
+    // `nm` prints the ELF symbol verbatim (`_Z...`). Checking for
+    // the bare Itanium prefix matches both.
     let required = [
-        "__ZN5PointD1Ev",    // ~Point()
-        "__ZN5PointC1Eii",   // Point(int, int)
-        "__ZNK5Point5get_xEv", // Point::get_x() const
-        "__ZN5Point9translateEii", // Point::translate(int, int)
+        "_ZN5PointD1Ev",    // ~Point()
+        "_ZN5PointC1Eii",   // Point(int, int)
+        "_ZNK5Point5get_xEv", // Point::get_x() const
+        "_ZN5Point9translateEii", // Point::translate(int, int)
     ];
     for sym in required {
         assert!(
