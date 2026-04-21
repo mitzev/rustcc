@@ -86,7 +86,7 @@ Not yet in v1, targeted for the next milestone:
 ### Install the forked compiler
 
 ```sh
-git clone https://github.com/<org>/rustcc
+git clone https://github.com/Mitzev/rustcc
 cd rustcc/fork
 ./build.sh               # applies patches, builds stage-1 rustc (~30–90 min)
 ```

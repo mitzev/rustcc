@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  workspace-test:
+    name: cargo test --workspace (stock nightly)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins the nightly this workspace builds with.
+      # rustup will honor it automatically on the first cargo invocation.
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain || true
+          cargo --version
+          rustc --version
+
+      - name: Install system deps (clang for clang-sys / cxx_importer)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --locked
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+  patches-apply:
+    name: fork/patches apply cleanly on pinned nightly
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run fork/build.sh --apply-only
+        run: ./fork/build.sh --apply-only
