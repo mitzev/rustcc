@@ -1,0 +1,117 @@
+From c2ac032fa9559ed99963d2606d3ec9211b1d5668 Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Wed, 22 Apr 2026 16:05:29 +0300
+Subject: [PATCH] RISC-V Itanium C++ ABI overlay
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds `riscv::compute_cxx_abi_info` matching the x86_64 / aarch64
+pattern: run the psABI C-path, then force-indirect any type that
+is non-trivial for C++ calls. Wires `ExternAbi::Cpp` on
+`Arch::RiscV32 | Arch::RiscV64` to use it.
+
+Also replaces a `panic!` in `should_use_fp_conv` (layout with a
+non-zero first-field offset) with a graceful `return None`. Leading
+padding before the first field — e.g. the vptr slot reserved for
+polymorphic `#[repr(cpp)]` classes — makes a type ineligible for
+the register-pair fp-conv optimization. The RISC-V psABI itself
+carves aggregates with vtables out, so falling back to memory /
+aggregate handling is correct and matches Clang/GCC.
+
+Validates on `riscv32imc-unknown-none-elf` (ESP32-C3): a
+polymorphic class now emits `void _ZN6WidgetC1Ei(ptr sret, i32)`
+matching Clang's Itanium output; vtable shape is `{ i32, ptr, ptr }`
+with 4-byte slots and address-point offset 8.
+---
+ compiler/rustc_target/src/callconv/mod.rs   | 12 +++++-
+ compiler/rustc_target/src/callconv/riscv.rs | 43 ++++++++++++++++++++-
+ 2 files changed, 53 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/rustc_target/src/callconv/mod.rs b/compiler/rustc_target/src/callconv/mod.rs
+index f11280c1..877a85bf 100644
+--- a/compiler/rustc_target/src/callconv/mod.rs
++++ b/compiler/rustc_target/src/callconv/mod.rs
+@@ -767,7 +767,17 @@ pub fn adjust_for_foreign_abi<C>(&mut self, cx: &C, abi: ExternAbi)
+             }
+             Arch::Hexagon => hexagon::compute_abi_info(cx, self),
+             Arch::Xtensa => xtensa::compute_abi_info(cx, self),
+-            Arch::RiscV32 | Arch::RiscV64 => riscv::compute_abi_info(cx, self),
++            Arch::RiscV32 | Arch::RiscV64 => {
++                // P09: Itanium C++ ABI overlay for RISC-V — force
++                // indirect for non-trivial-for-calls types, matching
++                // x86_64 / aarch64. The psABI itself specifies this
++                // rule for "aggregates [...] with vtables".
++                if matches!(abi, ExternAbi::Cpp { .. }) {
++                    riscv::compute_cxx_abi_info(cx, self)
++                } else {
++                    riscv::compute_abi_info(cx, self)
++                }
++            }
+             Arch::Wasm32 | Arch::Wasm64 => wasm::compute_abi_info(cx, self),
+             Arch::Bpf => bpf::compute_abi_info(cx, self),
+             arch @ (Arch::SpirV | Arch::Other(_)) => {
+diff --git a/compiler/rustc_target/src/callconv/riscv.rs b/compiler/rustc_target/src/callconv/riscv.rs
+index bc81ec95..28924ac5 100644
+--- a/compiler/rustc_target/src/callconv/riscv.rs
++++ b/compiler/rustc_target/src/callconv/riscv.rs
+@@ -182,7 +182,15 @@ fn should_use_fp_conv<'a, Ty, C>(
+             | RegPassKind::Float { offset_from_start, .. },
+             _,
+         ) if offset_from_start != Size::ZERO => {
+-            panic!("type {:?} has a first field with non-zero offset {offset_from_start:?}", arg.ty)
++            // P09: layouts with leading padding before the first
++            // field (e.g. a vptr slot reserved by `#[repr(cpp)]` for
++            // polymorphic classes) are not eligible for the register-
++            // pair fp-conv optimization. The RISC-V psABI itself
++            // carves such aggregates out — "C++ aggregates with
++            // [...] vtables" are passed by reference — so falling
++            // back to memory/register-aggregate mode here is correct
++            // and matches Clang/GCC.
++            return None;
+         }
+         (
+             RegPassKind::Integer { ty: first_ty, .. },
+@@ -449,6 +457,39 @@ pub(crate) fn compute_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
+     }
+ }
+ 
++/// P09 — Itanium C++ ABI overlay for RISC-V (rv32 and rv64).
++///
++/// Runs the RISC-V psABI C-path `compute_abi_info` first, then
++/// applies the Itanium rule: any type that is "non-trivial for
++/// C++ calls" (a `#[repr(cpp)]` ADT with a user `Drop`, a `!Copy`
++/// body, or — via the layout flag — a vtable) is passed / returned
++/// by invisible reference regardless of its size.
++///
++/// The RISC-V psABI itself calls this out: "aggregates [...] with
++/// nontrivial copy constructors, destructors, or vtables" are
++/// passed by reference. Mirrors the x86_64 / aarch64 overlays.
++pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
++where
++    Ty: TyAbiInterface<'a, C> + Copy,
++    C: HasDataLayout + HasTargetSpec,
++{
++    compute_abi_info(cx, fn_abi);
++
++    if !fn_abi.ret.is_ignore()
++        && fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++    {
++        fn_abi.ret.force_indirect();
++    }
++    for arg in fn_abi.args.iter_mut() {
++        if arg.is_ignore() {
++            continue;
++        }
++        if arg.layout.is_cxx_non_trivial_for_calls(cx) {
++            arg.force_indirect();
++        }
++    }
++}
++
+ pub(crate) fn compute_rust_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
+ where
+     Ty: TyAbiInterface<'a, C> + Copy,
+-- 
+2.52.0
+

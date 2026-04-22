@@ -1,7 +1,7 @@
-# rustcc — session restart (v1 shipped)
+# rustcc — session restart (v1 shipped + P09.37 RISC-V)
 
-Last updated: **2026-04-21**, Opus 4.7 (1M ctx). **rustcc v1
-milestone complete.**
+Last updated: **2026-04-22**, Opus 4.7 (1M ctx). **rustcc v1
+milestone complete; P09.37 adds RISC-V ESP32 / bare-metal rv32.**
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
 
@@ -24,7 +24,41 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## This session's additions (P09.31 + P09.32)
+## Latest addition (P09.37, 2026-04-22)
+
+**RISC-V Itanium C++ ABI overlay.** Polymorphic `#[repr(cpp)]`
+classes now compile on rv32 / rv64. Previously ICEd at
+`rustc_target/src/callconv/riscv.rs:185` because upstream's
+fp-conv probe doesn't expect vptr-style leading padding.
+
+- `compute_cxx_abi_info` overlay for rv32/rv64, mirroring the
+  x86_64 / aarch64 P09.6 / P09.11 overlays. Force-indirects any
+  type that `is_cxx_non_trivial_for_calls`.
+- Defensive `panic!` → `return None` in `should_use_fp_conv` so
+  layouts with leading padding gracefully fall back to memory
+  mode (matches the RISC-V psABI's own treatment of aggregates-
+  with-vtables).
+
+**Coverage**: all rv32 and rv64 ELF targets — notably
+`riscv32imc-unknown-none-elf` (ESP32-C3),
+`riscv32imac-unknown-none-elf` (ESP32-C6 / H2),
+`riscv32imafc-unknown-none-elf` (ESP32-P4), and the
+`riscv32im*c-esp-espidf` std targets.
+
+**Not covered**: Xtensa ESP32 (S3, original ESP32) — no upstream
+rustc Xtensa target.
+
+**Validation**: `/tmp/p09-40-riscv32-esp32c3/` polymorphic Widget
+builds; IR shows `void _ZN6WidgetC1Ei(ptr sret, i32)` matching
+Clang's Itanium output. Vtable shape `{ i32, ptr, ptr }`, 4-byte
+slots, address-point offset 8. Workspace 235/0.
+`examples/bare_metal_arm` (P09.36) still builds clean — ARM
+Cortex-M path unaffected.
+
+**Patch**: `fork/patches/09-riscv-cxx-overlay.patch` (the 8-patch
+series is now a 9-patch series).
+
+## v1 session additions (P09.31 + P09.32)
 
 **P09.31** — Coverage bundle (#1, #5, #6, #7, #9):
 
@@ -80,19 +114,23 @@ See `project_queue_state.md` memory. Headlines:
 
 ## Morning review checklist
 
-- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.32 +
-      the "rustcc v1 milestone" marker after P09.32.
+- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.37 +
+      the "rustcc v1 milestone" marker after P09.32 +
+      the "Post-v1 target extensions" section containing P09.37.
 - [ ] Read the rewritten `fork/getting-started.html` as a
-      GitHub project intro.
-- [ ] Diff the new patches:
-      `fork/patches/09-31-small-fixes-bundle.patch`
-      `fork/patches/09-32-single-inheritance.patch`
+      GitHub project intro (now lists ESP32-C3 / RISC-V alongside
+      STM32 / ARM Cortex-M).
+- [ ] Diff `fork/patches/09-riscv-cxx-overlay.patch`.
 - [ ] `cargo test --workspace` → 235/0.
 - [ ] Verify v1 capstones:
       - `cd /tmp/p09-35-inherit && ./probe`
       - `cd /tmp/p09-36-dyncast && ./probe`
       - `cd /tmp/p09-30-class-kw && ./probe`
       - `cd /tmp/p09-28-swift-auto && ./probe`
+- [ ] Verify P09.37 RISC-V probe:
+      `cd /tmp/p09-40-riscv32-esp32c3 && RUSTC=<rust-lang-rust>/build/host/stage1/bin/rustc \`
+      `RUSTC_BOOTSTRAP=1 cargo +nightly build --release \`
+      `--target riscv32imc-unknown-none-elf -Zbuild-std=core,compiler_builtins`
 
 ## Environment notes
 

@@ -2,7 +2,7 @@
 
 ## How this document is organized
 
-`fork/patches/` contains an eight-file series that applies cleanly in
+`fork/patches/` contains a nine-file series that applies cleanly in
 order against `rust-lang/rust` at commit
 `e22c616e4e87914135c1db261a03e0437255335e` (the SHA pinned in
 `fork/build.sh`). Each file is the mechanical delivery for one
@@ -18,8 +18,9 @@ semantic cluster:
 | `06-symbol-mangling.patch`            | Itanium + Swift mangling dispatch                                    |
 | `07-codegen.patch`                    | Codegen LLVM: vtable emission, ctor vptr-init, call lowering         |
 | `08-cargo-lock.patch`                 | `Cargo.lock` refresh                                                 |
+| `09-riscv-cxx-overlay.patch`          | RISC-V Itanium overlay (rv32 / rv64, P09.37 post-v1)                 |
 
-The **P01 … P09.36 sections below** are the authoritative design
+The **P01 … P09.37 sections below** are the authoritative design
 record. Each documents the intent, validation probe, and any
 compiler-internal trade-offs for one unit of work. The numbering is
 historical — it tracks the order the work was done, not the layout
@@ -2545,6 +2546,101 @@ above now reflects this.
 P07–P09 are described in prose but not yet authored as diffs —
 they require more structural work (new modules, Cargo wiring,
 target-specific ABI code) than the simple additions P01–P06 are.
+
+## Post-v1 target extensions
+
+Shipped after the 2026-04-21 v1 milestone. These extend the
+supported target matrix without touching v1 semantics.
+
+### P09.37 — RISC-V ESP32 / bare-metal rv32 Itanium overlay
+
+**File**: `compiler/rustc_target/src/callconv/riscv.rs` (+41 LOC),
+`compiler/rustc_target/src/callconv/mod.rs` (+11 LOC).
+**Patch**: `fork/patches/09-riscv-cxx-overlay.patch`.
+
+### The problem
+
+P09.35 made `CxxTarget` target-aware and P09.36 confirmed
+bare-metal ARM Cortex-M worked zero-code. A follow-up probe on
+`riscv32imc-unknown-none-elf` (ESP32-C3) found non-polymorphic
+`#[repr(cpp)]` classes compiled cleanly, but adding a
+`#[cpp_virtual]` method ICE'd the compiler:
+
+```
+thread 'rustc' panicked at compiler/rustc_target/src/callconv/riscv.rs:185:
+type Widget has a first field with non-zero offset Size(4 bytes)
+```
+
+Upstream rv32's `should_use_fp_conv` walks fields by increasing
+offset and asserted the first field starts at offset 0. Our
+polymorphic class lays out as `{ vptr-hole, v: i32 }` — the hole
+isn't a real Rust field, so the walker sees `v` at offset 4 and
+panics. ARM didn't hit this because ARM's call-conv doesn't run
+this probe.
+
+### The fix
+
+Two layered changes in `rustc_target/src/callconv/riscv.rs`:
+
+1. **Defensive panic-to-None** in `should_use_fp_conv`. A layout
+   with leading padding before the first field makes the type
+   ineligible for the register-pair fp-conv optimization. The
+   RISC-V psABI itself carves these out — "aggregates [...] with
+   nontrivial copy constructors, destructors, or vtables" are
+   passed by reference — so a graceful `return None` is correct
+   and matches Clang/GCC behaviour on non-trivial classes.
+
+2. **`riscv::compute_cxx_abi_info` overlay**, mirroring the
+   x86_64 / aarch64 P09.6 / P09.11 overlays: run the psABI
+   C-path `compute_abi_info`, then `force_indirect()` any type
+   where `is_cxx_non_trivial_for_calls` is true. Wired into
+   `adjust_for_foreign_abi` in `mod.rs` for
+   `ExternAbi::Cpp + Arch::RiscV32 | Arch::RiscV64`.
+
+### Validation
+
+`/tmp/p09-40-riscv32-esp32c3/` — polymorphic Widget on
+`riscv32imc-unknown-none-elf`:
+
+- No ICE. Compiles clean.
+- Ctor IR: `void @_ZN6WidgetC1Ei(ptr sret([8 x i8]) %_0, i32 %v)`.
+  Matches Clang's Itanium output for `Widget::Widget(int)`.
+- Vtable shape: `{ i32, ptr, ptr }` with 4-byte slots.
+- Address-point offset: `gep vtable, i32 8` (offset-to-top + RTTI,
+  2 × 4 bytes).
+- Ctor body: `store vtable+8, %_0` at offset 0 (vptr init) and
+  `store %v, %_0+4` (field init).
+- Symbols: `_ZN6WidgetC1Ei`, `_ZNK6Widget3fooEv`, `_ZTV6Widget`,
+  `_ZTI6Widget`, `_ZTS6Widget` — all Itanium-correct.
+
+Regression checks: workspace `cargo test --workspace` → 235/0.
+`examples/bare_metal_arm` (P09.36) still builds clean on
+`thumbv7em-none-eabihf` — ARM Cortex-M path unaffected because
+only the RiscV dispatch branch in `mod.rs` was changed.
+
+### Coverage
+
+Applies to rv32 and rv64 (one code change, both architectures):
+
+- `riscv32imc-unknown-none-elf` — **ESP32-C3** (tested).
+- `riscv32imac-unknown-none-elf` — **ESP32-C6 / H2**.
+- `riscv32imafc-unknown-none-elf` — **ESP32-P4**.
+- `riscv32imc-esp-espidf` / `riscv32imac-esp-espidf` /
+  `riscv32imafc-esp-espidf` — ESP-IDF std targets.
+- Any other rv32 / rv64 ELF target using the Itanium C++ ABI.
+
+Xtensa ESP32 (S3, original ESP32) remains out of reach — no
+upstream rustc Xtensa target.
+
+### Takeaway for memory
+
+Before estimating "new target support," probe end-to-end
+including polymorphism. The same "zero-code path that carried ARM
+Cortex-M" did not extend to rv32 — polymorphism exposed an
+unimplemented psABI case in upstream that needed a ~50 LOC fork
+patch. Probe → diagnose → fix was ~3 hours.
+
+---
 
 ## Build & test
 

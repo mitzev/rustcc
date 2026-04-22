@@ -86,7 +86,8 @@ project is for you.</p>
   <tr><td><code>swift_value!</code> macro</td><td>✓ supported</td><td>Auto-generates <code>impl Drop</code> + <code>impl Clone</code> for <code>#[repr(swift)]</code></td></tr>
   <tr><td>Cross-compilation</td><td>✓ supported</td><td>P09.35. Per-invocation target parameters flow into the C++ ABI paths; requires building target std via <code>./x.py build --stage 1 library --target &lt;triple&gt;</code></td></tr>
   <tr><td>Bare-metal ARM Cortex-M</td><td>✓ supported</td><td>P09.36. <code>thumbv7em-none-eabihf</code>, <code>thumbv7m-none-eabi</code>, <code>thumbv8m.*</code> — zero compiler changes needed; link-time RTTI stub (3 lines of C) required unless <code>libsupc++-nano</code> is linked. See §16</td></tr>
-  <tr><td>Targets</td><td colspan="2"><code>x86_64-apple-darwin</code>, <code>x86_64-unknown-linux-gnu</code>, <code>aarch64-apple-darwin</code>, <code>aarch64-unknown-linux-gnu</code>, <code>i686-*</code> (non-Windows), bare-metal <code>thumbv7em-*</code> / <code>thumbv7m-*</code> / <code>thumbv8m.*</code>. Cross-builds across these are supported.</td></tr>
+  <tr><td>RISC-V (ESP32-C3 / C6 / H2 / P4, bare-metal rv32 / rv64)</td><td>✓ supported</td><td>P09.37. <code>riscv32imc-unknown-none-elf</code>, <code>riscv32imac-unknown-none-elf</code>, <code>riscv32imafc-unknown-none-elf</code>, <code>riscv32im*c-esp-espidf</code>. Needs the rv32 Itanium overlay (forced <code>sret</code>/indirect pass mode for polymorphic classes, per RISC-V psABI). Xtensa ESP32 (S3 / original) is <em>not</em> supported — no upstream rustc Xtensa target.</td></tr>
+  <tr><td>Targets</td><td colspan="2"><code>x86_64-apple-darwin</code>, <code>x86_64-unknown-linux-gnu</code>, <code>aarch64-apple-darwin</code>, <code>aarch64-unknown-linux-gnu</code>, <code>i686-*</code> (non-Windows), bare-metal <code>thumbv7em-*</code> / <code>thumbv7m-*</code> / <code>thumbv8m.*</code>, bare-metal <code>riscv32im*c-unknown-none-elf</code> / <code>riscv32im*c-esp-espidf</code>. Cross-builds across these are supported.</td></tr>
 </table>
 
 <h2>v2 roadmap</h2>
@@ -907,6 +908,75 @@ target-specific instruction selection, so any Itanium-ABI
 32-bit ARM variant is eligible. If a specific triple produces
 different mangling vs <code>arm-none-eabi-g++</code>, open an
 issue with the ABI fact that mismatches.</div>
+
+<h3>17. ESP32 (RISC-V) / bare-metal rv32 (fork, P09.37)</h3>
+
+<p>RISC-V-based ESP32 parts (ESP32-C3 / C6 / H2 / P4) and any
+bare-metal rv32 / rv64 ELF target are supported. Unlike ARM
+Cortex-M, this <em>did</em> need a small compiler patch:
+upstream's rv32 calling convention ICEd on polymorphic
+<code>#[repr(cpp)]</code> layouts because the fp-conv probe
+doesn't expect the vptr slot at offset 0. P09.37 adds an
+Itanium overlay for rv32 / rv64 mirroring the x86_64 and
+aarch64 ones — polymorphic and other non-trivial-for-calls
+types are passed by invisible reference, matching what Clang
+and GCC emit per the RISC-V psABI.</p>
+
+<p><b>Supported triples</b>:</p>
+<ul>
+  <li><code>riscv32imc-unknown-none-elf</code> — <strong>ESP32-C3</strong>
+      (validated probe: <code>/tmp/p09-40-riscv32-esp32c3/</code>).</li>
+  <li><code>riscv32imac-unknown-none-elf</code> —
+      <strong>ESP32-C6 / H2</strong>.</li>
+  <li><code>riscv32imafc-unknown-none-elf</code> —
+      <strong>ESP32-P4</strong>.</li>
+  <li><code>riscv32imc-esp-espidf</code> /
+      <code>riscv32imac-esp-espidf</code> /
+      <code>riscv32imafc-esp-espidf</code> — ESP-IDF std targets.</li>
+  <li>Any other rv32 / rv64 ELF Itanium-ABI target.</li>
+</ul>
+
+<p><b>Build recipe</b> is identical to the ARM Cortex-M flow,
+just with a different <code>--target</code>:</p>
+
+<pre><code>RUSTC=/path/to/rust-lang-rust/build/host/stage1/bin/rustc \
+RUSTC_BOOTSTRAP=1 \
+cargo +nightly build --target riscv32imc-unknown-none-elf \
+  -Zbuild-std=core,compiler_builtins
+</code></pre>
+
+<p>The validated polymorphic Widget emits:</p>
+<ul>
+  <li><code>void @_ZN6WidgetC1Ei(ptr sret([8 x i8]) %_0, i32 %v)</code>
+      — ctor signature matches Clang's Itanium output for
+      <code>Widget::Widget(int)</code> on rv32.</li>
+  <li><code>{ i32, ptr, ptr }</code> vtable with 4-byte slots,
+      address-point offset 8.</li>
+  <li>Correct Itanium mangling:
+      <code>_ZN6WidgetC1Ei</code>, <code>_ZNK6Widget3fooEv</code>,
+      <code>_ZTV6Widget</code>, <code>_ZTI6Widget</code>,
+      <code>_ZTS6Widget</code>.</li>
+</ul>
+
+<p>The same libc++abi RTTI stub from §16 applies if you're not
+linking a real C++ runtime:</p>
+
+<pre><code>// rtti_stub.c
+__attribute__((weak))
+void* _ZTVN10__cxxabiv117__class_type_infoE[4] = { 0 };
+</code></pre>
+
+<p>Compile the C++ side with <code>riscv32-esp-elf-g++</code>
+(ESP-IDF toolchain) or <code>riscv32-unknown-elf-g++</code>
+(generic RISC-V GCC) or Espressif's Clang/LLVM RISC-V toolchain
+— all three use the same Itanium C++ ABI, so the Rust side's
+symbols and calling convention are compatible with any of them.</p>
+
+<div class="caveat"><b>Xtensa ESP32 (S3 / original ESP32) is
+<em>not</em> supported.</b> Xtensa has no upstream rustc target;
+Espressif maintains their own LLVM / Rust forks for Xtensa but
+those are out of scope for this fork. Only RISC-V-based ESP32
+parts (C3, C6, H2, P4) run Rust today.</div>
 
 <h2>What's still limited in v1</h2>
 
