@@ -20,7 +20,7 @@ semantic cluster:
 | `08-cargo-lock.patch`                 | `Cargo.lock` refresh                                                 |
 | `09-riscv-cxx-overlay.patch`          | RISC-V Itanium overlay (rv32 / rv64, P09.37 post-v1)                 |
 
-The **P01 … P09.37 sections below** are the authoritative design
+The **P01 … P09.38 sections below** are the authoritative design
 record. Each documents the intent, validation probe, and any
 compiler-internal trade-offs for one unit of work. The numbering is
 historical — it tracks the order the work was done, not the layout
@@ -2551,6 +2551,55 @@ target-specific ABI code) than the simple additions P01–P06 are.
 
 Shipped after the 2026-04-21 v1 milestone. These extend the
 supported target matrix without touching v1 semantics.
+
+### P09.38 — Raspberry Pi Pico / ARMv6-M (Cortex-M0+) coverage
+
+**Files**: none — documentation-only, zero code.
+**Patch**: no new patch file; the existing 9-patch series produces
+correct output on `thumbv6m-none-eabi` with no changes.
+
+### The surprise (again)
+
+P09.36 enumerated ARM Cortex-M coverage as `thumbv7m` / `thumbv7em`
+/ `thumbv8m.*`. The original Raspberry Pi Pico (RP2040,
+Cortex-M0+, ARMv6-M) uses <code>thumbv6m-none-eabi</code>, one
+ISA tier below the tested set. Probe answer: zero-code pass.
+Identical output to <code>thumbv7em-none-eabihf</code> because
+the fork's C++ ABI paths don't touch ARM's target-specific
+instruction selection; upstream rustc's ARM call-conv is shared
+across ARMv6-M / v7-M / v8-M.
+
+### Validation
+
+`/tmp/p09-41-rp2040-pico/` — polymorphic Widget on
+<code>thumbv6m-none-eabi</code>:
+
+- Compiles clean. Same build recipe as P09.36 (<code>-Zbuild-std</code>
+  with stage-1 rustc override).
+- Ctor IR: `void @_ZN6WidgetC1Ei(ptr sret([8 x i8]) %_0, i32 %v)`
+  — matches Clang's Itanium output.
+- Vtable: `{ i32, ptr, ptr }` with 4-byte slots, address-point
+  offset 8.
+- Vptr init at offset 0, `v` field at offset 4.
+- Symbols: `_ZN6WidgetC1Ei`, `_ZNK6Widget3fooEv`, `_ZTV6Widget`,
+  `_ZTI6Widget`, `_ZTS6Widget` — all correct.
+
+### Raspberry Pi Pico coverage matrix
+
+| Board | Chip | Core / ISA | Target | Covered by |
+|---|---|---|---|---|
+| Pico / Pico W (2021) | RP2040 | Cortex-M0+ (ARMv6-M) | `thumbv6m-none-eabi` | **P09.38** (this) |
+| Pico 2 (2024, ARM mode) | RP2350 | Cortex-M33 (ARMv8-M) | `thumbv8m.main-none-eabihf` | P09.36 |
+| Pico 2 (2024, RISC-V mode) | RP2350 | Hazard3 (RV32IMAC) | `riscv32imac-unknown-none-elf` | P09.37 |
+
+### Takeaway
+
+Same lesson as P09.36 reinforced: when a target expansion
+request lands ("do we support X board?"), probe before
+estimating. The cost was a 10-minute build, not the
+compiler-change scope a paper-read might have suggested.
+
+---
 
 ### P09.37 — RISC-V ESP32 / bare-metal rv32 Itanium overlay
 

@@ -1,7 +1,9 @@
-# rustcc — session restart (v1 shipped + P09.37 RISC-V)
+# rustcc — session restart (v1 + P09.37 RISC-V + P09.38 Pico)
 
 Last updated: **2026-04-22**, Opus 4.7 (1M ctx). **rustcc v1
-milestone complete; P09.37 adds RISC-V ESP32 / bare-metal rv32.**
+milestone complete; P09.37 adds RISC-V ESP32 / bare-metal rv32;
+P09.38 extends ARM Cortex-M coverage to ARMv6-M (Raspberry Pi
+Pico / RP2040).**
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
 
@@ -24,7 +26,30 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## Latest addition (P09.37, 2026-04-22)
+## Latest addition (P09.38, 2026-04-22, documentation-only)
+
+**Raspberry Pi Pico / ARMv6-M coverage.** Probe on
+`thumbv6m-none-eabi` (RP2040 Cortex-M0+) yields identical
+Itanium output to P09.36's `thumbv7em-none-eabihf`. Zero code
+changes needed — ARM's call-conv in upstream rustc is shared
+across ARMv6-M / v7-M / v8-M, and the fork's C++ ABI paths
+don't touch target-specific instruction selection.
+
+**Pico coverage matrix**:
+
+| Board | Target | Status |
+|---|---|---|
+| Pico / Pico W (RP2040, M0+) | `thumbv6m-none-eabi` | P09.38 (new) |
+| Pico 2 (RP2350, M33) | `thumbv8m.main-none-eabihf` | P09.36 |
+| Pico 2 RISC-V (RP2350, Hazard3) | `riscv32imac-unknown-none-elf` | P09.37 |
+
+**Validation**: `/tmp/p09-41-rp2040-pico/` — ctor
+`void _ZN6WidgetC1Ei(ptr sret, i32)`, vtable `{ i32, ptr, ptr }`
+with 4-byte slots, address-point offset 8. All Itanium-correct.
+
+**Patch**: none (documentation-only). No zip regeneration needed.
+
+## Prior addition (P09.37, 2026-04-22)
 
 **RISC-V Itanium C++ ABI overlay.** Polymorphic `#[repr(cpp)]`
 classes now compile on rv32 / rv64. Previously ICEd at
@@ -114,9 +139,10 @@ See `project_queue_state.md` memory. Headlines:
 
 ## Morning review checklist
 
-- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.37 +
+- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.38 +
       the "rustcc v1 milestone" marker after P09.32 +
-      the "Post-v1 target extensions" section containing P09.37.
+      the "Post-v1 target extensions" section containing P09.37
+      and P09.38.
 - [ ] Read the rewritten `fork/getting-started.html` as a
       GitHub project intro (now lists ESP32-C3 / RISC-V alongside
       STM32 / ARM Cortex-M).
@@ -131,6 +157,9 @@ See `project_queue_state.md` memory. Headlines:
       `cd /tmp/p09-40-riscv32-esp32c3 && RUSTC=<rust-lang-rust>/build/host/stage1/bin/rustc \`
       `RUSTC_BOOTSTRAP=1 cargo +nightly build --release \`
       `--target riscv32imc-unknown-none-elf -Zbuild-std=core,compiler_builtins`
+- [ ] Verify P09.38 Pico probe:
+      `cd /tmp/p09-41-rp2040-pico && RUSTC=... cargo +nightly build --release \`
+      `--target thumbv6m-none-eabi -Zbuild-std=core,compiler_builtins`
 
 ## Environment notes
 

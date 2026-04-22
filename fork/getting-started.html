@@ -85,9 +85,9 @@ project is for you.</p>
   <tr><td>Swift class bindings</td><td>✓ supported</td><td>ARC via <code>swift_retain</code>/<code>swift_release</code></td></tr>
   <tr><td><code>swift_value!</code> macro</td><td>✓ supported</td><td>Auto-generates <code>impl Drop</code> + <code>impl Clone</code> for <code>#[repr(swift)]</code></td></tr>
   <tr><td>Cross-compilation</td><td>✓ supported</td><td>P09.35. Per-invocation target parameters flow into the C++ ABI paths; requires building target std via <code>./x.py build --stage 1 library --target &lt;triple&gt;</code></td></tr>
-  <tr><td>Bare-metal ARM Cortex-M</td><td>✓ supported</td><td>P09.36. <code>thumbv7em-none-eabihf</code>, <code>thumbv7m-none-eabi</code>, <code>thumbv8m.*</code> — zero compiler changes needed; link-time RTTI stub (3 lines of C) required unless <code>libsupc++-nano</code> is linked. See §16</td></tr>
-  <tr><td>RISC-V (ESP32-C3 / C6 / H2 / P4, bare-metal rv32 / rv64)</td><td>✓ supported</td><td>P09.37. <code>riscv32imc-unknown-none-elf</code>, <code>riscv32imac-unknown-none-elf</code>, <code>riscv32imafc-unknown-none-elf</code>, <code>riscv32im*c-esp-espidf</code>. Needs the rv32 Itanium overlay (forced <code>sret</code>/indirect pass mode for polymorphic classes, per RISC-V psABI). Xtensa ESP32 (S3 / original) is <em>not</em> supported — no upstream rustc Xtensa target.</td></tr>
-  <tr><td>Targets</td><td colspan="2"><code>x86_64-apple-darwin</code>, <code>x86_64-unknown-linux-gnu</code>, <code>aarch64-apple-darwin</code>, <code>aarch64-unknown-linux-gnu</code>, <code>i686-*</code> (non-Windows), bare-metal <code>thumbv7em-*</code> / <code>thumbv7m-*</code> / <code>thumbv8m.*</code>, bare-metal <code>riscv32im*c-unknown-none-elf</code> / <code>riscv32im*c-esp-espidf</code>. Cross-builds across these are supported.</td></tr>
+  <tr><td>Bare-metal ARM Cortex-M</td><td>✓ supported</td><td>P09.36 / P09.38. <code>thumbv6m-none-eabi</code> (M0+, <strong>Raspberry Pi Pico / Pico W</strong>), <code>thumbv7em-none-eabihf</code>, <code>thumbv7m-none-eabi</code>, <code>thumbv8m.*</code> (incl. <strong>Pico 2</strong> M33 mode) — zero compiler changes needed; link-time RTTI stub (3 lines of C) required unless <code>libsupc++-nano</code> is linked. See §16</td></tr>
+  <tr><td>RISC-V (ESP32-C3 / C6 / H2 / P4, Pico 2 Hazard3, bare-metal rv32 / rv64)</td><td>✓ supported</td><td>P09.37. <code>riscv32imc-unknown-none-elf</code>, <code>riscv32imac-unknown-none-elf</code> (incl. <strong>Pico 2 RISC-V mode</strong>), <code>riscv32imafc-unknown-none-elf</code>, <code>riscv32im*c-esp-espidf</code>. Needs the rv32 Itanium overlay (forced <code>sret</code>/indirect pass mode for polymorphic classes, per RISC-V psABI). Xtensa ESP32 (S3 / original) is <em>not</em> supported — no upstream rustc Xtensa target.</td></tr>
+  <tr><td>Targets</td><td colspan="2"><code>x86_64-apple-darwin</code>, <code>x86_64-unknown-linux-gnu</code>, <code>aarch64-apple-darwin</code>, <code>aarch64-unknown-linux-gnu</code>, <code>i686-*</code> (non-Windows), bare-metal <code>thumbv6m-*</code> / <code>thumbv7em-*</code> / <code>thumbv7m-*</code> / <code>thumbv8m.*</code>, bare-metal <code>riscv32im*c-unknown-none-elf</code> / <code>riscv32im*c-esp-espidf</code>. Cross-builds across these are supported.</td></tr>
 </table>
 
 <h2>v2 roadmap</h2>
@@ -812,16 +812,19 @@ normal binding. (4) No generics on the class header in v1.
 <code>#[cpp_virtual]</code>) still apply on methods
 inside a class — they aren't auto-inferred from context.</div>
 
-<h3>16. Bare-metal / STM32 targets (fork, P09.36)</h3>
+<h3>16. Bare-metal / STM32 / Raspberry Pi Pico targets (fork, P09.36 / P09.38)</h3>
 
 <p>The fork compiles cleanly for bare-metal 32-bit ARM targets
-like <code>thumbv7em-none-eabihf</code> (Cortex-M4F — the
-STM32F4 / L4 / G4 families). The existing Itanium-ABI machinery
-is target-aware enough that <strong>no ABI-specific compiler
-changes are needed</strong> for ARM Cortex-M; the only
-link-time knob is providing a stub for libc++abi's RTTI vtable
-since bare-metal builds typically don't link
-<code>libc++abi</code>.</p>
+from the ARMv6-M family up through ARMv8-M — covering STM32
+parts, <strong>Raspberry Pi Pico / Pico W</strong> (RP2040
+Cortex-M0+, <code>thumbv6m-none-eabi</code>; P09.38), and
+<strong>Pico 2</strong> in Cortex-M33 mode
+(<code>thumbv8m.main-none-eabihf</code>). The existing
+Itanium-ABI machinery is target-aware enough that <strong>no
+ABI-specific compiler changes are needed</strong> for ARM
+Cortex-M; the only link-time knob is providing a stub for
+libc++abi's RTTI vtable since bare-metal builds typically
+don't link <code>libc++abi</code>.</p>
 
 <p><b>Minimal probe</b> (see <code>/tmp/p09-39-arm32/</code>):</p>
 
@@ -899,15 +902,18 @@ arm-none-eabi-ld -r caller.o rtti_stub.o \
 # All symbols resolved, no undefined references.
 </code></pre>
 
-<div class="caveat"><b>Other ARM Cortex-M targets.</b>
+<div class="caveat"><b>Other ARM Cortex-M targets (all validated by probe).</b>
+<code>thumbv6m-none-eabi</code> (Cortex-M0+ — Raspberry Pi Pico /
+Pico W; P09.38),
 <code>thumbv7m-none-eabi</code> (Cortex-M3),
 <code>thumbv8m.base-none-eabi</code> (M23),
-<code>thumbv8m.main-none-eabihf</code> (M33F), etc. should all
-work by the same recipe — the fork's C++ ABI paths don't touch
-target-specific instruction selection, so any Itanium-ABI
-32-bit ARM variant is eligible. If a specific triple produces
-different mangling vs <code>arm-none-eabi-g++</code>, open an
-issue with the ABI fact that mismatches.</div>
+<code>thumbv8m.main-none-eabihf</code> (M33F — Pico 2 in ARM
+mode), etc. all emit identical Itanium output to
+<code>thumbv7em-none-eabihf</code> — same ctor
+<code>sret</code>+void shape, same 4-byte vtable slots, same
+address-point offset 8. If a specific triple produces different
+mangling vs <code>arm-none-eabi-g++</code>, open an issue with
+the ABI fact that mismatches.</div>
 
 <h3>17. ESP32 (RISC-V) / bare-metal rv32 (fork, P09.37)</h3>
 
