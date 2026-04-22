@@ -90,27 +90,64 @@ project is for you.</p>
   <tr><td>Targets</td><td colspan="2"><code>x86_64-apple-darwin</code>, <code>x86_64-unknown-linux-gnu</code>, <code>aarch64-apple-darwin</code>, <code>aarch64-unknown-linux-gnu</code>, <code>i686-*</code> (non-Windows), bare-metal <code>thumbv6m-*</code> / <code>thumbv7em-*</code> / <code>thumbv7m-*</code> / <code>thumbv8m.*</code>, bare-metal <code>riscv32im*c-unknown-none-elf</code> / <code>riscv32im*c-esp-espidf</code>. Cross-builds across these are supported.</td></tr>
 </table>
 
-<h2>v2 roadmap</h2>
+<h2>Post-v1 roadmap</h2>
 
-<p>Not yet in v1, targeted for the next milestone:</p>
+<p>Grouped by release track. All items are additive — v1 code
+continues to work on every future track.</p>
+
+<h3>1.01 — polish (days-to-weeks, non-breaking)</h3>
 
 <ul>
-  <li><strong>Multi-inheritance and virtual bases</strong> —
-      secondary vtable sub-tables, this-adjusting thunks,
-      virtual-base offset slots.</li>
-  <li><strong>True compiler auto-synthesis for
-      <code>#[repr(swift)]</code></strong> — today's path uses the
-      <code>swift_value!</code> proc macro; a HIR-level
-      trait-impl synthesis would let users drop the wrapper.</li>
+  <li><strong>Const generics on class headers</strong> — <code>class
+      Array&lt;T, const N: usize&gt; { ... }</code>. Parser
+      accepts them today; the path isn't exercised. Probe +
+      whatever fixes surface.</li>
   <li><strong>Multi-field class-backed Swift bindings with
       non-POD extra fields</strong> — e.g. a class handle that
-      carries another class handle as a sibling field.</li>
-  <li><strong>Const generics on class headers</strong> — <code>class
-      Array&lt;T, const N: usize&gt; { ... }</code>. v1 accepts type
-      and lifetime params only.</li>
-  <li><strong>Windows MSVC ABI</strong> — out of scope for the
-      Itanium-focused fork; would be a separate targeting
-      effort.</li>
+      carries another class handle as a sibling field. Current
+      <code>swift_value!</code> handles POD extras via
+      memcpy+overwrite-ptr-0; non-POD needs per-field
+      <code>Clone</code> logic.</li>
+  <li><strong><code>rustc_cxx_*</code> attribute-plumbing
+      unification</strong> — each attr follows an identical
+      7-file shape; a macro could generate it. Pure cleanup.</li>
+  <li><strong>In-tree test crate</strong> — promote the
+      <code>/tmp/p09-*</code> probes into regression tests that
+      live in the fork.</li>
+  <li><strong>Three-surface doc</strong> — clarify when to use
+      <code>cxx_class!</code> vs <code>cxx_class_native!</code>
+      vs the parser <code>class</code> keyword.</li>
+</ul>
+
+<h3>1.02 — structural, non-inheritance (weeks)</h3>
+
+<ul>
+  <li><strong>True compiler auto-synthesis for
+      <code>#[repr(swift)]</code></strong> — today's path uses the
+      <code>swift_value!</code> proc macro; HIR-level
+      trait-impl synthesis would let users drop the wrapper.</li>
+  <li><strong>Parser-level distinct <code>ItemKind::Class</code>
+      AST variant</strong> — a first-class AST node for
+      <code>class</code> instead of parse-time desugaring. Only
+      worth doing if a concrete editor-tool consumer
+      (rust-analyzer, rustfmt) materializes.</li>
+</ul>
+
+<h3>1.1 — multi-inheritance capstone (weeks-to-months)</h3>
+
+<ul>
+  <li><strong>Multi-inheritance + virtual bases</strong> —
+      secondary vtable sub-tables, this-adjusting thunks,
+      virtual-base offset slots. Completes the polymorphic
+      story started in v1's single-inheritance path.</li>
+</ul>
+
+<h3>Out of scope</h3>
+
+<ul>
+  <li><strong>Windows MSVC ABI</strong> — the fork is
+      Itanium-focused. A separate targeting effort, not
+      blocking any release above.</li>
 </ul>
 
 <h2>Install the forked compiler</h2>
@@ -992,13 +1029,13 @@ parts (C3, C6, H2, P4) run Rust today.</div>
   <tr><td>Single inheritance</td><td>Supported</td><td>—</td></tr>
   <tr><td><code>dynamic_cast</code> across inheritance</td><td>Supported</td><td>—</td></tr>
   <tr><td>Virtual method override</td><td>Supported</td><td>Derived class methods with the same name as a base virtual replace the base's vtable slot (P09.34)</td></tr>
-  <tr><td>Multi-inheritance / virtual bases</td><td>v2</td><td>Use composition-over-inheritance at the C++ API boundary</td></tr>
-  <tr><td>Virtual-override signature-compat lint</td><td>v2</td><td>Name-match today; mismatched sigs are user error. A lint is future polish.</td></tr>
+  <tr><td>Multi-inheritance / virtual bases</td><td>1.1</td><td>Use composition-over-inheritance at the C++ API boundary</td></tr>
+  <tr><td>Virtual-override signature-compat lint</td><td>1.01</td><td>Name-match today; mismatched sigs are user error. A lint is future polish.</td></tr>
   <tr><td>Windows MSVC ABI</td><td>Out of scope</td><td>Itanium-only; use a different build for Windows</td></tr>
   <tr><td><code>isize</code> / <code>usize</code> in C++ sigs</td><td>Rejected (target-dependent mangling)</td><td>Use explicit <code>i64</code>/<code>u64</code></tr>
   <tr><td>Tuples, slices, <code>&amp;str</code>, fn pointers in C++ sigs</td><td>Rejected</td><td>Pass as struct / ptr+len / raw fn ptr</td></tr>
   <tr><td>Non-trivial move ctors (move-only C++ types)</td><td>Partial — covered by <code>!Copy</code> heuristic</td><td>Verify with a probe if precise move semantics matter</td></tr>
-  <tr><td>Const generics on <code>class</code> header</td><td>v2</td><td>Use type / lifetime params for v1; const generics parse but aren't tested</td></tr>
+  <tr><td>Const generics on <code>class</code> header</td><td>1.01</td><td>Use type / lifetime params for v1; const generics parse but aren't tested</td></tr>
 </table>
 
 <div class="caveat"><b>Error early, not at link time.</b> If you write a C++ signature

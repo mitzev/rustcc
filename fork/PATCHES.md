@@ -2388,7 +2388,8 @@ Patch: `fork/patches/09-36-arm32-baremetal.patch`.
 ## rustcc v1 milestone (2026-04-21)
 
 With P09.36 shipped, the fork reaches a coherent v1 feature
-set. Summary of what v1 delivers and what remains for v2:
+set. Summary of what v1 delivers and what remains for the
+1.01 / 1.02 / 1.1 release tracks:
 
 ### v1 supported
 
@@ -2424,20 +2425,44 @@ set. Summary of what v1 delivers and what remains for v2:
 - `cxx_class!` macro — stable-rustc-compatible C++ bindings.
 - `cxx_class_native!` macro — fork-only native bindings.
 
-### v2 deferred
+### Post-v1 release tracks
 
-- Multi-inheritance / virtual bases.
+The former "v2 deferred" bucket has been reorganized into
+three smaller tracks. All items are additive; v1 code
+continues to work across every future track.
+
+**1.01 — polish (days-to-weeks, non-breaking):**
+
+- Const generics on class headers (parser accepts; path not
+  exercised).
+- Multi-field class-backed Swift bindings with non-POD extra
+  fields.
 - Signature-compatibility lint for virtual overrides (v1
-  matches overrides by name only; mismatched signatures are
-  user error).
+  matches by name only; mismatched signatures are user error
+  today).
+- `rustc_cxx_*` attribute-plumbing unification (cleanup —
+  each attr has an identical 7-file shape).
+- Promote `/tmp/p09-*` probes into an in-tree test crate.
+- Clarify the three-surface story
+  (`cxx_class!` vs `cxx_class_native!` vs parser `class`).
+
+**1.02 — structural non-inheritance (weeks):**
+
 - True compiler-level auto-synthesis for `#[repr(swift)]`
-  (current path uses the `swift_value!` macro wrapper).
-- Multi-field class-backed Swift bindings with non-POD
-  extra fields.
-- Const generics on class headers.
-- Parser-level distinct `ItemKind::Class` AST variant (current
-  path is parse-time desugaring; an AST variant would give
-  editor tools a distinct node).
+  (replaces the `swift_value!` macro wrapper with HIR-level
+  trait-impl synthesis).
+- Parser-level distinct `ItemKind::Class` AST variant (only
+  if a concrete editor-tool consumer materializes).
+
+**1.1 — multi-inheritance capstone (weeks-to-months):**
+
+- Multi-inheritance + virtual bases. Secondary sub-tables,
+  this-adjusting thunks, virtual-base offset slots.
+
+**Out of scope:**
+
+- Windows MSVC ABI — the fork is Itanium-focused; a separate
+  targeting effort.
 
 ### Deferred from this session
 
