@@ -2445,14 +2445,20 @@ continues to work across every future track.
 - Promote `/tmp/p09-*` probes into an in-tree test crate.
 - Clarify the three-surface story
   (`cxx_class!` vs `cxx_class_native!` vs parser `class`).
+- Parser-level distinct `ItemKind::Class` AST variant
+  (compiler-internal enabler for 1.02's rust-analyzer fork;
+  user-invisible on its own).
 
-**1.02 — structural non-inheritance (weeks):**
+**1.02 — structural user-visible (weeks):**
 
 - True compiler-level auto-synthesis for `#[repr(swift)]`
   (replaces the `swift_value!` macro wrapper with HIR-level
   trait-impl synthesis).
-- Parser-level distinct `ItemKind::Class` AST variant (only
-  if a concrete editor-tool consumer materializes).
+- rust-analyzer fork for the `class` keyword — teach RA's
+  parser about `class Foo { ... }`. The user-facing deliverable
+  is IDE autocomplete, hover, go-to-def, and rename on
+  `class`-declared types. Stock RA today chokes on the
+  `class` token and breaks the rest of the file.
 
 **1.1 — multi-inheritance capstone (weeks-to-months):**
 

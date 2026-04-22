@@ -117,20 +117,31 @@ continues to work on every future track.</p>
   <li><strong>Three-surface doc</strong> — clarify when to use
       <code>cxx_class!</code> vs <code>cxx_class_native!</code>
       vs the parser <code>class</code> keyword.</li>
+  <li><strong>Parser-level distinct <code>ItemKind::Class</code>
+      AST variant</strong> — compiler-internal enabler for
+      1.02's rust-analyzer work. Gives rustc's own AST a
+      first-class node for <code>class</code> instead of
+      parse-time desugaring. Invisible to users on its own;
+      ships with 1.01 so the 1.02 RA fork can mirror rustc's
+      AST rather than duplicating the desugaring.</li>
 </ul>
 
-<h3>1.02 — structural, non-inheritance (weeks)</h3>
+<h3>1.02 — structural user-visible (weeks)</h3>
 
 <ul>
   <li><strong>True compiler auto-synthesis for
       <code>#[repr(swift)]</code></strong> — today's path uses the
       <code>swift_value!</code> proc macro; HIR-level
       trait-impl synthesis would let users drop the wrapper.</li>
-  <li><strong>Parser-level distinct <code>ItemKind::Class</code>
-      AST variant</strong> — a first-class AST node for
-      <code>class</code> instead of parse-time desugaring. Only
-      worth doing if a concrete editor-tool consumer
-      (rust-analyzer, rustfmt) materializes.</li>
+  <li><strong>rust-analyzer fork for the <code>class</code>
+      keyword</strong> — teach RA's parser about <code>class
+      Foo { ... }</code> so editor autocomplete, hover,
+      go-to-def, and rename all work on
+      <code>class</code>-declared types. Without this, stock
+      RA chokes on the <code>class</code> token and the rest
+      of the file becomes a parse error. <strong>This is the
+      item that actually delivers editor support to users.</strong>
+      Builds on top of 1.01's <code>ItemKind::Class</code>.</li>
 </ul>
 
 <h3>1.1 — multi-inheritance capstone (weeks-to-months)</h3>
