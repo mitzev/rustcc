@@ -2586,6 +2586,82 @@ target-specific ABI code) than the simple additions P01–P06 are.
 Shipped after the 2026-04-21 v1 milestone. These extend the
 supported target matrix without touching v1 semantics.
 
+### P09.45 — rust-analyzer parser support for `class` (1.02 #1 Phase 1)
+
+**Files**: `fork/ra-patches/01-ra-class-keyword.patch` applied
+against `rust-lang/rust-analyzer`. 18 files changed
+(+1351 / −182, most of which is regenerated `nodes.rs` /
+`generated.rs` output from the grammar codegen — hand-written
+parser + plumbing is ~200 LOC).
+
+#### What's delivered
+
+Stock rust-analyzer treated `class Widget { ... }` as a parse
+error cascade: `class` became an identifier, the body an error
+block, and anything downstream got recovered as expression
+statements. Files with even one `class` item were borderline
+unusable in an editor.
+
+This patch teaches rust-analyzer to recognize `class` as a weak
+keyword at item position and parse the body as a mixed
+record-field / assoc-item sequence. Output is a new `CLASS`
+syntax node with a `CLASS_MEMBER_LIST` child — mirroring rustc's
+P09.39 `ItemKind::Class` shape.
+
+#### Phase 1 = parser-level only
+
+- `class` added to `CONTEXTUAL_KEYWORDS` in the grammar codegen.
+- `rust.ungram` gains `Class` + `ClassMemberList` non-terminals.
+- `items::opt_item_without_modifiers` routes `class IDENT` at
+  item position to a new `adt::klass` parser; body delegates to
+  a new `class_member_list` that alternates record-field parsing
+  and `item_or_macro` based on a `looks_like_field_at` peek.
+- Non-exhaustive match arms updated in `hir-expand`, `hir-def`,
+  `hir/semantics`, `ide-assists`, `syntax` — Phase 1 arms mostly
+  bail for classes (treat like unions) or extract fields where
+  the existing logic can keep going (extract_module).
+- Inline parser test `class_item` + regenerated fixture.
+
+#### What Phase 1 unlocks
+
+- Class-containing files no longer break parsing. Items AFTER a
+  `class` declaration parse cleanly (previously everything after
+  was ERROR-recovered).
+- Items INSIDE a class body parse cleanly: `RECORD_FIELD` for
+  fields, `FN` (with its own name, param list, body) for
+  methods. Editor services that operate on syntax nodes (outline,
+  selection ranges, folding) work inside the class too.
+- Non-class items in the same file get their normal LSP
+  treatment (hover, rename, go-to-def, completion).
+
+#### What Phase 2 still owes
+
+- Class name itself isn't in the item tree, so hover /
+  go-to-def targeting the name doesn't resolve. Workspace
+  symbol search doesn't surface classes.
+- Method call sites don't resolve to the inline method bodies
+  — the items inside `CLASS_MEMBER_LIST` exist syntactically
+  but have no HIR representation.
+- Autocomplete for class fields / methods doesn't fire.
+
+Phase 2 design: synthesize a `Struct` + inherent `Impl` pair
+in `hir-def/item_tree/lower.rs::lower_mod_item`, mirroring what
+P09.39 does at the rustc AST → HIR boundary. That wires all the
+ADT/impl-based resolution paths to treat the class as a
+struct-plus-methods pair for LSP purposes, without changing the
+syntactic CLASS node.
+
+#### Validation
+
+- `cargo test -p parser` → **315/0** (was 314/0; +1 inline test
+  for `class_item`).
+- `cargo test -p syntax` → **51/0**.
+- Manual probe against a file with generics, single
+  inheritance, and a trailing regular `fn` — all emit zero
+  `ERROR@` nodes in the parse tree.
+
+---
+
 ### P09.44 — Linux/desktop target coverage (1.01 #6)
 
 **Files**: none — documentation-only, zero code.

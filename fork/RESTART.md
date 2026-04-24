@@ -1,13 +1,14 @@
-# rustcc — session restart (v1 + post-v1 through P09.44, 1.01 fully closed)
+# rustcc — session restart (v1 + 1.01 closed + 1.02 #1 Phase 1 shipped)
 
 Last updated: **2026-04-24**, Opus 4.7 (1M ctx). **rustcc v1
 milestone complete. Post-v1 shipped: P09.37 (RISC-V ESP32),
-P09.38 (Raspberry Pi Pico), P09.39 (ItemKind::Class), P09.40
-(three-surface doc), P09.41 (generics on class), P09.42 (non-POD
-Swift extras), P09.43 (attr-plumbing unification), P09.44 (Linux
-target coverage). 1.01 release track is fully closed — all seven
-items shipped plus #6's "on demand" probes extended to cover
-x86_64/aarch64/armv7/rv64 Linux.**
+P09.38 (Raspberry Pi Pico), P09.39 (ItemKind::Class), P09.40-44
+(1.01 batch closing items #1-#6), P09.45 (rust-analyzer fork for
+`class` keyword — Phase 1 parser support, 1.02 #1).**
+1.01 is fully shipped; 1.02 #1 Phase 1 is in — editors no longer
+cascade-error on class-containing files. Phase 2 (HIR-level
+resolution for class names + method dispatch) and 1.02 #2 (Swift
+auto-synth) are the next workable items.
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
 
@@ -30,7 +31,67 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## Latest addition (P09.44, 2026-04-24, documentation-only)
+## Latest addition (P09.45, 2026-04-24)
+
+**1.02 #1 Phase 1 shipped: rust-analyzer fork for `class`.** Parser
+now accepts `class Widget { ... }` as a first-class AST item
+instead of producing a cascade of error nodes. Files with class
+items go from "mostly broken in the editor" to "class body is
+syntactically visible, surrounding items work normally".
+
+**Scope — Phase 1 (parser only)**:
+- `class` added to `CONTEXTUAL_KEYWORDS` in RA's grammar codegen.
+- New `CLASS` syntax node + `CLASS_MEMBER_LIST` child in
+  rust.ungram. Regenerated `generated/nodes.rs` and
+  `syntax_kind/generated.rs`.
+- `adt::klass` parser handles the header (generics, optional
+  `: BaseType`, where-clause); `class_member_list` alternates
+  record-field parsing and `item_or_macro` based on a
+  `looks_like_field_at` peek.
+- Non-exhaustive match arms updated in hir-expand, hir-def,
+  hir/semantics, ide-assists (9 sites), syntax.
+
+**Scope — Phase 2 (deferred)**:
+- Class name isn't in item tree → no hover / go-to-def / workspace
+  symbol on the class name itself.
+- Methods inside the class body have FN nodes but no HIR
+  representation → no method-call resolution.
+- Autocomplete on class fields/methods doesn't fire.
+
+Phase 2 plan: synthesize `Struct` + inherent `Impl` pair in
+`hir-def/item_tree/lower.rs::lower_mod_item`, mirroring P09.39's
+rustc-side AST → HIR lowering. Most ADT + impl resolution paths
+then work "for free".
+
+**Patch**: `fork/ra-patches/01-ra-class-keyword.patch`, against
+`rust-lang/rust-analyzer`. 18 files touched (+1351/-182, mostly
+regenerated codegen output).
+
+**Validation**:
+- `cargo test -p parser` (in ra repo) → 315/0 (+1 inline test).
+- `cargo test -p syntax` → 51/0.
+- Manual probe with generics + inheritance + trailing `fn` — zero
+  ERROR nodes in parse tree.
+
+**Install note**: users point their editor at the built
+`target/release/rust-analyzer` binary via
+`rust-analyzer.server.path`. See `fork/ra-patches/README.md`.
+
+**Memory-worthy bugs**:
+- The `// test <name>` inline-test extraction in RA's xtask
+  reads all consecutive `//` lines after the `// test` line as
+  test body. Long comment blocks above a `fn` need the `// test
+  ...` / `// <code>` pair to be immediately adjacent, not
+  separated by any other `//` comment. Manifested when my first
+  codegen run captured the full docblock as the test case.
+- AstId typing is strict: `source_ast_id_map.ast_id(class)`
+  returns `AstId<ast::Class>`, which can't be directly stored
+  under a `Struct` small-data slot. Phase 1 works around by
+  emitting no item-tree entry for classes; Phase 2 will need a
+  proper synthesized struct node or an `ItemTreeAstId<Class>`
+  small-data variant.
+
+## Prior addition (P09.44, 2026-04-24, documentation-only)
 
 **1.01 #6 shipped: Linux/desktop target coverage.** Four
 commonly-asked-for Linux triples probed, all zero-code — upstream
@@ -267,8 +328,9 @@ closed.**
 7. ~~Parser-level `ItemKind::Class` AST variant~~ — P09.39.
 
 **1.02 — user-visible class-keyword IDE support**:
-1. rust-analyzer fork for `class` (weeks). Unblocked — RA mirrors
-   the `ItemKind::Class` shape from P09.39.
+1. ~~rust-analyzer fork for `class` — Phase 1 parser support~~
+   — P09.45. Phase 2 (HIR-level class→struct+impl synthesis for
+   hover / go-to-def / completion) remains.
 2. True compiler auto-synthesis for `#[repr(swift)]` (large).
 
 **1.1 — multi-inheritance capstone**:
@@ -278,7 +340,7 @@ Out of scope: Windows MSVC ABI.
 
 ## Morning review checklist
 
-- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.43.
+- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.45.
 - [ ] Read `fork/THREE-SURFACES.md` for the surface-selection
       reference.
 - [ ] `cargo test --workspace` → 235/0.
@@ -286,9 +348,13 @@ Out of scope: Windows MSVC ABI.
 - [ ] Optional cross-target probe:
       `RUSTC=<stage1> ./fork/tests/run_targets.sh` → 4/4
       (~3 min total; skip on quick regression checks).
-- [ ] Optional: diff the post-v1 patches 10–12:
-      `fork/patches/10-itemkind-class.patch`,
-      `11-class-generics.patch`, `12-attr-plumbing-macro.patch`.
+- [ ] Optional: diff the rustc-side post-v1 patches 10–12
+      (`fork/patches/10-itemkind-class.patch`,
+      `11-class-generics.patch`, `12-attr-plumbing-macro.patch`).
+- [ ] Optional rust-analyzer probe: apply
+      `fork/ra-patches/01-ra-class-keyword.patch` against a
+      clone of rust-lang/rust-analyzer; `cargo test -p parser`
+      → 315/0. Binary at `target/release/rust-analyzer`.
 - [ ] Verify v1 capstones:
       - `cd /tmp/p09-35-inherit && ./probe`
       - `cd /tmp/p09-36-dyncast && ./probe`
