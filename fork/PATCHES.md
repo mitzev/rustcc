@@ -2,7 +2,7 @@
 
 ## How this document is organized
 
-`fork/patches/` contains a nine-file series that applies cleanly in
+`fork/patches/` contains a ten-file series that applies cleanly in
 order against `rust-lang/rust` at commit
 `e22c616e4e87914135c1db261a03e0437255335e` (the SHA pinned in
 `fork/build.sh`). Each file is the mechanical delivery for one
@@ -19,6 +19,7 @@ semantic cluster:
 | `07-codegen.patch`                    | Codegen LLVM: vtable emission, ctor vptr-init, call lowering         |
 | `08-cargo-lock.patch`                 | `Cargo.lock` refresh                                                 |
 | `09-riscv-cxx-overlay.patch`          | RISC-V Itanium overlay (rv32 / rv64, P09.37 post-v1)                 |
+| `10-itemkind-class.patch`             | `ItemKind::Class` AST variant (P09.39, 1.01 #7)                      |
 
 The **P01 … P09.38 sections below** are the authoritative design
 record. Each documents the intent, validation probe, and any
@@ -2582,6 +2583,143 @@ target-specific ABI code) than the simple additions P01–P06 are.
 
 Shipped after the 2026-04-21 v1 milestone. These extend the
 supported target matrix without touching v1 semantics.
+
+### P09.39 — `ItemKind::Class` AST variant (1.01 #7)
+
+**Files**: 14 across rustc_ast, rustc_ast_lowering, rustc_ast_pretty,
+rustc_hir, rustc_parse, rustc_passes, rustc_resolve (+323 / −51 LOC).
+**Patch**: `fork/patches/10-itemkind-class.patch`.
+
+#### What and why
+
+P09.30 implemented the fork-only `class` keyword as a parse-time
+desugar: the parser returned `ItemKind::Struct` and parked a
+matching `ItemKind::Impl` in a `pending_injected_item` slot so
+the next `parse_item` call would surface it at module scope. That
+shape works for the compiler, but it leaves nothing in the AST
+for a rust-analyzer fork to mirror — by the time resolve sees the
+items, they're indistinguishable from a hand-written pair. RA
+would have to re-implement the desugar on its own, and editor
+hover/rename would get confused by the two synthesized items
+sharing a span.
+
+P09.39 promotes `class` to a real AST node that survives through
+name resolution and splits into two HIR items only at AST → HIR
+lowering. This is the compiler-internal enabler for 1.02's RA
+fork: once RA mirrors rustc's AST, IDE support (autocomplete,
+hover, go-to-def, rename) works with no extra duplication.
+
+No user-visible change on its own — the v1 test matrix (basic
+class, single inheritance, Swift bindings, cross-crate) stays
+identical. Internal plumbing only.
+
+#### Design — Option B1
+
+Parser emits `ItemKind::Class(Box<Class>)` where:
+
+```rust
+pub struct Class {
+    pub ident: Ident,
+    pub generics: Generics,
+    pub fields: ThinVec<FieldDef>,
+    pub methods: ThinVec<Box<AssocItem>>,
+    pub impl_id: NodeId,          // reserved for the synthetic inherent impl
+    pub self_ty: Box<Ty>,         // path to `ClassIdent<Args>`
+}
+```
+
+The `#[repr(cpp)]` attr continues to land on the enclosing Item's
+attrs at parse time; it propagates to the struct half via the
+normal `lower_item` path. `__base` for single inheritance stays
+as a first synthesized field with `#[rustc_cxx_base]` (carrying
+the same meaning P09.32's downstream layout/vtable hooks already
+recognize); no separate base pointer on `Class` is needed.
+
+**AST → HIR split**. `AstOwner` gains a `ClassImpl(&'a Item)`
+variant. The Indexer registers `item.id → Item(item)` for the
+struct half and `class.impl_id → ClassImpl(item)` for the impl
+half. `lower_node` dispatches each to its own lowering:
+
+- `Item(item)` with `item.kind == ItemKind::Class(..)` →
+  `lower_item_kind` Class arm produces `hir::ItemKind::Struct`
+- `ClassImpl(item)` → `lower_class_impl_half` produces
+  `hir::ItemKind::Impl { of_trait: None, self_ty: lowered,
+   items: methods }`, where `self_ty` is `lower_ty(class.self_ty)`
+
+`lower_item_ref` emits two `hir::ItemId`s per Class so the
+enclosing module's `item_ids` list has both halves.
+
+**Name resolution**. `resolve_class` delegates to `resolve_adt`
+— a single generic-param rib and a single self-rib cover both
+fields and methods because the class's generics are shared.
+`def_collector` creates two defs (struct at `item.id`, impl at
+`class.impl_id`) and walks methods under the impl def so assoc
+items get a proper Impl parent, matching the HIR shape.
+`build_reduced_graph_for_item` registers the struct-variant names
+and feeds visibility for both defs. `effective_visibilities`
+propagates field visibility like any struct.
+
+**NodeId allocation**. The parser seeds `impl_id: DUMMY_NODE_ID`;
+`rustc_expand::expand`'s `visit_id` replaces every DUMMY during
+expansion. The AST walker for Class visits `impl_id` via
+`visit_visitable!` so the expansion pass sees it — if it's
+missed, `ast_lowering::index_crate` panics looking up a dummy
+DefId.
+
+**Miscellaneous match-site arms**: `rustc_passes::lang_items`
+classifies Class methods as `MethodKind::Inherent` (matches the
+lowered HIR). `rustc_passes::input_stats` tracks Class in its
+variant-count list. `rustc_hir::Target::from_ast_item` maps Class
+to `Target::Struct` for attribute-validation purposes.
+`rustc_ast_pretty` gets a new print arm that emits `class Ident
+{ fields; methods }`.
+
+#### What P09.39 removes
+
+- `Parser::pending_injected_item` field (Parser's static size
+  returns to 288).
+- `parse_item`'s pending-item early-return path.
+- `parse_cxx_class_item`'s hand-constructed `Item { kind:
+  ItemKind::Impl(...) }` block. The self-type `Ty` it used to
+  build is still constructed, but now lives inside the `Class`
+  variant instead of being stashed in a synthetic Item.
+
+#### Validation
+
+- `./x.py build --stage 1 library` → green (both compiler and
+  library rebuild clean after every iteration of the
+  restructuring).
+- Workspace: `cargo test --workspace` → **235/0**, matching the
+  v1 baseline. No regression in cxx_class!, cxx_class_native!,
+  swift_value!, or any codegen / mangling test.
+- `/tmp/p09-39-itemkind-class/` end-to-end probe:
+  - Basic class with fields + methods: `Widget::new(3, 4).sum()`
+    → 7.
+  - Single inheritance via `class Derived : Base { ... }`:
+    `Derived::new(10, 5).sum()` → 15 (cross-field access
+    `self.__base.get_x() + self.y` works; the P09.32 base-layout
+    path is unaffected by AST-level restructuring because the
+    `#[rustc_cxx_base]` field marker still appears in the lowered
+    HIR struct).
+
+#### Takeaway for memory
+
+The paper-read estimate was 500–1000 LOC; actual was ~320 LOC.
+The "probe before estimating" rule saved scope again — but also
+validated that this one genuinely is on the larger end of 1.01
+work. The non-trivial part was the `AstOwner::ClassImpl` split
+and getting DefId flow right (two defs per Class means every
+resolve pass needs to feed visibility / walk the impl def
+explicitly). Straight-line application of existing patterns
+(resolve_adt, lower_item_kind Struct arm, impl_walkable!) covered
+most of the surface.
+
+The 1.02 RA fork now has a stable AST target to mirror. The rust-
+analyzer parser will produce `ItemKind::Class` on its side; hover
+/ rename / go-to-def query handlers see the same shape rustc's
+resolve does.
+
+---
 
 ### P09.38 — Raspberry Pi Pico / ARMv6-M (Cortex-M0+) coverage
 

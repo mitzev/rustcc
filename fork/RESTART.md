@@ -1,9 +1,10 @@
-# rustcc — session restart (v1 + P09.37 RISC-V + P09.38 Pico)
+# rustcc — session restart (v1 + P09.37 RISC-V + P09.38 Pico + P09.39 ItemKind::Class)
 
-Last updated: **2026-04-22**, Opus 4.7 (1M ctx). **rustcc v1
-milestone complete; P09.37 adds RISC-V ESP32 / bare-metal rv32;
+Last updated: **2026-04-24**, Opus 4.7 (1M ctx). **rustcc v1
+milestone complete. P09.37 adds RISC-V ESP32 / bare-metal rv32;
 P09.38 extends ARM Cortex-M coverage to ARMv6-M (Raspberry Pi
-Pico / RP2040).**
+Pico / RP2040); P09.39 ships 1.01 #7 — `ItemKind::Class` AST
+variant, enabler for the 1.02 rust-analyzer fork.**
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
 
@@ -26,7 +27,54 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## Latest addition (P09.38, 2026-04-22, documentation-only)
+## Latest addition (P09.39, 2026-04-24)
+
+**1.01 #7 shipped: `ItemKind::Class` AST variant.** The fork-only
+`class` keyword is now a first-class AST node that survives
+through name resolution and splits into `hir::ItemKind::Struct`
++ `hir::ItemKind::Impl` at AST → HIR lowering. Enables the 1.02
+rust-analyzer fork to mirror rustc's AST instead of re-doing the
+P09.30 parse-time desugar.
+
+**Design (Option B1)**: parser emits `ItemKind::Class(Box<Class
+{ ident, generics, fields, methods, impl_id, self_ty }>)`.
+`AstOwner` grows a `ClassImpl` variant so both halves get
+independent `lower_node` dispatch. `lower_class_impl_half`
+produces the inherent impl using `lower_ty(class.self_ty)` for
+the self type. Name resolution reuses `resolve_adt` (class's
+generics are shared between fields and methods, so one rib
+suffices). `def_collector` creates two DefIds per class (struct
+at `item.id`, impl at `class.impl_id`).
+
+**Patch**: `fork/patches/10-itemkind-class.patch` (+323 / −51
+across 14 files; series is now 10 patches).
+
+**Scope calibration**: paper estimate 500–1000 LOC, actual ~320
+LOC. Still genuinely on the larger end of 1.01 work — the
+non-trivial part was the two-DefId plumbing through def_collector,
+build_reduced_graph, effective_visibilities, and ast_lowering.
+"Probe before estimating" again useful.
+
+**Validation**:
+- stage-1 rustc builds clean in ~2 min (after the NodeId-assign
+  bugfix — see below).
+- `cargo test --workspace` → 235/0 (no regression from v1).
+- `/tmp/p09-39-itemkind-class/`: basic class `Widget::sum() == 7`
+  and single-inheritance `Derived::sum() == 15` both pass.
+
+**Bugs hit during development (memory-worthy)**:
+- `impl_id: DUMMY_NODE_ID` from parser must be walked through
+  `visit_visitable!` so `rustc_expand::expand`'s `visit_id`
+  replaces it with a real NodeId; forgetting to walk it panics
+  in `ast_lowering::index_crate` with "must have def_id".
+- Synthetic impl DefIds need explicit `feed_visibility` calls in
+  `build_reduced_graph_for_item`; otherwise `tcx.visibility(impl_did)`
+  bugs out with "not supported for this key".
+- `rustc_passes::lang_items::visit_assoc_item` matches on the
+  parent item's kind to determine `MethodKind`; needs a Class
+  arm (→ `MethodKind::Inherent`).
+
+## Prior addition (P09.38, 2026-04-22, documentation-only)
 
 **Raspberry Pi Pico / ARMv6-M coverage.** Probe on
 `thumbv6m-none-eabi` (RP2040 Cortex-M0+) yields identical
@@ -124,30 +172,46 @@ doesn't override. Override + multi-inheritance are v2.
 Validation: `/tmp/p09-35-inherit/` and `/tmp/p09-36-dyncast/`
 both pass end-to-end.
 
-## v2 backlog
+## Release-track backlog (1.01 / 1.02 / 1.1)
 
-See `project_queue_state.md` memory. Headlines:
+See `project_queue_state.md` memory. Post-P09.39 status:
 
-1. Virtual method override (medium).
-2. Multi-inheritance / virtual bases (very large, weeks).
-3. Compiler auto-synthesis for `#[repr(swift)]` (large).
-4. Non-POD extra fields in class-backed Swift bindings (small).
-5. Const generics on class header (small-medium).
-6. Distinct `ItemKind::Class` AST variant (very large, for
-   editor tools).
-7. Windows MSVC ABI (out of scope).
+**1.01 — polish + small extensions (remaining after #7 shipped)**:
+1. Const generics on class header (small-medium).
+2. Multi-field Swift bindings with non-POD extras (small-medium).
+3. `rustc_cxx_*` attr-plumbing unification (small).
+4. `/tmp/p09-*` probes → in-tree test crate (small).
+5. Three-surface doc (small).
+6. Additional target probes on demand (trivial each).
+7. ~~Parser-level distinct `ItemKind::Class` AST variant~~ —
+   **shipped as P09.39, 2026-04-24**.
+
+**1.02 — user-visible class-keyword IDE support**:
+1. rust-analyzer fork for `class` (weeks). Now unblocked: RA
+   mirrors the `ItemKind::Class` shape from P09.39.
+2. True compiler auto-synthesis for `#[repr(swift)]` (large).
+
+**1.1 — multi-inheritance capstone**:
+1. Multi-inheritance + virtual bases (very large).
+
+Out of scope: Windows MSVC ABI.
 
 ## Morning review checklist
 
-- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.38 +
+- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.39 +
       the "rustcc v1 milestone" marker after P09.32 +
-      the "Post-v1 target extensions" section containing P09.37
-      and P09.38.
+      the "Post-v1 target extensions" section containing P09.37,
+      P09.38, and P09.39.
 - [ ] Read the rewritten `fork/getting-started.html` as a
       GitHub project intro (now lists ESP32-C3 / RISC-V alongside
       STM32 / ARM Cortex-M).
-- [ ] Diff `fork/patches/09-riscv-cxx-overlay.patch`.
+- [ ] Diff `fork/patches/09-riscv-cxx-overlay.patch` and
+      `fork/patches/10-itemkind-class.patch`.
 - [ ] `cargo test --workspace` → 235/0.
+- [ ] Verify P09.39 probe:
+      `cd /tmp/p09-39-itemkind-class && RUSTC=<rust-lang-rust>/build/host/stage1/bin/rustc \`
+      `RUSTC_BOOTSTRAP=1 cargo +nightly build && ./target/debug/p09_39_probe`
+      (→ "ok: inheritance sum = 15")
 - [ ] Verify v1 capstones:
       - `cd /tmp/p09-35-inherit && ./probe`
       - `cd /tmp/p09-36-dyncast && ./probe`

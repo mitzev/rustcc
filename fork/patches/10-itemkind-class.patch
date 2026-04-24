@@ -1,0 +1,757 @@
+From e5c8a8dc0c2837b9f272cda8132644918f369b4d Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Fri, 24 Apr 2026 20:57:37 +0300
+Subject: [PATCH] P09.39: ItemKind::Class AST variant (1.01 #7)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Promotes the fork-only `class` keyword from parse-time desugar
+(P09.30) to a first-class AST variant that survives through name
+resolution and lowers at AST → HIR with proper DefId separation.
+
+This is the compiler-internal enabler for 1.02's rust-analyzer
+fork: RA's parser can mirror rustc's AST shape instead of
+duplicating the desugaring logic. No user-visible change on its
+own — v1 probes (basic class, single inheritance, Swift bindings)
+all still run green.
+
+Design (Option B1): parser emits `ItemKind::Class(Box<Class>)`
+carrying ident, generics, fields, methods, impl_id (NodeId
+reserved for the synthetic inherent impl), and self_ty (an AST
+path to ClassIdent<Args> used as the impl's self type). The
+`#[repr(cpp)]` attr still lands on the enclosing Item's attrs
+at parse time; it propagates to the struct half via normal
+`lower_item` attribute plumbing.
+
+AST → HIR: `AstOwner` gains a `ClassImpl` variant so the impl
+half gets its own `lower_node` dispatch. `lower_item_ref`
+emits two ItemIds per Class. `lower_item_kind` Class arm
+produces the struct half. `lower_class_impl_half` produces the
+inherent impl half, using `lower_ty` on the parser-built
+`self_ty` to get a correctly resolved self type.
+
+Name resolution: `resolve_class` delegates to `resolve_adt` —
+one generic-param rib and one self-rib cover both fields and
+methods because the class's generics are shared.
+`def_collector` creates two defs per class (struct at
+`item.id`, impl at `class.impl_id`) and walks methods under
+the impl def so assoc items get the right parent.
+`build_reduced_graph_for_item` registers the struct-variant
+names and feeds visibility for both defs.
+
+Miscellaneous:
+- rustc_passes/lang_items: Class methods classify as
+  MethodKind::Inherent (matches HIR shape post-lowering)
+- rustc_passes/input_stats: Class added to variant list
+- rustc_hir/target: Target::Struct for Class at AST level
+- rustc_ast_pretty: new arm prints class with fields + methods
+- visit.rs: walks impl_id through visit_visitable! so
+  `rustc_expand::expand`'s `visit_id` replaces the parser's
+  DUMMY_NODE_ID with a fresh NodeId
+
+Removed from P09.30:
+- Parser::pending_injected_item field (Parser size back to 288)
+- parse_item's pending-item return path
+- parse_cxx_class_item's hand-built Impl Item construction
+
+Validation: stage-1 rustc builds clean; rustcc workspace
+`cargo test --workspace` = 235/0; /tmp/p09-39-itemkind-class
+probe covers basic class + single inheritance with
+`Derived::sum() == 15`.
+---
+ compiler/rustc_ast/src/ast.rs                 | 50 +++++++++-
+ compiler/rustc_ast/src/visit.rs               | 24 +++++
+ compiler/rustc_ast_lowering/src/item.rs       | 99 +++++++++++++++++++
+ compiler/rustc_ast_lowering/src/lib.rs        | 16 +++
+ .../rustc_ast_pretty/src/pprust/state/item.rs | 26 +++++
+ compiler/rustc_hir/src/target.rs              |  5 +
+ compiler/rustc_parse/src/parser/item.rs       | 52 +++-------
+ compiler/rustc_parse/src/parser/mod.rs        |  9 +-
+ compiler/rustc_passes/src/input_stats.rs      |  1 +
+ compiler/rustc_passes/src/lang_items.rs       |  9 ++
+ .../rustc_resolve/src/build_reduced_graph.rs  | 22 +++++
+ compiler/rustc_resolve/src/def_collector.rs   | 35 ++++++-
+ .../src/effective_visibilities.rs             | 10 ++
+ compiler/rustc_resolve/src/late.rs            | 16 +++
+ 14 files changed, 323 insertions(+), 51 deletions(-)
+
+diff --git a/compiler/rustc_ast/src/ast.rs b/compiler/rustc_ast/src/ast.rs
+index b2c573c2..28db4561 100644
+--- a/compiler/rustc_ast/src/ast.rs
++++ b/compiler/rustc_ast/src/ast.rs
+@@ -3696,6 +3696,7 @@ pub fn opt_generics(&self) -> Option<&Generics> {
+             ItemKind::Enum(_, generics, _)
+             | ItemKind::Struct(_, generics, _)
+             | ItemKind::Union(_, generics, _) => Some(&generics),
++            ItemKind::Class(i) => Some(&i.generics),
+             ItemKind::Trait(i) => Some(&i.generics),
+             ItemKind::Impl(i) => Some(&i.generics),
+         }
+@@ -4001,6 +4002,36 @@ pub fn span(&self) -> Span {
+     }
+ }
+ 
++/// P09.39 (1.01 #7): body of a fork-only `class` item. Survives
++/// through AST-level passes (expansion, name resolution,
++/// ast_validation) and is lowered to a `#[repr(cpp)]` struct plus
++/// an inherent `impl` block during AST → HIR lowering. See the
++/// `ItemKind::Class` docs and `rustc_ast_lowering`.
++#[derive(Clone, Encodable, Decodable, Debug)]
++pub struct Class {
++    pub ident: Ident,
++    pub generics: Generics,
++    /// Fields in declaration order. For `class Derived : Base { ... }`,
++    /// the parser synthesizes a leading `#[rustc_cxx_base] __base: Base`
++    /// field so downstream layout/vtable paths can detect the
++    /// polymorphic base by attribute — no separate base pointer on
++    /// `Class` is needed.
++    pub fields: ThinVec<FieldDef>,
++    pub methods: ThinVec<Box<AssocItem>>,
++    /// NodeId reserved for the synthetic inherent `impl` block that
++    /// AST lowering produces from this class's methods. Allocated by
++    /// the parser so def_collector / HIR lowering agree on the DefId
++    /// for the impl. The struct's NodeId is the enclosing
++    /// `Item<ItemKind>::id`.
++    pub impl_id: NodeId,
++    /// Self-type for the synthetic inherent impl: a path `ClassIdent`
++    /// or `ClassIdent<Args>` matching `generics`. Built at parse time
++    /// and lowered via `lower_ty` in ast_lowering. Storing it as a
++    /// full AST `Ty` lets name resolution wire it to the struct half
++    /// like any other type reference.
++    pub self_ty: Box<Ty>,
++}
++
+ // Adding a new variant? Please update `test_item` in `tests/ui/macros/stringify.rs`.
+ #[derive(Clone, Encodable, Decodable, Debug)]
+ pub enum ItemKind {
+@@ -4053,6 +4084,16 @@ pub enum ItemKind {
+     ///
+     /// E.g., `struct Foo<A> { x: A }`.
+     Struct(Ident, Generics, VariantData),
++    /// A fork-only `class` definition (rustcc P09.39, 1.01 #7).
++    ///
++    /// E.g., `class Widget { x: i32; fn get(&self) -> i32 { self.x } }`.
++    ///
++    /// Parser-level sugar for `#[repr(cpp)] struct` plus an inherent
++    /// `impl` block. Lowered in `rustc_ast_lowering`; code after
++    /// lowering never sees this variant. The AST variant exists so
++    /// rust-analyzer (1.02) can mirror rustc's AST instead of
++    /// duplicating the desugaring.
++    Class(Box<Class>),
+     /// A union definition (`union`).
+     ///
+     /// E.g., `union Foo<A, B> { x: A, y: B }`.
+@@ -4096,6 +4137,7 @@ pub fn ident(&self) -> Option<Ident> {
+             | ItemKind::Enum(ident, ..)
+             | ItemKind::Struct(ident, ..)
+             | ItemKind::Union(ident, ..)
++            | ItemKind::Class(box Class { ident, .. })
+             | ItemKind::Trait(box Trait { ident, .. })
+             | ItemKind::TraitAlias(box TraitAlias { ident, .. })
+             | ItemKind::MacroDef(ident, _)
+@@ -4117,8 +4159,8 @@ pub fn article(&self) -> &'static str {
+         use ItemKind::*;
+         match self {
+             Use(..) | Static(..) | Const(..) | ConstBlock(..) | Fn(..) | Mod(..)
+-            | GlobalAsm(..) | TyAlias(..) | Struct(..) | Union(..) | Trait(..) | TraitAlias(..)
+-            | MacroDef(..) | Delegation(..) | DelegationMac(..) => "a",
++            | GlobalAsm(..) | TyAlias(..) | Struct(..) | Class(..) | Union(..) | Trait(..)
++            | TraitAlias(..) | MacroDef(..) | Delegation(..) | DelegationMac(..) => "a",
+             ExternCrate(..) | ForeignMod(..) | MacCall(..) | Enum(..) | Impl { .. } => "an",
+         }
+     }
+@@ -4137,6 +4179,7 @@ pub fn descr(&self) -> &'static str {
+             ItemKind::TyAlias(..) => "type alias",
+             ItemKind::Enum(..) => "enum",
+             ItemKind::Struct(..) => "struct",
++            ItemKind::Class(..) => "class",
+             ItemKind::Union(..) => "union",
+             ItemKind::Trait(..) => "trait",
+             ItemKind::TraitAlias(..) => "trait alias",
+@@ -4158,7 +4201,8 @@ pub fn generics(&self) -> Option<&Generics> {
+             | Self::Union(_, generics, _)
+             | Self::Trait(box Trait { generics, .. })
+             | Self::TraitAlias(box TraitAlias { generics, .. })
+-            | Self::Impl(Impl { generics, .. }) => Some(generics),
++            | Self::Impl(Impl { generics, .. })
++            | Self::Class(box Class { generics, .. }) => Some(generics),
+ 
+             Self::ExternCrate(..)
+             | Self::Use(..)
+diff --git a/compiler/rustc_ast/src/visit.rs b/compiler/rustc_ast/src/visit.rs
+index ee4b1d13..b435870d 100644
+--- a/compiler/rustc_ast/src/visit.rs
++++ b/compiler/rustc_ast/src/visit.rs
+@@ -445,6 +445,7 @@ pub fn ctxt(&self) -> Option<FnCtxt> {
+             GenericParamKind,
+             Guard,
+             Impl,
++            Class,
+             ImplPolarity,
+             Inline,
+             InlineAsmOperand,
+@@ -847,6 +848,8 @@ fn walk<$($lt,)? V: $Visitor$(<$lt>)?>(
+                     ItemKind::Struct(ident, generics, variant_data)
+                     | ItemKind::Union(ident, generics, variant_data) =>
+                         visit_visitable!($($mut)? vis, ident, generics, variant_data),
++                    ItemKind::Class(class) =>
++                        visit_visitable!($($mut)? vis, class),
+                     ItemKind::Impl(impl_) =>
+                         visit_visitable!($($mut)? vis, impl_),
+                     ItemKind::Trait(trait_) =>
+@@ -958,6 +961,27 @@ pub fn walk_fn<$($lt,)? V: $Visitor$(<$lt>)?>(vis: &mut V, kind: FnKind<$($lt)?
+             V::Result::output()
+         });
+ 
++        // P09.39: `Class` walks like a struct body plus an inherent
++        // impl body — fields are visited as struct fields (via
++        // `visit_field_def`), methods are visited as assoc items
++        // with `AssocCtxt::Impl { of_trait: false }` context so
++        // resolve/expand treat them identically to methods inside
++        // a normal `impl Name { ... }` block.
++        impl_walkable!(|&$($mut)? $($lt)? self: Class, vis: &mut V| {
++            // Walk `impl_id` through `visit_visitable!` so the
++            // MutVisitor in `rustc_expand::expand` replaces the
++            // parser's `DUMMY_NODE_ID` with a fresh `NodeId`. If
++            // it's left as dummy, `ast_lowering::index_crate`
++            // panics when trying to look up the impl half's DefId.
++            let Class { ident, generics, fields, methods, impl_id, self_ty } = self;
++            visit_visitable!($($mut)? vis, impl_id);
++            visit_visitable!($($mut)? vis, ident, generics);
++            visit_visitable!($($mut)? vis, fields);
++            try_visit!(vis.visit_ty(self_ty));
++            visit_visitable_with!($($mut)? vis, methods, AssocCtxt::Impl { of_trait: false });
++            V::Result::output()
++        });
++
+         // Special case to call `visit_method_receiver_expr`.
+         impl_walkable!(|&$($mut)? $($lt)? self: MethodCall, vis: &mut V| {
+             let MethodCall { seg, receiver, args, span } = self;
+diff --git a/compiler/rustc_ast_lowering/src/item.rs b/compiler/rustc_ast_lowering/src/item.rs
+index 239daecd..c74eb358 100644
+--- a/compiler/rustc_ast_lowering/src/item.rs
++++ b/compiler/rustc_ast_lowering/src/item.rs
+@@ -117,6 +117,19 @@ pub(super) fn lower_node(&mut self, def_id: LocalDefId) {
+                 AstOwner::ForeignItem(item) => self.with_lctx(item.id, |lctx| {
+                     hir::OwnerNode::ForeignItem(lctx.lower_foreign_item(item))
+                 }),
++                // P09.39: the synthetic inherent impl half of a
++                // `class` item. `item.kind` is guaranteed to be
++                // `ItemKind::Class`; the struct half was lowered via
++                // the `AstOwner::Item(item)` branch above under
++                // `item.id`, and this branch handles `class.impl_id`.
++                AstOwner::ClassImpl(item) => {
++                    let ast::ItemKind::Class(class) = &item.kind else {
++                        unreachable!("AstOwner::ClassImpl wraps a non-class item");
++                    };
++                    self.with_lctx(class.impl_id, |lctx| {
++                        hir::OwnerNode::Item(lctx.lower_class_impl_half(item, class))
++                    })
++                }
+             }
+         }
+     }
+@@ -142,6 +155,13 @@ pub(super) fn lower_mod(
+         if let ItemKind::Use(use_tree) = &i.kind {
+             self.lower_item_id_use_tree(use_tree, &mut node_ids);
+         }
++        // P09.39: `class` items materialize a second HIR item — the
++        // synthetic inherent impl holding the methods. Emit its
++        // `ItemId` here so it participates in the enclosing module's
++        // `item_ids` list.
++        if let ItemKind::Class(class) = &i.kind {
++            node_ids.push(hir::ItemId { owner_id: self.owner_id(class.impl_id) });
++        }
+         node_ids
+     }
+ 
+@@ -240,6 +260,7 @@ fn generate_extra_attrs_for_item_kind(
+             | ItemKind::TyAlias(..)
+             | ItemKind::Enum(..)
+             | ItemKind::Struct(..)
++            | ItemKind::Class(..)
+             | ItemKind::Union(..)
+             | ItemKind::Trait(..)
+             | ItemKind::TraitAlias(..)
+@@ -251,6 +272,64 @@ fn generate_extra_attrs_for_item_kind(
+         }
+     }
+ 
++    /// P09.39: lower the synthetic inherent `impl` half of a `class`
++    /// item. The struct half is produced via the normal `lower_item`
++    /// → `lower_item_kind` path under `item.id`; this function runs
++    /// under `class.impl_id` and emits `hir::ItemKind::Impl` with
++    /// `self_ty` lowered from the parser-built `class.self_ty`.
++    pub(super) fn lower_class_impl_half(
++        &mut self,
++        i: &Item,
++        class: &ast::Class,
++    ) -> &'hir hir::Item<'hir> {
++        let vis_span = self.lower_span(i.vis.span);
++        let hir_id = hir::HirId::make_owner(self.current_hir_id_owner.def_id);
++        // The impl half carries no user-written attributes;
++        // `#[repr(cpp)]` and other class-level attrs belong on the
++        // struct half.
++        let _ = self.lower_attrs_with_extra(
++            hir_id,
++            &[],
++            i.span,
++            Target::Impl { of_trait: false },
++            &[],
++        );
++
++        let impl_span = self.lower_span(i.span);
++        let (generics, (self_ty, items)) = self.lower_generics(
++            &class.generics,
++            class.impl_id,
++            ImplTraitContext::Universal,
++            |this| {
++                let self_ty = this.lower_ty_alloc(
++                    &class.self_ty,
++                    ImplTraitContext::Disallowed(ImplTraitPosition::ImplSelf),
++                );
++                let items = this.arena.alloc_from_iter(
++                    class.methods.iter().map(|m| this.lower_impl_item_ref(m)),
++                );
++                (self_ty, items)
++            },
++        );
++
++        let kind = hir::ItemKind::Impl(hir::Impl {
++            generics,
++            of_trait: None,
++            self_ty,
++            items,
++            constness: hir::Constness::NotConst,
++        });
++        let item = hir::Item {
++            owner_id: hir_id.expect_owner(),
++            kind,
++            vis_span,
++            span: impl_span,
++            has_delayed_lints: !self.delayed_lints.is_empty(),
++            eii: false,
++        };
++        self.arena.alloc(item)
++    }
++
+     fn lower_item(&mut self, i: &Item) -> &'hir hir::Item<'hir> {
+         let vis_span = self.lower_span(i.vis.span);
+         let hir_id = hir::HirId::make_owner(self.current_hir_id_owner.def_id);
+@@ -483,6 +562,26 @@ fn lower_item_kind(
+                 );
+                 hir::ItemKind::Struct(ident, generics, struct_def)
+             }
++            ItemKind::Class(box ast::Class { ident, generics, fields, methods: _, impl_id: _, self_ty: _ }) => {
++                // P09.39: AST-level `class` lowers to two HIR items.
++                // This branch produces the struct half; the inherent
++                // impl half is produced by `lower_class_impl_half`,
++                // dispatched from `lower_node` via
++                // `AstOwner::ClassImpl`.
++                let ident = self.lower_ident(*ident);
++                let (generics, hir_vdata) = self.lower_generics(
++                    generics,
++                    id,
++                    ImplTraitContext::Disallowed(ImplTraitPosition::Generic),
++                    |this| {
++                        let hir_fields = this.arena.alloc_from_iter(
++                            fields.iter().enumerate().map(|f| this.lower_field_def(f)),
++                        );
++                        hir::VariantData::Struct { fields: hir_fields, recovered: ast::Recovered::No }
++                    },
++                );
++                hir::ItemKind::Struct(ident, generics, hir_vdata)
++            }
+             ItemKind::Union(ident, generics, vdata) => {
+                 let ident = self.lower_ident(*ident);
+                 let (generics, vdata) = self.lower_generics(
+diff --git a/compiler/rustc_ast_lowering/src/lib.rs b/compiler/rustc_ast_lowering/src/lib.rs
+index 2ffb9c12..494d3fba 100644
+--- a/compiler/rustc_ast_lowering/src/lib.rs
++++ b/compiler/rustc_ast_lowering/src/lib.rs
+@@ -537,6 +537,12 @@ enum AstOwner<'a> {
+     Item(&'a ast::Item),
+     AssocItem(&'a ast::AssocItem, visit::AssocCtxt),
+     ForeignItem(&'a ast::ForeignItem),
++    /// P09.39 (1.01 #7): the synthetic inherent `impl` half of a
++    /// fork-only `class` item. The enclosing Class AST item is
++    /// what holds the methods; the `LocalDefId` keyed against this
++    /// variant is `class.impl_id`'s. AST lowering dispatches to
++    /// `lower_class_impl_half` for this variant.
++    ClassImpl(&'a ast::Item),
+ }
+ 
+ #[derive(Copy, Clone, Debug)]
+@@ -576,6 +582,16 @@ fn visit_attribute(&mut self, _: &'a Attribute) {
+         fn visit_item(&mut self, item: &'a ast::Item) {
+             let def_id = self.resolver.local_def_id(item.id);
+             *self.index.ensure_contains_elem(def_id, || AstOwner::NonOwner) = AstOwner::Item(item);
++            // P09.39: `class` items produce two DefIds — the struct
++            // half uses `item.id` (indexed just above as
++            // `AstOwner::Item`) and the synthetic inherent impl
++            // uses `class.impl_id`. Register the impl half so
++            // `lower_node` can lower it independently.
++            if let ast::ItemKind::Class(class) = &item.kind {
++                let impl_def_id = self.resolver.local_def_id(class.impl_id);
++                *self.index.ensure_contains_elem(impl_def_id, || AstOwner::NonOwner) =
++                    AstOwner::ClassImpl(item);
++            }
+             visit::walk_item(self, item)
+         }
+ 
+diff --git a/compiler/rustc_ast_pretty/src/pprust/state/item.rs b/compiler/rustc_ast_pretty/src/pprust/state/item.rs
+index cb9bbf01..ce158389 100644
+--- a/compiler/rustc_ast_pretty/src/pprust/state/item.rs
++++ b/compiler/rustc_ast_pretty/src/pprust/state/item.rs
+@@ -321,6 +321,32 @@ pub(crate) fn print_item(&mut self, item: &ast::Item) {
+                 let (cb, ib) = self.head(visibility_qualified(&item.vis, "struct"));
+                 self.print_struct(struct_def, generics, *ident, item.span, true, cb, ib);
+             }
++            ast::ItemKind::Class(box ast::Class { ident, generics, fields, methods, impl_id: _, self_ty: _ }) => {
++                let (cb, ib) = self.head(visibility_qualified(&item.vis, "class"));
++                self.print_ident(*ident);
++                self.print_generic_params(&generics.params);
++                self.print_where_clause(&generics.where_clause);
++                self.space();
++                self.bopen(ib);
++                for field in fields.iter() {
++                    self.hardbreak_if_not_bol();
++                    self.maybe_print_comment(field.span.lo());
++                    self.print_outer_attributes(&field.attrs);
++                    self.print_visibility(&field.vis);
++                    if let Some(ident) = field.ident {
++                        self.print_ident(ident);
++                        self.word_nbsp(":");
++                    }
++                    self.print_type(&field.ty);
++                    self.word(";");
++                }
++                for method in methods.iter() {
++                    self.hardbreak_if_not_bol();
++                    self.print_assoc_item(method);
++                }
++                let empty = fields.is_empty() && methods.is_empty();
++                self.bclose(item.span, empty, cb);
++            }
+             ast::ItemKind::Union(ident, generics, struct_def) => {
+                 let (cb, ib) = self.head(visibility_qualified(&item.vis, "union"));
+                 self.print_struct(struct_def, generics, *ident, item.span, true, cb, ib);
+diff --git a/compiler/rustc_hir/src/target.rs b/compiler/rustc_hir/src/target.rs
+index 07c33eb9..4b63f314 100644
+--- a/compiler/rustc_hir/src/target.rs
++++ b/compiler/rustc_hir/src/target.rs
+@@ -175,6 +175,11 @@ pub fn from_ast_item(item: &ast::Item) -> Target {
+             ast::ItemKind::TyAlias(..) => Target::TyAlias,
+             ast::ItemKind::Enum(..) => Target::Enum,
+             ast::ItemKind::Struct(..) => Target::Struct,
++            // P09.39: `class` items behave like structs at the
++            // attribute-validation level; the HIR Struct lowering
++            // runs in `rustc_ast_lowering` and target tables there
++            // see the lowered item.
++            ast::ItemKind::Class(..) => Target::Struct,
+             ast::ItemKind::Union(..) => Target::Union,
+             ast::ItemKind::Trait(..) => Target::Trait,
+             ast::ItemKind::TraitAlias(..) => Target::TraitAlias,
+diff --git a/compiler/rustc_parse/src/parser/item.rs b/compiler/rustc_parse/src/parser/item.rs
+index 6742a103..fddfdde7 100644
+--- a/compiler/rustc_parse/src/parser/item.rs
++++ b/compiler/rustc_parse/src/parser/item.rs
+@@ -126,13 +126,6 @@ pub fn parse_item(
+         force_collect: ForceCollect,
+         allow_const_block_items: AllowConstBlockItems,
+     ) -> PResult<'a, Option<Box<Item>>> {
+-        // P09.30: if a previous call parsed a `class` item, the
+-        // synthesized inherent `impl` was stashed here. Return it
+-        // now so the surrounding loop (usually in `parse_mod`)
+-        // sees both the struct and the impl at module scope.
+-        if let Some(pending) = self.pending_injected_item.take() {
+-            return Ok(Some(pending));
+-        }
+         let fn_parse_mode =
+             FnParseMode { req_name: |_, _| true, context: FnContext::Free, req_body: true };
+         self.parse_item_(fn_parse_mode, force_collect, allow_const_block_items)
+@@ -2250,9 +2243,9 @@ fn parse_cxx_class_item(
+         }
+         self.expect(exp!(CloseBrace))?;
+ 
+-        // Prepend `#[repr(cpp)]` to the struct's outer attrs so
+-        // the Itanium ABI overlay fires on this ADT. The span
+-        // is the `class` keyword for diagnostic anchoring.
++        // Prepend `#[repr(cpp)]` to the outer attrs of the Class
++        // item; `ast_lowering` propagates these onto the struct
++        // half, where the Itanium ABI overlay picks them up.
+         let repr_attr = rustc_ast::attr::mk_attr_nested_word(
+             &self.psess.attr_id_generator,
+             ast::AttrStyle::Outer,
+@@ -2263,13 +2256,10 @@ fn parse_cxx_class_item(
+         );
+         struct_attrs.push(repr_attr);
+ 
+-        // Build the inherent `impl Ident<args?> { methods }`. If
+-        // the class has generic parameters (lifetimes, types,
+-        // consts), the self-type path must reference each one as
+-        // an argument so the impl reads `impl<T> Pair<T> { ... }`
+-        // rather than `impl<T> Pair { ... }` (which would leave
+-        // `Pair` under-applied).
+-        let impl_span = lo.to(self.prev_token.span);
++        // Build `Ident` or `Ident<Args>` as the self-type for the
++        // synthetic inherent impl. `ast_lowering::lower_ty` walks
++        // this path, which resolves to the struct half via name
++        // resolution like any other type reference.
+         let self_path = Self::build_cxx_class_self_path(ident, &generics);
+         let self_ty = Box::new(Ty {
+             id: DUMMY_NODE_ID,
+@@ -2277,31 +2267,15 @@ fn parse_cxx_class_item(
+             span: ident.span,
+             tokens: None,
+         });
+-        let impl_item = Box::new(Item {
+-            attrs: AttrVec::new(),
+-            id: DUMMY_NODE_ID,
+-            span: impl_span,
+-            vis: Visibility {
+-                kind: VisibilityKind::Inherited,
+-                span: ident.span.shrink_to_lo(),
+-                tokens: None,
+-            },
+-            kind: ItemKind::Impl(Impl {
+-                generics: generics.clone(),
+-                constness: Const::No,
+-                of_trait: None,
+-                self_ty,
+-                items: methods,
+-            }),
+-            tokens: None,
+-        });
+-        self.pending_injected_item = Some(impl_item);
+ 
+-        Ok(ItemKind::Struct(
++        Ok(ItemKind::Class(Box::new(ast::Class {
+             ident,
+             generics,
+-            VariantData::Struct { fields, recovered: Recovered::No },
+-        ))
++            fields,
++            methods,
++            impl_id: DUMMY_NODE_ID,
++            self_ty,
++        })))
+     }
+ 
+     fn parse_item_union(&mut self) -> PResult<'a, ItemKind> {
+diff --git a/compiler/rustc_parse/src/parser/mod.rs b/compiler/rustc_parse/src/parser/mod.rs
+index 46ec68d4..8c1c3c70 100644
+--- a/compiler/rustc_parse/src/parser/mod.rs
++++ b/compiler/rustc_parse/src/parser/mod.rs
+@@ -240,20 +240,13 @@ pub struct Parser<'a> {
+     in_fn_body: bool = false,
+     /// Whether we have detected a missing semicolon in function body.
+     pub fn_body_missing_semi_guar: Option<ErrorGuaranteed> = None,
+-    /// P09.30: when parsing a `class` item (fork-only sugar), the
+-    /// parser builds two items — the `#[repr(cpp)]` struct and an
+-    /// inherent `impl` block holding the methods. `parse_item_kind`
+-    /// returns the struct's `ItemKind`; the impl is pre-built and
+-    /// parked here so the next call to `parse_item` returns it
+-    /// verbatim without re-entering `parse_item_kind`.
+-    pending_injected_item: Option<Box<ast::Item>> = None,
+ }
+ 
+ // This type is used a lot, e.g. it's cloned when matching many declarative macro rules with
+ // nonterminals. Make sure it doesn't unintentionally get bigger. We only check a few arches
+ // though, because `TokenTypeSet(u128)` alignment varies on others, changing the total size.
+ #[cfg(all(target_pointer_width = "64", any(target_arch = "aarch64", target_arch = "x86_64")))]
+-rustc_data_structures::static_assert_size!(Parser<'_>, 304);
++rustc_data_structures::static_assert_size!(Parser<'_>, 288);
+ 
+ /// Stores span information about a closure.
+ #[derive(Clone, Debug)]
+diff --git a/compiler/rustc_passes/src/input_stats.rs b/compiler/rustc_passes/src/input_stats.rs
+index e424cc09..5db24ca9 100644
+--- a/compiler/rustc_passes/src/input_stats.rs
++++ b/compiler/rustc_passes/src/input_stats.rs
+@@ -581,6 +581,7 @@ fn visit_item(&mut self, i: &'v ast::Item) {
+                 TyAlias,
+                 Enum,
+                 Struct,
++                Class,
+                 Union,
+                 Trait,
+                 TraitAlias,
+diff --git a/compiler/rustc_passes/src/lang_items.rs b/compiler/rustc_passes/src/lang_items.rs
+index b6fb9937..c48a37b7 100644
+--- a/compiler/rustc_passes/src/lang_items.rs
++++ b/compiler/rustc_passes/src/lang_items.rs
+@@ -283,6 +283,10 @@ fn visit_item(&mut self, i: &'ast ast::Item) {
+             ast::ItemKind::TyAlias(_) => Target::TyAlias,
+             ast::ItemKind::Enum(..) => Target::Enum,
+             ast::ItemKind::Struct(..) => Target::Struct,
++            // P09.39: `class` reports as Struct for lang-item
++            // eligibility; the lowered struct half is the actual
++            // item that later passes will interrogate.
++            ast::ItemKind::Class(..) => Target::Struct,
+             ast::ItemKind::Union(..) => Target::Union,
+             ast::ItemKind::Trait(_) => Target::Trait,
+             ast::ItemKind::TraitAlias(..) => Target::TraitAlias,
+@@ -334,6 +338,11 @@ fn visit_assoc_item(&mut self, i: &'ast ast::AssocItem, ctxt: visit::AssocCtxt)
+                             }
+                         }
+                         ast::ItemKind::Trait(_) => Target::Method(MethodKind::Trait { body }),
++                        // P09.39: methods inside a `class` body are
++                        // inherent methods — they lower to a
++                        // hir::Impl { of_trait: None } so the
++                        // lang-item classification matches.
++                        ast::ItemKind::Class(_) => Target::Method(MethodKind::Inherent),
+                         _ => unreachable!(),
+                     },
+                     generics,
+diff --git a/compiler/rustc_resolve/src/build_reduced_graph.rs b/compiler/rustc_resolve/src/build_reduced_graph.rs
+index 237f69eb..b345f862 100644
+--- a/compiler/rustc_resolve/src/build_reduced_graph.rs
++++ b/compiler/rustc_resolve/src/build_reduced_graph.rs
+@@ -972,6 +972,28 @@ fn build_reduced_graph_for_item(&mut self, item: &'a Item) {
+                 );
+             }
+ 
++            // P09.39: register the class's type-namespace name like
++            // a struct. Methods live under the synthetic inherent
++            // impl (no namespace entry for the impl itself) and are
++            // reached via method resolution after HIR lowering.
++            ItemKind::Class(ref class) => {
++                self.build_reduced_graph_for_struct_variant(
++                    &class.fields,
++                    class.ident,
++                    feed,
++                    res,
++                    vis,
++                    sp,
++                );
++                self.r.struct_generics.insert(local_def_id, class.generics.clone());
++                // Feed visibility for the synthetic inherent impl.
++                // The impl is unnamed — like any inherent impl — and
++                // carries the class's own visibility for privacy
++                // checks on method access.
++                let impl_feed = self.r.feed(class.impl_id);
++                self.r.feed_visibility(impl_feed, vis);
++            }
++
+             // These items do not add names to modules.
+             ItemKind::Impl { .. }
+             | ItemKind::ForeignMod(..)
+diff --git a/compiler/rustc_resolve/src/def_collector.rs b/compiler/rustc_resolve/src/def_collector.rs
+index 78dcb062..7634ba03 100644
+--- a/compiler/rustc_resolve/src/def_collector.rs
++++ b/compiler/rustc_resolve/src/def_collector.rs
+@@ -1,6 +1,6 @@
+ use std::mem;
+ 
+-use rustc_ast::visit::FnKind;
++use rustc_ast::visit::{AssocCtxt, FnKind};
+ use rustc_ast::*;
+ use rustc_attr_parsing::{AttributeParser, Early, OmitDoc, ShouldEmit};
+ use rustc_expand::expand::AstFragment;
+@@ -123,6 +123,14 @@ fn visit_item(&mut self, i: &'a Item) {
+             ItemKind::TraitAlias(..) => DefKind::TraitAlias,
+             ItemKind::Enum(..) => DefKind::Enum,
+             ItemKind::Struct(..) => DefKind::Struct,
++            // P09.39: primary def for `class Foo { ... }` is the
++            // struct — the identifier resolves to a type like any
++            // other. A second def for the synthetic inherent impl
++            // (carrying the methods) is created below in the
++            // `with_parent` block so methods get a proper Impl
++            // parent at HIR time, matching how normal `impl Foo`
++            // blocks are structured.
++            ItemKind::Class(..) => DefKind::Struct,
+             ItemKind::Union(..) => DefKind::Union,
+             ItemKind::ExternCrate(..) => DefKind::ExternCrate,
+             ItemKind::TyAlias(..) => DefKind::TyAlias,
+@@ -201,6 +209,31 @@ fn visit_item(&mut self, i: &'a Item) {
+                     }
+                     _ => {}
+                 }
++                // P09.39: for `class` items, synthesize a def for
++                // the inherent impl that `ast_lowering` will emit,
++                // and walk the methods with that impl as their
++                // parent so their DefIds land under the impl def
++                // (matching the def-graph shape of a hand-written
++                // `impl Class { ... }`).
++                if let ItemKind::Class(class) = &i.kind {
++                    let impl_def_id = this.create_def(
++                        class.impl_id,
++                        None,
++                        DefKind::Impl { of_trait: false },
++                        i.span,
++                    );
++                    this.visit_ident(&class.ident);
++                    this.visit_generics(&class.generics);
++                    for field in &class.fields {
++                        this.visit_field_def(field);
++                    }
++                    this.with_parent(impl_def_id, |this| {
++                        for method in &class.methods {
++                            this.visit_assoc_item(method, AssocCtxt::Impl { of_trait: false });
++                        }
++                    });
++                    return;
++                }
+                 visit::walk_item(this, i);
+             })
+         });
+diff --git a/compiler/rustc_resolve/src/effective_visibilities.rs b/compiler/rustc_resolve/src/effective_visibilities.rs
+index cd7790f2..a87242a1 100644
+--- a/compiler/rustc_resolve/src/effective_visibilities.rs
++++ b/compiler/rustc_resolve/src/effective_visibilities.rs
+@@ -246,6 +246,16 @@ fn visit_item(&mut self, item: &'a ast::Item) {
+                 }
+             }
+ 
++            // P09.39: same as Struct for field visibility. Methods
++            // inside the class body belong to the synthetic impl
++            // and are handled through the `Impl(..) => return` arm
++            // above when the impl is visited.
++            ast::ItemKind::Class(ref class) => {
++                for field in class.fields.iter() {
++                    self.update_field(self.r.local_def_id(field.id), def_id);
++                }
++            }
++
+             ast::ItemKind::Trait(..) => {
+                 self.set_bindings_effective_visibilities(def_id);
+             }
+diff --git a/compiler/rustc_resolve/src/late.rs b/compiler/rustc_resolve/src/late.rs
+index db71f7ed..97290b0b 100644
+--- a/compiler/rustc_resolve/src/late.rs
++++ b/compiler/rustc_resolve/src/late.rs
+@@ -2819,6 +2819,21 @@ fn resolve_item(&mut self, item: &'ast Item) {
+                 self.resolve_adt(item, generics);
+             }
+ 
++            // P09.39: share resolve_adt's shape — the class's
++            // generics form a single param rib visible to both
++            // fields and methods, and `Self` resolves to the class
++            // via the self-rib. `visit::walk_item` descends into
++            // fields (via `visit_field_def`) and methods (via
++            // `visit_assoc_item` with `AssocCtxt::Impl`), each
++            // resolving against that rib stack. The synthetic impl
++            // DefId exists in the def graph (registered by
++            // `def_collector`) but needs no further rib setup here
++            // because inherent impls don't contribute extra generic
++            // parameters or trait bounds beyond the class's own.
++            ItemKind::Class(box ast::Class { generics, .. }) => {
++                self.resolve_adt(item, generics);
++            }
++
+             ItemKind::Impl(Impl { generics, of_trait, self_ty, items: impl_items, .. }) => {
+                 self.diag_metadata.current_impl_items = Some(impl_items);
+                 self.resolve_implementation(
+@@ -5560,6 +5575,7 @@ fn visit_item(&mut self, item: &'ast Item) {
+             | ItemKind::Enum(_, generics, _)
+             | ItemKind::Struct(_, generics, _)
+             | ItemKind::Union(_, generics, _)
++            | ItemKind::Class(box ast::Class { generics, .. })
+             | ItemKind::Impl(Impl { generics, .. })
+             | ItemKind::Trait(box Trait { generics, .. })
+             | ItemKind::TraitAlias(box TraitAlias { generics, .. }) => {
+-- 
+2.52.0
+
