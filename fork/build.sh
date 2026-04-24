@@ -80,13 +80,37 @@ fi
 # 4. Copy the stock config template and build.
 if [[ ! -f "$CLONE_DIR/bootstrap.toml" ]]; then
   cp "$CLONE_DIR/bootstrap.example.toml" "$CLONE_DIR/bootstrap.toml"
-  # Enable stage-1 build + LLVM-asserts off for speed.
+  # rust-lang/rust's CI prunes `download-ci-llvm` artifacts for
+  # older commits. Our pinned commit is old enough that the
+  # prebuilt LLVM tarball has been deleted, so bootstrap falls
+  # back to a 404 on every retry. Force-build LLVM from source
+  # — adds ~30 min to a cold build but is the only path that
+  # reliably works across rebase cycles. Also turn off
+  # `assertions` for speed.
   python3 - "$CLONE_DIR/bootstrap.toml" <<'PY'
 import sys, re
 path = sys.argv[1]
 with open(path) as f: text = f.read()
-# Flip a couple of keys if present; leave the rest at template defaults.
 text = re.sub(r'^#?\s*assertions\s*=.*$', 'assertions = false', text, flags=re.M)
+# Flip download-ci-llvm off wherever it appears; the default
+# value in the template may be `true`, `"if-available"`, or a
+# commented-out hint depending on the upstream vintage.
+text = re.sub(
+    r'^#?\s*download-ci-llvm\s*=.*$',
+    'download-ci-llvm = false',
+    text,
+    flags=re.M,
+)
+# Some template versions don't have the key at all — guarantee
+# it by appending under the `[llvm]` section header.
+if 'download-ci-llvm' not in text:
+    text = re.sub(
+        r'^\[llvm\]\s*$',
+        '[llvm]\ndownload-ci-llvm = false',
+        text,
+        flags=re.M,
+        count=1,
+    )
 with open(path, 'w') as f: f.write(text)
 PY
 fi
