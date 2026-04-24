@@ -1,13 +1,16 @@
-# rustcc — session restart (v1 + 1.01 closed + 1.02 #1 Phase 1 + 1.02 #2 shipped)
+# rustcc — session restart (v1 + 1.01 closed + 1.02 #1 Phase 1 + 1.02 #2 + Rank 1 adoption infra)
 
 Last updated: **2026-04-25**, Opus 4.7 (1M ctx). **rustcc v1
 milestone complete. Post-v1 shipped: P09.37 (RISC-V ESP32),
 P09.38 (Raspberry Pi Pico), P09.39 (ItemKind::Class), P09.40-44
 (1.01 batch closing items #1-#6), P09.45 (rust-analyzer fork for
 `class` keyword — Phase 1 parser support, 1.02 #1 Phase 1),
-P09.46 (`#[swift_value]` built-in attribute macro, 1.02 #2).**
-1.01 fully shipped. 1.02 #1 Phase 1 in. 1.02 #2 shipped. Next
-workable items: 1.02 #1 Phase 2 (RA HIR-level resolution), 1.1
+P09.46 (`#[swift_value]` built-in attribute macro, 1.02 #2),
+P09.47 (Rank 1 adoption infra: release workflow + install action
++ INSTALL.md).** 1.01 fully shipped. 1.02 #1 Phase 1 in. 1.02 #2
+shipped. Adoption friction reduced from "30-90 min source build"
+to "3 min curl+extract" for published triples. Next workable
+items: 1.02 #1 Phase 2 (RA HIR-level resolution), 1.1
 (multi-inheritance).
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
@@ -31,7 +34,82 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## Latest addition (P09.46, 2026-04-25)
+## Latest addition (P09.47 / Rank 1, 2026-04-25, infra-only)
+
+**Shipped the prebuilt-binaries adoption path.** Rank 1 of the
+ecosystem-adoption analysis: closes the biggest adoption
+friction (30-90 min stage-1 source build → 3 min curl+extract)
+for users on x86_64/aarch64 macOS and Linux.
+
+**What's in**:
+- `.github/workflows/release.yml` — builds stage-1 rustcc for
+  4 targets on tag push (`v*`) or manual dispatch, tarballs
+  `build/host/stage1/` + sha256, uploads as GitHub Release
+  assets. Includes Linux disk-cleanup step (stage-1 needs
+  ~12 GB; default runner has ~14 GB free) and a
+  fork/build.sh → `./x.py build --stage 1 library` sequence
+  so shipped toolchains can compile normal Rust programs.
+- `.github/actions/install-rustcc/action.yml` — composite
+  action downstream projects consume via
+  `uses: rustcc/rustcc/.github/actions/install-rustcc@main`.
+  Auto-detects runner OS+arch, resolves `latest` → tag,
+  downloads + verifies sha256 + extracts + `rustup toolchain
+  link`s. Supports pinned `version: v1.02.0` for reproducible
+  CI.
+- `fork/INSTALL.md` — canonical user install doc. Fast path
+  (curl+extract+link+rust-toolchain.toml pin) vs source path
+  (existing `./fork/build.sh`). Covers supported-triple
+  matrix, CI integration, uninstall, troubleshooting.
+- `fork/examples/ci-snippet.yml` — minimal downstream CI
+  example; projects copy to their `.github/workflows/ci.yml`.
+- `fork/getting-started.html` install section rewritten to
+  lead with the fast path + `rust-toolchain.toml` pin pattern.
+
+**Critical caveat**: the release workflow has only been
+eyeball-reviewed, not tag-push-triggered. When you first push
+a `v*` tag, expect possible surprises in:
+- The `ubuntu-24.04-arm` runner label (GitHub's aarch64 Linux
+  runners changed names mid-2024; fallback documented in the
+  workflow as a comment).
+- The `$CLONE_DIR/build/host/stage1/` path — if rust-lang/rust's
+  stage output layout has changed on the pinned commit, the
+  `tar -C $CLONE_DIR/build/host stage1` step will fail loudly
+  with a directory listing in the logs.
+- Archive size: stage-1 toolchain tarball is probably 150-300 MB
+  compressed; GitHub Release asset limit is 2 GB so we have
+  headroom but no data yet.
+
+**Follow-ups** (not done in this batch — listed so they don't
+get lost):
+- Actually trigger a release by pushing `v1.02.0` and iterate
+  on any workflow failures. The four prior post-v1 LOC-
+  contributions (P09.40-46) make this a reasonable first
+  release tag.
+- Publish `rustcc_swift_rt` and `rustcc_macros` to crates.io
+  (Rank 2 in the adoption plan). Blocked until there's a
+  runtime-stubs variant for stock rustc users; otherwise the
+  crates fail to compile on crates.io's CI.
+- Rustup custom-channel manifest server (Rank 3) — only worth
+  building after prebuilts have been validated for a few
+  releases.
+
+**How to push a first release tag**:
+```bash
+# In the rustcc repo, with all recent work committed:
+git tag v1.02.0
+git push origin v1.02.0
+# Then watch Actions → "Release rustcc toolchain" for the 4
+# matrix jobs; they'll upload to Releases > v1.02.0 > Assets.
+# The release is created as draft; promote to public when all
+# 4 matrix jobs succeed.
+```
+
+Or manually via `workflow_dispatch` (useful for a dry-run):
+```bash
+gh workflow run release.yml -f release_tag=v1.02.0-rc1
+```
+
+## Prior addition (P09.46, 2026-04-25)
 
 **1.02 #2 shipped: `#[swift_value]` built-in attribute macro.**
 The `rustcc_macros::swift_value!` proc-macro wrapper is
@@ -414,7 +492,17 @@ Out of scope: Windows MSVC ABI.
 
 ## Morning review checklist
 
-- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.45.
+- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.46
+      + Rank 1 latest-addition block above.
+- [ ] Sanity-check the release workflow YAML
+      (`.github/workflows/release.yml`) — look for mis-quoted
+      strings, runner-label typos. The `workflow_dispatch`
+      `release_tag` input is the dry-run knob.
+- [ ] If comfortable: push a throwaway tag like `v1.02.0-rc1`
+      and watch the 4 matrix jobs. Artifacts land in
+      Actions → Run → Artifacts even if the Release-upload
+      step fails, so you can inspect the tarballs without
+      polluting the real Release page.
 - [ ] Read `fork/THREE-SURFACES.md` for the surface-selection
       reference.
 - [ ] `cargo test --workspace` → 235/0.
