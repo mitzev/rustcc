@@ -92,27 +92,35 @@ import sys, re
 path = sys.argv[1]
 with open(path) as f: text = f.read()
 text = re.sub(r'^#?\s*assertions\s*=.*$', 'assertions = false', text, flags=re.M)
-# Flip download-ci-llvm off wherever it appears; the default
-# value in the template may be `true`, `"if-available"`, or a
-# commented-out hint depending on the upstream vintage.
-text = re.sub(
-    r'^#?\s*download-ci-llvm\s*=.*$',
-    'download-ci-llvm = false',
-    text,
-    flags=re.M,
+# Append a final `[llvm]` block that turns off download-ci-llvm.
+# Template versions use dotted (`llvm.download-ci-llvm = ...`)
+# or sectioned (`[llvm]\ndownload-ci-llvm = ...`) syntax, and
+# the commented-out defaults don't match a single regex. TOML
+# resolves later values last, so appending an explicit section
+# at the end overrides any earlier setting regardless of form.
+if not text.endswith('\n'):
+    text += '\n'
+text += (
+    '\n# rustcc fork override — see fork/build.sh for why the\n'
+    '# pinned upstream commit can no longer use the CI LLVM.\n'
+    '[llvm]\n'
+    'download-ci-llvm = false\n'
 )
-# Some template versions don't have the key at all — guarantee
-# it by appending under the `[llvm]` section header.
-if 'download-ci-llvm' not in text:
-    text = re.sub(
-        r'^\[llvm\]\s*$',
-        '[llvm]\ndownload-ci-llvm = false',
-        text,
-        flags=re.M,
-        count=1,
-    )
 with open(path, 'w') as f: f.write(text)
 PY
+fi
+
+# If bootstrap.toml existed before build.sh ran (e.g. leftover
+# from a previous invocation), the block above is skipped — but
+# we still need to guarantee the LLVM override. Append the same
+# block idempotently every run.
+if ! grep -q "^# rustcc fork override" "$CLONE_DIR/bootstrap.toml"; then
+  {
+    printf '\n# rustcc fork override — see fork/build.sh for why the\n'
+    printf '# pinned upstream commit can no longer use the CI LLVM.\n'
+    printf '[llvm]\n'
+    printf 'download-ci-llvm = false\n'
+  } >> "$CLONE_DIR/bootstrap.toml"
 fi
 
 echo "==> stage-1 build (expect 30-90 min)"
