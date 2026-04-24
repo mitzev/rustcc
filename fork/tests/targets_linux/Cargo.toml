@@ -1,0 +1,16 @@
+[package]
+name = "targets_linux"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+name = "targets_linux"
+path = "src/lib.rs"
+crate-type = ["rlib"]
+
+[workspace]
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"

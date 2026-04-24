@@ -2586,6 +2586,69 @@ target-specific ABI code) than the simple additions P01–P06 are.
 Shipped after the 2026-04-21 v1 milestone. These extend the
 supported target matrix without touching v1 semantics.
 
+### P09.44 — Linux/desktop target coverage (1.01 #6)
+
+**Files**: none — documentation-only, zero code.
+**Patch**: no new patch file; the existing 12-patch series
+produces correct Itanium output on the listed Linux targets
+with no changes.
+
+#### What the probe covers
+
+Polymorphic `#[repr(cpp)]` Widget (ctor + `#[cpp_virtual] fn foo`)
+compiled under stage-1 rustc against four commonly-asked-for
+Linux / desktop triples. All four produce correct Itanium output
+with no fork code change needed:
+
+| Target | Arch | Covered by |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | x86_64 | P09.6 / P09.11 overlay (shared with darwin) |
+| `aarch64-unknown-linux-gnu` | aarch64 | P09.11 overlay (shared with darwin) |
+| `armv7-unknown-linux-gnueabihf` | ARMv7-A | upstream ARM callconv + Itanium (unchanged) |
+| `riscv64gc-unknown-linux-gnu` | rv64gc | P09.37 overlay |
+
+#### Why zero code
+
+The fork's Itanium C++ ABI overlays are keyed on
+**architecture** (`compute_cxx_abi_info` in
+`rustc_target/src/callconv/{x86_64,aarch64,riscv}.rs`), not on
+target triple. Switching the OS half of the triple from `apple-darwin`
+to `unknown-linux-gnu` changes the object-file format (Mach-O →
+ELF) but not the calling convention or symbol mangling, which
+are what Itanium cares about.
+
+#### Validation
+
+`/tmp/p09-44-linux-targets/`. Polymorphic `class Widget { #[cpp_virtual] fn foo(&self) -> i32 }` compiled with
+`--target X -Zbuild-std=core,compiler_builtins`. For each
+target: ctor `_ZN6Widget3newEi`, typeinfo `_ZTI6Widget`,
+type-string `_ZTS6Widget`, vtable `_ZTV6Widget { i64 0, ptr
+typeinfo, ptr foo }` — all emitted correctly.
+
+Per-target per-argument calling-convention details match the
+respective psABI:
+
+- x86_64 / aarch64: 16-byte struct, 8-byte align, sret
+- armv7-a (hard-float): 8-byte struct, 4-byte align (32-bit vptr)
+- rv64gc: 16-byte struct, 8-byte align, `signext` on `i32` args
+  per the RV64 psABI
+
+#### Takeaway
+
+The same "zero-code path" lesson from P09.36 / P09.38 applies:
+upstream rustc already knows how to build for these triples, and
+the fork's ABI paths sit above the target-triple split at the
+LLVM call-conv layer. When an ABI overlay exists for the
+*architecture*, every ELF/Linux variant that uses the same
+upstream callconv is covered automatically.
+
+If a user asks for an additional Linux-adjacent target (e.g.,
+`aarch64-unknown-linux-musl`, `aarch64-linux-android`, etc.),
+the probe is a ~5-minute `cargo build --target X
+-Zbuild-std=core,compiler_builtins` against the probe crate.
+
+---
+
 ### P09.40 — Three-surface reference doc (1.01 #5)
 
 **Files**: `fork/THREE-SURFACES.md` (new), `fork/getting-started.html`

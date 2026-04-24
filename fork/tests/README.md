@@ -29,6 +29,7 @@ any probe fails.
 | `class_keyword/type_generics`      | `class Pair<A, B>` — impl/struct half DefId separation   | P09.41                             |
 | `class_keyword/const_generics`     | `class Array<const N: usize>` — const-arg lowering       | P09.41                             |
 | `class_keyword/swift_nonpod`       | `swift_value!` class Clone respects non-POD extras       | P09.42                             |
+| `targets_linux` (via run_targets.sh) | Polymorphic class IR on Linux x86_64/aarch64/armv7/rv64 | P09.44                             |
 
 ## Adding a new probe
 
@@ -53,3 +54,25 @@ probe.
 A future cleanup could move these under an `xtask probe`
 subcommand that resolves `$RUSTC` from a config file and runs the
 same sequence.
+
+## Target probes (`run_targets.sh`)
+
+`run_targets.sh` is a separate runner for cross-target IR
+probes. It compiles `targets_linux/` against each listed triple
+with `-Zbuild-std=core,compiler_builtins -C opt-level=0` and
+checks that the emitted LLVM IR contains the expected Itanium
+symbols (`_ZN6Widget3newEi`, `_ZTI6Widget`, `_ZTS6Widget`,
+`_ZTV6Widget`).
+
+```bash
+# Default: probe x86_64 / aarch64 / armv7 / rv64 Linux targets.
+RUSTC=<stage1> ./fork/tests/run_targets.sh
+
+# Or probe a single target on demand:
+RUSTC=<stage1> ./fork/tests/run_targets.sh aarch64-linux-android
+```
+
+It's not run from the main `run.sh` because each target takes
+~40s to build its stdlib — not worth paying every regression
+check. Run this explicitly when adding target coverage to
+the fork.

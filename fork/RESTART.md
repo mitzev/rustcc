@@ -1,12 +1,13 @@
-# rustcc — session restart (v1 + post-v1 through P09.43, 1.01 closed)
+# rustcc — session restart (v1 + post-v1 through P09.44, 1.01 fully closed)
 
 Last updated: **2026-04-24**, Opus 4.7 (1M ctx). **rustcc v1
 milestone complete. Post-v1 shipped: P09.37 (RISC-V ESP32),
 P09.38 (Raspberry Pi Pico), P09.39 (ItemKind::Class), P09.40
 (three-surface doc), P09.41 (generics on class), P09.42 (non-POD
-Swift extras), P09.43 (attr-plumbing unification). 1.01 release
-track is fully shipped (items #1-#5 + #7); only items that were
-always "on demand" or "in scope for 1.1/v2" remain.**
+Swift extras), P09.43 (attr-plumbing unification), P09.44 (Linux
+target coverage). 1.01 release track is fully closed — all seven
+items shipped plus #6's "on demand" probes extended to cover
+x86_64/aarch64/armv7/rv64 Linux.**
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
 
@@ -29,7 +30,37 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## Latest additions — 1.01 batch (P09.40-P09.43, 2026-04-24)
+## Latest addition (P09.44, 2026-04-24, documentation-only)
+
+**1.01 #6 shipped: Linux/desktop target coverage.** Four
+commonly-asked-for Linux triples probed, all zero-code — upstream
+rustc handles the target-triple split at a layer below the
+fork's Itanium overlays, and the overlays themselves are keyed
+on **architecture**, not target:
+
+| Target | Arch | Covered by |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | x86_64 | P09.6 / P09.11 overlay |
+| `aarch64-unknown-linux-gnu` | aarch64 | P09.11 overlay |
+| `armv7-unknown-linux-gnueabihf` | ARMv7-A | upstream + Itanium |
+| `riscv64gc-unknown-linux-gnu` | rv64gc | P09.37 overlay |
+
+**Probe**: `fork/tests/run_targets.sh` runs
+`targets_linux/` against the four triples with
+`-Zbuild-std=core,compiler_builtins -C opt-level=0` and grep-
+checks for the expected Itanium symbols
+(`_ZN6Widget3newEi`, `_ZTI6Widget`, `_ZTS6Widget`, `_ZTV6Widget`).
+All four pass.
+
+**Patch**: none (documentation-only).
+
+**Why -O0 in the probe**: at release, LLVM devirtualizes
+`call_foo`'s dispatch and DCE's the vtable + typeinfo globals —
+useful for production but hides what the fork codegen actually
+emits. `-C opt-level=0` preserves the raw emission so the probe
+can verify ABI correctness rather than LLVM's eventual cleanup.
+
+## Prior 1.01 batch (P09.40-P09.43, 2026-04-24)
 
 After P09.39 shipped 1.01 #7, the remaining 1.01 backlog (items
 #1–#5) was closed in one batch:
@@ -225,13 +256,14 @@ both pass end-to-end.
 See `project_queue_state.md` memory. **Post-P09.43, 1.01 is
 closed.**
 
-**1.01 — SHIPPED 2026-04-24**:
+**1.01 — FULLY SHIPPED 2026-04-24**:
 1. ~~Const generics on class header~~ — P09.41.
 2. ~~Non-POD extras in swift_value!~~ — P09.42.
 3. ~~`rustc_cxx_*` attr-plumbing unification~~ — P09.43.
 4. ~~In-tree test crate for class probes~~ — `fork/tests/`.
 5. ~~Three-surface doc~~ — P09.40.
-6. Additional target probes on demand — trivial each, not blocking.
+6. ~~Additional Linux/desktop target probes~~ — P09.44
+   (x86_64 / aarch64 / armv7 / rv64 Linux; all zero-code).
 7. ~~Parser-level `ItemKind::Class` AST variant~~ — P09.39.
 
 **1.02 — user-visible class-keyword IDE support**:
@@ -251,6 +283,9 @@ Out of scope: Windows MSVC ABI.
       reference.
 - [ ] `cargo test --workspace` → 235/0.
 - [ ] `RUSTC=<stage1> ./fork/tests/run.sh` → 5/5 passing.
+- [ ] Optional cross-target probe:
+      `RUSTC=<stage1> ./fork/tests/run_targets.sh` → 4/4
+      (~3 min total; skip on quick regression checks).
 - [ ] Optional: diff the post-v1 patches 10–12:
       `fork/patches/10-itemkind-class.patch`,
       `11-class-generics.patch`, `12-attr-plumbing-macro.patch`.
