@@ -1,0 +1,10 @@
+[package]
+name = "class_keyword_basic"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "class_keyword_basic"
+path = "src/main.rs"
+
+[workspace]

@@ -1,10 +1,12 @@
-# rustcc — session restart (v1 + P09.37 RISC-V + P09.38 Pico + P09.39 ItemKind::Class)
+# rustcc — session restart (v1 + post-v1 through P09.43, 1.01 closed)
 
 Last updated: **2026-04-24**, Opus 4.7 (1M ctx). **rustcc v1
-milestone complete. P09.37 adds RISC-V ESP32 / bare-metal rv32;
-P09.38 extends ARM Cortex-M coverage to ARMv6-M (Raspberry Pi
-Pico / RP2040); P09.39 ships 1.01 #7 — `ItemKind::Class` AST
-variant, enabler for the 1.02 rust-analyzer fork.**
+milestone complete. Post-v1 shipped: P09.37 (RISC-V ESP32),
+P09.38 (Raspberry Pi Pico), P09.39 (ItemKind::Class), P09.40
+(three-surface doc), P09.41 (generics on class), P09.42 (non-POD
+Swift extras), P09.43 (attr-plumbing unification). 1.01 release
+track is fully shipped (items #1-#5 + #7); only items that were
+always "on demand" or "in scope for 1.1/v2" remain.**
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
 
@@ -27,7 +29,53 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## Latest addition (P09.39, 2026-04-24)
+## Latest additions — 1.01 batch (P09.40-P09.43, 2026-04-24)
+
+After P09.39 shipped 1.01 #7, the remaining 1.01 backlog (items
+#1–#5) was closed in one batch:
+
+- **P09.40 (#5, three-surface doc)**. New `fork/THREE-SURFACES.md`
+  reference explaining when to use `cxx_class!` vs
+  `cxx_class_native!` vs parser `class`. Doc-only.
+- **P09.41 (#1, generics on class)**. Fixed a P09.39 regression:
+  any `class Foo<A>` (lifetime/type/const generic) ICEd at
+  ast_lowering with "duplicate copy of DefId". Root cause: single
+  `generics` field shared between struct + impl halves. Fix:
+  parallel `impl_generics` on `ast::Class`, clone at parse time,
+  two-phase `resolve_class` (struct rib for fields, impl rib for
+  methods). 161 / −33 LOC across 7 rustc files.
+- **P09.42 (#2, non-POD Swift extras)**. Class-backed `swift_value!`
+  Clone now uses a `Self { ... }` struct literal with per-field
+  `Clone::clone` for extras; previous memcpy-and-overwrite
+  double-freed Box/String/Vec extras. ~85 LOC in
+  crates/rustcc_macros.
+- **P09.43 (#3, attr-plumbing unification)**. Collapsed five
+  `NoArgsAttributeParser` impls in rustc_attr_parsing into one
+  `rustcc_noargs_attr!` macro invocation each. Pure cleanup; ~30
+  LOC down.
+- **1.01 #4 (in-tree test crate)**. `fork/tests/class_keyword/`
+  now holds five probes covering basic, inheritance, type
+  generics, const generics, and non-POD Swift extras. Runner
+  script `fork/tests/run.sh` rebuilds each under stage-1 rustc
+  and checks output banners. Replaces the ephemeral /tmp probes.
+
+**Validation across the batch**:
+- `./x.py build --stage 1 library` clean.
+- `cargo test --workspace` → 235/0 (unchanged from v1 baseline).
+- `RUSTC=<stage1> ./fork/tests/run.sh` → 5/5 passing.
+
+**Bugs surfaced during P09.41**:
+- Type generics (`class Pair<A, B>`) were ICEing the same way
+  const generics did. P09.39's regression affected ALL generics,
+  not just const — const was just the first symptom I noticed.
+  Worth remembering: when one generic form breaks, probe the
+  others before declaring the fix scope.
+- The `build_cxx_class_self_path` stub for const generics
+  emitted `GenericArg::Type` wrapping a const-param path;
+  typeck couldn't process it. Fixed to emit
+  `GenericArg::Const(AnonConst { value: path_expr })`.
+
+## Prior addition (P09.39, 2026-04-24)
 
 **1.01 #7 shipped: `ItemKind::Class` AST variant.** The fork-only
 `class` keyword is now a first-class AST node that survives
@@ -174,21 +222,21 @@ both pass end-to-end.
 
 ## Release-track backlog (1.01 / 1.02 / 1.1)
 
-See `project_queue_state.md` memory. Post-P09.39 status:
+See `project_queue_state.md` memory. **Post-P09.43, 1.01 is
+closed.**
 
-**1.01 — polish + small extensions (remaining after #7 shipped)**:
-1. Const generics on class header (small-medium).
-2. Multi-field Swift bindings with non-POD extras (small-medium).
-3. `rustc_cxx_*` attr-plumbing unification (small).
-4. `/tmp/p09-*` probes → in-tree test crate (small).
-5. Three-surface doc (small).
-6. Additional target probes on demand (trivial each).
-7. ~~Parser-level distinct `ItemKind::Class` AST variant~~ —
-   **shipped as P09.39, 2026-04-24**.
+**1.01 — SHIPPED 2026-04-24**:
+1. ~~Const generics on class header~~ — P09.41.
+2. ~~Non-POD extras in swift_value!~~ — P09.42.
+3. ~~`rustc_cxx_*` attr-plumbing unification~~ — P09.43.
+4. ~~In-tree test crate for class probes~~ — `fork/tests/`.
+5. ~~Three-surface doc~~ — P09.40.
+6. Additional target probes on demand — trivial each, not blocking.
+7. ~~Parser-level `ItemKind::Class` AST variant~~ — P09.39.
 
 **1.02 — user-visible class-keyword IDE support**:
-1. rust-analyzer fork for `class` (weeks). Now unblocked: RA
-   mirrors the `ItemKind::Class` shape from P09.39.
+1. rust-analyzer fork for `class` (weeks). Unblocked — RA mirrors
+   the `ItemKind::Class` shape from P09.39.
 2. True compiler auto-synthesis for `#[repr(swift)]` (large).
 
 **1.1 — multi-inheritance capstone**:
@@ -198,20 +246,14 @@ Out of scope: Windows MSVC ABI.
 
 ## Morning review checklist
 
-- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.39 +
-      the "rustcc v1 milestone" marker after P09.32 +
-      the "Post-v1 target extensions" section containing P09.37,
-      P09.38, and P09.39.
-- [ ] Read the rewritten `fork/getting-started.html` as a
-      GitHub project intro (now lists ESP32-C3 / RISC-V alongside
-      STM32 / ARM Cortex-M).
-- [ ] Diff `fork/patches/09-riscv-cxx-overlay.patch` and
-      `fork/patches/10-itemkind-class.patch`.
+- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.43.
+- [ ] Read `fork/THREE-SURFACES.md` for the surface-selection
+      reference.
 - [ ] `cargo test --workspace` → 235/0.
-- [ ] Verify P09.39 probe:
-      `cd /tmp/p09-39-itemkind-class && RUSTC=<rust-lang-rust>/build/host/stage1/bin/rustc \`
-      `RUSTC_BOOTSTRAP=1 cargo +nightly build && ./target/debug/p09_39_probe`
-      (→ "ok: inheritance sum = 15")
+- [ ] `RUSTC=<stage1> ./fork/tests/run.sh` → 5/5 passing.
+- [ ] Optional: diff the post-v1 patches 10–12:
+      `fork/patches/10-itemkind-class.patch`,
+      `11-class-generics.patch`, `12-attr-plumbing-macro.patch`.
 - [ ] Verify v1 capstones:
       - `cd /tmp/p09-35-inherit && ./probe`
       - `cd /tmp/p09-36-dyncast && ./probe`

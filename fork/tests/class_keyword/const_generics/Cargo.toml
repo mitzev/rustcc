@@ -1,0 +1,10 @@
+[package]
+name = "class_keyword_const_generics"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "class_keyword_const_generics"
+path = "src/main.rs"
+
+[workspace]

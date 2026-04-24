@@ -1,0 +1,376 @@
+From c6b12b3612c8c8db7a21a9ebf4e90e71b7c983e7 Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Fri, 24 Apr 2026 21:27:52 +0300
+Subject: [PATCH] P09.41: generics on class header (1.01 #1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Classes with generic parameters (lifetime, type, or const) now
+compile. Before this patch, any `class Foo<A> { ... }` ICEd
+at ast_lowering with "duplicate copy of DefId(Foo::A) in
+lctx.children" because both HIR halves (Struct + Impl) tried to
+claim the same generic-param DefId.
+
+Root cause: P09.39 had a single `generics: Generics` on
+`ast::Class`, shared between the struct half and the synthetic
+inherent impl half. When each half's `lower_generics` call
+registered HIR children for the params, the DefIds collided.
+
+Fix: give the impl half its own parallel `Generics` value
+(`ast::Class::impl_generics`), emitted as a clone of the
+parsed `generics` with all-dummy NodeIds — expansion's
+`visit_id` then assigns fresh distinct NodeIds during the
+normal pass. This matches how a hand-written `impl<A> Foo<A>`
+has DefIds separate from the struct's.
+
+Downstream:
+- rustc_resolve: new `resolve_class` two-phase walk. Struct
+  half's generic-param rib scopes the fields; impl half's rib
+  scopes the self-type and methods. Mirrors
+  resolve_adt + resolve_implementation composed.
+- rustc_resolve/def_collector: walks `impl_generics` under the
+  impl def parent so its params get DefIds owned by the impl.
+- rustc_ast_lowering: `lower_class_impl_half` uses
+  `class.impl_generics` for the impl's generic-param lowering;
+  struct half's generics unchanged.
+- rustc_ast/visit: walks `impl_generics` alongside `generics`
+  so expansion's `visit_id` sees both copies separately.
+- rustc_parse: `build_cxx_class_self_path` handles const-generic
+  args as `GenericArg::Const(AnonConst)` instead of the P09.30
+  type-path stub (which ICEd typeck); const generics now round-trip
+  correctly.
+
+Validation:
+- /tmp/p09-41-class-const-generics: type-generic
+  `Pair<i32, &str>` passes; const-generic `Array<const N: usize>`
+  passes with `sum() == 10`.
+- /tmp/p09-39-itemkind-class: basic + single inheritance still
+  green (no regression).
+- rustcc workspace: cargo test --workspace → 235/0.
+---
+ compiler/rustc_ast/src/ast.rs                 | 20 +++-
+ compiler/rustc_ast/src/visit.rs               | 17 +++-
+ compiler/rustc_ast_lowering/src/item.rs       |  6 +-
+ .../rustc_ast_pretty/src/pprust/state/item.rs |  4 +-
+ compiler/rustc_parse/src/parser/item.rs       | 41 +++++---
+ compiler/rustc_resolve/src/def_collector.rs   |  8 ++
+ compiler/rustc_resolve/src/late.rs            | 98 ++++++++++++++++---
+ 7 files changed, 161 insertions(+), 33 deletions(-)
+
+diff --git a/compiler/rustc_ast/src/ast.rs b/compiler/rustc_ast/src/ast.rs
+index 28db4561..d444e612 100644
+--- a/compiler/rustc_ast/src/ast.rs
++++ b/compiler/rustc_ast/src/ast.rs
+@@ -4010,7 +4010,19 @@ pub fn span(&self) -> Span {
+ #[derive(Clone, Encodable, Decodable, Debug)]
+ pub struct Class {
+     pub ident: Ident,
++    /// Generic parameters attached to the struct half. Each param's
++    /// `NodeId` gets its own `DefId` via `def_collector::
++    /// visit_generic_param` and becomes an owner-child of the
++    /// struct's HIR owner.
+     pub generics: Generics,
++    /// Parallel generic parameters attached to the synthetic
++    /// inherent impl half. A deep-clone of `generics` emitted by
++    /// the parser with fresh `DUMMY_NODE_ID`s on every `id` field,
++    /// so expansion assigns a distinct set of `NodeId`s — and
++    /// hence `DefId`s — to the impl's params. This mirrors how a
++    /// hand-written `impl<A> Pair<A> { ... }` has its own
++    /// generic-param `DefId`s separate from the struct's.
++    pub impl_generics: Generics,
+     /// Fields in declaration order. For `class Derived : Base { ... }`,
+     /// the parser synthesizes a leading `#[rustc_cxx_base] __base: Base`
+     /// field so downstream layout/vtable paths can detect the
+@@ -4025,10 +4037,10 @@ pub struct Class {
+     /// `Item<ItemKind>::id`.
+     pub impl_id: NodeId,
+     /// Self-type for the synthetic inherent impl: a path `ClassIdent`
+-    /// or `ClassIdent<Args>` matching `generics`. Built at parse time
+-    /// and lowered via `lower_ty` in ast_lowering. Storing it as a
+-    /// full AST `Ty` lets name resolution wire it to the struct half
+-    /// like any other type reference.
++    /// or `ClassIdent<Args>` matching `impl_generics`. Built at
++    /// parse time and lowered via `lower_ty` in ast_lowering.
++    /// Resolution picks up the impl's generic params because
++    /// `resolve_class` pushes the impl rib before walking the self-type.
+     pub self_ty: Box<Ty>,
+ }
+ 
+diff --git a/compiler/rustc_ast/src/visit.rs b/compiler/rustc_ast/src/visit.rs
+index b435870d..fca7ba7c 100644
+--- a/compiler/rustc_ast/src/visit.rs
++++ b/compiler/rustc_ast/src/visit.rs
+@@ -973,10 +973,25 @@ pub fn walk_fn<$($lt,)? V: $Visitor$(<$lt>)?>(vis: &mut V, kind: FnKind<$($lt)?
+             // parser's `DUMMY_NODE_ID` with a fresh `NodeId`. If
+             // it's left as dummy, `ast_lowering::index_crate`
+             // panics when trying to look up the impl half's DefId.
+-            let Class { ident, generics, fields, methods, impl_id, self_ty } = self;
++            //
++            // P09.41: walk `impl_generics` as well. Both generics
++            // sets are fresh clones at parse time; expansion
++            // visits each independently and assigns distinct
++            // NodeIds so the two halves have parallel but
++            // non-colliding `DefId`s for their generic params.
++            let Class {
++                ident,
++                generics,
++                impl_generics,
++                fields,
++                methods,
++                impl_id,
++                self_ty,
++            } = self;
+             visit_visitable!($($mut)? vis, impl_id);
+             visit_visitable!($($mut)? vis, ident, generics);
+             visit_visitable!($($mut)? vis, fields);
++            visit_visitable!($($mut)? vis, impl_generics);
+             try_visit!(vis.visit_ty(self_ty));
+             visit_visitable_with!($($mut)? vis, methods, AssocCtxt::Impl { of_trait: false });
+             V::Result::output()
+diff --git a/compiler/rustc_ast_lowering/src/item.rs b/compiler/rustc_ast_lowering/src/item.rs
+index c74eb358..c8f3d2bd 100644
+--- a/compiler/rustc_ast_lowering/src/item.rs
++++ b/compiler/rustc_ast_lowering/src/item.rs
+@@ -297,7 +297,7 @@ pub(super) fn lower_class_impl_half(
+ 
+         let impl_span = self.lower_span(i.span);
+         let (generics, (self_ty, items)) = self.lower_generics(
+-            &class.generics,
++            &class.impl_generics,
+             class.impl_id,
+             ImplTraitContext::Universal,
+             |this| {
+@@ -562,7 +562,9 @@ fn lower_item_kind(
+                 );
+                 hir::ItemKind::Struct(ident, generics, struct_def)
+             }
+-            ItemKind::Class(box ast::Class { ident, generics, fields, methods: _, impl_id: _, self_ty: _ }) => {
++            ItemKind::Class(box ast::Class {
++                ident, generics, impl_generics: _, fields, methods: _, impl_id: _, self_ty: _,
++            }) => {
+                 // P09.39: AST-level `class` lowers to two HIR items.
+                 // This branch produces the struct half; the inherent
+                 // impl half is produced by `lower_class_impl_half`,
+diff --git a/compiler/rustc_ast_pretty/src/pprust/state/item.rs b/compiler/rustc_ast_pretty/src/pprust/state/item.rs
+index ce158389..beebe6de 100644
+--- a/compiler/rustc_ast_pretty/src/pprust/state/item.rs
++++ b/compiler/rustc_ast_pretty/src/pprust/state/item.rs
+@@ -321,7 +321,9 @@ pub(crate) fn print_item(&mut self, item: &ast::Item) {
+                 let (cb, ib) = self.head(visibility_qualified(&item.vis, "struct"));
+                 self.print_struct(struct_def, generics, *ident, item.span, true, cb, ib);
+             }
+-            ast::ItemKind::Class(box ast::Class { ident, generics, fields, methods, impl_id: _, self_ty: _ }) => {
++            ast::ItemKind::Class(box ast::Class {
++                ident, generics, impl_generics: _, fields, methods, impl_id: _, self_ty: _,
++            }) => {
+                 let (cb, ib) = self.head(visibility_qualified(&item.vis, "class"));
+                 self.print_ident(*ident);
+                 self.print_generic_params(&generics.params);
+diff --git a/compiler/rustc_parse/src/parser/item.rs b/compiler/rustc_parse/src/parser/item.rs
+index fddfdde7..c2d87ad6 100644
+--- a/compiler/rustc_parse/src/parser/item.rs
++++ b/compiler/rustc_parse/src/parser/item.rs
+@@ -2042,18 +2042,26 @@ fn build_cxx_class_self_path(ident: Ident, generics: &Generics) -> ast::Path {
+                         span: p.ident.span,
+                         tokens: None,
+                     })),
+-                    // Const generics aren't part of v1's `class`
+-                    // header surface. Reference them as a bare
+-                    // type path — if the user actually declares
+-                    // a const generic, typeck will reject the
+-                    // bogus GenericArg::Type, giving a targeted
+-                    // error. Keeps this helper simple.
+-                    GenericParamKind::Const { .. } => ast::GenericArg::Type(Box::new(Ty {
+-                        id: DUMMY_NODE_ID,
+-                        kind: TyKind::Path(None, ast::Path::from_ident(p.ident)),
+-                        span: p.ident.span,
+-                        tokens: None,
+-                    })),
++                    // P09.41 (1.01 #1): const generic — reference
++                    // the parameter by its identifier as an anon
++                    // const expression. Lowers to `GenericArg::Const`
++                    // at HIR time, matching how a hand-written
++                    // `impl<const N: usize> Foo<N> { ... }`
++                    // self-type resolves.
++                    GenericParamKind::Const { .. } => {
++                        let ident_expr = Box::new(ast::Expr {
++                            id: DUMMY_NODE_ID,
++                            kind: ast::ExprKind::Path(None, ast::Path::from_ident(p.ident)),
++                            span: p.ident.span,
++                            attrs: ThinVec::new(),
++                            tokens: None,
++                        });
++                        ast::GenericArg::Const(ast::AnonConst {
++                            id: DUMMY_NODE_ID,
++                            value: ident_expr,
++                            mgca_disambiguation: ast::MgcaDisambiguation::AnonConst,
++                        })
++                    }
+                 };
+                 ast::AngleBracketedArg::Arg(arg)
+             })
+@@ -2268,9 +2276,18 @@ fn parse_cxx_class_item(
+             tokens: None,
+         });
+ 
++        // P09.41: clone `generics` into a second set owned by the
++        // impl half. Parser always emits `DUMMY_NODE_ID` for
++        // generic-param node ids, so a shallow clone preserves
++        // dummy state — expansion's `visit_id` then walks each
++        // copy separately and assigns fresh monotonic ids so
++        // struct and impl halves end up with distinct `DefId`s.
++        let impl_generics = generics.clone();
++
+         Ok(ItemKind::Class(Box::new(ast::Class {
+             ident,
+             generics,
++            impl_generics,
+             fields,
+             methods,
+             impl_id: DUMMY_NODE_ID,
+diff --git a/compiler/rustc_resolve/src/def_collector.rs b/compiler/rustc_resolve/src/def_collector.rs
+index 7634ba03..39803fa0 100644
+--- a/compiler/rustc_resolve/src/def_collector.rs
++++ b/compiler/rustc_resolve/src/def_collector.rs
+@@ -215,6 +215,12 @@ fn visit_item(&mut self, i: &'a Item) {
+                 // parent so their DefIds land under the impl def
+                 // (matching the def-graph shape of a hand-written
+                 // `impl Class { ... }`).
++                //
++                // P09.41: walk `impl_generics` under the impl
++                // parent so its generic params get separate DefIds
++                // from the struct's. Without this, both halves'
++                // HIR lowering try to claim the same generic-param
++                // DefId and `with_lctx` asserts "duplicate copy".
+                 if let ItemKind::Class(class) = &i.kind {
+                     let impl_def_id = this.create_def(
+                         class.impl_id,
+@@ -228,6 +234,8 @@ fn visit_item(&mut self, i: &'a Item) {
+                         this.visit_field_def(field);
+                     }
+                     this.with_parent(impl_def_id, |this| {
++                        this.visit_generics(&class.impl_generics);
++                        this.visit_ty(&class.self_ty);
+                         for method in &class.methods {
+                             this.visit_assoc_item(method, AssocCtxt::Impl { of_trait: false });
+                         }
+diff --git a/compiler/rustc_resolve/src/late.rs b/compiler/rustc_resolve/src/late.rs
+index 97290b0b..04219be8 100644
+--- a/compiler/rustc_resolve/src/late.rs
++++ b/compiler/rustc_resolve/src/late.rs
+@@ -2716,6 +2716,83 @@ fn is_label_valid_from_rib(&self, rib_index: usize) -> bool {
+         ribs.iter().all(|rib| !rib.kind.is_label_barrier())
+     }
+ 
++    /// P09.41: two-phase resolution for a `class` item. Mirrors a
++    /// hand-written `struct Foo<A> { ... }` + `impl<A> Foo<A> { ... }`
++    /// pair: the struct's generics scope the fields; the impl's
++    /// generics scope the self-type and methods. Two separate ribs
++    /// because each set of generic params has its own `DefId` (see
++    /// `ast::Class::impl_generics`).
++    fn resolve_class(&mut self, item: &'ast Item, class: &'ast ast::Class) {
++        let struct_kind = self.r.local_def_kind(item.id);
++        let impl_kind = self.r.local_def_kind(class.impl_id);
++        let struct_def_id = self.r.local_def_id(item.id).to_def_id();
++
++        // Struct half — generics + fields under the struct's rib.
++        self.with_current_self_item(item, |this| {
++            this.with_generic_param_rib(
++                &class.generics.params,
++                RibKind::Item(HasGenericParams::Yes(class.generics.span), struct_kind),
++                item.id,
++                LifetimeBinderKind::Item,
++                class.generics.span,
++                |this| {
++                    this.with_self_rib(
++                        Res::SelfTyAlias {
++                            alias_to: struct_def_id,
++                            is_trait_impl: false,
++                        },
++                        |this| {
++                            this.visit_generics(&class.generics);
++                            for field in &class.fields {
++                                this.visit_field_def(field);
++                            }
++                        },
++                    );
++                },
++            );
++        });
++
++        // Impl half — impl_generics + self_ty + methods under the
++        // impl's rib. Self resolves to the struct (same DefId as
++        // a hand-written inherent impl's `Self`).
++        self.with_generic_param_rib(
++            &class.impl_generics.params,
++            RibKind::Item(HasGenericParams::Yes(class.impl_generics.span), impl_kind),
++            class.impl_id,
++            LifetimeBinderKind::ImplBlock,
++            class.impl_generics.span,
++            |this| {
++                this.with_self_rib(
++                    Res::SelfTyAlias {
++                        alias_to: struct_def_id,
++                        is_trait_impl: false,
++                    },
++                    |this| {
++                        this.visit_generics(&class.impl_generics);
++                        this.visit_ty(&class.self_ty);
++                        this.with_current_self_type(&class.self_ty, |this| {
++                            this.with_self_rib_ns(
++                                ValueNS,
++                                Res::SelfCtor(struct_def_id),
++                                |this| {
++                                    let mut seen_trait_items = Default::default();
++                                    for method in &class.methods {
++                                        this.resolve_impl_item(
++                                            method,
++                                            &mut seen_trait_items,
++                                            None,
++                                            false,
++                                        );
++                                    }
++                                },
++                            );
++                        });
++                    },
++                );
++            },
++        );
++    }
++
+     fn resolve_adt(&mut self, item: &'ast Item, generics: &'ast Generics) {
+         debug!("resolve_adt");
+         let kind = self.r.local_def_kind(item.id);
+@@ -2819,19 +2896,14 @@ fn resolve_item(&mut self, item: &'ast Item) {
+                 self.resolve_adt(item, generics);
+             }
+ 
+-            // P09.39: share resolve_adt's shape — the class's
+-            // generics form a single param rib visible to both
+-            // fields and methods, and `Self` resolves to the class
+-            // via the self-rib. `visit::walk_item` descends into
+-            // fields (via `visit_field_def`) and methods (via
+-            // `visit_assoc_item` with `AssocCtxt::Impl`), each
+-            // resolving against that rib stack. The synthetic impl
+-            // DefId exists in the def graph (registered by
+-            // `def_collector`) but needs no further rib setup here
+-            // because inherent impls don't contribute extra generic
+-            // parameters or trait bounds beyond the class's own.
+-            ItemKind::Class(box ast::Class { generics, .. }) => {
+-                self.resolve_adt(item, generics);
++            // P09.39 / P09.41: two-phase resolve for `class`. The
++            // struct half's generics scope the fields; the impl
++            // half's generics scope the self-type and methods.
++            // Mirrors what `resolve_adt` + `resolve_implementation`
++            // do for a hand-written `struct Foo<A> { ... }` +
++            // `impl<A> Foo<A> { ... }` pair.
++            ItemKind::Class(class) => {
++                self.resolve_class(item, class);
+             }
+ 
+             ItemKind::Impl(Impl { generics, of_trait, self_ty, items: impl_items, .. }) => {
+-- 
+2.52.0
+

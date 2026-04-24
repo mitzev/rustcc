@@ -935,34 +935,17 @@ fn expand_swift_value(mut item: ItemStruct) -> syn::Result<TokenStream2> {
     };
 
     let clone_body = if binding.is_class {
-        // Classes: retain the ref pointer, keep all other bytes
-        // as a straight copy. Copying extra fields is safe
-        // because class-backed `#[repr(swift)]` bindings in v1
-        // are single-field handles (the class pointer). Future
-        // multi-field class wrappers would need per-field clone
-        // logic.
-        quote! {
-            let ptr: *mut ::core::ffi::c_void =
-                unsafe { *(self as *const Self as *const *mut ::core::ffi::c_void) };
-            let retained = if ptr.is_null() {
-                ptr
-            } else {
-                unsafe { ::rustcc_swift_rt::retain_swift_class(ptr) }
-            };
-            let mut copy: ::core::mem::MaybeUninit<Self> =
-                ::core::mem::MaybeUninit::uninit();
-            unsafe {
-                ::core::ptr::copy_nonoverlapping(
-                    self as *const Self as *const u8,
-                    copy.as_mut_ptr() as *mut u8,
-                    ::core::mem::size_of::<Self>(),
-                );
-                // Overwrite the pointer field with the retained
-                // copy (it's at offset 0 by assumption).
-                *(copy.as_mut_ptr() as *mut *mut ::core::ffi::c_void) = retained;
-                copy.assume_init()
-            }
-        }
+        // Classes: retain the ref pointer and `.clone()` every
+        // other field in a struct literal so non-POD extras
+        // (Box, String, Vec, ...) don't alias heap owned by the
+        // original. P09.42 (1.01 #2): replaces a byte-wise
+        // memcpy-and-overwrite that double-freed any non-POD
+        // extra when the clone was dropped.
+        //
+        // Convention: the Swift class pointer lives at offset 0,
+        // so the first declared field is the pointer. All other
+        // fields participate in the standard `Clone` protocol.
+        build_class_clone_body(&item)?
     } else {
         quote! {
             let mut copy: ::core::mem::MaybeUninit<Self> =
@@ -1011,6 +994,93 @@ fn expand_swift_value(mut item: ItemStruct) -> syn::Result<TokenStream2> {
             }
         }
     })
+}
+
+/// P09.42 (1.01 #2): build the class-backed `Clone` body. The
+/// first field (by convention the Swift class pointer at offset
+/// 0) is overwritten with the retained pointer; every other
+/// field uses its own `Clone` impl so non-POD extras don't
+/// alias heap owned by the original. Tuple and named structs
+/// are both supported; unit structs are rejected at parse time
+/// (a `swift_type = "...:class"` binding requires at least the
+/// pointer field).
+fn build_class_clone_body(item: &ItemStruct) -> syn::Result<TokenStream2> {
+    let retain_preamble = quote! {
+        let ptr: *mut ::core::ffi::c_void =
+            unsafe { *(self as *const Self as *const *mut ::core::ffi::c_void) };
+        let retained = if ptr.is_null() {
+            ptr
+        } else {
+            unsafe { ::rustcc_swift_rt::retain_swift_class(ptr) }
+        };
+    };
+
+    match &item.fields {
+        syn::Fields::Named(named) => {
+            let mut fields = named.named.iter();
+            let first = fields.next().ok_or_else(|| {
+                syn::Error::new_spanned(
+                    &item.ident,
+                    "swift_value! with `:class` requires at least one field \
+                     (the Swift class pointer at offset 0)",
+                )
+            })?;
+            let first_ident = first.ident.as_ref().expect("named field");
+            let first_ty = &first.ty;
+            let extras = fields.map(|f| {
+                let ident = f.ident.as_ref().expect("named field");
+                quote! { #ident: ::core::clone::Clone::clone(&self.#ident) }
+            });
+            Ok(quote! {
+                #retain_preamble
+                // Cast the retained `*mut c_void` to whatever
+                // opaque wrapper type the user has given the
+                // pointer field. Transmute is safe here because
+                // the field must be a pointer-sized handle (the
+                // `#[repr(swift)]` layout hinges on it).
+                let retained_handle: #first_ty = unsafe {
+                    ::core::mem::transmute_copy::<
+                        *mut ::core::ffi::c_void,
+                        #first_ty,
+                    >(&retained)
+                };
+                Self {
+                    #first_ident: retained_handle,
+                    #(#extras,)*
+                }
+            })
+        }
+        syn::Fields::Unnamed(unnamed) => {
+            let mut iter = unnamed.unnamed.iter().enumerate();
+            let (_idx0, first) = iter.next().ok_or_else(|| {
+                syn::Error::new_spanned(
+                    &item.ident,
+                    "swift_value! with `:class` requires at least one field \
+                     (the Swift class pointer at offset 0)",
+                )
+            })?;
+            let first_ty = &first.ty;
+            let extras = iter.map(|(idx, _f)| {
+                let idx = syn::Index::from(idx);
+                quote! { ::core::clone::Clone::clone(&self.#idx) }
+            });
+            Ok(quote! {
+                #retain_preamble
+                let retained_handle: #first_ty = unsafe {
+                    ::core::mem::transmute_copy::<
+                        *mut ::core::ffi::c_void,
+                        #first_ty,
+                    >(&retained)
+                };
+                Self(retained_handle, #(#extras,)*)
+            })
+        }
+        syn::Fields::Unit => Err(syn::Error::new_spanned(
+            &item.ident,
+            "swift_value! with `:class` cannot be used on a unit struct; \
+             add at least a pointer field (e.g. `_ptr: *mut c_void`)",
+        )),
+    }
 }
 
 /// Parsed form of `#[swift_type = "Module.Type"]` or

@@ -2,8 +2,8 @@
 
 ## How this document is organized
 
-`fork/patches/` contains a ten-file series that applies cleanly in
-order against `rust-lang/rust` at commit
+`fork/patches/` contains a twelve-file series that applies cleanly
+in order against `rust-lang/rust` at commit
 `e22c616e4e87914135c1db261a03e0437255335e` (the SHA pinned in
 `fork/build.sh`). Each file is the mechanical delivery for one
 semantic cluster:
@@ -20,6 +20,8 @@ semantic cluster:
 | `08-cargo-lock.patch`                 | `Cargo.lock` refresh                                                 |
 | `09-riscv-cxx-overlay.patch`          | RISC-V Itanium overlay (rv32 / rv64, P09.37 post-v1)                 |
 | `10-itemkind-class.patch`             | `ItemKind::Class` AST variant (P09.39, 1.01 #7)                      |
+| `11-class-generics.patch`             | Generics on class header — two-defid split (P09.41, 1.01 #1)         |
+| `12-attr-plumbing-macro.patch`        | Unify 5 `#[rustc_cxx_*]` no-args attrs via a macro (P09.43, 1.01 #3) |
 
 The **P01 … P09.38 sections below** are the authoritative design
 record. Each documents the intent, validation probe, and any
@@ -2583,6 +2585,89 @@ target-specific ABI code) than the simple additions P01–P06 are.
 
 Shipped after the 2026-04-21 v1 milestone. These extend the
 supported target matrix without touching v1 semantics.
+
+### P09.40 — Three-surface reference doc (1.01 #5)
+
+**Files**: `fork/THREE-SURFACES.md` (new), `fork/getting-started.html`
+(one-line link update). No compiler change.
+
+Documents when to use `cxx_class!` (stock-rustc compatible),
+`cxx_class_native!` (fork-only declarative macro), or the parser
+`class` keyword. Each surface produces identical machine code;
+differences are syntax ergonomics, stock-rustc compatibility,
+and boilerplate level. Also lists the cross-surface attribute
+table (`#[constructor]`, `#[cpp_virtual]`, etc.) and explains
+why tooling (rust-analyzer) can only see `class`-keyword files
+once the 1.02 RA fork ships.
+
+### P09.41 — Generics on class header (1.01 #1)
+
+**File**: `fork/patches/11-class-generics.patch` (+161 / −33
+across 7 rustc files).
+
+Fixes a P09.39 regression: any `class Foo<A> { ... }` — lifetime,
+type, or const generic — ICEd at `ast_lowering` with
+`duplicate copy of DefId(Foo::A) in lctx.children`. P09.39's
+single `generics` field on `ast::Class` made the struct half and
+the synthetic inherent impl half both try to own the same generic-
+param `DefId`s.
+
+**Fix**: `ast::Class` gains a parallel `impl_generics: Generics`.
+The parser clones `generics` into `impl_generics` at parse time;
+expansion's `visit_id` assigns distinct fresh `NodeId`s per copy
+so the two halves end up with non-colliding `DefId`s. Mirrors
+how hand-written `struct Foo<A>` + `impl<A> Foo<A>` have
+separate generic-param DefIds.
+
+**Downstream**:
+- `rustc_resolve`: new `resolve_class` runs a two-phase resolve
+  — struct-generics rib scopes the fields; impl-generics rib
+  scopes self-type + methods. Composes resolve_adt +
+  resolve_implementation shapes.
+- `rustc_resolve/def_collector`: walks `impl_generics` under the
+  impl def parent so its params get DefIds owned by the impl.
+- `rustc_ast_lowering::lower_class_impl_half`: uses
+  `class.impl_generics` for the impl's generic lowering.
+- `rustc_parse::build_cxx_class_self_path`: const-generic args
+  emit as `GenericArg::Const(AnonConst)` not the P09.30 type-path
+  stub (which ICEd typeck).
+
+**Validation**: workspace 235/0; /tmp probes for basic +
+inheritance + type generics + const generics all pass.
+
+### P09.42 — Non-POD extras in `swift_value!` (1.01 #2)
+
+**File**: `crates/rustcc_macros/src/lib.rs` (+85 / −20).
+
+Before P09.42, the class-backed `swift_value!` Clone did a
+byte-wise memcpy + overwrite of the pointer slot. For structs
+with POD extras (plain integers, pointers, arrays) this was
+fine; for non-POD extras (`Box`, `String`, `Vec`) the memcpy
+aliased the heap owned by the original, double-freeing on drop
+of the clone.
+
+**Fix**: class-backed Clone builds a `Self { ... }` struct
+literal. The first field (class pointer, by convention at
+offset 0) gets the retained pointer; every other field goes
+through `::core::clone::Clone::clone(&self.field)` so heap
+ownership transfers correctly. Named structs and tuple structs
+are both supported; unit structs reject with a clear error.
+
+**Validation**: `/tmp/p09-42-swift-nonpod/` — class with
+`extra: Box<i32>` clones + drops without aliasing. Workspace
+235/0.
+
+### P09.43 — Unify `#[rustc_cxx_*]` no-args attr plumbing (1.01 #3)
+
+**File**: `fork/patches/12-attr-plumbing-macro.patch` (+76 / −67
+in `rustc_attr_parsing/src/attributes/codegen_attrs.rs`).
+
+Pure cleanup. Five fork-only `NoArgsAttributeParser` impls
+(`RustcCxxCtor`, `RustcCxxWrapper`, `RustcCxxDropWrapper`,
+`RustcCxxVirtual`, `RustcCxxBase`) shared an identical shape;
+collapsed via a new `rustcc_noargs_attr!` macro that takes the
+parser name, symbol, attribute-kind variant, and target
+allow-list. Net ~30 LOC down. No semantic change.
 
 ### P09.39 — `ItemKind::Class` AST variant (1.01 #7)
 
