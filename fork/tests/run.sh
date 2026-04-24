@@ -30,6 +30,7 @@ declare -a probes=(
   "class_keyword/const_generics"
   "class_keyword/swift_nonpod"
   "class_keyword/swift_value_attr"
+  "class_keyword/swift_throws"
 )
 
 # Map of probe directory to expected stdout prefix (matches the
@@ -41,6 +42,7 @@ declare -a expect=(
   "ok: const-generic class sum"
   "ok: non-POD extra cloned"
   "ok: swift_value built-in attr"
+  "ok: swift_throws wrapper"
 )
 
 pass=0

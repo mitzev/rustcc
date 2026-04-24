@@ -23,6 +23,7 @@ semantic cluster:
 | `11-class-generics.patch`             | Generics on class header — two-defid split (P09.41, 1.01 #1)         |
 | `12-attr-plumbing-macro.patch`        | Unify 5 `#[rustc_cxx_*]` no-args attrs via a macro (P09.43, 1.01 #3) |
 | `13-swift-value-builtin.patch`        | `#[swift_value]` built-in attribute macro (P09.46, 1.02 #2)          |
+| `14-swift-throws.patch`               | `#[rustc_swift_throws]` + `swifterror` LLVM attr (P09.48, 1.02 throws)|
 
 The **P01 … P09.38 sections below** are the authoritative design
 record. Each documents the intent, validation probe, and any
@@ -2586,6 +2587,122 @@ target-specific ABI code) than the simple additions P01–P06 are.
 
 Shipped after the 2026-04-21 v1 milestone. These extend the
 supported target matrix without touching v1 semantics.
+
+### P09.48 — Swift `throws` support (1.02 throws)
+
+**File**: `fork/patches/14-swift-throws.patch` + 
+`crates/rustcc_swift_rt/src/lib.rs` (+106 LOC for the
+`SwiftError` owned-handle type). 15 rustc files touched
+(+100 / -2 LOC).
+
+#### What's delivered
+
+Swift throwing functions now have a first-class rustcc binding:
+
+```rust
+use rustcc_swift_rt::SwiftError;
+
+unsafe extern "Swift" {
+    #[rustc_swift_throws]
+    #[link_name = "$s5MyLib8do_thingSiSiAA5InputVtKF"]
+    fn do_thing_raw(
+        input: i64,
+        err: *mut *mut core::ffi::c_void,
+    ) -> i64;
+}
+
+fn do_thing(input: i64) -> Result<i64, SwiftError> {
+    let mut err: *mut core::ffi::c_void = core::ptr::null_mut();
+    let ret = unsafe { do_thing_raw(input, &mut err) };
+    if err.is_null() {
+        Ok(ret)
+    } else {
+        Err(unsafe { SwiftError::from_retained(err) })
+    }
+}
+```
+
+`#[rustc_swift_throws]` on an `extern "Swift"` foreign fn tells
+rustcc to attach LLVM's `swifterror` attribute to the **last**
+parameter. LLVM then pins that parameter to the Swift-ABI
+error register (r12 on x86_64, x21 on aarch64 Darwin) and
+handles the caller-side read automatically after the call.
+The `SwiftError` runtime type in `rustcc_swift_rt` owns the
+retained error pointer; Drop decrements the refcount.
+
+#### Plumbing path
+
+1. `LLVMRustAttributeKind::SwiftError` — new variant in both
+   the Rust enum (`ffi.rs`) and the C++ bridge
+   (`RustWrapper.cpp::fromRust`), mapping to LLVM's
+   `Attribute::SwiftError`.
+2. `CodegenFnAttrFlags::SWIFT_ERROR_LAST_ARG` — new flag,
+   set when the callee's HIR attrs contain `RustcSwiftThrows`.
+3. `FnAbi::swift_error_last_arg: bool` — threads the flag
+   from codegen_fn_attrs to the callconv layer. Populated in
+   `rustc_ty_utils::abi::fn_abi_new_uncached`.
+4. `apply_attrs_llfn` + `apply_attrs_callsite` in
+   `rustc_codegen_llvm/src/abi.rs` attach the LLVM SwiftError
+   attribute to the last argument slot when the flag is set.
+
+#### LLVM IR verification
+
+Compiled probe emits exactly what the Swift ABI wants:
+
+```llvm
+declare swiftcc i64 @"$s...VtKF"(i64, ptr swifterror)
+
+define i64 @call_do_thing(i64 %input) {
+  ...
+  %ret = call swiftcc i64 @"$s...VtKF"(i64 %input, ptr swifterror %err)
+  ...
+}
+```
+
+Both the declaration and the call site carry `ptr swifterror`
+on the error parameter.
+
+#### SwiftError runtime type
+
+`rustcc_swift_rt::SwiftError` — owned handle to a Swift Error
+instance. Holds one retain; Drop releases. Methods:
+- `from_retained(ptr) -> SwiftError` (unsafe) — take ownership
+- `into_raw() -> *mut c_void` — extract without releasing
+- `as_ptr() -> *mut c_void` — borrow raw pointer
+- `is_null() -> bool` — convenience
+
+Send (atomic refcount); not Sync by default (Swift Errors
+may carry interior mutability).
+
+#### Scope notes
+
+- **Last-argument positional convention.** The attr attaches
+  SwiftError to the last LLVM parameter. Every Swift throwing
+  function the ABI emits has the error slot as an implicit
+  trailing hidden arg, so this covers 100% of expected use.
+  A future `#[rustc_swift_error_slot]` per-param attribute
+  could add flexibility if needed.
+- **Runtime integration is user-side.** The in-tree probe
+  exercises only the Rust-side `SwiftError` ownership semantics;
+  end-to-end throw/catch against a real Swift library requires
+  linking against `libswiftCore`, which is a user-environment
+  concern. The LLVM IR verification is the real codegen check.
+- **Doesn't enable `async`.** `async throws` functions use an
+  additional continuation-passing convention that P09.48
+  doesn't touch.
+
+#### Validation
+
+- `cargo check compiler` → clean.
+- `./x.py build --stage 1 library` → clean (~2 min
+  incremental).
+- `/tmp/p09-48-swift-throws/` LLVM IR has `swifterror` on
+  both declaration and callsite as expected.
+- `fork/tests/class_keyword/swift_throws/` added to in-tree
+  probes; `fork/tests/run.sh` now 7/7.
+- `cargo test --workspace` (rustcc) → 235/0.
+
+---
 
 ### P09.46 — `#[swift_value]` built-in attribute macro (1.02 #2)
 

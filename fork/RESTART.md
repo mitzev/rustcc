@@ -1,4 +1,4 @@
-# rustcc — session restart (v1 + 1.01 closed + 1.02 #1 Phase 1 + 1.02 #2 + Rank 1 adoption infra)
+# rustcc — session restart (v1 + 1.01 closed + 1.02 #1 Phase 1 + 1.02 #2 + throws + Rank 1 adoption infra)
 
 Last updated: **2026-04-25**, Opus 4.7 (1M ctx). **rustcc v1
 milestone complete. Post-v1 shipped: P09.37 (RISC-V ESP32),
@@ -6,12 +6,13 @@ P09.38 (Raspberry Pi Pico), P09.39 (ItemKind::Class), P09.40-44
 (1.01 batch closing items #1-#6), P09.45 (rust-analyzer fork for
 `class` keyword — Phase 1 parser support, 1.02 #1 Phase 1),
 P09.46 (`#[swift_value]` built-in attribute macro, 1.02 #2),
-P09.47 (Rank 1 adoption infra: release workflow + install action
-+ INSTALL.md).** 1.01 fully shipped. 1.02 #1 Phase 1 in. 1.02 #2
-shipped. Adoption friction reduced from "30-90 min source build"
-to "3 min curl+extract" for published triples. Next workable
-items: 1.02 #1 Phase 2 (RA HIR-level resolution), 1.1
-(multi-inheritance).
+P09.47 (Rank 1 adoption infra), P09.48 (Swift throws support —
+`#[rustc_swift_throws]` + LLVM `swifterror` + SwiftError runtime
+wrapper).** 1.01 fully shipped. 1.02 #1 Phase 1 in. 1.02 #2
+shipped. Swift throws shipped. Adoption friction reduced from
+"30-90 min source build" to "3 min curl+extract" for published
+triples. Next workable items: 1.02 #1 Phase 2 (RA HIR-level
+resolution), 1.1 (multi-inheritance).
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
 
@@ -34,7 +35,63 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## Latest addition (P09.47 / Rank 1, 2026-04-25, infra-only)
+## Latest addition (P09.48, 2026-04-25)
+
+**1.02 throws shipped.** `#[rustc_swift_throws]` is a new
+attribute on `extern "Swift"` foreign fns that attaches LLVM's
+`swifterror` to the last parameter, pinning it to the Swift-ABI
+error register. The `SwiftError` type in `rustcc_swift_rt`
+owns the retained error pointer with Drop semantics.
+
+**Why it matters**: Swift throwing functions were the single
+biggest Swift-interop gap I called out in the 1.02 scope
+discussion. ~280 LOC closed the whole feature — much lower
+than the memory's prior "large" estimate because most of the
+work is existing LLVM machinery; rustcc just flips the right
+attribute at the right arg slot.
+
+**Patch**: `fork/patches/14-swift-throws.patch` (15 rustc
+files, +100 / -2 LOC) plus `crates/rustcc_swift_rt/src/lib.rs`
+(+106 LOC for SwiftError type). Series now 14 patches.
+
+**Scope walkthrough**:
+- `LLVMRustAttributeKind::SwiftError` new variant in both the
+  C++ wrapper (`RustWrapper.cpp::fromRust`) and the Rust FFI
+  enum (`rustc_codegen_llvm::llvm::ffi::AttributeKind`), mapping
+  to LLVM's `Attribute::SwiftError`.
+- `rustc_swift_throws` symbol + `RustcSwiftThrows(Span)` HIR
+  variant + parser via P09.43's `rustcc_noargs_attr!` macro +
+  `CodegenFnAttrFlags::SWIFT_ERROR_LAST_ARG` flag.
+- `FnAbi::swift_error_last_arg: bool` — threads the flag from
+  codegen_fn_attrs to the callconv layer. Populated in
+  `rustc_ty_utils::abi::fn_abi_new_uncached`. Static-size
+  assert bumped 80 → 88.
+- `apply_attrs_llfn` + `apply_attrs_callsite` attach the LLVM
+  SwiftError attribute at `Argument(i - 1)` after the normal
+  arg loop.
+
+**Validation**:
+- Stage-1 library rebuilds clean.
+- `/tmp/p09-48-swift-throws/` emits
+  `declare swiftcc i64 @"..."(i64, ptr swifterror)` +
+  matching call site — exactly what the Swift ABI wants.
+- In-tree `fork/tests/class_keyword/swift_throws/` added;
+  `fork/tests/run.sh` now 7/7.
+- `cargo test --workspace` (rustcc): 235/0, unchanged.
+
+**Memory-worthy**:
+- LLVM's `SwiftError` attribute was already there — just
+  needed wrapping. Every LLVM C++ attr has two touchpoints
+  for rustc bridging: `LLVMRustAttributeKind` enum (both
+  sides) + `fromRust` switch case. Pattern reusable for any
+  attr not already bridged.
+- Runtime round-trip needs matching `swiftcc + swifterror`
+  on BOTH caller and callee. An `extern "C"` stub doesn't
+  participate in the register convention and reads back the
+  original null — the IR-level validation is the real codegen
+  check, runtime integration is a Swift-runtime-side concern.
+
+## Prior addition (P09.47 / Rank 1, 2026-04-25, infra-only)
 
 **Shipped the prebuilt-binaries adoption path.** Rank 1 of the
 ecosystem-adoption analysis: closes the biggest adoption

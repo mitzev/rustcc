@@ -1,0 +1,13 @@
+[package]
+name = "swift_throws"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "swift_throws"
+path = "src/main.rs"
+
+[dependencies]
+rustcc_swift_rt = { path = "../../../../crates/rustcc_swift_rt" }
+
+[workspace]

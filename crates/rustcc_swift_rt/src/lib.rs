@@ -256,3 +256,117 @@ pub unsafe fn retain_swift_class(obj: *mut core::ffi::c_void) -> *mut core::ffi:
 pub unsafe fn release_swift_class(obj: *mut core::ffi::c_void) {
     unsafe { swift_release(obj) };
 }
+
+// ============================================================
+// P09.48 / 1.02 throws — Swift `throws` error handle.
+// ============================================================
+//
+// `SwiftError` is an opaque owned handle to a Swift `Error`
+// instance. It behaves like a `Box<dyn Error>` in Rust: the
+// inner pointer is `swift_retain`'d on construction and
+// `swift_release`'d on drop. Dropping a null-pointer
+// `SwiftError` is a no-op (the Swift convention for "no error").
+//
+// A throwing Swift function, when declared in `extern "Swift"`,
+// takes a trailing `err: *mut *mut SwiftError` parameter. The
+// caller seeds `*err = null_mut()` before the call; the callee
+// writes a retained error pointer there on throw and leaves it
+// null on success. The `#[rustc_swift_throws]` attribute on
+// the foreign-fn decl tells rustcc to attach LLVM's
+// `swifterror` to that parameter, which pins it to the Swift-
+// ABI error register (r12 on x86_64, x21 on aarch64 Darwin).
+//
+// A future helper macro will generate the Result-wrapping
+// thunk automatically; for now users write it themselves —
+// see the example in the doc-comment below.
+
+/// Owned handle to a Swift `Error` instance. Holds one retain
+/// on the underlying reference.
+///
+/// # Example
+///
+/// ```ignore
+/// use rustcc_swift_rt::SwiftError;
+///
+/// extern "Swift" {
+///     #[rustc_swift_throws]
+///     #[link_name = "$s5MyLib8do_thingSiSiAA5InputVtKF"]
+///     fn do_thing_raw(
+///         input: Input,
+///         err: *mut *mut core::ffi::c_void,
+///     ) -> i64;
+/// }
+///
+/// fn do_thing(input: Input) -> Result<i64, SwiftError> {
+///     let mut err: *mut core::ffi::c_void = core::ptr::null_mut();
+///     let ret = unsafe { do_thing_raw(input, &mut err) };
+///     if err.is_null() {
+///         Ok(ret)
+///     } else {
+///         // SAFETY: the Swift ABI guarantees `err` is either
+///         // null or a retained Error; we take ownership here.
+///         Err(unsafe { SwiftError::from_retained(err) })
+///     }
+/// }
+/// ```
+#[repr(transparent)]
+pub struct SwiftError {
+    ptr: *mut core::ffi::c_void,
+}
+
+impl SwiftError {
+    /// Take ownership of a retained Swift Error pointer produced
+    /// by a throwing extern "Swift" call. The caller must not
+    /// release the pointer separately — `SwiftError`'s `Drop`
+    /// will do it.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be either null or a valid, already-retained
+    /// Swift `Error` class instance pointer.
+    #[inline]
+    pub unsafe fn from_retained(ptr: *mut core::ffi::c_void) -> Self {
+        SwiftError { ptr }
+    }
+
+    /// Extract the underlying raw pointer without releasing it.
+    /// Useful when handing the error back to Swift (e.g. forwarding
+    /// from a Rust throwing shim). After this call the caller is
+    /// responsible for the retain.
+    #[inline]
+    pub fn into_raw(self) -> *mut core::ffi::c_void {
+        let p = self.ptr;
+        core::mem::forget(self);
+        p
+    }
+
+    /// Borrow the raw pointer without transferring ownership.
+    #[inline]
+    pub fn as_ptr(&self) -> *mut core::ffi::c_void {
+        self.ptr
+    }
+
+    /// True if this handle is the Swift "no error" null pointer.
+    /// The throwing-call wrapper usually short-circuits before
+    /// constructing a `SwiftError` with null; this method is
+    /// provided for defensive code paths.
+    #[inline]
+    pub fn is_null(&self) -> bool {
+        self.ptr.is_null()
+    }
+}
+
+impl Drop for SwiftError {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { swift_release(self.ptr) };
+        }
+    }
+}
+
+// `SwiftError` is a pointer to a refcounted object. Swift's
+// ARC is thread-safe (atomic retain/release), so the handle
+// itself is safe to `Send` and `Sync` as long as the inner
+// error type is. We default to `Send` only — Swift errors can
+// carry interior mutability, so `Sync` is opt-in.
+unsafe impl Send for SwiftError {}
