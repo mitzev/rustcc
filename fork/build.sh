@@ -43,17 +43,32 @@ fi
   git checkout "$PINNED_COMMIT"
 )
 
-# 2. Apply the patch series in order. `git apply --check` first so a
-#    failure is loud and doesn't leave the tree half-patched.
+# 2. Apply the patch series in order. Use `git am --3way` so the
+#    blob hashes embedded in the format-patch output drive a
+#    three-way merge on any context drift. Patches 10+ were
+#    generated against a cumulative local fork state, so strict
+#    `git apply` can reject them even when the semantic diff
+#    would apply cleanly. `--3way` handles that gracefully.
+#
+#    Git needs a user identity for `am` to produce commits;
+#    seed one if the caller doesn't already have a `.gitconfig`
+#    (happens in clean CI runners and fresh containers).
 echo "==> applying rustcc patches"
 (
   cd "$CLONE_DIR"
+  if ! git config --get user.email >/dev/null 2>&1; then
+    git config user.email "rustcc@localhost"
+  fi
+  if ! git config --get user.name >/dev/null 2>&1; then
+    git config user.name "rustcc-build"
+  fi
   for patch in "$FORK_DIR"/patches/*.patch; do
     echo "    apply $(basename "$patch")"
-    git apply --check "$patch"
-  done
-  for patch in "$FORK_DIR"/patches/*.patch; do
-    git apply "$patch"
+    if ! git am --3way "$patch"; then
+      echo "==> patch $(basename "$patch") failed to apply; aborting" >&2
+      git am --abort >/dev/null 2>&1 || true
+      exit 1
+    fi
   done
 )
 
