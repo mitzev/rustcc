@@ -1,0 +1,26 @@
+# A self-contained polymorphic-class demo for the rustcc fork.
+#
+# Declares a small Shape hierarchy using the `class` keyword:
+#   Shape (abstract-ish)
+#     ├─ Rectangle
+#     └─ Circle
+#
+# Runs without any C++ side — purpose is to exercise the
+# class-keyword surface (P09.30 / P09.39), single-inheritance
+# (P09.32), and virtual-method override (P09.34) all in one place
+# and print the results so users can see the dispatch behavior.
+#
+# Build:
+#   RUSTC=<stage1> cargo +nightly build
+#   ./target/debug/shape_hierarchy
+
+[package]
+name = "shape_hierarchy"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "shape_hierarchy"
+path = "src/main.rs"
+
+[workspace]
