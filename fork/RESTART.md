@@ -1,14 +1,14 @@
-# rustcc — session restart (v1 + 1.01 closed + 1.02 #1 Phase 1 shipped)
+# rustcc — session restart (v1 + 1.01 closed + 1.02 #1 Phase 1 + 1.02 #2 shipped)
 
-Last updated: **2026-04-24**, Opus 4.7 (1M ctx). **rustcc v1
+Last updated: **2026-04-25**, Opus 4.7 (1M ctx). **rustcc v1
 milestone complete. Post-v1 shipped: P09.37 (RISC-V ESP32),
 P09.38 (Raspberry Pi Pico), P09.39 (ItemKind::Class), P09.40-44
 (1.01 batch closing items #1-#6), P09.45 (rust-analyzer fork for
-`class` keyword — Phase 1 parser support, 1.02 #1).**
-1.01 is fully shipped; 1.02 #1 Phase 1 is in — editors no longer
-cascade-error on class-containing files. Phase 2 (HIR-level
-resolution for class names + method dispatch) and 1.02 #2 (Swift
-auto-synth) are the next workable items.
+`class` keyword — Phase 1 parser support, 1.02 #1 Phase 1),
+P09.46 (`#[swift_value]` built-in attribute macro, 1.02 #2).**
+1.01 fully shipped. 1.02 #1 Phase 1 in. 1.02 #2 shipped. Next
+workable items: 1.02 #1 Phase 2 (RA HIR-level resolution), 1.1
+(multi-inheritance).
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
 
@@ -31,7 +31,79 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## Latest addition (P09.45, 2026-04-24)
+## Latest addition (P09.46, 2026-04-25)
+
+**1.02 #2 shipped: `#[swift_value]` built-in attribute macro.**
+The `rustcc_macros::swift_value!` proc-macro wrapper is
+retired; users now write:
+
+```rust
+#[swift_value]
+#[swift_type = "Foo.Bar:class"]
+pub struct Bar {
+    _ptr: *mut core::ffi::c_void,
+    extra: Box<i32>,
+}
+```
+
+and the compiler auto-synthesizes `impl Drop`, `impl Clone`
+(with per-field Clone for non-POD extras on class-backed
+types — keeps the P09.42 semantics), and the metadata
+accessor `extern "C"` decl with Swift-mangled `link_name`.
+`#[repr(swift)]` is added to the struct during expansion if
+not already present.
+
+**Scope (Option A — built-in attribute macro)**:
+- `compiler/rustc_builtin_macros/src/swift_value.rs` (new,
+  ~270 LOC): finds sibling `#[swift_type]`, parses the Swift
+  binding, formats expansion as Rust source, re-parses via
+  `new_parser_from_source_str`.
+- `compiler/rustc_builtin_macros/src/lib.rs`:
+  `swift_value: swift_value::expand` in `register_attr!`.
+- `compiler/rustc_span/src/symbol.rs`: +`swift_value` symbol.
+- `library/core/src/macros/mod.rs`: `pub macro
+  swift_value($item:item)` stub with `#[rustc_builtin_macro]`.
+- `library/core/src/prelude/v1.rs` + `library/std/src/prelude/v1.rs`:
+  re-export so `#[swift_value]` works without a `use`
+  statement (matches `#[global_allocator]`).
+
+**Patch**: `fork/patches/13-swift-value-builtin.patch` (6
+files, +421/0).
+
+**Probe**: `fork/tests/class_keyword/swift_value_attr/`
+(class-backed with `Box<i32>` extra). `fork/tests/run.sh` now
+6/6.
+
+**Validation**:
+- Stage-1 library rebuilds clean (~2 min incrementally).
+- `cargo test --workspace` → 235/0 (unchanged).
+- `RUSTC=<stage1> ./fork/tests/run.sh` → 6/6.
+
+**Design note**: I redesigned mid-implementation from
+`#[swift_value = "Module.Type"]` (value form) to
+`#[swift_value]` + sibling `#[swift_type = "..."]` because
+the `pub macro swift_value($item:item)` stub signature in
+core doesn't accept name-value input syntax. Siblings are
+also more symmetric with how `#[swift_type]` already acts as
+the canonical source of the Swift binding.
+
+**Memory-worthy bugs**:
+- `pub macro X($item:item)` stubs in `library/core/src/macros/mod.rs`
+  reject name-value attribute input. Prefer the sibling-attr
+  pattern (`#[X]` + `#[X_config = "..."]`) for anything that
+  needs configuration. `#[test_case]` and `#[global_allocator]`
+  follow this pattern too.
+- Built-in attribute macros need a prelude entry in BOTH
+  `core/prelude/v1.rs` AND `std/prelude/v1.rs`, otherwise
+  they're "not found in this scope" under `#![no_std]` (or
+  with std, depending on which prelude applies).
+- Stubbed runtime symbols need `#[export_name]` (not
+  `#[no_mangle]` + matching Rust name), because the synthesized
+  extern decl uses the Swift-mangled symbol string
+  `$s<modlen><mod><typelen><type>VMa` which isn't a valid Rust
+  identifier.
+
+## Prior addition (P09.45, 2026-04-24)
 
 **1.02 #1 Phase 1 shipped: rust-analyzer fork for `class`.** Parser
 now accepts `class Widget { ... }` as a first-class AST item
@@ -331,7 +403,9 @@ closed.**
 1. ~~rust-analyzer fork for `class` — Phase 1 parser support~~
    — P09.45. Phase 2 (HIR-level class→struct+impl synthesis for
    hover / go-to-def / completion) remains.
-2. True compiler auto-synthesis for `#[repr(swift)]` (large).
+2. ~~True compiler auto-synthesis for `#[repr(swift)]`~~
+   — P09.46. `#[swift_value]` built-in attribute macro
+   retires the `swift_value!` proc macro.
 
 **1.1 — multi-inheritance capstone**:
 1. Multi-inheritance + virtual bases (very large).

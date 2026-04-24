@@ -22,6 +22,7 @@ semantic cluster:
 | `10-itemkind-class.patch`             | `ItemKind::Class` AST variant (P09.39, 1.01 #7)                      |
 | `11-class-generics.patch`             | Generics on class header — two-defid split (P09.41, 1.01 #1)         |
 | `12-attr-plumbing-macro.patch`        | Unify 5 `#[rustc_cxx_*]` no-args attrs via a macro (P09.43, 1.01 #3) |
+| `13-swift-value-builtin.patch`        | `#[swift_value]` built-in attribute macro (P09.46, 1.02 #2)          |
 
 The **P01 … P09.38 sections below** are the authoritative design
 record. Each documents the intent, validation probe, and any
@@ -2585,6 +2586,114 @@ target-specific ABI code) than the simple additions P01–P06 are.
 
 Shipped after the 2026-04-21 v1 milestone. These extend the
 supported target matrix without touching v1 semantics.
+
+### P09.46 — `#[swift_value]` built-in attribute macro (1.02 #2)
+
+**File**: `fork/patches/13-swift-value-builtin.patch`. 6 files
+touched (+421 / 0) across `rustc_builtin_macros`, `rustc_span`,
+`library/core/src/macros`, and both preludes.
+
+#### What's delivered
+
+`#[swift_value]` is now a compiler built-in attribute. Users
+drop the `rustcc_macros::swift_value!` function-like wrapper
+and get Drop + Clone + metadata-accessor extern synthesized by
+the compiler itself:
+
+```rust
+// Before (P09.42):
+rustcc_macros::swift_value! {
+    #[swift_type = "Foo.Bar:class"]
+    pub struct Bar {
+        _ptr: *mut core::ffi::c_void,
+        extra: Box<i32>,
+    }
+}
+
+// After (P09.46):
+#[swift_value]
+#[swift_type = "Foo.Bar:class"]
+pub struct Bar {
+    _ptr: *mut core::ffi::c_void,
+    extra: Box<i32>,
+}
+```
+
+No `use rustcc_macros::...` needed — `swift_value` is in the
+prelude like `#[global_allocator]`, `#[test]`, etc.
+
+#### Design (Option A)
+
+Built-in attribute macro registered in
+`rustc_builtin_macros::register_attr!`, declared as a stub
+`pub macro swift_value($item:item)` in
+`library/core/src/macros/mod.rs` (behind `rustc_attrs`
+feature-gate). Expansion:
+
+1. Verifies the item is a struct.
+2. Finds the sibling `#[swift_type = "Module.Type"]`
+   attribute (required; emits a targeted diagnostic if
+   missing).
+3. Parses the Swift binding into `module`, `name`, and
+   `is_class` (from the optional `:class` suffix).
+4. Augments the struct's attrs with `#[repr(swift)]` if not
+   already present. `#[swift_type]` is left as-is so the
+   existing Swift-mangling pass in `rustc_symbol_mangling`
+   sees it.
+5. Formats the expansion (metadata extern + Drop impl + Clone
+   impl) as Rust source, parses it via
+   `rustc_parse::new_parser_from_source_str`, returns the
+   augmented struct + synthesized items.
+
+String-based expansion avoids ~200 LOC of hand-built AST
+construction (`ecx.item`, `ecx.expr_*`, `ecx.path_*`, etc.)
+that the equivalent `global_allocator` expander uses. The
+trade-off: errors in the formatted code surface as
+`anon_source_code` parse errors, which rebranding
+`rebrand_item_span` papers over reasonably well.
+
+#### Preserves P09.42 non-POD extras
+
+Class-backed Clone still uses a `Self { ptr_field:
+retained_handle, extra1: self.extra1.clone(), ... }` struct
+literal — not a byte-wise memcpy. `Box<T>`, `String`, `Vec<T>`
+etc. as extra fields on a class-backed `#[swift_value]` don't
+double-free on drop of the clone. The port from
+`crates/rustcc_macros/src/lib.rs::build_class_clone_body` was
+mechanical: `quote!` blocks → format strings, otherwise
+identical logic.
+
+#### What we don't yet delete
+
+`crates/rustcc_macros/src/lib.rs::swift_value` proc macro
+still exists and works. Users on older rustcc stage-1 binaries
+continue to use the proc-macro form. A follow-up can delete
+the proc-macro after the built-in has been stable in the fork
+for one release cycle.
+
+#### Validation
+
+- `/tmp/p09-46-swift-value-attr/` class-backed probe: 
+  `Bar::clone()` + `drop(b)` + `drop(c)` with `Box<i32>` extra
+  — no double-free. Value-type probe compiles and links
+  (runtime segfaults without a real Swift stdlib, which is
+  expected).
+- `fork/tests/class_keyword/swift_value_attr/` added to the
+  in-tree runner; `RUSTC=<stage1> ./fork/tests/run.sh` now
+  reports 6/6.
+- rustcc workspace unaffected: `cargo test --workspace` →
+  235/0.
+- Stage-1 library rebuilds clean.
+
+#### Takeaway
+
+The "large" scope label in the pre-P09.46 queue was
+overblown. ~270 LOC in the new expander + ~20 LOC of glue
+(symbol, registration, core stub, preludes) shipped the full
+feature. The P09.42 per-field Clone work did most of the
+semantic heavy-lifting; what remained was wiring.
+
+---
 
 ### P09.45 — rust-analyzer parser support for `class` (1.02 #1 Phase 1)
 

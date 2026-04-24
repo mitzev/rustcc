@@ -29,6 +29,7 @@ any probe fails.
 | `class_keyword/type_generics`      | `class Pair<A, B>` — impl/struct half DefId separation   | P09.41                             |
 | `class_keyword/const_generics`     | `class Array<const N: usize>` — const-arg lowering       | P09.41                             |
 | `class_keyword/swift_nonpod`       | `swift_value!` class Clone respects non-POD extras       | P09.42                             |
+| `class_keyword/swift_value_attr`   | `#[swift_value]` built-in attr macro auto-synthesizes Drop + Clone | P09.46                 |
 | `targets_linux` (via run_targets.sh) | Polymorphic class IR on Linux x86_64/aarch64/armv7/rv64 | P09.44                             |
 
 ## Adding a new probe

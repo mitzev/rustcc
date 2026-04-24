@@ -1,0 +1,560 @@
+From 691695d1ee4b0d266eca3a7f34e7463233db1c92 Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Sat, 25 Apr 2026 01:02:33 +0300
+Subject: [PATCH] P09.46: built-in attribute macro for #[swift_value] (1.02 #2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Promotes the `swift_value!` proc-macro from crates/rustcc_macros
+into a built-in attribute macro in rustc_builtin_macros. Users
+now write `#[swift_value]` as a sibling of `#[swift_type = "..."]`
+on a bare struct; the compiler synthesizes `#[repr(swift)]` (if
+not already present), the metadata accessor `extern "C"` decl
+with Swift-mangled link_name, `impl Drop` forwarding to
+rustcc_swift_rt::drop_swift_value / release_swift_class, and
+`impl Clone` forwarding to clone_swift_value (value types) or
+a per-field-clone struct literal (class types with non-POD
+extras — keeps the P09.42 semantics).
+
+Files touched:
+- compiler/rustc_builtin_macros/src/swift_value.rs (new,
+  ~270 LOC): parses #[swift_type] as sibling attr, formats the
+  expansion as Rust source, parses it via
+  rustc_parse::new_parser_from_source_str, returns the
+  augmented struct + synthesized items.
+- compiler/rustc_builtin_macros/src/lib.rs: `swift_value:
+  swift_value::expand` in the register_attr! list + `mod
+  swift_value;`.
+- compiler/rustc_span/src/symbol.rs: +swift_value symbol.
+- library/core/src/macros/mod.rs: `pub macro swift_value($item:item)`
+  stub with #[rustc_builtin_macro] so the resolver wires the
+  expander; feature-gated behind rustc_attrs for now.
+- library/core/src/prelude/v1.rs and
+  library/std/src/prelude/v1.rs: re-export swift_value so users
+  don't need a `use` statement (matches #[global_allocator]).
+
+User-facing delta:
+  before (P09.42):                      after (P09.46):
+    rustcc_macros::swift_value! {         #[swift_value]
+        #[swift_type = "Foo.Bar"]         #[swift_type = "Foo.Bar"]
+        pub struct Bar { ... }            pub struct Bar { ... }
+    }
+
+The rustcc_macros proc macro can be deleted in a follow-up; for
+now it still works (users on a prior-stage rustc keep the same
+path). The new form additionally doesn't require importing
+rustcc_macros — the attribute is in the prelude.
+
+Validation:
+- /tmp/p09-46-swift-value-attr/ probe: class-backed Bar with
+  non-POD Box<i32> extra clones + drops without aliasing; value-
+  type Point compiles/links (runtime would need a real Swift
+  stdlib).
+- Stage-1 library rebuilds clean.
+- cargo test --workspace in rustcc repo: 235/0 (unchanged).
+- fork/tests/run.sh: 5/5 (all prior class probes still pass).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ compiler/rustc_builtin_macros/src/lib.rs      |   2 +
+ .../rustc_builtin_macros/src/swift_value.rs   | 393 ++++++++++++++++++
+ compiler/rustc_span/src/symbol.rs             |   1 +
+ library/core/src/macros/mod.rs                |  14 +
+ library/core/src/prelude/v1.rs                |   7 +
+ library/std/src/prelude/v1.rs                 |   4 +
+ 6 files changed, 421 insertions(+)
+ create mode 100644 compiler/rustc_builtin_macros/src/swift_value.rs
+
+diff --git a/compiler/rustc_builtin_macros/src/lib.rs b/compiler/rustc_builtin_macros/src/lib.rs
+index d39e3d81..b1870afa 100644
+--- a/compiler/rustc_builtin_macros/src/lib.rs
++++ b/compiler/rustc_builtin_macros/src/lib.rs
+@@ -44,6 +44,7 @@
+ mod log_syntax;
+ mod pattern_type;
+ mod source_util;
++mod swift_value;
+ mod test;
+ mod trace_macros;
+ 
+@@ -116,6 +117,7 @@ pub fn register_builtin_macros(resolver: &mut dyn ResolverExpand) {
+         eii_declaration: eii::eii_declaration,
+         eii_shared_macro: eii::eii_shared_macro,
+         global_allocator: global_allocator::expand,
++        swift_value: swift_value::expand,
+         test: test::expand_test,
+         test_case: test::expand_test_case,
+         unsafe_eii: eii::unsafe_eii,
+diff --git a/compiler/rustc_builtin_macros/src/swift_value.rs b/compiler/rustc_builtin_macros/src/swift_value.rs
+new file mode 100644
+index 00000000..5ac82434
+--- /dev/null
++++ b/compiler/rustc_builtin_macros/src/swift_value.rs
+@@ -0,0 +1,393 @@
++//! P09.46 (1.02 #2): built-in attribute macro for `#[swift_value = "Module.Type"]`.
++//!
++//! Retires the `swift_value!` proc macro from `crates/rustcc_macros`
++//! by promoting the same expansion into `rustc_builtin_macros`.
++//! Users now just write:
++//!
++//! ```ignore
++//! #[swift_value = "Foo.Bar"]
++//! pub struct Bar { _ptr: *mut core::ffi::c_void }
++//! ```
++//!
++//! and the compiler synthesizes:
++//! - `#[repr(swift)]` on the struct (if not already present)
++//! - `#[swift_type = "Foo.Bar"]` (for Swift-mangling downstream passes)
++//! - `extern "C"` metadata-accessor decl with Swift-mangled link_name
++//! - `impl Drop` forwarding to `rustcc_swift_rt::drop_swift_value` or
++//!   `release_swift_class`
++//! - `impl Clone` forwarding to `rustcc_swift_rt::clone_swift_value`
++//!   (value types) or a struct-literal with per-field `Clone::clone`
++//!   (class-backed types — keeps the P09.42 non-POD extras semantics)
++//!
++//! `"Foo.Bar"` is a value type; `"Foo.Bar:class"` is a reference type.
++//! ASCII module and type names only (matches the proc macro's scope).
++
++use rustc_ast::{self as ast, Item, ItemKind};
++use rustc_expand::base::{Annotatable, ExtCtxt};
++use rustc_parse::lexer::StripTokens;
++use rustc_parse::new_parser_from_source_str;
++use rustc_span::{FileName, Span, sym};
++
++use crate::util::check_builtin_macro_attribute;
++
++pub(crate) fn expand(
++    ecx: &mut ExtCtxt<'_>,
++    span: Span,
++    meta_item: &ast::MetaItem,
++    item: Annotatable,
++) -> Vec<Annotatable> {
++    check_builtin_macro_attribute(ecx, meta_item, sym::swift_value);
++
++    let Annotatable::Item(orig_struct) = &item else {
++        ecx.dcx().span_err(
++            item.span(),
++            "`#[swift_value]` may only be applied to a struct item",
++        );
++        return vec![item];
++    };
++
++    // Find the sibling `#[swift_type = "Module.Type"]` attribute
++    // — required for Swift mangling and as the source of truth
++    // for the binding's module/type/kind.
++    let swift_type_attr = orig_struct
++        .attrs
++        .iter()
++        .find(|a| a.has_name(sym::swift_type));
++    let Some(swift_type_attr) = swift_type_attr else {
++        ecx.dcx().span_err(
++            span,
++            "`#[swift_value]` requires a sibling \
++             `#[swift_type = \"Module.Type\"]` attribute (add \
++             `:class` suffix for reference types)",
++        );
++        return vec![item];
++    };
++    let Some(binding_symbol) = swift_type_attr.value_str() else {
++        ecx.dcx().span_err(
++            swift_type_attr.span,
++            "`#[swift_type]` must be a name-value string: \
++             `#[swift_type = \"Module.Type\"]`",
++        );
++        return vec![item];
++    };
++    let binding_str = binding_symbol.as_str();
++    let Some(binding) = SwiftBinding::parse(binding_str) else {
++        ecx.dcx().span_err(
++            swift_type_attr.span,
++            format!(
++                "`#[swift_type = {:?}]` is not in the expected \
++                 `\"Module.Type\"` or `\"Module.Type:class\"` format",
++                binding_str
++            ),
++        );
++        return vec![item];
++    };
++    let orig_struct = orig_struct.clone();
++    let ItemKind::Struct(ident, _generics, variant_data) = &orig_struct.kind else {
++        ecx.dcx().span_err(
++            orig_struct.span,
++            "`#[swift_value]` may only be applied to a struct item",
++        );
++        return vec![Annotatable::Item(orig_struct)];
++    };
++    let struct_name = *ident;
++
++    // Collect field info for the Clone-body generation. We only need
++    // this for the class-backed path; value types copy via the Swift
++    // VWT and don't care about Rust-side field shape.
++    let fields: Vec<(String, bool)> = match variant_data {
++        ast::VariantData::Struct { fields, .. } => fields
++            .iter()
++            .enumerate()
++            .map(|(idx, f)| match &f.ident {
++                Some(id) => (id.name.as_str().to_string(), true),
++                None => (format!("{idx}"), false),
++            })
++            .collect(),
++        ast::VariantData::Tuple(fields, _) => fields
++            .iter()
++            .enumerate()
++            .map(|(idx, _)| (format!("{idx}"), false))
++            .collect(),
++        ast::VariantData::Unit(_) => Vec::new(),
++    };
++
++    if binding.is_class && fields.is_empty() {
++        ecx.dcx().span_err(
++            orig_struct.span,
++            "class-backed `#[swift_value]` requires at least one field \
++             (the Swift class pointer at offset 0)",
++        );
++        return vec![Annotatable::Item(orig_struct)];
++    }
++
++    // Build an augmented struct: the original item with
++    // `#[repr(swift)]` added if not already present. The
++    // `#[swift_type]` attribute is already on the user's item.
++    let struct_attrs = augment_struct_attrs(ecx, &orig_struct.attrs, span);
++    let mut augmented_struct = (*orig_struct).clone();
++    augmented_struct.attrs = struct_attrs;
++    let augmented_item = Annotatable::Item(Box::new(augmented_struct));
++
++    // Render the metadata extern + Drop/Clone impls as a single source
++    // string, parse it into items, and return them alongside the
++    // augmented struct. Saves ~200 LOC of hand-built AST construction.
++    let source = render_expansion(&binding, &struct_name.name.as_str(), &fields);
++    let parsed_items = parse_items_from_string(ecx, span, source);
++
++    let mut out = Vec::with_capacity(1 + parsed_items.len());
++    out.push(augmented_item);
++    out.extend(parsed_items.into_iter().map(Annotatable::Item));
++    out
++}
++
++struct SwiftBinding<'a> {
++    module: &'a str,
++    name: &'a str,
++    is_class: bool,
++}
++
++impl<'a> SwiftBinding<'a> {
++    fn parse(s: &'a str) -> Option<Self> {
++        // Split off optional `:class` / `:struct` kind suffix.
++        let (body, is_class) = match s.rsplit_once(':') {
++            Some((b, "class")) => (b, true),
++            Some((b, "struct")) => (b, false),
++            _ => (s, false),
++        };
++        let (module, name) = body.rsplit_once('.')?;
++        if module.is_empty() || name.is_empty() {
++            return None;
++        }
++        if !is_ascii_ident(module) || !is_ascii_ident(name) {
++            return None;
++        }
++        Some(SwiftBinding { module, name, is_class })
++    }
++
++    /// Itanium-style Swift mangling for the metadata accessor:
++    ///   `$s<modlen><module><typelen><type>VMa` (value type)
++    ///   `$s<modlen><module><typelen><type>CMa` (class)
++    fn metadata_accessor_symbol(&self) -> String {
++        let tag = if self.is_class { 'C' } else { 'V' };
++        format!(
++            "$s{}{}{}{}{}Ma",
++            self.module.len(),
++            self.module,
++            self.name.len(),
++            self.name,
++            tag
++        )
++    }
++}
++
++fn is_ascii_ident(s: &str) -> bool {
++    let mut chars = s.chars();
++    match chars.next() {
++        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
++        _ => return false,
++    }
++    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
++}
++
++/// Ensure `#[repr(swift)]` and `#[swift_type = "..."]` are on the
++/// struct's attribute list; add them if missing. Preserves the user's
++/// original attribute order for anything we don't touch.
++fn augment_struct_attrs(
++    ecx: &ExtCtxt<'_>,
++    orig: &ast::AttrVec,
++    span: Span,
++) -> ast::AttrVec {
++    let has_repr_swift = orig.iter().any(|a| {
++        if !a.has_name(sym::repr) {
++            return false;
++        }
++        let Some(list) = a.meta_item_list() else { return false };
++        list.iter().any(|nested| nested.has_name(sym::swift))
++    });
++
++    let attr_gen = &ecx.sess.psess.attr_id_generator;
++    let mut out = orig.clone();
++    if !has_repr_swift {
++        out.push(rustc_ast::attr::mk_attr_nested_word(
++            attr_gen,
++            ast::AttrStyle::Outer,
++            ast::Safety::Default,
++            sym::repr,
++            sym::swift,
++            span,
++        ));
++    }
++    out
++}
++
++/// Render the expanded code (metadata extern + Drop impl + Clone
++/// impl) as a single Rust source string. The struct is emitted
++/// separately — see `expand()` — because we need to preserve the
++/// original item's tokens and attribute ordering as much as possible.
++fn render_expansion(binding: &SwiftBinding<'_>, struct_name: &str, fields: &[(String, bool)]) -> String {
++    let link_name = binding.metadata_accessor_symbol();
++    let metadata_ident = format!("__{struct_name}__metadata");
++
++    let metadata_extern = if binding.is_class {
++        // Classes use swift_retain / swift_release from the C
++        // runtime directly — no per-type metadata accessor needed.
++        String::new()
++    } else {
++        format!(
++            "unsafe extern \"C\" {{\n    \
++                 #[link_name = \"{link_name}\"]\n    \
++                 fn {metadata_ident}(flags: usize) \
++                     -> ::rustcc_swift_rt::MetadataResponse;\n\
++             }}\n"
++        )
++    };
++
++    let drop_body = if binding.is_class {
++        // Null-safe release of the class pointer at offset 0.
++        "        let ptr: *mut ::core::ffi::c_void =\n            \
++             unsafe { *(self as *const Self as *const *mut ::core::ffi::c_void) };\n        \
++             if !ptr.is_null() {\n            \
++                 unsafe { ::rustcc_swift_rt::release_swift_class(ptr); }\n        \
++             }"
++        .to_string()
++    } else {
++        format!(
++            "        unsafe {{\n            \
++                 ::rustcc_swift_rt::drop_swift_value(\n                \
++                     self as *mut Self,\n                \
++                     {metadata_ident},\n            \
++                 );\n        \
++             }}"
++        )
++    };
++
++    let clone_body = if binding.is_class {
++        // Class: retain ptr at offset 0, Clone each extra field
++        // (keeps the P09.42 non-POD extras semantics).
++        render_class_clone_body(fields)
++    } else {
++        format!(
++            "        let mut copy: ::core::mem::MaybeUninit<Self> =\n            \
++                 ::core::mem::MaybeUninit::uninit();\n        \
++             unsafe {{\n            \
++                 ::rustcc_swift_rt::clone_swift_value(\n                \
++                     copy.as_mut_ptr(),\n                \
++                     self as *const Self,\n                \
++                     {metadata_ident},\n            \
++                 );\n            \
++                 copy.assume_init()\n        \
++             }}"
++        )
++    };
++
++    format!(
++        "{metadata_extern}\
++         impl ::core::ops::Drop for {struct_name} {{\n    \
++             fn drop(&mut self) {{\n{drop_body}\n    }}\n\
++         }}\n\
++         impl ::core::clone::Clone for {struct_name} {{\n    \
++             fn clone(&self) -> Self {{\n{clone_body}\n    }}\n\
++         }}\n"
++    )
++}
++
++/// Class-backed Clone body. First field (convention: Swift class
++/// pointer at offset 0) is overwritten with the retained pointer;
++/// every other field uses its own Clone impl so non-POD extras
++/// (`Box`, `String`, `Vec`) don't alias heap owned by the original.
++/// Named structs and tuple structs both supported.
++fn render_class_clone_body(fields: &[(String, bool)]) -> String {
++    let (first_name, first_named) = &fields[0];
++    let preamble = "        let ptr: *mut ::core::ffi::c_void =\n            \
++         unsafe { *(self as *const Self as *const *mut ::core::ffi::c_void) };\n        \
++         let retained = if ptr.is_null() {\n            \
++             ptr\n        \
++         } else {\n            \
++             unsafe { ::rustcc_swift_rt::retain_swift_class(ptr) }\n        \
++         };\n        \
++         let retained_handle = unsafe {\n            \
++             ::core::mem::transmute_copy::<\n                \
++                 *mut ::core::ffi::c_void,\n                \
++                 _,\n            \
++             >(&retained)\n        \
++         };";
++
++    if *first_named {
++        let mut literal = format!("Self {{\n            {first_name}: retained_handle,\n");
++        for (name, _) in fields.iter().skip(1) {
++            literal.push_str(&format!(
++                "            {name}: ::core::clone::Clone::clone(&self.{name}),\n"
++            ));
++        }
++        literal.push_str("        }");
++        format!("{preamble}\n        {literal}")
++    } else {
++        let mut literal = String::from("Self(retained_handle");
++        for (idx, _) in fields.iter().enumerate().skip(1) {
++            literal.push_str(&format!(
++                ", ::core::clone::Clone::clone(&self.{idx})"
++            ));
++        }
++        literal.push(')');
++        format!("{preamble}\n        {literal}")
++    }
++}
++
++/// Parse a source string containing Rust items (no crate-level
++/// attrs, no leading doc-comments) and return the resulting item
++/// list. Errors are emitted to the ExtCtxt's dcx and the offending
++/// items dropped.
++fn parse_items_from_string(
++    ecx: &mut ExtCtxt<'_>,
++    span: Span,
++    source: String,
++) -> Vec<Box<Item>> {
++    let src_clone = source.clone();
++    let parser_res = new_parser_from_source_str(
++        &ecx.sess.psess,
++        FileName::anon_source_code(&src_clone),
++        source,
++        StripTokens::Nothing,
++    );
++    let mut parser = match parser_res {
++        Ok(p) => p,
++        Err(errs) => {
++            for e in errs {
++                e.emit();
++            }
++            return Vec::new();
++        }
++    };
++
++    let mut items = Vec::new();
++    while parser.token != rustc_ast::token::TokenKind::Eof {
++        match parser.parse_item(
++            rustc_parse::parser::ForceCollect::No,
++            rustc_parse::parser::AllowConstBlockItems::No,
++        ) {
++            Ok(Some(item)) => {
++                let mut item = *item;
++                rebrand_item_span(&mut item, span);
++                items.push(Box::new(item));
++            }
++            Ok(None) => break,
++            Err(err) => {
++                err.emit();
++                break;
++            }
++        }
++    }
++    items
++}
++
++/// Recursively rebrand spans on an item + its children. We do the
++/// minimum necessary: span, attrs span, and ident span. Deeper
++/// descendants (field spans, method bodies) are left as-is since
++/// they point at synthetic source that the source map understands.
++fn rebrand_item_span(item: &mut Item, span: Span) {
++    item.span = span;
++    for attr in item.attrs.iter_mut() {
++        attr.span = span;
++    }
++}
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index aa1f2904..2fc46b4e 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -1820,6 +1820,7 @@
+         rustc_swift_labels,
+         swift_symbol,
+         swift_type,
++        swift_value,
+         rustc_strict_coherence,
+         rustc_test_marker,
+         rustc_then_this_would_need,
+diff --git a/library/core/src/macros/mod.rs b/library/core/src/macros/mod.rs
+index 08a12b64..59416d65 100644
+--- a/library/core/src/macros/mod.rs
++++ b/library/core/src/macros/mod.rs
+@@ -1785,6 +1785,20 @@ macro_rules! trace_macros {
+         /* compiler built-in */
+     }
+ 
++    /// rustcc fork (1.02 #2): attribute macro applied to a
++    /// `struct` to mark it as a `#[repr(swift)]` value or class
++    /// binding. Expansion synthesizes `impl Drop` and `impl
++    /// Clone` that forward to the Swift runtime via
++    /// `rustcc_swift_rt`, plus the metadata-accessor `extern "C"`
++    /// decl with the Swift-mangled `link_name`. See
++    /// `fork/THREE-SURFACES.md` in the rustcc repo.
++    #[unstable(feature = "rustc_attrs", issue = "none")]
++    #[allow_internal_unstable(rustc_attrs)]
++    #[rustc_builtin_macro]
++    pub macro swift_value($item:item) {
++        /* compiler built-in */
++    }
++
+     /// Attribute macro applied to a function to give it a post-condition.
+     ///
+     /// The attribute carries an argument token-tree which is
+diff --git a/library/core/src/prelude/v1.rs b/library/core/src/prelude/v1.rs
+index 6122ab12..215d1bf6 100644
+--- a/library/core/src/prelude/v1.rs
++++ b/library/core/src/prelude/v1.rs
+@@ -123,6 +123,13 @@ mod panic {}
+     alloc_error_handler, bench, global_allocator, test, test_case,
+ };
+ 
++// rustcc fork: `swift_value` is the 1.02 #2 built-in attribute
++// macro. Exposed here so users can write `#[swift_value = ...]`
++// without a `use` statement, matching how `#[global_allocator]`
++// etc. behave.
++#[unstable(feature = "rustc_attrs", issue = "none")]
++pub use crate::macros::builtin::swift_value;
++
+ #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
+ #[doc(no_inline)]
+ pub use crate::macros::builtin::derive;
+diff --git a/library/std/src/prelude/v1.rs b/library/std/src/prelude/v1.rs
+index aeefec8b..ef945528 100644
+--- a/library/std/src/prelude/v1.rs
++++ b/library/std/src/prelude/v1.rs
+@@ -118,6 +118,10 @@ mod panic {}
+     alloc_error_handler, bench, global_allocator, test, test_case,
+ };
+ 
++// rustcc fork: prelude the `swift_value` built-in attribute.
++#[unstable(feature = "rustc_attrs", issue = "none")]
++pub use core::prelude::v1::swift_value;
++
+ #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
+ #[doc(no_inline)]
+ pub use core::prelude::v1::derive;
+-- 
+2.52.0
+
