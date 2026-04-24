@@ -1,0 +1,156 @@
+name: Release rustcc toolchain
+
+# Builds stage-1 rustcc for each supported host triple and
+# uploads tarballs as release assets. Triggered by:
+#   - Pushing a tag matching `v*` (e.g. `v1.02.0`), or
+#   - Manual `workflow_dispatch` with a release tag input.
+#
+# The tarballs are the shipping form of the fork: users who don't
+# want to run `./fork/build.sh` can download the matching tarball,
+# extract it, and `rustup toolchain link rustcc <extracted>/stage1`
+# to get a working fork rustc in ~3 minutes instead of ~45.
+#
+# Caveat: as of the initial rollout this workflow has only been
+# exercised via dry-run review, not an actual tag push. First real
+# tag may surface toolchain-path or archive-structure issues that
+# need a second pass. The paths and archive shape are documented
+# in `fork/INSTALL.md` so users can verify by hand.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch/tag/sha); default uses the dispatched ref'
+        required: false
+        default: ''
+      release_tag:
+        description: 'Release tag to publish to (e.g. v1.02.0). Required for dispatch runs.'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          # aarch64-unknown-linux-gnu uses GitHub's free arm runner
+          # label `ubuntu-24.04-arm`. Availability of this runner has
+          # been in flux through 2024-2025; if the job fails to queue,
+          # comment this matrix entry out and ship 3 binaries instead.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - name: Checkout rustcc
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Stage-1 rustc build needs ~12-15 GB. Default Linux
+          # runners ship with ~14 GB free; clear bundled tooling we
+          # don't need (dotnet, Android SDK, Haskell, etc.) to
+          # guarantee headroom. macOS runners have plenty of room.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build python3 clang lld pkg-config libssl-dev
+
+      - name: Install build deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # macOS runners already have clang, python3, git. cmake +
+          # ninja via Homebrew — usually already cached but `--quiet
+          # || true` so we don't fail if they're already installed.
+          brew list cmake >/dev/null 2>&1 || brew install cmake
+          brew list ninja >/dev/null 2>&1 || brew install ninja
+
+      - name: Run fork/build.sh (clone + apply patches + stage-1 compiler)
+        env:
+          CLONE_DIR: ${{ runner.temp }}/rust-lang-rust
+        run: |
+          ./fork/build.sh
+          # build.sh builds the stage-1 compiler. We additionally
+          # need the stage-1 library (std, core, alloc, ...) so the
+          # shipped toolchain can compile normal Rust programs.
+          cd "$CLONE_DIR"
+          ./x.py build --stage 1 library
+
+      - name: Package stage-1 toolchain
+        env:
+          CLONE_DIR: ${{ runner.temp }}/rust-lang-rust
+        run: |
+          # The rustup-linkable prefix is `build/host/stage1/`.
+          # Tarball it preserving relative paths so users extract
+          # and `rustup toolchain link rustcc <extracted>` without
+          # knowing the internal layout.
+          STAGE1_DIR="$CLONE_DIR/build/host/stage1"
+          if [[ ! -d "$STAGE1_DIR/bin" ]]; then
+            echo "error: stage1 bin dir not found at $STAGE1_DIR" >&2
+            ls -la "$CLONE_DIR/build" || true
+            ls -la "$CLONE_DIR/build/host" || true
+            exit 1
+          fi
+          ARCHIVE="rustcc-${{ matrix.target }}.tar.xz"
+          tar -cJf "$ARCHIVE" -C "$CLONE_DIR/build/host" stage1
+          ls -lh "$ARCHIVE"
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256" 2>/dev/null \
+            || shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Upload build artifacts (job-scoped)
+        # Keep the artifacts even if the release-upload step fails,
+        # so maintainers can download them from the workflow run.
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustcc-${{ matrix.target }}
+          path: |
+            rustcc-${{ matrix.target }}.tar.xz
+            rustcc-${{ matrix.target }}.tar.xz.sha256
+          retention-days: 30
+
+      - name: Upload to GitHub Release
+        # Only publish when the workflow was triggered by a tag push
+        # (`refs/tags/v*`) or by a manual dispatch that named a
+        # release tag. Skipped on dispatch runs with no release tag
+        # (useful for dry-run builds).
+        if: >
+          startsWith(github.ref, 'refs/tags/v') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        run: |
+          # Create the release if it doesn't already exist; upload
+          # the tarball + sha256 as assets. `gh release upload
+          # --clobber` lets us re-run for a single target without
+          # deleting the other targets' assets.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "$TAG" \
+              --notes "Prebuilt rustcc toolchain for tag $TAG. See fork/INSTALL.md for the install recipe."
+          fi
+          gh release upload "$TAG" \
+            "rustcc-${{ matrix.target }}.tar.xz" \
+            "rustcc-${{ matrix.target }}.tar.xz.sha256" \
+            --clobber

@@ -1,0 +1,140 @@
+name: 'Install rustcc toolchain'
+description: >
+  Downloads a prebuilt rustcc toolchain tarball (published by the
+  rustcc release workflow) and registers it with rustup so the
+  caller's job can run `cargo +rustcc ...` or set it as the default.
+author: rustcc
+
+inputs:
+  version:
+    description: >
+      Which rustcc release to install. `latest` resolves to the
+      most recent `v*` tag on the rustcc repository. Otherwise
+      must be an exact tag name (e.g. `v1.02.0`).
+    required: false
+    default: 'latest'
+  toolchain-name:
+    description: >
+      Name to use when linking the toolchain via `rustup toolchain
+      link`. Defaults to `rustcc`; set a different name if you
+      need multiple parallel rustcc installs.
+    required: false
+    default: 'rustcc'
+  set-default:
+    description: >
+      When `true`, also run `rustup default <toolchain-name>` so
+      plain `cargo build` uses the fork. When `false`, users must
+      invoke `cargo +<toolchain-name> ...` explicitly.
+    required: false
+    default: 'false'
+  repository:
+    description: >
+      GitHub owner/repo to fetch tarballs from. Defaults to the
+      canonical rustcc repo; override for testing against a fork.
+    required: false
+    default: 'rustcc/rustcc'
+
+outputs:
+  toolchain-path:
+    description: Absolute path to the installed stage-1 sysroot.
+    value: ${{ steps.install.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect host target
+      id: detect
+      shell: bash
+      run: |
+        # Map uname output to rustcc's target-triple naming scheme.
+        # Extend this table if we add more release triples.
+        os_arch="$(uname -s)-$(uname -m)"
+        case "$os_arch" in
+          Darwin-arm64)   target=aarch64-apple-darwin ;;
+          Darwin-x86_64)  target=x86_64-apple-darwin ;;
+          Linux-x86_64)   target=x86_64-unknown-linux-gnu ;;
+          Linux-aarch64)  target=aarch64-unknown-linux-gnu ;;
+          *)
+            echo "::error::rustcc does not publish a prebuilt \
+                 binary for $os_arch. Build from source via \
+                 \`./fork/build.sh\` instead (see fork/INSTALL.md)."
+            exit 1
+            ;;
+        esac
+        echo "target=$target" >> "$GITHUB_OUTPUT"
+
+    - name: Resolve release tag
+      id: tag
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        version="${{ inputs.version }}"
+        if [[ "$version" == "latest" ]]; then
+          # `gh release list` returns releases newest-first.
+          tag="$(gh release list --repo ${{ inputs.repository }} \
+                                  --limit 1 \
+                                  --json tagName \
+                                  --jq '.[0].tagName')"
+          if [[ -z "$tag" ]]; then
+            echo "::error::no releases found on ${{ inputs.repository }}"
+            exit 1
+          fi
+        else
+          tag="$version"
+        fi
+        echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+    - name: Install rustcc toolchain
+      id: install
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        target="${{ steps.detect.outputs.target }}"
+        tag="${{ steps.tag.outputs.tag }}"
+        name="${{ inputs.toolchain-name }}"
+        archive="rustcc-$target.tar.xz"
+
+        install_dir="$HOME/.rustcc/$tag"
+        mkdir -p "$install_dir"
+
+        # Download the prebuilt tarball + its sha256 from the
+        # matching release. Fall back to `curl -L` if gh release
+        # download fails (e.g. rate-limited).
+        if ! gh release download "$tag" \
+               --repo ${{ inputs.repository }} \
+               --pattern "$archive" \
+               --pattern "$archive.sha256" \
+               --dir "$install_dir" \
+               --clobber; then
+          echo "::warning::gh release download failed; trying curl"
+          base="https://github.com/${{ inputs.repository }}/releases/download/$tag"
+          curl -fsSL -o "$install_dir/$archive" "$base/$archive"
+          curl -fsSL -o "$install_dir/$archive.sha256" "$base/$archive.sha256"
+        fi
+
+        (cd "$install_dir" && \
+          (sha256sum --check "$archive.sha256" 2>/dev/null || \
+           shasum -a 256 --check "$archive.sha256"))
+
+        tar -xJf "$install_dir/$archive" -C "$install_dir"
+        stage1="$install_dir/stage1"
+        if [[ ! -x "$stage1/bin/rustc" ]]; then
+          echo "::error::extracted archive does not contain stage1/bin/rustc; layout may have changed."
+          ls -la "$install_dir" "$stage1" 2>&1 || true
+          exit 1
+        fi
+
+        # rustup toolchain link is idempotent modulo the name; if
+        # the caller re-runs the action in the same job we just
+        # reuse the existing link.
+        rustup toolchain link "$name" "$stage1" || true
+
+        if [[ "${{ inputs.set-default }}" == "true" ]]; then
+          rustup default "$name"
+        fi
+
+        echo "path=$stage1" >> "$GITHUB_OUTPUT"
+        echo "::notice::Installed rustcc $tag at $stage1 (toolchain name: $name)"
