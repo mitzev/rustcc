@@ -1,0 +1,78 @@
+# Minimal CI example for a project that builds with rustcc.
+#
+# Copy this into your project as `.github/workflows/ci.yml` and
+# commit. Assumes:
+# - Your project has a `rust-toolchain.toml` pinning `channel =
+#   "rustcc"` (so `cargo build` without `+rustcc` works once the
+#   toolchain is linked — see fork/INSTALL.md step 3).
+# - Your project depends on `rustcc_swift_rt` (or other fork-only
+#   runtime crates) via path deps or git deps pointing at rustcc's
+#   repo.
+#
+# What this workflow does:
+# 1. Checks out your project.
+# 2. Downloads the latest prebuilt rustcc toolchain for the runner
+#    OS/arch and links it as `rustcc` via rustup.
+# 3. Runs `cargo build --workspace` and `cargo test --workspace`
+#    using the linked toolchain (because `rust-toolchain.toml`
+#    pins `channel = "rustcc"`).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+          - os: macos-latest   # Apple Silicon
+          - os: macos-13       # Intel Mac
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pull the latest prebuilt rustcc release. Pin `version` to a
+      # specific tag (e.g. `v1.02.0`) to get reproducible CI.
+      - uses: rustcc/rustcc/.github/actions/install-rustcc@main
+        with:
+          version: latest
+          set-default: 'true'
+
+      - name: Show toolchain
+        run: |
+          rustup show active-toolchain
+          rustc --version
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  # Optional: guard against accidental stock-rustc usage by a
+  # separate job that tries to build with stable and expects the
+  # build to FAIL if the project uses fork-only features like
+  # `#[repr(cpp)]`. Opt-in; remove if you want your crate to also
+  # work on stock rustc via graceful feature detection.
+  stock-rustc-is-rejected:
+    runs-on: ubuntu-latest
+    if: false   # flip to `true` once you commit to fork-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build must fail on stable
+        run: |
+          if cargo build --workspace 2>/tmp/out.txt; then
+            echo "::error::Expected stock rustc to reject this \
+                  crate, but the build succeeded."
+            exit 1
+          fi
+          cat /tmp/out.txt

@@ -165,18 +165,62 @@ continues to work on every future track.</p>
 
 <h2>Install the forked compiler</h2>
 
-<pre><code>git clone &lt;rustcc-repo&gt; rustcc
-cd rustcc/fork
-./build.sh              # applies patches, builds stage-1 rustc
-# ~30-90 min on a dev laptop
+<p>Two paths; full walkthrough in
+<a href="INSTALL.md"><code>fork/INSTALL.md</code></a>.</p>
+
+<h3>Fast path (~3 min)</h3>
+
+<p>Download a prebuilt toolchain for your OS+arch from the latest
+rustcc <a href="https://github.com/rustcc/rustcc/releases">GitHub
+Release</a>, extract, link with rustup:</p>
+
+<pre><code>TARGET=aarch64-apple-darwin   # pick yours: aarch64-apple-darwin /
+                              #   x86_64-apple-darwin /
+                              #   x86_64-unknown-linux-gnu /
+                              #   aarch64-unknown-linux-gnu
+VERSION=v1.02.0               # or grab from the Releases page
+
+BASE="https://github.com/rustcc/rustcc/releases/download/$VERSION"
+curl -fsSL -o rustcc.tar.xz "$BASE/rustcc-$TARGET.tar.xz"
+mkdir -p "$HOME/.rustcc/$VERSION"
+tar -xJf rustcc.tar.xz -C "$HOME/.rustcc/$VERSION"
+rustup toolchain link rustcc "$HOME/.rustcc/$VERSION/stage1"
+rustc +rustcc --version
 </code></pre>
 
-<p>After the build, the toolchain lives at
-<code>rust-lang-rust/build/host/stage1/bin/rustc</code>. Either invoke it
-directly or register it with <code>rustup</code>:</p>
+<p>Pin a Cargo project to the fork with a
+<code>rust-toolchain.toml</code> at the project root:</p>
 
-<pre><code>rustup toolchain link rustcc /path/to/rust-lang-rust/build/host/stage1
-rustup default rustcc
+<pre><code>[toolchain]
+channel = "rustcc"
+</code></pre>
+
+<p>After that, <code>cargo build</code> / <code>cargo test</code>
+in the project Just Work without any <code>+rustcc</code>
+prefix.</p>
+
+<h3>Source path (~30-90 min)</h3>
+
+<pre><code>git clone https://github.com/rustcc/rustcc.git
+cd rustcc
+./fork/build.sh        # clones rust-lang/rust, applies patches, builds stage-1
+rustup toolchain link rustcc "$HOME/rust-lang-rust-fork/build/host/stage1"
+</code></pre>
+
+<p>Use this path if your host isn't in the prebuilt list
+(currently x86_64/aarch64 macOS and Linux) or if you're
+modifying the fork itself.</p>
+
+<h3>CI integration</h3>
+
+<p>A <a href="examples/ci-snippet.yml">composite-action-based
+example</a> installs the fork in GitHub Actions in ~3 lines:</p>
+
+<pre><code>- uses: rustcc/rustcc/.github/actions/install-rustcc@main
+  with:
+    version: latest
+    set-default: 'true'
+- run: cargo build --workspace
 </code></pre>
 
 <h2>Quick start — "Hello from C++"</h2>
