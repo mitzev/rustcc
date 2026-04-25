@@ -1,4 +1,4 @@
-# rustcc — session restart (v1 + 1.01 closed + 1.02 #1 Phase 1 + 1.02 #2 + throws + Rank 1 adoption infra)
+# rustcc — session restart (v1 + 1.01 closed + 1.02 #1 Phase 1 + 1.02 #2 + throws + Rank 1 adoption infra + v1.02.0 published)
 
 Last updated: **2026-04-25**, Opus 4.7 (1M ctx). **rustcc v1
 milestone complete. Post-v1 shipped: P09.37 (RISC-V ESP32),
@@ -8,11 +8,13 @@ P09.38 (Raspberry Pi Pico), P09.39 (ItemKind::Class), P09.40-44
 P09.46 (`#[swift_value]` built-in attribute macro, 1.02 #2),
 P09.47 (Rank 1 adoption infra), P09.48 (Swift throws support —
 `#[rustc_swift_throws]` + LLVM `swifterror` + SwiftError runtime
-wrapper).** 1.01 fully shipped. 1.02 #1 Phase 1 in. 1.02 #2
-shipped. Swift throws shipped. Adoption friction reduced from
-"30-90 min source build" to "3 min curl+extract" for published
-triples. Next workable items: 1.02 #1 Phase 2 (RA HIR-level
-resolution), 1.1 (multi-inheritance).
+wrapper). v1.02.0 release published 2026-04-25 with 3 of 4
+prebuilt binaries (aarch64-darwin + both Linux triples).** 1.01
+fully shipped. 1.02 #1 Phase 1 in. 1.02 #2 shipped. Swift throws
+shipped. Adoption friction reduced from "30-90 min source build"
+to "3 min curl+extract" for published triples. Next workable
+items: 1.02 #1 Phase 2 (RA HIR-level resolution), 1.1
+(multi-inheritance), x86_64-darwin binary backfill.
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
 
@@ -35,7 +37,109 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## Latest addition (P09.48, 2026-04-25)
+## Latest addition (v1.02.0 published, 2026-04-25)
+
+**v1.02.0 GitHub Release shipped** with 3 of 4 prebuilt
+toolchains:
+
+- `rustcc-aarch64-apple-darwin.tar.xz` (129 MB)
+- `rustcc-aarch64-unknown-linux-gnu.tar.xz` (164 MB)
+- `rustcc-x86_64-unknown-linux-gnu.tar.xz` (214 MB)
+- `rustcc-x86_64-apple-darwin.tar.xz` — **deferred**: GitHub's
+  free `macos-13` (Intel) runner pool was saturated for 4+ hours
+  during the build window. Build path is proven (other 3
+  triples succeeded end-to-end); future release will retry.
+
+Live at: https://github.com/mitzev/rustcc/releases/tag/v1.02.0
+
+### Iteration history (rc1 → rc5) — five gates surfaced
+
+The release workflow had never been tag-triggered before this
+push. Each rc dispatch surfaced exactly one new gate; pattern
+worth remembering for next release:
+
+1. **rc1 — `git apply` strict, patch context drift.** Patches
+   10+ were format-patch'd from cumulative local commits whose
+   intermediate state differs subtly from "01-09 applied
+   pure-sequence to upstream". Strict apply rejected patch 10.
+   **Fix**: `fork/build.sh` switched to `git am --3way` which
+   uses the blob hashes embedded by format-patch to drive a
+   3-way merge across context drift.
+
+2. **rc2 — `download-ci-llvm` 404.** rust-lang/rust CI prunes
+   prebuilt LLVM artifacts after a retention window; our
+   pinned commit (~2025-10) is old enough that the artifact
+   was deleted. Bootstrap retried 4× then aborted. **Fix
+   attempt 1**: regex `s/#?\s*download-ci-llvm = .*/download-ci-llvm = false/`
+   in build.sh's bootstrap.toml mutator. **Did not work**:
+   the upstream template uses dotted-key `#llvm.download-ci-llvm = ...`
+   syntax, not sectioned `[llvm]\ndownload-ci-llvm = ...`.
+
+3. **rc3 — same 404.** **Fix**: drop the regex entirely;
+   append a final `[llvm]\ndownload-ci-llvm = false` block
+   unconditionally to bootstrap.toml. TOML resolves later
+   values last. Idempotent via marker-comment grep guard.
+
+4. **rc4 — `gh release create` 403.** Build actually succeeded
+   for aarch64-darwin (129 MB tarball produced and uploaded to
+   Actions artifact storage), but the final release-create
+   step returned `Resource not accessible by integration`.
+   GitHub tightened default `GITHUB_TOKEN` scopes in 2023;
+   creating releases needs `contents: write`. **Fix**: add
+   `permissions: contents: write` at workflow top level.
+   (First edit broke YAML by splitting `workflow_dispatch:`
+   from its `inputs:` block; corrected with structure
+   reordering.)
+
+5. **rc5 — partial success.** 3 of 4 jobs succeeded end-to-end
+   including release upload. x86_64-apple-darwin queued for
+   4+ hours and never picked up — Intel Mac runner shortage,
+   not a workflow issue.
+
+**Resolution**: cancelled rc5, downloaded the 3 successful
+tarballs locally, disabled workflow temporarily, pushed
+`v1.02.0` tag, created release manually with `gh release
+create v1.02.0 ... rustcc-*.tar.xz`, re-enabled workflow.
+
+### Lessons saved to memory
+
+- **Patch series brittleness**: `git format-patch` produces
+  diffs that can be context-fragile when applied via strict
+  `git apply`. Always use `git am --3way` in CI scripts; it
+  uses the blob hash metadata format-patch embeds.
+- **Bootstrap config keys**: `bootstrap.example.toml` uses
+  dotted-key syntax (`llvm.foo`) for many keys, not section
+  headers. Append-overrides at end of file are more robust
+  than regex substitution.
+- **GitHub Actions permissions** default to read-only on
+  `contents`. Any release workflow needs explicit
+  `permissions: contents: write` at the workflow top level.
+- **Intel Mac runners are tight**: `macos-13` runners can
+  queue for 4+ hours. For releases that must include Intel
+  Mac, expect to ship 3-of-4 and backfill, OR pre-warm with
+  a paid/larger runner.
+
+### Future-release recipe (now that workflow is proven)
+
+```bash
+# Make sure main is up to date
+cd /Users/mitzev/rustcc && git push origin main
+
+# Push tag — workflow auto-triggers on push events matching v*
+git tag -a v1.0X.0 -m "rustcc v1.0X.0 — <one-liner>"
+git push origin v1.0X.0
+
+# Watch the 4 matrix jobs at:
+#   https://github.com/mitzev/rustcc/actions/workflows/release.yml
+# Each takes ~90 min. Release is created automatically on
+# first job success. 3-of-4 is acceptable; 4-of-4 is the goal.
+```
+
+If x86_64-darwin doesn't get a runner within ~2 hours of the
+other jobs finishing, follow the same "cancel + download
+artifacts + manual release" pattern from this release.
+
+## Prior addition (P09.48, 2026-04-25)
 
 **1.02 throws shipped.** `#[rustc_swift_throws]` is a new
 attribute on `extern "Swift"` foreign fns that attaches LLVM's
@@ -549,8 +653,10 @@ Out of scope: Windows MSVC ABI.
 
 ## Morning review checklist
 
-- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.46
-      + Rank 1 latest-addition block above.
+- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.48
+      + Rank 1 + v1.02.0-published latest-addition blocks above.
+- [ ] Verify v1.02.0 release is still live and assets resolve:
+      `gh release view v1.02.0 --repo mitzev/rustcc`
 - [ ] Sanity-check the release workflow YAML
       (`.github/workflows/release.yml`) — look for mis-quoted
       strings, runner-label typos. The `workflow_dispatch`
