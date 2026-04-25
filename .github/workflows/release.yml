@@ -16,6 +16,13 @@ name: Release rustcc toolchain
 # need a second pass. The paths and archive shape are documented
 # in `fork/INSTALL.md` so users can verify by hand.
 
+# Default `GITHUB_TOKEN` is read-only on `contents` since GitHub
+# tightened the defaults in 2023. We need write access to create
+# the GitHub Release and upload assets via `gh release create` /
+# `gh release upload`. Limit the elevation to this workflow only.
+permissions:
+  contents: write
+
 on:
   push:
     tags:
