@@ -3,16 +3,67 @@
 //! the expected Itanium-mangled symbols. If either fails the pre-
 //! fork pipeline can't produce working bodies — this test is the
 //! gate that proves it does.
+//!
+//! These tests run on both stock rustc (CI) and the rustcc fork
+//! (local dev). The forwarder generator's record-return shape is
+//! ABI-coincidence-on-x86_64 under `extern "C"` (stock-compatible)
+//! versus per-target-correct under `extern "C++"` (fork-only). We
+//! probe rustc's calling-conventions list at test entry to pick:
+//! stock + x86_64 keeps the legacy `__sret`-first-arg shape, the
+//! fork (any arch) opts into `extern "C++"`. Stock + aarch64 is
+//! unsupported and skipped — see `pick_record_return_abi` below.
 
 use std::path::PathBuf;
 use std::process::Command;
 
-use cxx_importer::rust_forwarders::{default_rust_name, generate_rust_forwarders};
+use cxx_importer::rust_forwarders::{
+    default_rust_name, generate_rust_forwarders, generate_rust_forwarders_with,
+    ForwarderConfig, RecordReturnAbi,
+};
 use rustc_abi_cxx::{
     ClassDef, CxxType, CxxTypeCtx, CvQual, FieldDef, FnSig, Ident, IntWidth,
     MethodDef, MethodName, NameSegment, NestedName, RecordKind, SpecialMember,
     Target, Virtuality,
 };
+
+/// Probe the active rustc for `extern "C++"` support. The fork
+/// accepts the ABI string; stock rustc rejects it with E0703.
+/// `RUSTC` env var is honored to mirror what the test bodies use
+/// when invoking rustc to compile generated forwarders.
+fn rustc_supports_extern_cpp() -> bool {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let dir = tmpdir("abi_probe");
+    let src = dir.join("probe.rs");
+    let out = dir.join("probe.rlib");
+    if std::fs::write(&src, b"pub unsafe extern \"C++\" fn _x() {}\n").is_err() {
+        return false;
+    }
+    Command::new(&rustc)
+        .args(["--edition=2021", "--crate-type", "lib"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Decide the record-return ABI shape the test should drive. Stock
+/// rustc is restricted to `ExternCExplicitSret` and only works on
+/// x86_64 (SysV ABI coincidence). The fork uses `ExternCpp` on any
+/// arch. Stock + aarch64 has no working shape — return `None` so
+/// the caller skips with a clear message.
+fn pick_record_return_abi() -> Option<RecordReturnAbi> {
+    if rustc_supports_extern_cpp() {
+        Some(RecordReturnAbi::ExternCpp)
+    } else if cfg!(target_arch = "x86_64") {
+        Some(RecordReturnAbi::ExternCExplicitSret)
+    } else {
+        None
+    }
+}
 
 fn tmpdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -196,13 +247,23 @@ fn forwarders_compile_with_rustc_and_export_itanium_symbols() {
 #[cfg(unix)]
 #[test]
 fn record_returned_by_value_roundtrips_across_cxx_boundary() {
-    // Records by value were the most visible forwarder limitation
-    // before this session. Rust's `extern "C"` lowering for POD-
-    // for-layout aggregates matches the Itanium SysV AMD64
-    // classifier (small PODs packed into rax/rdx, large ones via
-    // sret) — which is also what Clang emits for the C++ side.
-    // This test proves the agreement end-to-end for the
-    // register-return case: a 2×i32 struct returned by value.
+    // Record-by-value return: matches Clang's Itanium ABI on the
+    // C++ side. Stock-rustc-compatible shape (`extern "C"` +
+    // explicit `__sret`) only works on x86_64 SysV. The fork
+    // shape (`extern "C++"` + return-by-value) routes sret per-
+    // target via the `compute_cxx_abi_info` overlay. Skip if
+    // we're on stock rustc + a non-x86_64 target — neither shape
+    // is correct there.
+    let abi = match pick_record_return_abi() {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "skipping: stock rustc + non-x86_64 has no working \
+                 record-return ABI shape; rerun with RUSTC=fork-rustc"
+            );
+            return;
+        }
+    };
 
     // IR: Point with Point::new(i32, i32) -> Self and
     // Point::translated(&self, i32, i32) -> Point.
@@ -266,20 +327,35 @@ fn record_returned_by_value_roundtrips_across_cxx_boundary() {
         special: None,
     });
 
-    let fwd_src = generate_rust_forwarders(&ctx, default_rust_name(&ctx))
-        .expect("forwarder gen");
-    // Sanity: the generated signature uses sret convention — the
-    // forwarder takes `__sret: *mut Point` as the first arg and
-    // returns (). This matches C++'s sret ABI for non-trivial-
-    // for-calls classes (which is what our hpp declares).
-    assert!(
-        fwd_src.contains("__sret: *mut Point"),
-        "forwarders didn't emit sret arg:\n{fwd_src}"
-    );
-    assert!(
-        fwd_src.contains("::core::ptr::write(__sret,"),
-        "forwarders didn't write into sret slot:\n{fwd_src}"
-    );
+    let fwd_src = generate_rust_forwarders_with(
+        &ctx,
+        default_rust_name(&ctx),
+        ForwarderConfig { record_return_abi: abi },
+    )
+    .expect("forwarder gen");
+    // Sanity: the chosen shape is reflected in the source.
+    match abi {
+        RecordReturnAbi::ExternCExplicitSret => {
+            assert!(
+                fwd_src.contains("__sret: *mut Point"),
+                "forwarders didn't emit sret arg:\n{fwd_src}"
+            );
+            assert!(
+                fwd_src.contains("::core::ptr::write(__sret,"),
+                "forwarders didn't write into sret slot:\n{fwd_src}"
+            );
+        }
+        RecordReturnAbi::ExternCpp => {
+            assert!(
+                fwd_src.contains("extern \"C++\""),
+                "forwarders didn't switch to extern \"C++\":\n{fwd_src}"
+            );
+            assert!(
+                fwd_src.contains("-> Point"),
+                "forwarders didn't return Point by value:\n{fwd_src}"
+            );
+        }
+    }
 
     let dir = tmpdir("point_return");
     let lib_rs = dir.join("lib.rs");
