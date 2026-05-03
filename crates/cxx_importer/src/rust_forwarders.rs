@@ -77,6 +77,40 @@ impl core::fmt::Display for ForwarderError {
 
 impl std::error::Error for ForwarderError {}
 
+/// Selects the calling-convention shape for record-by-value return
+/// forwarders. Stock rustc and the rustcc fork disagree on what's
+/// possible here:
+///
+/// - `ExternCExplicitSret` (default): emit `extern "C" fn(__sret:
+///   *mut T, ...)` with `()` return. Works on any stock rustc, but
+///   only correct on x86_64 SysV — there the indirect-result
+///   pointer goes in `rdi`, which happens to coincide with the
+///   first pointer arg slot under SysV C, so the explicit
+///   `__sret` arg lands in the right register. AAPCS64 puts the
+///   indirect-result pointer in the dedicated `x8` register, so
+///   this shape misroutes every other register and crashes at
+///   runtime.
+/// - `ExternCpp` (fork-only): emit `extern "C++" fn(...) -> T`
+///   and let the fork's per-target `compute_cxx_abi_info` overlay
+///   force-indirect the ADT return — sret in `rdi` on x86_64,
+///   `x8` on AAPCS64. Requires the rustcc fork's `extern "C++"`
+///   ABI; stock rustc rejects the ABI string outright.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordReturnAbi {
+    /// Stock-rustc-compatible shape (x86_64 SysV only).
+    #[default]
+    ExternCExplicitSret,
+    /// Fork-only shape that delegates sret to `extern "C++"`.
+    ExternCpp,
+}
+
+/// Tunables for [`generate_rust_forwarders_with`]. Defaults select
+/// the maximally compatible (stock rustc, x86_64) shape.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ForwarderConfig {
+    pub record_return_abi: RecordReturnAbi,
+}
+
 /// Emit the full forwarders source for every Rust-origin class in
 /// `ctx`. Callers write the result to disk and arrange for it to be
 /// `include!`'d from the user's crate.
@@ -87,9 +121,26 @@ impl std::error::Error for ForwarderError {}
 /// the cpp name directly out of the IR. Users who override
 /// `#[cpp_name = "..."]` should pass a closure that looks up the
 /// original Rust identifier.
+///
+/// Uses [`ForwarderConfig::default`] — the stock-compatible record-
+/// return shape. To opt into the fork's `extern "C++"` shape (required
+/// for aarch64 correctness), call [`generate_rust_forwarders_with`].
 pub fn generate_rust_forwarders<F>(
     ctx: &CxxTypeCtx,
     rust_name_of: F,
+) -> Result<String, ForwarderError>
+where
+    F: Fn(ClassId) -> String,
+{
+    generate_rust_forwarders_with(ctx, rust_name_of, ForwarderConfig::default())
+}
+
+/// Same as [`generate_rust_forwarders`], with caller-supplied
+/// [`ForwarderConfig`] for the record-return ABI shape.
+pub fn generate_rust_forwarders_with<F>(
+    ctx: &CxxTypeCtx,
+    rust_name_of: F,
+    config: ForwarderConfig,
 ) -> Result<String, ForwarderError>
 where
     F: Fn(ClassId) -> String,
@@ -201,6 +252,7 @@ where
                 is_ctor,
                 &sym,
                 &rust_name_of,
+                config,
             )?;
             out.push_str(&body);
         }
@@ -239,6 +291,7 @@ fn render_forwarder<F>(
     is_ctor: bool,
     export_sym: &str,
     rust_name_of: &F,
+    config: ForwarderConfig,
 ) -> Result<String, ForwarderError>
 where
     F: Fn(ClassId) -> String,
@@ -284,13 +337,9 @@ where
         format!("(&mut *this).{method_name}")
     };
 
-    // sret detection. C++ returns any class with non-trivial
-    // copy/move/dtor via an implicit sret hidden-arg. The `.hpp`
-    // emitter always declares deleted copy + noexcept move + user
-    // dtor, so EVERY Rust-origin class is non-trivial-for-calls on
-    // the C++ side. Match that convention explicitly here rather
-    // than hoping Rust's `extern "C"` return ABI agrees (it
-    // doesn't — Rust packs small PODs into rax).
+    // Record-by-value return splits two ways depending on
+    // `config.record_return_abi` — see `RecordReturnAbi` for
+    // the per-target / per-rustc tradeoffs.
     let ret_is_record = matches!(
         ctx.type_of(method.sig.ret),
         CxxType::Record(_)
@@ -298,20 +347,46 @@ where
     if ret_is_record {
         let record_ty =
             render_type_rust(ctx, method.sig.ret, "return", rust_name_of)?;
-        let _ = writeln!(
-            out,
-            "// Forwarder for {rust_name}::{method_name} (sret return)"
-        );
-        let _ = writeln!(out, "#[unsafe(export_name = \"{export_sym}\")]");
-        let _ = writeln!(
-            out,
-            "pub unsafe extern \"C\" fn {fwd_ident}(__sret: *mut {record_ty}, this: {self_ptr_ty} {rust_name}{maybe_comma}{params}) {{",
-            maybe_comma = if method.sig.params.is_empty() { "" } else { ", " },
-        );
-        let _ = writeln!(
-            out,
-            "    __rustcc_guard(|| unsafe {{ ::core::ptr::write(__sret, {self_deref}({args_forward})); }})"
-        );
+        match config.record_return_abi {
+            RecordReturnAbi::ExternCExplicitSret => {
+                let _ = writeln!(
+                    out,
+                    "// Forwarder for {rust_name}::{method_name} (sret return)"
+                );
+                let _ = writeln!(
+                    out,
+                    "#[unsafe(export_name = \"{export_sym}\")]"
+                );
+                let _ = writeln!(
+                    out,
+                    "pub unsafe extern \"C\" fn {fwd_ident}(__sret: *mut {record_ty}, this: {self_ptr_ty} {rust_name}{maybe_comma}{params}) {{",
+                    maybe_comma = if method.sig.params.is_empty() { "" } else { ", " },
+                );
+                let _ = writeln!(
+                    out,
+                    "    __rustcc_guard(|| unsafe {{ ::core::ptr::write(__sret, {self_deref}({args_forward})); }})"
+                );
+            }
+            RecordReturnAbi::ExternCpp => {
+                let _ = writeln!(
+                    out,
+                    "// Forwarder for {rust_name}::{method_name} (record return)"
+                );
+                let _ = writeln!(
+                    out,
+                    "#[unsafe(export_name = \"{export_sym}\")]"
+                );
+                let _ = writeln!(
+                    out,
+                    "pub unsafe extern \"C++\" fn {fwd_ident}(this: {self_ptr_ty} {rust_name}{maybe_comma}{params}) -> {record_ty} {{",
+                    maybe_comma = if method.sig.params.is_empty() { "" } else { ", " },
+                );
+                let _ = writeln!(
+                    out,
+                    "    __rustcc_guard(|| unsafe {{ {self_deref}({args_forward}) }})"
+                );
+            }
+        }
         let _ = writeln!(out, "}}\n");
         return Ok(out);
     }
@@ -714,19 +789,39 @@ mod tests {
             special: None,
         });
 
-        let src =
+        // Default config (stock-rustc compatible): explicit
+        // `__sret` first arg under `extern "C"`. Matches Itanium
+        // sret on x86_64 SysV by ABI coincidence (sret in rdi ==
+        // first ptr arg in rdi); broken on AAPCS64 (sret in x8).
+        let src_default =
             generate_rust_forwarders(&ctx, default_rust_name(&ctx)).unwrap();
-        // Body uses sret convention: `__sret: *mut Point` first
-        // arg, `()` return. This matches C++'s sret ABI for
-        // classes the hpp emitter declares as non-trivial-for-
-        // calls (every Rust-origin class, today).
         assert!(
-            src.contains("__sret: *mut Point"),
-            "record return didn't emit sret arg: {src}"
+            src_default.contains("__sret: *mut Point"),
+            "default record return didn't emit sret arg: {src_default}"
         );
         assert!(
-            src.contains("::core::ptr::write(__sret,"),
-            "record return didn't write into sret slot: {src}"
+            src_default.contains("::core::ptr::write(__sret,"),
+            "default record return didn't write into sret slot: {src_default}"
+        );
+
+        // Fork-only config: `extern "C++"` + return-by-value.
+        // Relies on the fork's `compute_cxx_abi_info` overlay to
+        // force-indirect ADT returns per-target.
+        let src_cpp = generate_rust_forwarders_with(
+            &ctx,
+            default_rust_name(&ctx),
+            ForwarderConfig {
+                record_return_abi: RecordReturnAbi::ExternCpp,
+            },
+        )
+        .unwrap();
+        assert!(
+            src_cpp.contains("extern \"C++\""),
+            "ExternCpp record return didn't switch ABI: {src_cpp}"
+        );
+        assert!(
+            src_cpp.contains("-> Point"),
+            "ExternCpp record return didn't return Point by value: {src_cpp}"
         );
     }
 

@@ -1,0 +1,93 @@
+From 30107f29891833dd551c8762b77cf5d7ebd5f0b1 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Mon, 4 May 2026 01:44:51 +0300
+Subject: [PATCH] P09.50: force-indirect ADT returns under extern "C++" (1.02
+ #N)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Broadens compute_cxx_abi_info on aarch64 and x86_64 to force-indirect
+any ADT return regardless of is_cxx_non_trivial_for_calls. Closes the
+aarch64-specific gap where cxx_importer-generated forwarders failed
+because the explicit-`__sret`-as-first-arg trick under `extern "C"`
+worked on x86_64 SysV (sret in rdi == first ptr arg in rdi) but
+broke on AAPCS64 (sret in dedicated x8, not x0).
+
+Why ADT-blanket and not just `is_cxx_non_trivial_for_calls`:
+the hpp emitter declares EVERY Rust-origin class as non-trivial-for-
+calls (deleted copy + noexcept move + user dtor), so the C++ caller
+always uses sret for an ADT return. cxx_importer forwarders, however,
+generate against `#[repr(C)]` user types — the `is_cxx_non_trivial_
+for_calls` predicate gate-keeps on `#[repr(cpp)]` and rejects them.
+Broadening to all ADTs covers the forwarder path without forcing
+users to switch to `#[repr(cpp)]` (which would collide with P09.4
+auto-export of inherent methods).
+
+Args left alone: forwarders pointer-ize record-by-value params via
+caller-destroys, and the macro path uses `*mut Self`/scalars only.
+
+Closes the only failing aarch64 e2e test in the cxx_importer suite
+on aarch64-apple-darwin.
+---
+ compiler/rustc_target/src/callconv/aarch64.rs | 12 +++++++++++-
+ compiler/rustc_target/src/callconv/x86_64.rs  | 12 +++++++++++-
+ 2 files changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/rustc_target/src/callconv/aarch64.rs b/compiler/rustc_target/src/callconv/aarch64.rs
+index bdd06409c40..96d7d377c89 100644
+--- a/compiler/rustc_target/src/callconv/aarch64.rs
++++ b/compiler/rustc_target/src/callconv/aarch64.rs
+@@ -191,6 +191,15 @@ pub(crate) fn compute_rust_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty
+ /// "non-trivial for C++ calls" (a `#[repr(cpp)]` ADT with a user
+ /// `Drop` impl) is passed / returned by invisible reference
+ /// regardless of its size. Mirrors the x86_64 overlay.
++///
++/// Returns additionally force-indirect any plain ADT (struct/enum/
++/// union) regardless of `is_cxx_non_trivial_for_calls`. The hpp
++/// emitter declares every Rust-origin class as non-trivial-for-
++/// calls (deleted copy + noexcept move + user dtor), so the C++
++/// caller always uses sret-via-`x8` for an ADT return — even when
++/// the user struct stays `#[repr(C)]` (as `cxx_importer` forwarders
++/// generate). Without this rule, a `#[repr(C)]` 8-byte struct would
++/// come back in `x0`/`x1` while C++ writes to `x8` → garbage.
+ pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>, kind: AbiKind)
+ where
+     Ty: TyAbiInterface<'a, C> + Copy,
+@@ -199,7 +208,8 @@ pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>
+     compute_abi_info(cx, fn_abi, kind);
+ 
+     if !fn_abi.ret.is_ignore()
+-        && fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++        && (fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++            || fn_abi.ret.layout.is_adt())
+     {
+         fn_abi.ret.force_indirect();
+     }
+diff --git a/compiler/rustc_target/src/callconv/x86_64.rs b/compiler/rustc_target/src/callconv/x86_64.rs
+index 1d4b291050d..342631d8b09 100644
+--- a/compiler/rustc_target/src/callconv/x86_64.rs
++++ b/compiler/rustc_target/src/callconv/x86_64.rs
+@@ -337,8 +337,18 @@ pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>
+     // `force_indirect` bypasses that assertion — correct because
+     // we're deliberately overriding the C classification to
+     // match Clang's Itanium output.
++    //
++    // Returns additionally force-indirect any plain ADT regardless
++    // of `is_cxx_non_trivial_for_calls`. The hpp emitter declares
++    // every Rust-origin class as non-trivial-for-calls, so the C++
++    // caller always uses sret-via-`rdi` for an ADT return — even
++    // when the user struct stays `#[repr(C)]` (as `cxx_importer`
++    // forwarders generate). Without this rule, a `#[repr(C)]`
++    // 8-byte struct would come back in `rax` while C++ writes to
++    // `rdi` → garbage. Symmetric to the AArch64 overlay.
+     if !fn_abi.ret.is_ignore()
+-        && fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++        && (fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++            || fn_abi.ret.layout.is_adt())
+     {
+         fn_abi.ret.force_indirect();
+     }
+-- 
+2.50.1 (Apple Git-155)
+

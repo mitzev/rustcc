@@ -2,7 +2,7 @@
 
 ## How this document is organized
 
-`fork/patches/` contains a twelve-file series that applies cleanly
+`fork/patches/` contains a fifteen-file series that applies cleanly
 in order against `rust-lang/rust` at commit
 `e22c616e4e87914135c1db261a03e0437255335e` (the SHA pinned in
 `fork/build.sh`). Each file is the mechanical delivery for one
@@ -24,6 +24,7 @@ semantic cluster:
 | `12-attr-plumbing-macro.patch`        | Unify 5 `#[rustc_cxx_*]` no-args attrs via a macro (P09.43, 1.01 #3) |
 | `13-swift-value-builtin.patch`        | `#[swift_value]` built-in attribute macro (P09.46, 1.02 #2)          |
 | `14-swift-throws.patch`               | `#[rustc_swift_throws]` + `swifterror` LLVM attr (P09.48, 1.02 throws)|
+| `15-cpp-abi-force-sret-record-ret.patch` | Force-indirect ADT returns under `extern "C++"` (P09.50, aarch64 forwarder fix) |
 
 The **P01 … P09.38 sections below** are the authoritative design
 record. Each documents the intent, validation probe, and any
@@ -3307,6 +3308,52 @@ including polymorphism. The same "zero-code path that carried ARM
 Cortex-M" did not extend to rv32 — polymorphism exposed an
 unimplemented psABI case in upstream that needed a ~50 LOC fork
 patch. Probe → diagnose → fix was ~3 hours.
+
+---
+
+## P09.50 — Force-indirect ADT returns under `extern "C++"`
+
+**File:** `compiler/rustc_target/src/callconv/{aarch64,x86_64}.rs`
+
+**Patch:** `15-cpp-abi-force-sret-record-ret.patch`
+
+The Itanium overlay's `compute_cxx_abi_info` previously force-
+indirected only types matching `is_cxx_non_trivial_for_calls` —
+i.e. `#[repr(cpp)]` ADTs with a `Drop` impl or `!Copy`. That left a
+gap for the cxx_importer's forwarder pipeline, which generates
+forwarders against `#[repr(C)]` user types: the predicate would
+return false at the `#[repr(cpp)]` gate, the override never fired,
+and the forwarder's `extern "C++"` return-by-value lowered as plain
+AAPCS64 / SysV C — which on aarch64 returns 8-byte aggregates in
+`x0`/`x1` rather than via the dedicated `x8` indirect-result
+register Itanium expects for non-trivial classes.
+
+The hpp emitter already declares every Rust-origin class as non-
+trivial-for-calls on the C++ side (deleted copy + noexcept move +
+user dtor), so the C++ caller always uses sret regardless of what
+`#[repr]` Rust uses. Broaden the overlay accordingly: any ADT
+return under `extern "C++"` is force-indirect, not just types the
+predicate accepts. Args are left alone — forwarders pointer-ize
+record-by-value params, and the macro path uses `*mut Self` /
+scalar params only.
+
+Pre-fix failure on aarch64-apple-darwin:
+`misaligned pointer dereference: address must be a multiple of
+0x4 but is 0xa` in
+`crates/cxx_importer/tests/rust_forwarders_e2e.rs::record_returned
+_by_value_roundtrips_across_cxx_boundary` — `0xa` was an i32 arg
+shifted into a register slot that the Rust forwarder treated as
+`*const Point` and dereferenced.
+
+`#[repr(cpp)]` users see no behavior change: the predicate already
+returned true for them, so the OR-clause is a no-op. The blanket
+ADT rule only fires for cases the predicate rejected.
+
+**Validation probe:** the four `cxx_importer::rust_forwarders_e2e`
+tests (constructor + dtor symbols, by-value param round-trip,
+by-value return round-trip, panic-aborts-instead-of-unwinding)
+must all pass on both `aarch64-apple-darwin` and
+`x86_64-apple-darwin` / `x86_64-unknown-linux-gnu`.
 
 ---
 
