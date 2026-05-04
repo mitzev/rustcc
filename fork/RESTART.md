@@ -1,20 +1,22 @@
-# rustcc — session restart (v1 + 1.01 closed + 1.02 #1 Phase 1 + 1.02 #2 + throws + Rank 1 adoption infra + v1.02.0 published)
+# rustcc — session restart (v1 + 1.01 closed + 1.02 + throws + Rank 1 adoption infra + v1.02.0 + v1.03.0 published)
 
-Last updated: **2026-04-25**, Opus 4.7 (1M ctx). **rustcc v1
+Last updated: **2026-05-04**, Opus 4.7 (1M ctx). **rustcc v1
 milestone complete. Post-v1 shipped: P09.37 (RISC-V ESP32),
 P09.38 (Raspberry Pi Pico), P09.39 (ItemKind::Class), P09.40-44
 (1.01 batch closing items #1-#6), P09.45 (rust-analyzer fork for
 `class` keyword — Phase 1 parser support, 1.02 #1 Phase 1),
 P09.46 (`#[swift_value]` built-in attribute macro, 1.02 #2),
-P09.47 (Rank 1 adoption infra), P09.48 (Swift throws support —
-`#[rustc_swift_throws]` + LLVM `swifterror` + SwiftError runtime
-wrapper). v1.02.0 release published 2026-04-25 with 3 of 4
-prebuilt binaries (aarch64-darwin + both Linux triples).** 1.01
-fully shipped. 1.02 #1 Phase 1 in. 1.02 #2 shipped. Swift throws
-shipped. Adoption friction reduced from "30-90 min source build"
-to "3 min curl+extract" for published triples. Next workable
-items: 1.02 #1 Phase 2 (RA HIR-level resolution), 1.1
-(multi-inheritance), x86_64-darwin binary backfill.
+P09.47 (Rank 1 adoption infra), P09.48 (Swift throws support),
+P09.50 (aarch64 sret routing for cxx_importer forwarders).
+v1.02.0 release published 2026-04-25; v1.03.0 published
+2026-05-04 — both shipped 3 of 4 prebuilt binaries
+(aarch64-darwin + both Linux triples; x86_64-darwin runner pool
+saturated in both windows).** 1.01 fully shipped. 1.02 #1 Phase
+1 in. 1.02 #2 shipped. Swift throws shipped. aarch64 cxx_importer
+forwarders unblocked. Adoption friction reduced from "30-90 min
+source build" to "3 min curl+extract" for published triples.
+Next workable items: 1.02 #1 Phase 2 (RA HIR-level resolution),
+1.1 (multi-inheritance), x86_64-darwin binary backfill.
 
 Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
 
@@ -37,7 +39,82 @@ See `fork/getting-started.html` — rewritten as a GitHub
 project intro with v1 feature matrix, v2 roadmap, and a
 five-example gallery.
 
-## Latest addition (v1.02.0 published, 2026-04-25)
+## Latest addition (v1.03.0 published, 2026-05-04)
+
+**v1.03.0 GitHub Release shipped** with the same 3-of-4 prebuilt
+matrix as v1.02.0 (both Linux triples + aarch64-darwin). Single
+new fork patch — P09.50, `15-cpp-abi-force-sret-record-ret.patch`
+— closes the aarch64-apple-darwin gap surfaced when running the
+cxx_importer e2e suite on M-series Macs. Plus a dual-mode
+emission shape in `cxx_importer::rust_forwarders` so the same
+generator output compiles on stock-rustc CI and the fork.
+
+Live at: https://github.com/mitzev/rustcc/releases/tag/v1.03.0
+
+### What changed
+
+The cxx_importer's pre-fork forwarder shape — `extern "C" fn(__sret:
+*mut T, ...)` with the indirect-result pointer as an explicit
+first arg — only matched Itanium on x86_64 SysV by ABI
+coincidence (sret in `rdi` == first ptr arg in `rdi`). On
+AAPCS64 the indirect-result pointer goes in the dedicated `x8`
+register, so the explicit-arg shape misroutes every register
+slot and crashed `record_returned_by_value_roundtrips_across_cxx_boundary`
+on aarch64 with `misaligned pointer dereference: address must be
+a multiple of 0x4 but is 0xa`.
+
+**Fork patch** broadens `compute_cxx_abi_info` on aarch64 +
+x86_64 to force-indirect any ADT return regardless of
+`is_cxx_non_trivial_for_calls`. The hpp emitter declares every
+Rust-origin class as non-trivial-for-calls (deleted copy +
+noexcept move + user dtor), so the C++ caller always uses sret
+for an ADT return — even when the user struct stays `#[repr(C)]`
+(as cxx_importer forwarders generate). Existing `#[repr(cpp)]`
+users are unaffected: the predicate already returned true for
+them.
+
+**cxx_importer side** gains `RecordReturnAbi` / `ForwarderConfig`
+and `generate_rust_forwarders_with`. Default config keeps the
+stock-rustc-compatible explicit-`__sret` shape;
+`RecordReturnAbi::ExternCpp` opts into the fork's per-target
+ABI. The e2e test probes rustc for `extern "C++"` support and
+picks per-(rustc × target arch): fork → ExternCpp; stock +
+x86_64 → legacy SysV-only shape; stock + aarch64 → no working
+shape, skip with eprintln.
+
+### Iteration history (this release)
+
+Notably **zero rc iterations** — workflow ran clean on the first
+tag push. All v1.02.0 gates (patch context drift, download-ci-llvm
+404, GITHUB_TOKEN scopes, YAML structure) were already fixed in
+the workflow. Only friction was the recurring x86_64-darwin
+runner shortage, which timed out as expected; resolved with
+`gh run cancel` + manual release-edit, identical to v1.02.0's
+final-step playbook.
+
+### Lessons reinforced
+
+- **Workflow has paid its debt.** Hardening done in the v1.02.0
+  rc1-rc4 cycle covers the entire happy path; future point
+  releases that don't add new bootstrap surface should "just
+  work" on first push. The Intel Mac runner shortage is the
+  one remaining gate, and it's external (GitHub infra), not
+  fixable in our workflow.
+- **Stock-CI compatibility matters.** Splitting the forwarder
+  emission shape (legacy stock-compat default + fork-only
+  opt-in via `ForwarderConfig`) was the right call over a
+  fork-only one-way change. Lets `cargo test --workspace`
+  stay green on the stock-x86_64 ubuntu CI while the fork's
+  per-target ABI enables aarch64.
+- **`is_cxx_non_trivial_for_calls` was too narrow.** The
+  predicate gated on `#[repr(cpp)]`, which excluded
+  cxx_importer's `#[repr(C)]` user types even though the C++
+  side declared them non-trivial. Broadening to "any ADT
+  return under extern "C++"" is the right fix for the codebase's
+  actual semantics — the hpp emitter never declares trivial-
+  for-calls Rust-origin classes.
+
+## Prior addition (v1.02.0 published, 2026-04-25)
 
 **v1.02.0 GitHub Release shipped** with 3 of 4 prebuilt
 toolchains:
