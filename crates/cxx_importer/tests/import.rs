@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use cxx_importer::{import_header, import_header_with_annotations};
+use cxx_importer::{import_header, import_header_with_annotations, Driver, HeaderGraph};
 use cxx_importer::rust_bindings::{
     generate_rust_bindings, generate_rust_bindings_with_annotations,
     BindingsBackend, RustBindingsConfig,
@@ -1673,6 +1673,74 @@ fn annotations_drive_class_and_method_renaming_end_to_end() {
         src.contains("pub fn value(&self) -> i32"),
         "expected renamed `value()` method:\n{src}"
     );
+    cleanup(&header);
+}
+
+#[test]
+fn driver_force_instantiates_class_template_via_synthetic_root() {
+    // M8 (sidecar template instantiation) — exercising the
+    // `HeaderGraph::template_instantiations` path. The driver
+    // synthesizes a temp `.cpp` that `#include`s the user header
+    // and emits `template class Box<int>;`, parses both, and
+    // surfaces the instantiated `Box<int>` as a regular concrete
+    // class.
+    //
+    // Limitation note (matches the long-standing import.rs gap):
+    // libclang doesn't reliably surface instantiated method
+    // bodies via child traversal of the spec cursor — fields come
+    // through, methods may not. This test exercises the
+    // synthetic-root + class-import side; method coverage on
+    // template specs is tracked separately.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "template<class T>\n\
+         struct Box {\n\
+         \x20   T value;\n\
+         };\n",
+        "template_instantiate",
+    );
+
+    let driver = Driver::new(HeaderGraph {
+        roots: vec![header.clone()],
+        include_paths: vec![],
+        clang_flags: vec!["-std=c++17".into()],
+        template_instantiations: vec!["Box<int>".into()],
+    });
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let class_ids = driver.parse_all(&mut ctx).expect("parse_all");
+
+    // The driver's synthetic root forces a specialization. Find
+    // the `Box<int>` spec in the imports.
+    let box_int = class_ids.iter().find(|&&id| {
+        let class = ctx.class(id);
+        match class.name.0.last() {
+            Some(NameSegment::TemplateSpec { name, .. }) => name.0 == "Box",
+            _ => false,
+        }
+    });
+    assert!(
+        box_int.is_some(),
+        "expected `Box<int>` template specialization in imports; got {:?}",
+        class_ids
+            .iter()
+            .map(|&id| ctx.class(id).name.0.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // The spec should have its sole field `value: int` resolved
+    // through the canonical-type path.
+    let class = ctx.class(*box_int.unwrap());
+    assert_eq!(
+        class.fields.len(),
+        1,
+        "expected one field (value), got {}",
+        class.fields.len()
+    );
+    match ctx.type_of(class.fields[0].ty) {
+        CxxType::Int { signed: true, width: IntWidth::I32 } => {}
+        other => panic!("expected i32 (int) field, got {other:?}"),
+    }
+
     cleanup(&header);
 }
 

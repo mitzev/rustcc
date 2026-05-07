@@ -61,8 +61,8 @@ struct Widget {
 
     let graph = HeaderGraph {
         roots: vec![header_abs.clone()],
-        include_paths: Vec::new(),
         clang_flags: vec!["-std=c++17".into()],
+        ..HeaderGraph::default()
     };
     let driver = Driver::new(graph);
 
@@ -166,6 +166,7 @@ struct Beta {
         roots: vec![a_abs.clone(), b_abs.clone()],
         include_paths: vec![include_dir.canonicalize().unwrap()],
         clang_flags: vec!["-std=c++17".into()],
+        ..HeaderGraph::default()
     };
     let driver = Driver::new(graph);
 

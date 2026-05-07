@@ -267,7 +267,7 @@ into dozens of "unknown identifier" errors downstream.
 | 4  | Overload renaming + operator mapping                                                                                      | ✅ shipped |
 | 5  | Inheritance (non-virtual, single), `CxxBase` emission                                                                     | 🟨 partial (BaseSpec lowering ✓; upcast emission deferred) |
 | 6  | Virtual methods → vtable-index-aware emission                                                                             | ✅ shipped (single-inheritance; pure virtuals + secondary vtables open) |
-| 7  | Annotation processing (inline attrs + sidecar YAML)                                                                       | 🟨 partial (schema ✓; libclang-side walker open) |
-| 8  | Explicit template instantiation import                                                                                    | 🟨 partial (specs import; sidecar `instantiate(…)` open) |
+| 7  | Annotation processing (inline attrs + sidecar YAML)                                                                       | ✅ shipped (libclang `[[clang::annotate("rustcc::…")]]` walker + emitter wiring; sidecar YAML parser already shipped) |
+| 8  | Explicit template instantiation import                                                                                    | ✅ shipped (`HeaderGraph::template_instantiations` synthesizes a root that force-instantiates each entry) |
 | 9  | Diagnostic translator, error recovery, poisoned nodes                                                                     | ⏳ open |
 | 10 | Incremental compilation integration                              |
