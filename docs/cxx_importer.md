@@ -307,7 +307,7 @@ of Phase B.
 | 18  | Default-argument fan-out (max-arity wrapper + documented defaults)          | `void redraw(int delay = 0)`                                | ~3 d   |
 | 19  | M5 finish — `CxxBase<T>` upcast emission OR derived-class method flattening | `Fl_Button btn; btn.show();` (inherits `Fl_Widget::show`)   | ~1.5 wk |
 | 20  | `const char*` ↔ `&CStr` / `&str` ergonomics layer                            | Labels, tooltips, file paths                                | ~1 wk  |
-| 21  | Bitfield-aware layout in `rustc_abi_cxx`                                    | Some FLTK structs use `unsigned when_:8;`-style fields. Verify `rustc_abi_cxx::layout` handles them; add support if missing. | ~3 d (probe-then-ship) |
+| 21  | Bitfield-aware layout in `rustc_abi_cxx`                                    | Some FLTK structs use `unsigned when_:8;`-style fields. Verify `rustc_abi_cxx::layout` handles them; add support if missing. | ✅ shipped (probe phase: `rustc_abi_cxx::layout` does NOT model Itanium bit-packing today; importer poisons any class containing a bitfield with a clear M21 reason. Proper packing is tracked as M21.b for a follow-up — until then, bitfield-bearing classes emit as opaque `pub struct` with the poison reason in a doc comment. Ships safe-fail rather than silent layout corruption.) |
 
 ### Out of FLTK's path but still tracked
 

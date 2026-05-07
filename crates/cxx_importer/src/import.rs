@@ -838,9 +838,42 @@ impl<'a> Importer<'a> {
         // returns instantiated fields even on template specializations,
         // whereas `get_children()` on a spec cursor sometimes comes back
         // empty.
+        //
+        // M21: detect bitfields up front. The current `rustc_abi_cxx`
+        // layout engine has no notion of bit-packing, so a struct
+        // with even one bitfield member would compute the wrong
+        // size / offsets — and silently mismatch the C++ side at
+        // runtime. Until proper Itanium bit-packing lands, we
+        // poison the whole class with a clear reason. Users see a
+        // doc-commented opaque struct instead of a layout that
+        // appears to work but corrupts the data.
         if let Some(field_entities) =
             entity.get_type().and_then(|t| t.get_fields())
         {
+            for child in &field_entities {
+                if child.is_bit_field() {
+                    let fname = child.get_name().unwrap_or_default();
+                    let width = child.get_bit_field_width().unwrap_or(0);
+                    let reason = format!(
+                        "bitfield member `{name}::{fname}` ({width}-bit) — \
+                         bitfield-aware layout (M21) is not yet implemented; \
+                         the class is exposed opaquely until support lands.",
+                    );
+                    // We've already registered the placeholder
+                    // ClassDef under `id` and inserted the USR into
+                    // `self.classes`. Poison the existing entry in
+                    // place rather than minting a fresh one — so
+                    // any earlier reference to `id` (recorded
+                    // before we discovered the bitfield) keeps
+                    // pointing at the same opaque type.
+                    let reason_with_span = match span_of_entity(entity) {
+                        Some(span) => format!("{span}: {reason}"),
+                        None => reason,
+                    };
+                    self.ctx.poison(id, reason_with_span);
+                    return Ok(id);
+                }
+            }
             for child in field_entities {
                 let fname = child.get_name().unwrap_or_default();
                 // On a template specialization, `child.get_type()` may

@@ -2440,6 +2440,88 @@ fn m17_alias_to_unsupported_type_is_skipped_not_fatal() {
 }
 
 // ============================================================
+// M21: bitfield-aware layout — probe-first behavior.
+// ============================================================
+//
+// `rustc_abi_cxx::layout` doesn't model Itanium bitfield packing,
+// so a class with bit-packed members would compute a wrong size
+// and silently mismatch the C++ side at runtime. Until proper
+// support lands, the importer poisons any class with bitfields
+// so emission produces an opaque `pub struct` + clear doc-
+// comment reason instead of a layout that looks fine but
+// corrupts data.
+
+#[test]
+fn m21_bitfield_class_is_poisoned_with_clear_reason() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct PackedFlags {\n  unsigned a : 4;\n  unsigned b : 4;\n  unsigned c : 8;\n};\n",
+        "m21_bitfield_poisoned",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    assert_eq!(class_ids.len(), 1);
+    let id = class_ids[0];
+
+    assert!(
+        ctx.is_poisoned(id),
+        "bitfield-bearing class should be poisoned (M21 v0)",
+    );
+    let reason = ctx.poison_reason(id).expect("reason recorded");
+    assert!(
+        reason.contains("bitfield"),
+        "poison reason should mention bitfield; got: {reason}",
+    );
+    assert!(
+        reason.contains("M21"),
+        "poison reason should reference the milestone; got: {reason}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m21_bitfield_class_emits_opaque_struct_with_doc_comment() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct PackedFlags {\n  unsigned a : 4;\n  unsigned b : 4;\n};\n",
+        "m21_bitfield_emits_opaque",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("bitfield member") && src.contains("M21"),
+        "opaque struct should include the bitfield-poison reason; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub struct PackedFlags"),
+        "opaque PackedFlags struct should still emit; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+// ============================================================
 // M16: enum class + plain enum body lowering.
 // ============================================================
 
