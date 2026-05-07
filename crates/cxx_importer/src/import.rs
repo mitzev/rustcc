@@ -40,7 +40,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use clang::{Clang, Entity, EntityKind, EntityVisitResult, Index, Type, TypeKind};
+use clang::{
+    Clang, Entity, EntityKind, EntityVisitResult, ExceptionSpecification, Index,
+    RefQualifier, Type, TypeKind,
+};
 use rustc_abi_cxx::{
     Access, BaseSpec, ClassDef, ClassId, CvQual, CxxType, CxxTypeCtx,
     FieldDef, FloatKind, FnSig, Ident, IntWidth, MethodDef, MethodName,
@@ -420,6 +423,41 @@ impl<'a> Importer<'a> {
             is_volatile: false,
         };
 
+        // Ref-qualifier (`Foo::bar() &` vs `&&`) and variadic-ness
+        // are properties of the *type* of the method, not the
+        // method entity itself. `entity.get_type()` returns the
+        // FunctionPrototype Type for a method, which carries both.
+        let method_type = entity.get_type();
+        let ref_q = method_type
+            .as_ref()
+            .and_then(|t| t.get_ref_qualifier())
+            .map(|r| match r {
+                RefQualifier::LValue => RefKind::Lvalue,
+                RefQualifier::RValue => RefKind::Rvalue,
+            });
+        let variadic = method_type
+            .as_ref()
+            .map(|t| t.is_variadic())
+            .unwrap_or(false);
+
+        // `noexcept` extraction. C++17 made `noexcept` part of the
+        // function type; the Itanium mangler doesn't fold it into
+        // ordinary method symbols, but it's load-bearing for
+        // pointer-to-member types and template signatures, plus it's
+        // useful surface info for downstream emitters (e.g. shim
+        // generation can drop the `try` wrapper for noexcept fns).
+        //
+        // Only `BasicNoexcept` and `ComputedNoexcept` map to
+        // `noexcept = true`. `DynamicNone` (`throw()`) was C++03
+        // syntax that doesn't participate in the type system, and
+        // `NoThrow` (`__declspec(nothrow)`) is an MSVC annotation
+        // that doesn't affect Itanium semantics.
+        let noexcept = matches!(
+            entity.get_exception_specification(),
+            Some(ExceptionSpecification::BasicNoexcept)
+                | Some(ExceptionSpecification::ComputedNoexcept),
+        );
+
         let virtuality = if entity.is_pure_virtual_method() {
             Virtuality::PureVirtual
         } else if entity.is_virtual_method() {
@@ -477,9 +515,9 @@ impl<'a> Importer<'a> {
                 params,
                 ret,
                 cv,
-                ref_q: None,
-                variadic: false,
-                noexcept: false,
+                ref_q,
+                variadic,
+                noexcept,
             },
             virtuality,
             vtable_index: None,
