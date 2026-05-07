@@ -14,6 +14,7 @@ pub mod import;
 mod lower;
 mod name_mapping;
 mod resolve;
+pub mod rust_bindings;
 pub mod rust_forwarders;
 pub mod rust_stubs;
 pub mod shims;
