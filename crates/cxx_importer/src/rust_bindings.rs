@@ -100,11 +100,12 @@
 //! vtable indices, lifetime annotations — each lands in its own
 //! release in cxx_importer's milestone series.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use rustc_abi_cxx::{
     ClassId, CtorVariant, CxxType, CxxTypeCtx, DtorVariant, FloatKind, IntWidth,
-    MethodDef, MethodName, SpecialMember, Symbol, TypeId, Virtuality,
+    MethodDef, MethodName, NameSegment, SpecialMember, Symbol, TypeId, Virtuality,
 };
 
 /// Selects the surface the emitter writes against. The three backends
@@ -258,21 +259,98 @@ fn emit_direct_extern_cpp(
          // Backend: DirectExternCpp (fork-required for `extern \"C++\"`).\n"
     );
 
-    let indent = if config.crate_module.is_some() { "    " } else { "" };
+    let initial_indent = if config.crate_module.is_some() { "    " } else { "" };
     if let Some(modname) = config.crate_module.as_deref() {
         let _ = writeln!(out, "pub mod {modname} {{");
     }
 
-    for &class_id in classes {
-        let block = render_direct_extern_class(ctx, class_id, config, indent)?;
-        out.push_str(&block);
-        out.push('\n');
-    }
+    // Group classes by their `NestedName` namespace prefix so the
+    // emitter recovers the C++ scope structure as a Rust `mod`
+    // tree. A flat list (no `Namespace` segments) collapses to the
+    // root and emits at the top level — same shape the v0 emitter
+    // produced before this change, with no namespace overhead.
+    let tree = build_namespace_tree(ctx, classes)?;
+    render_namespace_tree(ctx, &tree, &mut out, config, initial_indent)?;
 
     if config.crate_module.is_some() {
         let _ = writeln!(out, "}}");
     }
     Ok(out)
+}
+
+/// Tree of imported classes grouped by their C++ namespace prefix.
+/// A class with `NestedName = [Namespace("ns"), Class("Foo")]` lands
+/// at `root.children["ns"].classes` containing its `ClassId`.
+#[derive(Default)]
+struct NamespaceTree {
+    /// Classes directly inside this scope.
+    classes: Vec<ClassId>,
+    /// Sub-namespaces at this scope, keyed by name.
+    /// `BTreeMap` for deterministic emission order.
+    children: BTreeMap<String, NamespaceTree>,
+}
+
+fn build_namespace_tree(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+) -> Result<NamespaceTree, BindingsError> {
+    let mut root = NamespaceTree::default();
+    for &class_id in classes {
+        let class = ctx.class(class_id);
+        let segments = &class.name.0;
+        if segments.is_empty() {
+            return Err(BindingsError::UnsupportedType {
+                where_: format!("class {class_id:?}"),
+                kind: "empty NestedName".into(),
+            });
+        }
+        // Walk every segment except the final one, which is the
+        // class identifier itself.
+        let prefix = &segments[..segments.len() - 1];
+        let mut node = &mut root;
+        for seg in prefix {
+            let key = match seg {
+                NameSegment::Namespace(id) => id.0.clone(),
+                NameSegment::AnonymousNamespace => "__anon".to_string(),
+                other => {
+                    return Err(BindingsError::UnsupportedType {
+                        where_: format!(
+                            "{}",
+                            ident_of_class(class).unwrap_or_else(|| "<class>".into())
+                        ),
+                        kind: format!(
+                            "v0 namespace tree only handles Namespace / \
+                             AnonymousNamespace prefixes; got {other:?}"
+                        ),
+                    });
+                }
+            };
+            node = node.children.entry(key).or_default();
+        }
+        node.classes.push(class_id);
+    }
+    Ok(root)
+}
+
+fn render_namespace_tree(
+    ctx: &CxxTypeCtx,
+    tree: &NamespaceTree,
+    out: &mut String,
+    config: &RustBindingsConfig,
+    indent: &str,
+) -> Result<(), BindingsError> {
+    for &class_id in &tree.classes {
+        let block = render_direct_extern_class(ctx, class_id, config, indent)?;
+        out.push_str(&block);
+        out.push('\n');
+    }
+    for (name, child) in &tree.children {
+        let _ = writeln!(out, "{indent}pub mod {name} {{");
+        let inner_indent = format!("{indent}    ");
+        render_namespace_tree(ctx, child, out, config, &inner_indent)?;
+        let _ = writeln!(out, "{indent}}}");
+    }
+    Ok(())
 }
 
 fn render_direct_extern_class(
@@ -372,7 +450,7 @@ fn render_direct_extern_class(
             // Dtor is exposed through `Drop`, not the impl block.
             continue;
         }
-        let body = render_direct_extern_wrapper(emission, &class_name);
+        let body = render_direct_extern_wrapper(emission, &class_name, indent);
         block.push_str(&body);
         wrote_any_method = true;
     }
@@ -606,10 +684,19 @@ fn classify_for_direct_extern(
     })
 }
 
-fn render_direct_extern_wrapper(emission: &MethodEmission, class_name: &str) -> String {
+fn render_direct_extern_wrapper(
+    emission: &MethodEmission,
+    class_name: &str,
+    block_indent: &str,
+) -> String {
     let _ = class_name; // captured for future Self/ClassName disambiguation.
     let mut out = String::new();
-    let indent = "        ";
+    // The wrapper sits inside `impl Class { … }`, which is itself
+    // indented at `block_indent`. So function heads are at
+    // `block_indent + "    "`. We emit relative to that — the
+    // current code calls this `indent` for brevity.
+    let indent = format!("{block_indent}    ");
+    let indent = indent.as_str();
     match emission.kind {
         EmissionKind::Ctor => {
             // Wrapper for ctors: allocate a stack temp, call the
@@ -1164,6 +1251,55 @@ mod tests {
         assert!(
             src.contains("}\n"),
             "expected closing brace for module:\n{src}"
+        );
+    }
+
+    #[test]
+    fn namespaced_class_emits_pub_mod_wrapping_in_direct_extern_cpp() {
+        // A class in a C++ namespace `ns` must emit as
+        // `pub mod ns { #[repr(C)] pub struct Foo … }`. Mirrors
+        // `imports_class_inside_single_namespace` in the libclang
+        // suite — same `NestedName` shape, no clang dep needed
+        // here.
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let i32_ = ctx.intern_type(CxxType::Int {
+            signed: true,
+            width: IntWidth::I32,
+        });
+        let id = ctx.define_rust_class(ClassDef {
+            name: NestedName(vec![
+                NameSegment::Namespace(Ident("ns".into())),
+                NameSegment::Class(Ident("Foo".into())),
+            ]),
+            bases: vec![],
+            fields: vec![FieldDef {
+                name: Ident("x".into()),
+                ty: i32_,
+                explicit_align: None,
+            }],
+            methods: vec![],
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+
+        let src = generate_rust_bindings(&ctx, &[id], &RustBindingsConfig::default())
+            .expect("emit");
+
+        assert!(
+            src.contains("pub mod ns {"),
+            "expected `pub mod ns` wrap:\n{src}"
+        );
+        assert!(
+            src.contains("pub struct Foo"),
+            "expected `pub struct Foo`:\n{src}"
+        );
+        // The class block should be indented one level past the
+        // module wrapper.
+        assert!(
+            src.contains("    #[repr(C)]") || src.contains("\n    pub struct Foo"),
+            "expected indented class block:\n{src}"
         );
     }
 
