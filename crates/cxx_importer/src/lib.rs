@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 mod annotations;
+#[cfg(feature = "cache")]
+mod cache;
 mod diagnostics;
 mod driver;
 pub mod hpp;

@@ -18,6 +18,10 @@ rustc_abi_cxx = { path = "../rustc_abi_cxx" }
 clang = { version = "2.0", optional = true, features = ["runtime", "clang_3_7", "clang_5_0"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+# `cache` feature pulls these in; without it the cache module is
+# inert.
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -28,3 +32,9 @@ default = []
 # machines without a system libclang. Tests for the real importer path
 # compile only when this feature is enabled.
 libclang = ["dep:clang"]
+# M10 (incremental compilation). When enabled, `Driver::load_or_parse`
+# can serialize / deserialize the parsed `CxxTypeCtx` to disk between
+# build.rs runs, keyed on header content + clang flags + version
+# stamps. Pulls in serde derives across the IR via
+# `rustc_abi_cxx/serde`.
+cache = ["rustc_abi_cxx/serde", "dep:serde_json", "dep:sha2"]

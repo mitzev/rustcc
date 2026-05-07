@@ -9,6 +9,8 @@ use crate::ty::{
     ClassDef, ClassId, CxxType, RustEnumDef, RustEnumId, TypeId, TypeOrigin,
 };
 
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CxxTypeCtx {
     target: Target,
     classes: Vec<ClassDef>,

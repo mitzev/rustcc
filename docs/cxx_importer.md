@@ -278,8 +278,8 @@ for "useful subset of FLTK": callbacks, custom widgets, basic styling.
 | 6  | Virtual methods → vtable-index-aware emission                                                                             | ✅ shipped (single-inheritance; pure virtuals + secondary vtables open) |
 | 7  | Annotation processing (inline attrs + sidecar YAML)                                                                       | ✅ shipped (libclang `[[clang::annotate("rustcc::…")]]` walker + emitter wiring; sidecar YAML parser already shipped) |
 | 8  | Explicit template instantiation import                                                                                    | ✅ shipped (`HeaderGraph::template_instantiations` synthesizes a root that force-instantiates each entry) |
-| 9  | Diagnostic translator, error recovery, poisoned nodes                                                                     | ⏳ open |
-| 10 | Incremental compilation integration                                                                                       | ⏳ open |
+| 9  | Diagnostic translator, error recovery, poisoned nodes                                                                     | ✅ shipped (`SourceSpan` carry-through, `Diagnostic` formatter, poison-node side-table on `CxxTypeCtx`, `Importer::poison_class` recovery on forward-only decls) |
+| 10 | Incremental compilation integration                                                                                       | ✅ shipped (cache feature, `Driver::load_or_parse` with SHA-256 of headers + clang-flags + version stamps; HIR-integrated lazy-import path remains a v2 follow-up) |
 
 ### Phase B — Tier 1: FLTK "Hello World"
 

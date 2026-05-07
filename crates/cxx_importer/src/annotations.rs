@@ -5,11 +5,12 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::diagnostics::ImportError;
 
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "cache", derive(serde::Serialize, serde::Deserialize))]
 pub struct AnnotationSet {
     /// Inline attributes, keyed by fully-qualified entity name as
     /// `cxx_importer` resolves it during import.
@@ -43,6 +44,7 @@ impl AnnotationSet {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "cache", derive(serde::Serialize, serde::Deserialize))]
 pub enum Annotation {
     /// Override the Rust-side name used by `cxx_importer::name_mapping`.
     Name(String),
@@ -101,7 +103,7 @@ enum AnnotationKind {
 }
 
 /// Parsed sidecar YAML body. Schema mirrors `docs/cxx_importer.md §5.2`.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SidecarSchema {
     pub schema: u32,
@@ -109,7 +111,7 @@ pub struct SidecarSchema {
     pub types: BTreeMap<String, TypeEntry>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TypeEntry {
     /// Kind classification per `docs/ownership_and_safety.md` (value,
@@ -140,7 +142,7 @@ pub struct TypeEntry {
     pub instantiations: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TypeKind {
     Value,
@@ -149,7 +151,7 @@ pub enum TypeKind {
     Immortal,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MethodEntry {
     #[serde(default)]
