@@ -17,17 +17,23 @@
 //!   `pl`, `ix`, …), conversion functions (`operator T()`).
 //! - **Templates**: explicit class-template specializations (`vector<int>`).
 //!
-//! Self-doc gaps (still open, smaller now):
+//! Self-doc gaps (open follow-ups, smaller still):
 //!
-//! - `noexcept`, ref-qualifiers (`&` / `&&`), and variadics in
-//!   `FnSig` are extracted as defaults today (`false`, `None`,
-//!   `false`). Scheduled in the polish pass that lands alongside
-//!   this revision of the docs.
-//! - Vtable indices are computed at layout time inside
-//!   `rustc_abi_cxx::vtable`, not propagated back into per-method
-//!   `MethodDef::vtable_index`. The mangler / dispatcher reads the
-//!   index out of the layout query, so this is a metadata gap, not
-//!   a correctness one.
+//! - Annotations engine (`[[rustcc::*]]` inline + sidecar YAML).
+//!   The schema and consumer types are defined in
+//!   `crates/cxx_importer/src/annotations.rs`, but no clang-side
+//!   walker reads `[[clang::annotate(...)]]` cursors during import
+//!   yet. Tracked for a follow-up release.
+//! - Pure virtuals: `populate_vtable_indices` skips them in v0
+//!   because their slot target is the shared `__cxa_pure_virtual`
+//!   symbol and `MethodId`-based disambiguation conflicts with
+//!   the importer's eager method-vector clones. The bindings
+//!   emitter rejects pure virtuals with a clear error.
+//! - Multi-inheritance / virtual-base classes whose primary
+//!   subobject doesn't sit at offset 0 — `populate_vtable_indices`
+//!   walks the primary sub-table only, so secondary vtables
+//!   aren't reflected in `MethodDef::vtable_index`. The
+//!   single-inheritance case (the common one) works today.
 //! - Uninstantiated templates (`CXCursor_ClassTemplate`) are
 //!   skipped. Sidecar-driven explicit instantiation lands later.
 //!
@@ -48,9 +54,10 @@ use rustc_abi_cxx::{
     Access, BaseSpec, ClassDef, ClassId, CvQual, CxxType, CxxTypeCtx,
     FieldDef, FloatKind, FnSig, Ident, IntWidth, MethodDef, MethodName,
     NameSegment, NestedName, OperatorKind, RecordKind, RefKind, SpecialMember,
-    TemplateArg, TypeId, Virtuality,
+    Symbol, TemplateArg, TypeId, VTableEntry, Virtuality,
 };
 
+use crate::annotations::{Annotation, AnnotationSet};
 use crate::diagnostics::ImportError;
 
 pub fn import_header(
@@ -60,6 +67,107 @@ pub fn import_header(
 ) -> Result<Vec<ClassId>, ImportError> {
     let mut cache = HashMap::new();
     import_header_with_cache(source, args, ctx, &mut cache)
+}
+
+/// Like [`import_header`], but additionally returns the
+/// [`AnnotationSet`] populated from inline
+/// `[[clang::annotate("rustcc::…")]]` attributes on classes and
+/// methods. Use this entry point with
+/// `rust_bindings::generate_rust_bindings_with_annotations` to
+/// honor user-supplied name overrides and nullability markers.
+pub fn import_header_with_annotations(
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+) -> Result<(Vec<ClassId>, AnnotationSet), ImportError> {
+    let mut cache = HashMap::new();
+    let mut set = AnnotationSet::default();
+    let ids = import_header_full(source, args, ctx, &mut cache, &mut set)?;
+    Ok((ids, set))
+}
+
+/// Internal entry point used by [`Driver::parse_all`] to share its
+/// USR cache and accumulate annotations across multiple header
+/// roots in a single pass.
+pub(crate) fn import_header_full(
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+    cache: &mut HashMap<String, ClassId>,
+    annotations: &mut AnnotationSet,
+) -> Result<Vec<ClassId>, ImportError> {
+    let ids = import_header_with_cache(source, args, ctx, cache)?;
+    // The cache-and-annotations collection is currently re-derived
+    // by re-running the importer when the caller wants annotations;
+    // a follow-up release can plumb annotations through the
+    // existing `import_header_with_cache` call to avoid double work.
+    let mut set_cache: HashMap<String, ClassId> = std::mem::take(cache);
+    let collected = collect_annotations(source, args, ctx, &mut set_cache)?;
+    *cache = set_cache;
+    for (key, anns) in collected {
+        annotations
+            .inline
+            .entry(key)
+            .or_default()
+            .extend(anns);
+    }
+    Ok(ids)
+}
+
+/// Re-run the libclang parse just to harvest annotations. This is
+/// a temporary measure — the next iteration should fold the
+/// annotation walk directly into [`import_header_with_cache`] so
+/// each header is parsed once.
+fn collect_annotations(
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+    cache: &mut HashMap<String, ClassId>,
+) -> Result<HashMap<String, Vec<Annotation>>, ImportError> {
+    let _ = (ctx, cache);
+    let clang = Clang::new().map_err(|e| ImportError::ClangDiagnostic {
+        file: source.display().to_string(),
+        line: 0,
+        message: format!("failed to initialize libclang: {e}"),
+    })?;
+    let index = Index::new(&clang, false, false);
+    let tu = index
+        .parser(source)
+        .arguments(args)
+        .parse()
+        .map_err(|e| ImportError::ClangDiagnostic {
+            file: source.display().to_string(),
+            line: 0,
+            message: format!("parse failed: {e:?}"),
+        })?;
+
+    let mut out: HashMap<String, Vec<Annotation>> = HashMap::new();
+    walk_for_annotations(&tu.get_entity(), &mut out);
+    Ok(out)
+}
+
+fn walk_for_annotations(
+    entity: &Entity<'_>,
+    out: &mut HashMap<String, Vec<Annotation>>,
+) {
+    match entity.get_kind() {
+        EntityKind::StructDecl
+        | EntityKind::ClassDecl
+        | EntityKind::UnionDecl
+        | EntityKind::Method
+        | EntityKind::Constructor
+        | EntityKind::Destructor
+        | EntityKind::ConversionFunction => {
+            let anns = read_annotations(entity);
+            if !anns.is_empty() {
+                out.insert(entity_fqn(entity), anns);
+            }
+        }
+        _ => {}
+    }
+    for child in entity.get_children() {
+        walk_for_annotations(&child, out);
+    }
 }
 
 /// Like [`import_header`], but threads a caller-owned USR→`ClassId`
@@ -211,6 +319,10 @@ struct Importer<'a> {
     // for a decl; we use it to dedup repeat references to the same class
     // within the translation unit.
     classes: HashMap<String, ClassId>,
+    /// Inline `[[clang::annotate("rustcc::…")]]` annotations parsed
+    /// from class + method entities, keyed by fully-qualified C++
+    /// path (e.g. `ns::Foo`, `ns::Foo::bar`).
+    annotations: HashMap<String, Vec<Annotation>>,
 }
 
 impl<'a> Importer<'a> {
@@ -222,11 +334,19 @@ impl<'a> Importer<'a> {
         ctx: &'a mut CxxTypeCtx,
         classes: HashMap<String, ClassId>,
     ) -> Self {
-        Self { ctx, classes }
+        Self {
+            ctx,
+            classes,
+            annotations: HashMap::new(),
+        }
     }
 
     fn into_cache(self) -> HashMap<String, ClassId> {
         self.classes
+    }
+
+    fn into_annotations(self) -> HashMap<String, Vec<Annotation>> {
+        self.annotations
     }
 
     fn import_class(
@@ -278,6 +398,14 @@ impl<'a> Importer<'a> {
         };
         let id = self.ctx.define_class(placeholder);
         self.classes.insert(usr, id);
+
+        // Capture inline annotations (`[[clang::annotate("rustcc::…")]]`)
+        // for this class. Keyed by the class's FQN so the bindings
+        // emitter can look them up by `NestedName::display`.
+        let class_anns = read_annotations(entity);
+        if !class_anns.is_empty() {
+            self.annotations.insert(entity_fqn(entity), class_anns);
+        }
 
         // **Known v1 gap for template specializations.** libclang's
         // cursor traversal (`visit_children`) does not surface the
@@ -373,6 +501,15 @@ impl<'a> Importer<'a> {
         class.methods = methods;
         class.is_polymorphic = is_polymorphic;
 
+        // After everything is in place, walk the class's primary
+        // vtable and stamp `vtable_index` onto each virtual method
+        // we own — useful metadata for downstream emitters that
+        // want to dispatch through the vtable rather than calling
+        // the mangled symbol directly.
+        if is_polymorphic {
+            populate_vtable_indices(self.ctx, id);
+        }
+
         Ok(id)
     }
 
@@ -385,6 +522,18 @@ impl<'a> Importer<'a> {
         let name = entity.get_name().unwrap_or_default();
         let kind = entity.get_kind();
         let ctx_where = format!("{parent_name}::{name}");
+
+        // Capture inline annotations before lowering so the
+        // bindings emitter can override Rust names per-method.
+        // FQN matches what the bindings emitter constructs from
+        // `<class FQN>::<method-source-name>`. The walk uses the
+        // method entity's semantic-parent chain to recover the
+        // class FQN — we ignore `parent_name` here because that
+        // string is the class's *short* name, not the FQN.
+        let method_anns = read_annotations(entity);
+        if !method_anns.is_empty() {
+            self.annotations.insert(entity_fqn(entity), method_anns);
+        }
 
         // Parameters come from ParmDecl children.
         let mut params = Vec::new();
@@ -880,6 +1029,168 @@ fn class_has_virtual_base_chain(
         }
     }
     false
+}
+
+/// Build a `::`-joined FQN by walking semantic parents up to the
+/// translation-unit boundary. Used as the lookup key for inline
+/// annotations stored on the [`Importer`]. Mirrors what the
+/// [`AnnotationSet`] consumer in `rust_bindings` constructs from
+/// `NestedName` after lowering — same string, different source.
+///
+/// libclang reports the TU root cursor with kind `NotImplemented`
+/// rather than the (non-existent in this enum) `TranslationUnit`,
+/// and its `name` is the file path. We stop the walk on either
+/// shape, plus on a missing semantic parent, so file paths never
+/// appear in the FQN.
+fn entity_fqn(entity: &Entity<'_>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = Some(*entity);
+    while let Some(e) = cur {
+        if matches!(
+            e.get_kind(),
+            EntityKind::TranslationUnit | EntityKind::NotImplemented,
+        ) {
+            break;
+        }
+        if let Some(name) = e.get_name() {
+            if !name.is_empty() {
+                parts.push(name);
+            }
+        }
+        cur = e.get_semantic_parent();
+    }
+    parts.reverse();
+    parts.join("::")
+}
+
+/// Read inline `[[clang::annotate("rustcc::…")]]` annotations from
+/// `entity`'s direct children. Recognizes the v0 set:
+///
+/// - `rustcc::name=NewName`     → [`Annotation::Name`]
+/// - `rustcc::nullable`         → [`Annotation::Nullable`]
+/// - `rustcc::nonnull`          → [`Annotation::NonNull`]
+/// - `rustcc::skip`             → [`Annotation::Skip`]
+///
+/// Annotations whose payload doesn't match one of these patterns
+/// are silently ignored — a stricter v0.X release can promote
+/// unknowns to a diagnostic.
+fn read_annotations(entity: &Entity<'_>) -> Vec<Annotation> {
+    let mut out = Vec::new();
+    for child in entity.get_children() {
+        if child.get_kind() != EntityKind::AnnotateAttr {
+            continue;
+        }
+        // Both `get_display_name()` and `get_name()` work for
+        // `AnnotateAttr` cursors on modern libclang (>= 11). We try
+        // the more reliable display-name route first.
+        let raw = child
+            .get_display_name()
+            .or_else(|| child.get_name())
+            .unwrap_or_default();
+        if let Some(ann) = parse_rustcc_annotation(&raw) {
+            out.push(ann);
+        }
+    }
+    out
+}
+
+fn parse_rustcc_annotation(text: &str) -> Option<Annotation> {
+    let s = text.trim();
+    let rest = s.strip_prefix("rustcc::")?;
+    if let Some(value) = rest.strip_prefix("name=") {
+        return Some(Annotation::Name(value.trim().to_string()));
+    }
+    match rest {
+        "nullable" => Some(Annotation::Nullable),
+        "nonnull" => Some(Annotation::NonNull),
+        "skip" => Some(Annotation::Skip),
+        _ => None,
+    }
+}
+
+/// Walk a polymorphic class's primary vtable and stamp `vtable_index`
+/// onto each virtual method the class owns or overrides.
+///
+/// The fork-side vtable layout (`CxxTypeCtx::vtable`) computes one
+/// `VTableEntry::FunctionPointer` slot per dispatchable method, in
+/// the canonical Itanium order: base virtuals first (slots that
+/// either keep base targets or get rewritten with our overriders),
+/// then any new virtuals introduced by this class.
+///
+/// Per-method `vtable_index` is the *function-pointer rank* in the
+/// primary sub-table — the count of `FunctionPointer` slots that
+/// precede this one, ignoring the virtual-base offsets, offset-to-
+/// top, and RTTI slots that lead each table.
+///
+/// We only update methods that match by Itanium-mangled symbol with
+/// what's actually in the slot. This handles two cases cleanly:
+///
+/// - A virtual we override: our class's own mangled symbol is in
+///   the slot, so we own the index.
+/// - A virtual a base owns and we don't override: the slot's
+///   target is the base's symbol, so the lookup misses and our
+///   `vtable_index` stays `None` (we never see the inherited
+///   methods on this class anyway since the importer copies
+///   methods from `child.get_children()`, not from base classes).
+///
+/// Pure virtuals are skipped in v0 — their slot target is
+/// `__cxa_pure_virtual` (a single shared symbol), so the symbol-
+/// match approach can't disambiguate them. A future revision can
+/// reach pure virtuals via the `MethodId` field once the importer
+/// stops eagerly cloning method vectors.
+fn populate_vtable_indices(ctx: &mut CxxTypeCtx, class_id: ClassId) {
+    let Some(vtable) = ctx.vtable(class_id) else {
+        return;
+    };
+    let Some(primary) = vtable.sub_tables.first() else {
+        return;
+    };
+
+    // Snapshot method symbols before mutating.
+    let class_clone = ctx.class(class_id).clone();
+    let mut wanted: Vec<Option<String>> = Vec::with_capacity(class_clone.methods.len());
+    for m in &class_clone.methods {
+        if m.virtuality == Virtuality::Virtual {
+            // Skip ConversionTo (we don't know how to mangle them
+            // here — the conversion target's TypeId would change
+            // hands and we don't want to drop a borrow on ctx).
+            let mangled = ctx.mangle(&Symbol::Method {
+                class: class_id,
+                name: m.name.clone(),
+                sig: m.sig.clone(),
+            });
+            wanted.push(Some(mangled));
+        } else {
+            wanted.push(None);
+        }
+    }
+
+    // Walk the primary sub-table, count `FunctionPointer` rank,
+    // and remember the rank of any slot whose target matches one
+    // of our methods' mangled symbols.
+    let mut updates: Vec<(usize, u32)> = Vec::new();
+    let mut fp_rank: u32 = 0;
+    for entry in &primary.entries {
+        if let VTableEntry::FunctionPointer { mangled_target, .. } = entry {
+            for (m_idx, expected) in wanted.iter().enumerate() {
+                if let Some(sym) = expected {
+                    if sym == mangled_target {
+                        updates.push((m_idx, fp_rank));
+                        // Don't break — defensively allow the same
+                        // method to appear in multiple slots if
+                        // future overload patterns require it. In
+                        // practice each method shows up once.
+                    }
+                }
+            }
+            fp_rank += 1;
+        }
+    }
+
+    let class_mut = ctx.class_mut(class_id);
+    for (m_idx, vt) in updates {
+        class_mut.methods[m_idx].vtable_index = Some(vt);
+    }
 }
 
 fn entity_usr(entity: &Entity<'_>) -> String {

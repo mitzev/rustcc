@@ -108,6 +108,11 @@ use rustc_abi_cxx::{
     MethodDef, MethodName, NameSegment, SpecialMember, Symbol, TypeId, Virtuality,
 };
 
+use crate::annotations::{Annotation, AnnotationSet};
+use crate::name_mapping::{
+    disambiguate_overloads, rust_name_for_operator, OverloadEntry,
+};
+
 /// Selects the surface the emitter writes against. The three backends
 /// span two orthogonal axes:
 ///
@@ -188,21 +193,47 @@ impl std::error::Error for BindingsError {}
 /// Emit Rust source bridging the imported classes named in `classes`.
 /// The caller is expected to have populated `ctx` via
 /// [`super::driver::Driver::parse_all`] (or hand-built it for tests).
+///
+/// This entry point does not consult any annotations. To honor
+/// `[[clang::annotate("rustcc::name=Foo")]]` overrides imported via
+/// [`super::import::import_header_with_annotations`], use
+/// [`generate_rust_bindings_with_annotations`] instead.
 pub fn generate_rust_bindings(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
+    let empty = AnnotationSet::default();
+    generate_rust_bindings_with_annotations(ctx, classes, &empty, config)
+}
+
+/// Emit Rust source consulting `annotations` for per-entity Rust-name
+/// overrides. Currently honors:
+///
+/// - [`Annotation::Name`] on a class FQN → overrides the emitted
+///   Rust struct identifier.
+/// - [`Annotation::Name`] on a method FQN (`<class FQN>::<method>`) →
+///   overrides the emitted Rust wrapper name (still routed through
+///   the disambiguator, so collisions with sibling methods are
+///   resolved deterministically).
+/// - [`Annotation::Skip`] on a class FQN → omits the class from
+///   the emission entirely.
+///
+/// Other annotation kinds (`Nullable`, `LifetimeBound`, etc.) are
+/// recognized at parse time but not yet wired into the emission —
+/// tracked per `docs/cxx_importer.md §5`.
+pub fn generate_rust_bindings_with_annotations(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+    annotations: &AnnotationSet,
+    config: &RustBindingsConfig,
+) -> Result<String, BindingsError> {
     match config.backend {
         BindingsBackend::NativeCppClassMacro => emit_native_macro(ctx, classes, config),
-        BindingsBackend::DirectExternCpp => emit_direct_extern_cpp(ctx, classes, config),
-        backend @ BindingsBackend::CxxClassMacro => Err(BindingsError::UnsupportedBackend {
-            backend,
-            reason: "v0 scaffold ships `NativeCppClassMacro` (export direction) and \
-                     `DirectExternCpp` (import direction). The stable-rustc-friendly \
-                     `CxxClassMacro` shape is tracked for a follow-up release."
-                .into(),
-        }),
+        BindingsBackend::DirectExternCpp => {
+            emit_direct_extern_cpp(ctx, classes, annotations, config)
+        }
+        BindingsBackend::CxxClassMacro => emit_cxx_class_macro(ctx, classes, config),
     }
 }
 
@@ -224,7 +255,77 @@ fn emit_native_macro(
     }
 
     for &class_id in classes {
-        let block = render_class_block(ctx, class_id, config, indent)?;
+        let block = render_class_block(ctx, class_id, config, indent, MacroPath::Native)?;
+        out.push_str(&block);
+        out.push('\n');
+    }
+
+    if config.crate_module.is_some() {
+        let _ = writeln!(out, "}}");
+    }
+    Ok(out)
+}
+
+/// Selects which workspace macro the class-block emission writes
+/// against. Both macros share the same input grammar; the only
+/// difference is the macro path token at the head of the block,
+/// which means a single class-block renderer can drive both.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MacroPath {
+    /// `::rustcc_macros::native_cpp_class!` — fork-only, expands
+    /// to `extern "C++"` + `#[constructor]` + `#[repr(cpp)]`.
+    Native,
+    /// `::rustcc_macros::cxx_class!` — stable-rustc-friendly,
+    /// expands to `extern "C"` + manual `__sret` trampolines +
+    /// `#[repr(C, align(N))]`.
+    Stable,
+}
+
+impl MacroPath {
+    fn token(self) -> &'static str {
+        match self {
+            MacroPath::Native => "::rustcc_macros::native_cpp_class!",
+            MacroPath::Stable => "::rustcc_macros::cxx_class!",
+        }
+    }
+
+    fn comment_label(self) -> &'static str {
+        match self {
+            MacroPath::Native => "NativeCppClassMacro (fork-only).",
+            MacroPath::Stable => "CxxClassMacro (stable-rustc-friendly).",
+        }
+    }
+}
+
+/// Stable-rustc-friendly macro emission. Writes one
+/// `::rustcc_macros::cxx_class! { … }` invocation per imported
+/// class. The macro itself expands to the pre-fork shape
+/// (`extern "C"` + manual `__sret` trampolines + `#[repr(C,
+/// align(N))]`), so the emitted source compiles on plain nightly
+/// without the rustcc fork.
+///
+/// Identical class-block grammar to `NativeCppClassMacro` (size,
+/// align, ctor / dtor / instance / static methods); the only
+/// difference at our layer is the macro path.
+fn emit_cxx_class_macro(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+    config: &RustBindingsConfig,
+) -> Result<String, BindingsError> {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "// Generated by rustcc cxx_importer::rust_bindings. Do not hand-edit.\n\
+         // Backend: CxxClassMacro (stable-rustc-friendly).\n"
+    );
+
+    let indent = if config.crate_module.is_some() { "    " } else { "" };
+    if let Some(modname) = config.crate_module.as_deref() {
+        let _ = writeln!(out, "pub mod {modname} {{");
+    }
+
+    for &class_id in classes {
+        let block = render_class_block(ctx, class_id, config, indent, MacroPath::Stable)?;
         out.push_str(&block);
         out.push('\n');
     }
@@ -250,6 +351,7 @@ fn emit_native_macro(
 fn emit_direct_extern_cpp(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
+    annotations: &AnnotationSet,
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
     let mut out = String::new();
@@ -258,6 +360,18 @@ fn emit_direct_extern_cpp(
         "// Generated by rustcc cxx_importer::rust_bindings. Do not hand-edit.\n\
          // Backend: DirectExternCpp (fork-required for `extern \"C++\"`).\n"
     );
+
+    // Filter classes annotated with `Skip` before tree building.
+    let classes: Vec<ClassId> = classes
+        .iter()
+        .copied()
+        .filter(|&cid| {
+            !annotations
+                .effective(&class_fqn_string(ctx, cid))
+                .iter()
+                .any(|a| matches!(a, Annotation::Skip))
+        })
+        .collect();
 
     let initial_indent = if config.crate_module.is_some() { "    " } else { "" };
     if let Some(modname) = config.crate_module.as_deref() {
@@ -269,13 +383,32 @@ fn emit_direct_extern_cpp(
     // tree. A flat list (no `Namespace` segments) collapses to the
     // root and emits at the top level — same shape the v0 emitter
     // produced before this change, with no namespace overhead.
-    let tree = build_namespace_tree(ctx, classes)?;
-    render_namespace_tree(ctx, &tree, &mut out, config, initial_indent)?;
+    let tree = build_namespace_tree(ctx, &classes)?;
+    render_namespace_tree(ctx, &tree, &mut out, annotations, config, initial_indent)?;
 
     if config.crate_module.is_some() {
         let _ = writeln!(out, "}}");
     }
     Ok(out)
+}
+
+/// Build the `::`-joined fully-qualified C++ name for a class.
+/// Mirrors what the libclang-side `entity_fqn` builds during
+/// import. Used as the lookup key for class- and method-level
+/// annotations.
+fn class_fqn_string(ctx: &CxxTypeCtx, class_id: ClassId) -> String {
+    let class = ctx.class(class_id);
+    let mut parts = Vec::with_capacity(class.name.0.len());
+    for seg in &class.name.0 {
+        match seg {
+            NameSegment::Namespace(id)
+            | NameSegment::Class(id)
+            | NameSegment::Enum(id) => parts.push(id.0.clone()),
+            NameSegment::TemplateSpec { name, .. } => parts.push(name.0.clone()),
+            NameSegment::AnonymousNamespace => parts.push("__anon".into()),
+        }
+    }
+    parts.join("::")
 }
 
 /// Tree of imported classes grouped by their C++ namespace prefix.
@@ -336,18 +469,20 @@ fn render_namespace_tree(
     ctx: &CxxTypeCtx,
     tree: &NamespaceTree,
     out: &mut String,
+    annotations: &AnnotationSet,
     config: &RustBindingsConfig,
     indent: &str,
 ) -> Result<(), BindingsError> {
     for &class_id in &tree.classes {
-        let block = render_direct_extern_class(ctx, class_id, config, indent)?;
+        let block =
+            render_direct_extern_class(ctx, class_id, annotations, config, indent)?;
         out.push_str(&block);
         out.push('\n');
     }
     for (name, child) in &tree.children {
         let _ = writeln!(out, "{indent}pub mod {name} {{");
         let inner_indent = format!("{indent}    ");
-        render_namespace_tree(ctx, child, out, config, &inner_indent)?;
+        render_namespace_tree(ctx, child, out, annotations, config, &inner_indent)?;
         let _ = writeln!(out, "{indent}}}");
     }
     Ok(())
@@ -356,29 +491,58 @@ fn render_namespace_tree(
 fn render_direct_extern_class(
     ctx: &CxxTypeCtx,
     class_id: ClassId,
+    annotations: &AnnotationSet,
     config: &RustBindingsConfig,
     indent: &str,
 ) -> Result<String, BindingsError> {
     let class = ctx.class(class_id);
-    let class_name = ident_of_class(class).ok_or_else(|| BindingsError::UnsupportedType {
-        where_: "class name".into(),
-        kind: "anonymous or non-identifier-named class".into(),
-    })?;
+    let class_fqn = class_fqn_string(ctx, class_id);
+    // Inline / sidecar annotations override the Rust class
+    // identifier when `[[clang::annotate("rustcc::name=NewName")]]`
+    // is present on the C++ class. Falls back to the source
+    // identifier otherwise.
+    let class_name = annotations
+        .effective(&class_fqn)
+        .into_iter()
+        .find_map(|a| match a {
+            Annotation::Name(n) => Some(n),
+            _ => None,
+        })
+        .or_else(|| ident_of_class(class))
+        .ok_or_else(|| BindingsError::UnsupportedType {
+            where_: "class name".into(),
+            kind: "anonymous or non-identifier-named class".into(),
+        })?;
     let layout = ctx.layout(class_id).map_err(|e| BindingsError::LayoutFailed {
         class: class_name.clone(),
         detail: format!("{e:?}"),
     })?;
 
     // Collect methods up front — we need them for the extern block,
-    // the impl block, and the Drop check. Rejecting on virtual,
-    // operator, and conversion methods up front keeps later code
-    // simple.
+    // the impl block, and the Drop check. We accept virtuals here
+    // (their `vtable_index` was populated by the importer's
+    // post-pass); the wrapper renderer routes them through a
+    // vtable-lookup path. Pure virtuals stay rejected for v0
+    // because they don't have an own-class implementation to call.
     let methods = ctx.class(class_id).methods.clone();
     for m in &methods {
-        if m.virtuality != Virtuality::NonVirtual {
+        if m.virtuality == Virtuality::Virtual && m.vtable_index.is_none() {
             return Err(BindingsError::UnsupportedMethod {
                 where_: format!("{class_name}::{:?}", m.name),
-                why: "virtual methods deferred until vtable-aware emission lands".into(),
+                why: "virtual method without populated vtable_index — the importer's \
+                      vtable post-pass didn't recognize this slot. Likely a class \
+                      structure (multi-inheritance, virtual bases) the v0 vtable \
+                      walker doesn't yet handle."
+                    .into(),
+            });
+        }
+        if m.virtuality == Virtuality::PureVirtual {
+            return Err(BindingsError::UnsupportedMethod {
+                where_: format!("{class_name}::{:?}", m.name),
+                why: "pure virtual method (no own-class implementation to call) — \
+                      a future revision can either skip it or route to an \
+                      `__cxa_pure_virtual` shim."
+                    .into(),
             });
         }
     }
@@ -411,30 +575,55 @@ fn render_direct_extern_class(
     //    register-passed identically to C.
     let _ = writeln!(block, "{indent}unsafe extern \"C++\" {{");
 
+    // Pre-compute the disambiguated Rust name for each method.
+    // Ctors and dtors are special-cased to `new` / `drop`; operators
+    // route through `rust_name_for_operator`; identifier-named
+    // methods keep their source name, with collisions resolved by
+    // appending a stringified parameter-type signature.
+    let resolved_names = resolve_method_names(
+        ctx,
+        &methods,
+        &class_name,
+        &class_fqn,
+        annotations,
+    )?;
+
     let mut ctor_seen = 0usize;
     let mut method_blocks: Vec<MethodEmission> = Vec::with_capacity(methods.len());
     let mut has_user_dtor = false;
-    for method in &methods {
-        let emission = classify_for_direct_extern(ctx, class_id, &class_name, method)?;
+    for (method, resolved_name) in methods.iter().zip(resolved_names.iter()) {
+        let emission = classify_for_direct_extern(
+            ctx,
+            class_id,
+            &class_name,
+            method,
+            resolved_name,
+        )?;
         if matches!(emission.kind, EmissionKind::Dtor) {
             has_user_dtor = true;
         }
         if matches!(emission.kind, EmissionKind::Ctor) {
             ctor_seen += 1;
         }
-        // Emit the extern decl line.
-        let _ = writeln!(
-            block,
-            "{indent}    #[link_name = \"{}\"]",
-            emission.link_name,
-        );
-        let _ = writeln!(
-            block,
-            "{indent}    fn {ext}({decl}){ret};",
-            ext = emission.extern_ident,
-            decl = emission.extern_decl_params,
-            ret = emission.extern_return_clause,
-        );
+        // Virtual methods don't get a `#[link_name]` extern decl —
+        // they're dispatched via the vtable at the call site, not
+        // by linker resolution. The wrapper does its own vptr load
+        // and transmute.
+        if !matches!(emission.kind, EmissionKind::Virtual { .. }) {
+            // Emit the extern decl line.
+            let _ = writeln!(
+                block,
+                "{indent}    #[link_name = \"{}\"]",
+                emission.link_name,
+            );
+            let _ = writeln!(
+                block,
+                "{indent}    fn {ext}({decl}){ret};",
+                ext = emission.extern_ident,
+                decl = emission.extern_decl_params,
+                ret = emission.extern_return_clause,
+            );
+        }
         method_blocks.push(emission);
     }
     let _ = writeln!(block, "{indent}}}");
@@ -531,10 +720,144 @@ struct MethodEmission {
 enum EmissionKind {
     Ctor,
     Dtor,
-    /// `&self` / `&mut self` instance method.
+    /// `&self` / `&mut self` instance method, dispatched directly
+    /// to the Itanium-mangled symbol.
     Instance,
     /// No-self static method.
     Static,
+    /// `&self` / `&mut self` virtual method, dispatched through
+    /// the C++ vtable. `vtable_index` is the rank of this method
+    /// among the primary sub-table's function-pointer slots.
+    Virtual { vtable_index: u32 },
+}
+
+/// Compute one disambiguated Rust identifier per method in `methods`,
+/// in the same order. Handles three flavors:
+///
+/// - Ctor → `"new"` (every ctor in v0; multi-ctor support gets
+///   suffixes via the disambiguator pass).
+/// - Dtor → `"drop"`.
+/// - Operator → `op_<word>` / `op_<word>_mut` per
+///   [`rust_name_for_operator`].
+/// - Plain identifier → the source name.
+///
+/// After base-name selection, collisions get
+/// `<base>_<arg-type-signature>` suffixes via
+/// [`disambiguate_overloads`]. The disambiguator string is the
+/// param-type list joined by `_`, sanitized into a valid Rust
+/// identifier suffix.
+fn resolve_method_names(
+    ctx: &CxxTypeCtx,
+    methods: &[MethodDef],
+    class_name: &str,
+    class_fqn: &str,
+    annotations: &AnnotationSet,
+) -> Result<Vec<String>, BindingsError> {
+    // First pass: base name + disambiguator string per method.
+    // Per-method `Annotation::Name` overrides win over the
+    // operator-table / source-name defaults, but the disambiguator
+    // pass still runs on top to resolve any user-introduced
+    // collisions.
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(methods.len());
+    for method in methods {
+        let default_base = base_rust_name_for_method(method, class_name)?;
+        let method_fqn = format!(
+            "{class_fqn}::{}",
+            method_source_name_for_fqn(method).unwrap_or_else(|| default_base.clone()),
+        );
+        let base = annotations
+            .effective(&method_fqn)
+            .into_iter()
+            .find_map(|a| match a {
+                Annotation::Name(n) => Some(n),
+                _ => None,
+            })
+            .unwrap_or(default_base);
+        let disamb = stringify_param_signature(ctx, method, class_name)?;
+        entries.push((base, disamb));
+    }
+
+    // Second pass: feed into the disambiguator.
+    let entries_view: Vec<OverloadEntry<&str>> = entries
+        .iter()
+        .map(|(b, d)| OverloadEntry {
+            base_name: b.as_str(),
+            disambiguator: d.as_str(),
+        })
+        .collect();
+    let resolved = disambiguate_overloads(entries_view);
+    Ok(resolved.into_iter().map(|i| i.0).collect())
+}
+
+/// The source-level C++ identifier for a method, used as the
+/// trailing component of the annotation-lookup FQN.
+///
+/// v0 only exposes annotation lookups for plain identifier-named
+/// methods. Special members (ctors, dtors) and operator overloads
+/// rarely benefit from `Annotation::Name` overrides — the rename
+/// machinery for those is tracked separately.
+fn method_source_name_for_fqn(method: &MethodDef) -> Option<String> {
+    match (&method.special, &method.name) {
+        (None, MethodName::Ident(id)) => Some(id.0.clone()),
+        _ => None,
+    }
+}
+
+fn base_rust_name_for_method(
+    method: &MethodDef,
+    class_name: &str,
+) -> Result<String, BindingsError> {
+    match &method.special {
+        Some(SpecialMember::DefaultCtor | SpecialMember::OtherCtor) => Ok("new".into()),
+        Some(SpecialMember::Dtor) => Ok("drop".into()),
+        Some(other @ (SpecialMember::CopyCtor
+        | SpecialMember::MoveCtor
+        | SpecialMember::CopyAssign
+        | SpecialMember::MoveAssign)) => Err(BindingsError::UnsupportedMethod {
+            where_: format!("{class_name}::{:?}", method.name),
+            why: format!(
+                "special member `{other:?}` not yet wired (v0 covers Ctor + Dtor + \
+                 plain instance/static methods + operators)"
+            ),
+        }),
+        None => match &method.name {
+            MethodName::Ident(id) => Ok(id.0.clone()),
+            MethodName::Operator(op) => {
+                Ok(rust_name_for_operator(*op, method.sig.cv.is_const))
+            }
+            MethodName::ConversionTo(_) => Err(BindingsError::UnsupportedMethod {
+                where_: format!("{class_name}::<conversion>"),
+                why: "C++ conversion functions (operator T()) deferred — needs \
+                      separate target-type-aware lowering"
+                    .into(),
+            }),
+        },
+    }
+}
+
+/// Stringify a method's parameter type list as a stable token usable
+/// as an overload-disambiguator suffix. Keeps just enough information
+/// to differentiate signatures the C++ side considers distinct
+/// overloads. Sanitization to a valid Rust identifier happens
+/// downstream in [`name_mapping::sanitize_disambiguator`].
+fn stringify_param_signature(
+    ctx: &CxxTypeCtx,
+    method: &MethodDef,
+    class_name: &str,
+) -> Result<String, BindingsError> {
+    if method.sig.params.is_empty() {
+        return Ok(String::new());
+    }
+    let mut parts = Vec::with_capacity(method.sig.params.len());
+    for (i, &ty_id) in method.sig.params.iter().enumerate() {
+        let s = render_rust_type(
+            ctx,
+            ty_id,
+            &format!("{class_name} overload sig param {i}"),
+        )?;
+        parts.push(s);
+    }
+    Ok(parts.join("_"))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -550,6 +873,7 @@ fn classify_for_direct_extern(
     class_id: ClassId,
     class_name: &str,
     method: &MethodDef,
+    resolved_rust_name: &str,
 ) -> Result<MethodEmission, BindingsError> {
     let arity = method.sig.params.len();
 
@@ -567,7 +891,12 @@ fn classify_for_direct_extern(
         user_forward.push(format!("arg{i}"));
     }
 
-    // Special-case ctor / dtor first.
+    // Special-case ctor / dtor first. The resolved Rust name is
+    // already `"new"` / `"drop"` for these (assigned by
+    // `resolve_method_names`), but we route through the same code
+    // path so disambiguator suffixes (e.g. multiple ctors becoming
+    // `new_int_int` / `new_double`) get propagated into the extern
+    // ident too.
     match &method.special {
         Some(SpecialMember::DefaultCtor | SpecialMember::OtherCtor) => {
             let mut decl = vec![format!("this: *mut {class_name}")];
@@ -579,8 +908,8 @@ fn classify_for_direct_extern(
             });
             return Ok(MethodEmission {
                 kind: EmissionKind::Ctor,
-                rust_name: "new".into(),
-                extern_ident: format!("__cxx_{class_name}_ctor_0"),
+                rust_name: resolved_rust_name.to_string(),
+                extern_ident: format!("__cxx_{class_name}_{resolved_rust_name}"),
                 link_name: link,
                 extern_decl_params: decl.join(", "),
                 extern_return_clause: String::new(),
@@ -597,7 +926,7 @@ fn classify_for_direct_extern(
             });
             return Ok(MethodEmission {
                 kind: EmissionKind::Dtor,
-                rust_name: "drop".into(),
+                rust_name: resolved_rust_name.to_string(),
                 extern_ident: format!("__cxx_{class_name}_dtor"),
                 link_name: link,
                 extern_decl_params: format!("this: *mut {class_name}"),
@@ -608,28 +937,32 @@ fn classify_for_direct_extern(
                 forward_args: String::new(),
             });
         }
-        Some(other) => {
+        Some(SpecialMember::CopyCtor | SpecialMember::MoveCtor)
+        | Some(SpecialMember::CopyAssign | SpecialMember::MoveAssign) => {
             return Err(BindingsError::UnsupportedMethod {
                 where_: format!("{class_name}::{:?}", method.name),
-                why: format!(
-                    "special member `{other:?}` not yet wired (v0 covers Ctor + Dtor + \
-                     plain instance/static methods)"
-                ),
+                why: "copy/move special members not yet wired (v0 covers \
+                      DefaultCtor + OtherCtor + Dtor + plain methods + operators)"
+                    .into(),
             });
         }
         None => {}
     }
 
-    // Operator + conversion-named methods deferred — tracked by
-    // their own milestone in the design doc.
-    let method_name = match &method.name {
-        MethodName::Ident(id) => id.0.clone(),
-        other => {
+    // Identifier-named or operator-named non-special method.
+    // `resolved_rust_name` already encodes the operator → `op_<word>`
+    // mapping and any disambiguator suffix; we just need the
+    // *Itanium-mangling-friendly* original name token to feed to the
+    // mangler. For operators we hand the raw `MethodName::Operator`
+    // through; for plain identifiers we use the source string.
+    let method_name = resolved_rust_name.to_string();
+    let mangler_method_name: MethodName = match &method.name {
+        MethodName::Ident(id) => MethodName::Ident(id.clone()),
+        MethodName::Operator(op) => MethodName::Operator(*op),
+        MethodName::ConversionTo(_) => {
             return Err(BindingsError::UnsupportedMethod {
-                where_: format!("{class_name}::{other:?}"),
-                why: "operator + conversion-function names deferred (v0 takes \
-                      identifier-named methods only)"
-                    .into(),
+                where_: format!("{class_name}::<conversion>"),
+                why: "C++ conversion functions (operator T()) deferred".into(),
             });
         }
     };
@@ -645,13 +978,27 @@ fn classify_for_direct_extern(
         format!(" -> {ret_rust}")
     };
 
-    // Distinguish instance vs static. The current importer doesn't
-    // mark static methods explicitly, so we infer: any non-special
-    // method without a `cv` const flag and with `MethodDef::name`
-    // outside the special-member list is treated as an instance
-    // method by default. (Real static-method support arrives once
-    // libclang's `is_static_method` flag gets surfaced.)
-    let kind = EmissionKind::Instance;
+    // Distinguish instance / static / virtual. The current importer
+    // doesn't mark static methods explicitly (real static-method
+    // support arrives once libclang's `is_static_method` flag gets
+    // surfaced), so we default non-virtual methods to Instance.
+    // Virtuals carry their `vtable_index` into the emission so the
+    // wrapper can synthesize a vptr load + transmute.
+    let kind = if method.virtuality == Virtuality::Virtual {
+        match method.vtable_index {
+            Some(vt) => EmissionKind::Virtual { vtable_index: vt },
+            None => {
+                return Err(BindingsError::UnsupportedMethod {
+                    where_: format!("{class_name}::{method_name}"),
+                    why: "virtual method missing vtable_index — populate_vtable_indices \
+                          should have set it; this is an internal invariant break"
+                        .into(),
+                });
+            }
+        }
+    } else {
+        EmissionKind::Instance
+    };
     let receiver = if method.sig.cv.is_const {
         WrapperReceiver::SelfConst
     } else {
@@ -664,9 +1011,14 @@ fn classify_for_direct_extern(
     let mut extern_decl = vec![this_ty];
     extern_decl.extend(user_arg_decls.clone());
 
+    // Mangle using the *original* C++ method name (operator code or
+    // identifier) so the symbol matches what Clang produced for the
+    // C++ object. The Rust-side identifier (`resolved_rust_name`)
+    // is what the wrapper exposes to callers; the link_name is
+    // separate and follows the C++ side verbatim.
     let link = ctx.mangle(&Symbol::Method {
         class: class_id,
-        name: MethodName::Ident(rustc_abi_cxx::Ident(method_name.clone())),
+        name: mangler_method_name,
         sig: method.sig.clone(),
     });
 
@@ -682,6 +1034,19 @@ fn classify_for_direct_extern(
         wrapper_return: ret_rust,
         forward_args: user_forward.join(", "),
     })
+}
+
+/// Convert a wrapper-style parameter list (`arg0: i32, arg1: f64`)
+/// into a fn-pointer-style type list (`i32, f64`). Used to build
+/// the `unsafe extern "C++" fn(...)` type for vtable-lookup
+/// transmutes.
+fn strip_arg_names(wrapper_params: &str) -> String {
+    wrapper_params
+        .split(',')
+        .map(|p| p.trim().split(": ").nth(1).unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_direct_extern_wrapper(
@@ -787,6 +1152,110 @@ fn render_direct_extern_wrapper(
             }
             let _ = writeln!(out, "{indent}}}");
         }
+        EmissionKind::Virtual { vtable_index } => {
+            // Vtable-lookup wrapper. Reads the vptr at offset 0 of
+            // the primary subobject, indexes into the vtable, and
+            // calls through a transmuted function pointer with the
+            // right `extern "C++"` ABI so the fork's
+            // `compute_cxx_abi_info` overlay still routes
+            // record-by-value returns through the correct
+            // indirect-result register.
+            //
+            // Layout assumptions (Itanium):
+            //   - vptr lives at byte 0 of the most-derived object
+            //     (no virtual bases preceding the primary).
+            //   - The vptr in the object points at the vtable's
+            //     "address point" — past the offset-to-top + RTTI
+            //     prelude. Function-pointer slots start there.
+            //   - `vtable_index` is the function-pointer rank
+            //     populated by the importer's vtable post-pass.
+            //
+            // Multi-inheritance / virtual-base complications would
+            // require offset adjustments on the `this` pointer
+            // before the call. Left for a follow-up release;
+            // single-inheritance hierarchies (the common case)
+            // work today.
+            let receiver_kw = match emission.wrapper_receiver {
+                WrapperReceiver::SelfConst => "&self",
+                WrapperReceiver::SelfMut => "&mut self",
+                _ => unreachable!("virtual method without self receiver"),
+            };
+            let self_ptr_ty = match emission.wrapper_receiver {
+                WrapperReceiver::SelfConst => "*const Self",
+                WrapperReceiver::SelfMut => "*mut Self",
+                _ => unreachable!(),
+            };
+            let self_cast = match emission.wrapper_receiver {
+                WrapperReceiver::SelfConst => "self as *const Self",
+                WrapperReceiver::SelfMut => "self as *mut Self",
+                _ => unreachable!(),
+            };
+            let ret_clause = if emission.wrapper_return == "()" {
+                String::new()
+            } else {
+                format!(" -> {}", emission.wrapper_return)
+            };
+            let head = if emission.wrapper_params.is_empty() {
+                format!(
+                    "{indent}pub fn {name}({recv}){ret} {{",
+                    name = emission.rust_name,
+                    recv = receiver_kw,
+                    ret = ret_clause,
+                )
+            } else {
+                format!(
+                    "{indent}pub fn {name}({recv}, {params}){ret} {{",
+                    name = emission.rust_name,
+                    recv = receiver_kw,
+                    params = emission.wrapper_params,
+                    ret = ret_clause,
+                )
+            };
+            let _ = writeln!(out, "{head}");
+            let _ = writeln!(out, "{indent}    unsafe {{");
+            let _ = writeln!(
+                out,
+                "{indent}        let __this: {self_ptr_ty} = {self_cast};",
+            );
+            let _ = writeln!(
+                out,
+                "{indent}        let __vtable: *const usize = \
+                 *(__this as *const *const usize);",
+            );
+            let _ = writeln!(
+                out,
+                "{indent}        let __slot: usize = *__vtable.add({vtable_index});",
+            );
+            // Function pointer type: extern "C++" so the fork's
+            // ABI overlay applies. Param signature mirrors the
+            // wrapper, with the explicit `this` slot.
+            let fn_ptr_args = if emission.wrapper_params.is_empty() {
+                self_ptr_ty.to_string()
+            } else {
+                format!("{self_ptr_ty}, {}", strip_arg_names(&emission.wrapper_params))
+            };
+            let fn_ptr_ret = if emission.wrapper_return == "()" {
+                String::new()
+            } else {
+                format!(" -> {}", emission.wrapper_return)
+            };
+            let _ = writeln!(
+                out,
+                "{indent}        let __f: unsafe extern \"C++\" fn({fn_ptr_args}){fn_ptr_ret} = \
+                 ::core::mem::transmute(__slot);",
+            );
+            if emission.forward_args.is_empty() {
+                let _ = writeln!(out, "{indent}        __f(__this)");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{indent}        __f(__this, {fwd})",
+                    fwd = emission.forward_args,
+                );
+            }
+            let _ = writeln!(out, "{indent}    }}");
+            let _ = writeln!(out, "{indent}}}");
+        }
         EmissionKind::Static => {
             let ret_clause = if emission.wrapper_return == "()" {
                 String::new()
@@ -828,6 +1297,7 @@ fn render_class_block(
     class_id: ClassId,
     config: &RustBindingsConfig,
     indent: &str,
+    macro_path: MacroPath,
 ) -> Result<String, BindingsError> {
     let class = ctx.class(class_id);
     let class_name = ident_of_class(class).ok_or_else(|| BindingsError::UnsupportedType {
@@ -844,7 +1314,7 @@ fn render_class_block(
     if config.doc_hidden {
         let _ = writeln!(block, "{indent}#[doc(hidden)]");
     }
-    let _ = writeln!(block, "{indent}::rustcc_macros::native_cpp_class! {{");
+    let _ = writeln!(block, "{indent}{} {{", macro_path.token());
     let _ = writeln!(block, "{indent}    #[size = {}]", layout.size_bytes);
     let _ = writeln!(block, "{indent}    #[align = {}]", layout.align_bytes);
     let _ = writeln!(block, "{indent}    pub class {class_name} {{");
@@ -1304,16 +1774,183 @@ mod tests {
     }
 
     #[test]
-    fn cxx_class_macro_backend_returns_clear_unsupported_error() {
+    fn virtual_method_emits_vtable_lookup_wrapper_with_transmute() {
+        // Build a polymorphic class by hand: one virtual method
+        // with a known vtable_index. The emitter should skip the
+        // extern decl for this method (no `#[link_name]`) and emit
+        // a wrapper that loads the vptr, indexes, transmutes, and
+        // calls.
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let i32_ = ctx.intern_type(CxxType::Int {
+            signed: true,
+            width: IntWidth::I32,
+        });
+        let id = ctx.define_rust_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("Shape".into()))]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![MethodDef {
+                name: MethodName::Ident(Ident("area".into())),
+                sig: FnSig {
+                    params: vec![],
+                    ret: i32_,
+                    cv: CvQual { is_const: true, is_volatile: false },
+                    ref_q: None,
+                    variadic: false,
+                    noexcept: false,
+                },
+                virtuality: Virtuality::Virtual,
+                vtable_index: Some(0),
+                special: None,
+            }],
+            kind: RecordKind::Struct,
+            is_polymorphic: true,
+            is_final: false,
+            source_alignment: None,
+        });
+
+        let src = generate_rust_bindings(&ctx, &[id], &RustBindingsConfig::default())
+            .expect("emit");
+
+        // No `#[link_name]` for the virtual method — it's not in
+        // the extern block at all.
+        assert!(
+            !src.contains("#[link_name = \"_ZNK5Shape4areaEv\"]"),
+            "virtual method should not have a #[link_name] extern decl:\n{src}"
+        );
+        // Wrapper exists, takes `&self`, returns `i32`.
+        assert!(
+            src.contains("pub fn area(&self) -> i32 {"),
+            "expected `pub fn area(&self) -> i32` wrapper:\n{src}"
+        );
+        // Vtable lookup pattern.
+        assert!(
+            src.contains("*(__this as *const *const usize)"),
+            "expected vptr load:\n{src}"
+        );
+        assert!(
+            src.contains("__vtable.add(0)"),
+            "expected vtable_index = 0 lookup:\n{src}"
+        );
+        assert!(
+            src.contains("::core::mem::transmute(__slot)"),
+            "expected transmute call:\n{src}"
+        );
+        // The transmuted fn pointer carries `extern "C++"` so the
+        // fork's ABI overlay routes by-value record returns via
+        // sret on aarch64 (P09.50).
+        assert!(
+            src.contains("unsafe extern \"C++\" fn(*const Self) -> i32"),
+            "expected extern \"C++\" fn pointer type:\n{src}"
+        );
+    }
+
+    #[test]
+    fn annotation_overrides_class_name_in_emission() {
+        use crate::annotations::Annotation;
+        let (ctx, id) = point_ctx();
+        let mut ann = AnnotationSet::default();
+        ann.inline.insert(
+            "Point".into(),
+            vec![Annotation::Name("RenamedPoint".into())],
+        );
+        let src = generate_rust_bindings_with_annotations(
+            &ctx,
+            &[id],
+            &ann,
+            &RustBindingsConfig::default(),
+        )
+        .expect("emit");
+        assert!(
+            src.contains("pub struct RenamedPoint"),
+            "expected renamed struct identifier:\n{src}"
+        );
+        assert!(
+            !src.contains("pub struct Point "),
+            "original `Point` shouldn't appear as a struct head:\n{src}"
+        );
+    }
+
+    #[test]
+    fn annotation_overrides_method_name_in_emission() {
+        use crate::annotations::Annotation;
+        let (ctx, id) = point_ctx();
+        let mut ann = AnnotationSet::default();
+        ann.inline.insert(
+            "Point::get_x".into(),
+            vec![Annotation::Name("x".into())],
+        );
+        let src = generate_rust_bindings_with_annotations(
+            &ctx,
+            &[id],
+            &ann,
+            &RustBindingsConfig::default(),
+        )
+        .expect("emit");
+        assert!(
+            src.contains("pub fn x(&self) -> i32"),
+            "expected renamed method `x`:\n{src}"
+        );
+        assert!(
+            !src.contains("pub fn get_x("),
+            "original `get_x` wrapper shouldn't appear:\n{src}"
+        );
+    }
+
+    #[test]
+    fn skip_annotation_omits_class_from_emission() {
+        use crate::annotations::Annotation;
+        let (ctx, id) = point_ctx();
+        let mut ann = AnnotationSet::default();
+        ann.inline.insert("Point".into(), vec![Annotation::Skip]);
+        let src = generate_rust_bindings_with_annotations(
+            &ctx,
+            &[id],
+            &ann,
+            &RustBindingsConfig::default(),
+        )
+        .expect("emit");
+        assert!(
+            !src.contains("pub struct Point"),
+            "Skip-annotated class shouldn't be emitted:\n{src}"
+        );
+    }
+
+    #[test]
+    fn cxx_class_macro_backend_emits_stable_macro_invocation() {
         let (ctx, id) = point_ctx();
         let cfg = RustBindingsConfig {
             backend: BindingsBackend::CxxClassMacro,
             ..RustBindingsConfig::default()
         };
-        let err = generate_rust_bindings(&ctx, &[id], &cfg).unwrap_err();
+        let src = generate_rust_bindings(&ctx, &[id], &cfg).expect("emit");
+
+        // Stable-rustc-friendly macro path.
         assert!(
-            matches!(err, BindingsError::UnsupportedBackend { .. }),
-            "expected UnsupportedBackend for CxxClassMacro, got {err:?}"
+            src.contains("::rustcc_macros::cxx_class!"),
+            "expected cxx_class! invocation:\n{src}"
+        );
+        // Same input grammar as native_cpp_class! — size/align/methods.
+        assert!(
+            src.contains("#[size = 8]"),
+            "expected #[size = 8]:\n{src}"
+        );
+        assert!(
+            src.contains("#[align = 4]"),
+            "expected #[align = 4]:\n{src}"
+        );
+        assert!(
+            src.contains("pub class Point"),
+            "expected `pub class Point`:\n{src}"
+        );
+        assert!(
+            src.contains("#[ctor] fn new(arg0: i32, arg1: i32) -> Self;"),
+            "expected ctor line:\n{src}"
+        );
+        // Native macro path should NOT be in this output.
+        assert!(
+            !src.contains("::rustcc_macros::native_cpp_class!"),
+            "native macro path leaked into stable backend:\n{src}"
         );
     }
 }

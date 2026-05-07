@@ -99,11 +99,7 @@ fn generated_header_compiles_and_models_layout_faithfully() {
         source_alignment: None,
     });
 
-    let driver = Driver::new(HeaderGraph {
-        roots: Vec::new(),
-        include_paths: Vec::new(),
-        clang_flags: Vec::new(),
-    });
+    let driver = Driver::new(HeaderGraph::default());
 
     let hpp_src = driver.emit_hpp(&ctx, &[widget]).expect("emit_hpp");
     write(&hpp_path, &hpp_src);

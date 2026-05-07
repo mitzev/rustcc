@@ -259,15 +259,15 @@ into dozens of "unknown identifier" errors downstream.
 
 ## 14. Milestones
 
-| M# | Deliverable                                                     |
-|----|------------------------------------------------------------------|
-| 1  | Clang driver: parse header graph, produce `CXTranslationUnit`    |
-| 2  | Lower primitive types, free functions, namespaces                |
-| 3  | Lower POD classes with fields and non-virtual methods            |
-| 4  | Overload renaming + operator mapping                             |
-| 5  | Inheritance (non-virtual, single), `CxxBase` emission            |
-| 6  | Virtual methods → vtable-index-aware HIR                         |
-| 7  | Annotation processing (inline attrs + sidecar YAML)              |
-| 8  | Explicit template instantiation import                           |
-| 9  | Diagnostic translator, error recovery, poisoned nodes            |
+| M# | Deliverable                                                                                                               | Status |
+|----|---------------------------------------------------------------------------------------------------------------------------|--------|
+| 1  | Clang driver: parse header graph, produce `CXTranslationUnit`                                                             | ✅ shipped |
+| 2  | Lower primitive types, free functions, namespaces                                                                         | ✅ shipped |
+| 3  | Lower POD classes with fields and non-virtual methods                                                                     | ✅ shipped |
+| 4  | Overload renaming + operator mapping                                                                                      | ✅ shipped |
+| 5  | Inheritance (non-virtual, single), `CxxBase` emission                                                                     | 🟨 partial (BaseSpec lowering ✓; upcast emission deferred) |
+| 6  | Virtual methods → vtable-index-aware emission                                                                             | ✅ shipped (single-inheritance; pure virtuals + secondary vtables open) |
+| 7  | Annotation processing (inline attrs + sidecar YAML)                                                                       | ✅ shipped (libclang `[[clang::annotate("rustcc::…")]]` walker + emitter wiring; sidecar YAML parser already shipped) |
+| 8  | Explicit template instantiation import                                                                                    | ✅ shipped (`HeaderGraph::template_instantiations` synthesizes a root that force-instantiates each entry) |
+| 9  | Diagnostic translator, error recovery, poisoned nodes                                                                     | ⏳ open |
 | 10 | Incremental compilation integration                              |
