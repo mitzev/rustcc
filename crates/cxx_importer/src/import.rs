@@ -1,22 +1,35 @@
-//! libclang-backed importer — POD structs, nested records, and bases.
+//! libclang-backed importer — translates a C++ translation unit into
+//! `rustc_abi_cxx`'s `CxxTypeCtx`.
 //!
-//! Current scope:
+//! Current scope (validated by the libclang-gated suite in
+//! `tests/import.rs`):
 //!
-//! - Top-level (non-nested) struct and class definitions.
-//! - Fields of primitive type, pointer/reference, and nested record
-//!   (by-value composition).
-//! - Non-virtual inheritance, single or multiple
-//!   (`struct D : A, B` — each non-primary base sits at an aligned
-//!   offset after the primary).
+//! - **Records**: top-level + namespace-nested struct / class /
+//!   union definitions. Anonymous and named namespaces.
+//! - **Fields**: primitives, pointers, references, nested records
+//!   (by-value composition), arrays, enums.
+//! - **Inheritance**: non-virtual (single + multiple), virtual
+//!   bases including diamond. Polymorphism, vtable layout, and
+//!   `is_polymorphic` propagation through base chains.
+//! - **Methods**: instance + static methods, ctors (default + copy
+//!   + move + `OtherCtor`), dtors, copy/move-assign operators,
+//!   user-declared operator overloads (with the short Itanium codes
+//!   `pl`, `ix`, …), conversion functions (`operator T()`).
+//! - **Templates**: explicit class-template specializations (`vector<int>`).
 //!
-//! Not yet handled:
+//! Self-doc gaps (still open, smaller now):
 //!
-//! - Method / ctor / dtor declarations (affects `is_polymorphic`).
-//! - Namespace scoping (classes still get a single `NameSegment::Class`).
-//! - Templates, enums, function types, member pointers, unions.
-//! - Forward-declared-only types (self-references-by-pointer would
-//!   deadlock the recursive import; classes must be defined before
-//!   they're referenced).
+//! - `noexcept`, ref-qualifiers (`&` / `&&`), and variadics in
+//!   `FnSig` are extracted as defaults today (`false`, `None`,
+//!   `false`). Scheduled in the polish pass that lands alongside
+//!   this revision of the docs.
+//! - Vtable indices are computed at layout time inside
+//!   `rustc_abi_cxx::vtable`, not propagated back into per-method
+//!   `MethodDef::vtable_index`. The mangler / dispatcher reads the
+//!   index out of the layout query, so this is a metadata gap, not
+//!   a correctness one.
+//! - Uninstantiated templates (`CXCursor_ClassTemplate`) are
+//!   skipped. Sidecar-driven explicit instantiation lands later.
 //!
 //! Recursive import: when a field or base references a record type,
 //! the importer recursively lowers that record before continuing. Each
