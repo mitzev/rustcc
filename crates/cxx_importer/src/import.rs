@@ -394,9 +394,23 @@ impl<'a> Importer<'a> {
         entity: &Entity<'_>,
     ) -> Result<ClassId, ImportError> {
         let usr = entity_usr(entity);
-        if let Some(&id) = self.classes.get(&usr) {
-            return Ok(id);
-        }
+
+        // M13: USR-cache lookup with upgrade-on-later-definition.
+        //
+        // Three states for a cached entry:
+        //   1. Not cached            → fall through to fresh import.
+        //   2. Cached + healthy      → reuse the existing id.
+        //   3. Cached + poisoned     → the previous import saw only
+        //                              a forward decl. If THIS call
+        //                              hands us a definition, we
+        //                              upgrade the placeholder in
+        //                              place and unpoison; otherwise
+        //                              return the existing poison id.
+        let upgrade_target = match self.classes.get(&usr).copied() {
+            Some(id) if self.ctx.is_poisoned(id) => Some(id),
+            Some(id) => return Ok(id),
+            None => None,
+        };
 
         // For template specializations reached via `Type::get_declaration()`,
         // the cursor handed to us can be a forward-decl whose
@@ -413,6 +427,13 @@ impl<'a> Importer<'a> {
             // with a doc-comment reason rather than a hard error
             // that aborts the whole import. (M9: error recovery
             // via poison nodes per `docs/cxx_importer.md §11`.)
+            //
+            // If we already had a poisoned entry for this USR, just
+            // return it — re-poisoning would erase any annotation
+            // / span info the first poison call captured.
+            if let Some(target) = upgrade_target {
+                return Ok(target);
+            }
             let name = entity.get_name().unwrap_or_default();
             return Ok(self.poison_class(
                 entity,
@@ -436,6 +457,14 @@ impl<'a> Importer<'a> {
         // self-referential type encountered while processing the body
         // (e.g. `const Bar&` parameter inside Bar's own method) can be
         // resolved to this same `ClassId` via the USR cache.
+        //
+        // Upgrade path (M13): if `upgrade_target` is set, we already
+        // have a (poisoned) ClassId for this USR. Reuse it instead
+        // of minting a new one — references from earlier imports
+        // are still pointing at it. Overwrite the placeholder
+        // ClassDef with the freshly-derived `kind` + correct
+        // `name_path`; the body walk below will populate fields /
+        // bases / methods.
         let name_path = self.build_nested_path(entity)?;
         let placeholder = ClassDef {
             name: NestedName(name_path),
@@ -447,8 +476,14 @@ impl<'a> Importer<'a> {
             is_final: false,
             source_alignment: None,
         };
-        let id = self.ctx.define_class(placeholder);
-        self.classes.insert(usr, id);
+        let id = if let Some(target) = upgrade_target {
+            *self.ctx.class_mut(target) = placeholder;
+            target
+        } else {
+            let new_id = self.ctx.define_class(placeholder);
+            self.classes.insert(usr, new_id);
+            new_id
+        };
 
         // Capture inline annotations (`[[clang::annotate("rustcc::…")]]`)
         // for this class. Keyed by the class's FQN so the bindings
@@ -560,6 +595,15 @@ impl<'a> Importer<'a> {
         // the mangled symbol directly.
         if is_polymorphic {
             populate_vtable_indices(self.ctx, id);
+        }
+
+        // M13: if this import call upgraded a previously-poisoned
+        // entry (forward-only → full definition), clear the poison
+        // marker now that the class has real fields / methods /
+        // bases. Downstream emitters render it as a concrete type
+        // instead of an opaque struct.
+        if upgrade_target.is_some() {
+            self.ctx.unpoison(id);
         }
 
         Ok(id)

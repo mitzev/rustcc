@@ -70,6 +70,16 @@ impl CxxTypeCtx {
         self.poison_reason.contains_key(&id)
     }
 
+    /// Clear the poison marker on `id`. Used by the importer's M13
+    /// upgrade path: when a class previously poisoned for being
+    /// forward-only is later seen with a full definition (in the
+    /// same TU or another included header), the placeholder gets
+    /// replaced in place via `class_mut`, and this call promotes
+    /// it back to a healthy entry.
+    pub fn unpoison(&mut self, id: ClassId) {
+        self.poison_reason.remove(&id);
+    }
+
     /// Register a Rust-origin enum for C++ exposure. Returns the
     /// stable id used by emitters when rendering the `enum class`
     /// declaration.

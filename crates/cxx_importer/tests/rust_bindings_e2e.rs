@@ -157,8 +157,7 @@ int Calc::sum() const { return a_ + b_; }
         &class_ids,
         &RustBindingsConfig {
             backend: BindingsBackend::DirectExternCpp,
-            crate_module: None,
-            doc_hidden: false,
+            ..RustBindingsConfig::default()
         },
     )
     .expect("emit_rust_bindings");

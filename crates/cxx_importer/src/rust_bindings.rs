@@ -164,6 +164,18 @@ pub struct RustBindingsConfig {
     /// emitted file is part of an internal layer the downstream
     /// crate re-exports selectively.
     pub doc_hidden: bool,
+    /// Emit M14 heap-allocation thunks: `pub fn new_boxed(...) ->
+    /// ::cxx::CxxHeap<Self>` wrappers + an `unsafe impl
+    /// ::cxx::CxxDeletable for <class>` per class with a ctor.
+    /// Off by default because the generated source references the
+    /// [`::cxx`] runtime crate, which the bare `include!`-style
+    /// test path doesn't link in. Downstream users who depend on
+    /// `cxx` can opt in for heap-rooted widget support
+    /// (FLTK-style). Pairs with `Driver::emit_shims` — the C++
+    /// side always emits the `__cxx_<class>_new_heap_<i>` and
+    /// `__cxx_<class>_delete` thunks regardless, so users can
+    /// also implement their own heap wrapper if they prefer.
+    pub emit_heap_alloc: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -710,7 +722,138 @@ fn render_direct_extern_class(
         });
     }
 
+    // M14: heap-allocation thunks. For each ctor, emit:
+    //   - An `unsafe extern "C"` decl for the matching
+    //     `__cxx_<class>_new_heap_<i>` shim from `shims.rs`.
+    //   - A `pub fn new_boxed[_<i>](args) -> ::cxx::CxxHeap<Self>`
+    //     wrapper that calls the heap shim and wraps the returned
+    //     pointer in `CxxHeap`.
+    //
+    // Plus, once per class:
+    //   - An `unsafe extern "C"` decl for `__cxx_<class>_delete`.
+    //   - An `unsafe impl ::cxx::CxxDeletable for <class>` that
+    //     routes `Drop` for `CxxHeap<Self>` through the C++
+    //     `delete` shim.
+    //
+    // Skipped when `config.emit_heap_alloc` is `false` (default)
+    // because the emission references `::cxx`. Skipped also for
+    // poisoned classes (no constructable Rust analog).
+    let ctor_emissions: Vec<(usize, &MethodEmission)> = method_blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.kind, EmissionKind::Ctor))
+        .collect();
+    if config.emit_heap_alloc && !ctor_emissions.is_empty() {
+        let _ = writeln!(block);
+        let _ = writeln!(
+            block,
+            "{indent}// M14: heap-allocation thunks paired with `__cxx_<class>_new_heap_<i>`",
+        );
+        let _ = writeln!(
+            block,
+            "{indent}// and `__cxx_<class>_delete` shims emitted by `cxx_importer::shims`.",
+        );
+        let _ = writeln!(block, "{indent}unsafe extern \"C\" {{");
+        for (ctor_idx, _emission) in ctor_emissions.iter().enumerate() {
+            let (_, e) = _emission;
+            // Reuse the existing extern_decl_params (which start
+            // with `this: *mut <class>`) but we need a different
+            // shape for the heap shim — drop the `this` slot, use
+            // the user-arg list only.
+            let user_args = strip_first_param(&e.extern_decl_params);
+            let _ = writeln!(
+                block,
+                "{indent}    fn __cxx_{class_name}_new_heap_{ctor_idx}({user_args}) -> *mut {class_name};",
+            );
+        }
+        let _ = writeln!(
+            block,
+            "{indent}    fn __cxx_{class_name}_delete(p: *mut {class_name});",
+        );
+        let _ = writeln!(block, "{indent}}}");
+
+        // Heap-allocating wrappers and the CxxDeletable impl. Add
+        // to the existing impl block by re-opening it briefly —
+        // but the impl block was closed earlier, so emit a fresh
+        // `impl Foo` block for the heap wrappers only.
+        let _ = writeln!(block);
+        let _ = writeln!(block, "{indent}impl {class_name} {{");
+        for (ctor_idx, _emission) in ctor_emissions.iter().enumerate() {
+            let (_, e) = _emission;
+            let suffix = if ctor_emissions.len() > 1 {
+                format!("_{ctor_idx}")
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                block,
+                "{indent}    /// Heap-allocate via C++ `new {class_name}(...)`.",
+            );
+            let _ = writeln!(
+                block,
+                "{indent}    /// Returned [`::cxx::CxxHeap`] frees with C++ `delete` on drop,",
+            );
+            let _ = writeln!(
+                block,
+                "{indent}    /// keeping the new/delete pair the C++ ABI requires.",
+            );
+            let header = if e.wrapper_params.is_empty() {
+                format!(
+                    "{indent}    pub fn new_boxed{suffix}() -> ::cxx::CxxHeap<Self> {{",
+                )
+            } else {
+                format!(
+                    "{indent}    pub fn new_boxed{suffix}({params}) -> ::cxx::CxxHeap<Self> {{",
+                    params = e.wrapper_params,
+                )
+            };
+            let _ = writeln!(block, "{header}");
+            if e.forward_args.is_empty() {
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{ ::cxx::CxxHeap::from_raw(__cxx_{class_name}_new_heap_{ctor_idx}()) }}",
+                );
+            } else {
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{ ::cxx::CxxHeap::from_raw(__cxx_{class_name}_new_heap_{ctor_idx}({fwd})) }}",
+                    fwd = e.forward_args,
+                );
+            }
+            let _ = writeln!(block, "{indent}    }}");
+        }
+        let _ = writeln!(block, "{indent}}}");
+
+        let _ = writeln!(block);
+        let _ = writeln!(
+            block,
+            "{indent}unsafe impl ::cxx::CxxDeletable for {class_name} {{",
+        );
+        let _ = writeln!(
+            block,
+            "{indent}    unsafe fn cxx_delete(p: *mut Self) {{",
+        );
+        let _ = writeln!(
+            block,
+            "{indent}        unsafe {{ __cxx_{class_name}_delete(p); }}",
+        );
+        let _ = writeln!(block, "{indent}    }}");
+        let _ = writeln!(block, "{indent}}}");
+    }
+
     Ok(block)
+}
+
+/// Strip the first parameter from a comma-joined extern-decl
+/// parameter list (e.g. `"this: *mut Foo, arg0: i32"` →
+/// `"arg0: i32"`). Used to reshape a ctor's normal extern params
+/// for the heap-allocation shim, which doesn't take a `this`
+/// slot — C++ `new` synthesizes the storage internally.
+fn strip_first_param(params: &str) -> String {
+    match params.find(',') {
+        Some(comma) => params[comma + 1..].trim_start().to_string(),
+        None => String::new(),
+    }
 }
 
 /// Internal record describing one method's lowered shape: enough info
@@ -1941,6 +2084,49 @@ mod tests {
         assert!(
             !src.contains("pub struct Point"),
             "Skip-annotated class shouldn't be emitted:\n{src}"
+        );
+    }
+
+    #[test]
+    fn direct_extern_cpp_emits_heap_alloc_shims_paired_with_cxx_heap() {
+        // M14: ctors get an extra `__cxx_<class>_new_heap_<i>`
+        // extern decl + a `pub fn new_boxed(...) -> ::cxx::CxxHeap<Self>`
+        // wrapper. Once per class, a `__cxx_<class>_delete` extern
+        // decl + `unsafe impl ::cxx::CxxDeletable for <class>`.
+        let (ctx, id) = point_ctx();
+        let src = generate_rust_bindings(
+            &ctx,
+            &[id],
+            &RustBindingsConfig {
+                emit_heap_alloc: true,
+                ..RustBindingsConfig::default()
+            },
+        )
+        .expect("emit");
+
+        // Heap extern block has the new_heap thunk for the single ctor.
+        assert!(
+            src.contains("fn __cxx_Point_new_heap_0(arg0: i32, arg1: i32) -> *mut Point;"),
+            "expected heap-ctor extern decl:\n{src}"
+        );
+        // Heap extern block has the delete thunk.
+        assert!(
+            src.contains("fn __cxx_Point_delete(p: *mut Point);"),
+            "expected delete extern decl:\n{src}"
+        );
+        // Heap-alloc wrapper.
+        assert!(
+            src.contains("pub fn new_boxed(arg0: i32, arg1: i32) -> ::cxx::CxxHeap<Self>"),
+            "expected heap wrapper:\n{src}"
+        );
+        // CxxDeletable impl.
+        assert!(
+            src.contains("unsafe impl ::cxx::CxxDeletable for Point"),
+            "expected CxxDeletable impl:\n{src}"
+        );
+        assert!(
+            src.contains("__cxx_Point_delete(p)"),
+            "expected delete-shim call inside cxx_delete:\n{src}"
         );
     }
 

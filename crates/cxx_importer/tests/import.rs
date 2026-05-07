@@ -1825,6 +1825,203 @@ fn forward_only_class_referenced_via_pointer_becomes_poison_node() {
 }
 
 #[test]
+fn forward_decl_then_full_def_in_same_tu_upgrades_poison_to_concrete() {
+    // M13: when a class is forward-declared early in a TU and
+    // fully defined later (or in a sibling header that gets
+    // included), the importer's USR cache surfaces the previously-
+    // minted poison node, but the upgrade path replaces the
+    // placeholder ClassDef with the real one and clears the
+    // poison marker.
+    //
+    // Common shape in real headers (FLTK, Qt): class Foo;
+    // declared in a fwd-decls header, struct Bar with `Foo*`
+    // fields in a second header, then class Foo's full body in
+    // a third — all transitively included from a single TU root.
+    //
+    // We model this by writing a single header that does both:
+    // forward-declare Foo on line 1, define struct Bar
+    // referencing Foo* on line 2, then provide Foo's full
+    // definition on line 3. The importer sees Foo as a forward
+    // ref while resolving Bar's field, then sees the full body
+    // when walk_top_level reaches it. Both arrive in one
+    // import_header_with_cache call.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "class Foo;\n\
+         struct Bar { Foo* f; };\n\
+         class Foo { public: int compute() const; };\n",
+        "fwd_then_def",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let _ = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // Find Foo (which should now be a healthy concrete class
+    // with its method, NOT a poison node).
+    let foo = ctx
+        .class_ids()
+        .find(|&id| {
+            matches!(
+                ctx.class(id).name.0.last(),
+                Some(NameSegment::Class(i)) if i.0 == "Foo",
+            )
+        })
+        .expect("Foo should be in the ctx");
+
+    assert!(
+        !ctx.is_poisoned(foo),
+        "Foo should NOT be poisoned after seeing its full definition; \
+         poison_reason: {:?}",
+        ctx.poison_reason(foo)
+    );
+    let class = ctx.class(foo);
+    assert_eq!(
+        class.methods.len(),
+        1,
+        "expected `compute()` method on the upgraded Foo"
+    );
+    assert_eq!(
+        class.methods[0].name.ident_name(),
+        Some("compute"),
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m14_heap_shim_and_new_boxed_wrapper_pair_through_full_pipeline() {
+    // M14: import a real C++ class with a ctor + dtor; the shim
+    // generator emits `__cxx_<class>_new_heap_<i>` and
+    // `__cxx_<class>_delete` thunks; the bindings emitter pairs
+    // them with `pub fn new_boxed(...) -> ::cxx::CxxHeap<Self>`
+    // and `unsafe impl ::cxx::CxxDeletable for <class>`.
+    //
+    // The shim source must compile cleanly with clang++ (proves
+    // the C++ syntax is right). The bindings source needs to
+    // contain both halves of the pairing so consumers can route
+    // heap allocation through `CxxHeap`.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Calc {\n\
+         \x20   Calc(int a, int b);\n\
+         \x20   ~Calc();\n\
+         \x20   int sum() const;\n\
+         private:\n\
+         \x20   int a_;\n\
+         \x20   int b_;\n\
+         };\n",
+        "m14_heap",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // Shim source compiles with clang++ (proves C++ syntax).
+    let driver = cxx_importer::Driver::new(cxx_importer::HeaderGraph {
+        roots: vec![header.clone()],
+        clang_flags: vec!["-std=c++17".into()],
+        ..cxx_importer::HeaderGraph::default()
+    });
+    let shim_src = driver
+        .emit_shims(&ctx, &class_ids)
+        .expect("emit_shims");
+    assert!(
+        shim_src.contains("__cxx_Calc_new_heap_0("),
+        "expected heap-ctor thunk in shim source:\n{shim_src}"
+    );
+    assert!(
+        shim_src.contains("__cxx_Calc_delete("),
+        "expected delete thunk in shim source:\n{shim_src}"
+    );
+    assert!(
+        shim_src.contains("return new Calc("),
+        "expected `new Calc(...)` body:\n{shim_src}"
+    );
+    assert!(
+        shim_src.contains("delete p"),
+        "expected `delete p` body:\n{shim_src}"
+    );
+
+    // Compile the shim source through clang++ to verify it's
+    // syntactically valid C++ that links against the user's
+    // header.
+    let dir = std::env::temp_dir().join(format!(
+        "rustcc_m14_shim_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let shim_cpp = dir.join("shims.cpp");
+    let shim_obj = dir.join("shims.o");
+    // The shim sources include the user's header by relative
+    // path; copy our temp header into the shim dir so the include
+    // resolves.
+    std::fs::write(&shim_cpp, &shim_src).unwrap();
+    let header_in_dir = dir.join(
+        header
+            .file_name()
+            .expect("header has filename"),
+    );
+    std::fs::copy(&header, &header_in_dir).unwrap();
+    // Update the shim source's `#include "<absolute path>"` to
+    // resolve against the directory we just created. The driver
+    // emits an absolute path, so this just works.
+    let cpp_compile = std::process::Command::new("clang++")
+        .args(["-c", "-std=c++17", "-fPIC"])
+        .arg("-o")
+        .arg(&shim_obj)
+        .arg(&shim_cpp)
+        .output()
+        .expect("spawn clang++");
+    assert!(
+        cpp_compile.status.success(),
+        "clang++ shim compile failed:\nshim source:\n{shim_src}\nstderr:\n{}",
+        String::from_utf8_lossy(&cpp_compile.stderr),
+    );
+
+    // Bindings emission contains both halves (with the M14 opt-in).
+    let bindings_src = generate_rust_bindings(
+        &ctx,
+        &class_ids,
+        &RustBindingsConfig {
+            emit_heap_alloc: true,
+            ..RustBindingsConfig::default()
+        },
+    )
+    .expect("emit_rust_bindings");
+    assert!(
+        bindings_src.contains("fn __cxx_Calc_new_heap_0(arg0: i32, arg1: i32) -> *mut Calc;"),
+        "expected heap-ctor extern decl in bindings:\n{bindings_src}"
+    );
+    assert!(
+        bindings_src.contains("fn __cxx_Calc_delete(p: *mut Calc);"),
+        "expected delete extern decl in bindings:\n{bindings_src}"
+    );
+    assert!(
+        bindings_src.contains("pub fn new_boxed(arg0: i32, arg1: i32) -> ::cxx::CxxHeap<Self>"),
+        "expected `new_boxed` wrapper:\n{bindings_src}"
+    );
+    assert!(
+        bindings_src.contains("unsafe impl ::cxx::CxxDeletable for Calc"),
+        "expected CxxDeletable impl:\n{bindings_src}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+    cleanup(&header);
+}
+
+#[test]
 fn imports_variadic_methods_into_fnsig() {
     // Variadic functions / methods (C-style `...` ellipsis) are
     // surfaced via `FnSig::variadic`. Required for round-tripping
