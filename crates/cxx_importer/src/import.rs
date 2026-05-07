@@ -57,6 +57,7 @@ use rustc_abi_cxx::{
     Symbol, TemplateArg, TypeId, VTableEntry, Virtuality,
 };
 
+use crate::annotations::{Annotation, AnnotationSet};
 use crate::diagnostics::ImportError;
 
 pub fn import_header(
@@ -66,6 +67,107 @@ pub fn import_header(
 ) -> Result<Vec<ClassId>, ImportError> {
     let mut cache = HashMap::new();
     import_header_with_cache(source, args, ctx, &mut cache)
+}
+
+/// Like [`import_header`], but additionally returns the
+/// [`AnnotationSet`] populated from inline
+/// `[[clang::annotate("rustcc::…")]]` attributes on classes and
+/// methods. Use this entry point with
+/// `rust_bindings::generate_rust_bindings_with_annotations` to
+/// honor user-supplied name overrides and nullability markers.
+pub fn import_header_with_annotations(
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+) -> Result<(Vec<ClassId>, AnnotationSet), ImportError> {
+    let mut cache = HashMap::new();
+    let mut set = AnnotationSet::default();
+    let ids = import_header_full(source, args, ctx, &mut cache, &mut set)?;
+    Ok((ids, set))
+}
+
+/// Internal entry point used by [`Driver::parse_all`] to share its
+/// USR cache and accumulate annotations across multiple header
+/// roots in a single pass.
+pub(crate) fn import_header_full(
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+    cache: &mut HashMap<String, ClassId>,
+    annotations: &mut AnnotationSet,
+) -> Result<Vec<ClassId>, ImportError> {
+    let ids = import_header_with_cache(source, args, ctx, cache)?;
+    // The cache-and-annotations collection is currently re-derived
+    // by re-running the importer when the caller wants annotations;
+    // a follow-up release can plumb annotations through the
+    // existing `import_header_with_cache` call to avoid double work.
+    let mut set_cache: HashMap<String, ClassId> = std::mem::take(cache);
+    let collected = collect_annotations(source, args, ctx, &mut set_cache)?;
+    *cache = set_cache;
+    for (key, anns) in collected {
+        annotations
+            .inline
+            .entry(key)
+            .or_default()
+            .extend(anns);
+    }
+    Ok(ids)
+}
+
+/// Re-run the libclang parse just to harvest annotations. This is
+/// a temporary measure — the next iteration should fold the
+/// annotation walk directly into [`import_header_with_cache`] so
+/// each header is parsed once.
+fn collect_annotations(
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+    cache: &mut HashMap<String, ClassId>,
+) -> Result<HashMap<String, Vec<Annotation>>, ImportError> {
+    let _ = (ctx, cache);
+    let clang = Clang::new().map_err(|e| ImportError::ClangDiagnostic {
+        file: source.display().to_string(),
+        line: 0,
+        message: format!("failed to initialize libclang: {e}"),
+    })?;
+    let index = Index::new(&clang, false, false);
+    let tu = index
+        .parser(source)
+        .arguments(args)
+        .parse()
+        .map_err(|e| ImportError::ClangDiagnostic {
+            file: source.display().to_string(),
+            line: 0,
+            message: format!("parse failed: {e:?}"),
+        })?;
+
+    let mut out: HashMap<String, Vec<Annotation>> = HashMap::new();
+    walk_for_annotations(&tu.get_entity(), &mut out);
+    Ok(out)
+}
+
+fn walk_for_annotations(
+    entity: &Entity<'_>,
+    out: &mut HashMap<String, Vec<Annotation>>,
+) {
+    match entity.get_kind() {
+        EntityKind::StructDecl
+        | EntityKind::ClassDecl
+        | EntityKind::UnionDecl
+        | EntityKind::Method
+        | EntityKind::Constructor
+        | EntityKind::Destructor
+        | EntityKind::ConversionFunction => {
+            let anns = read_annotations(entity);
+            if !anns.is_empty() {
+                out.insert(entity_fqn(entity), anns);
+            }
+        }
+        _ => {}
+    }
+    for child in entity.get_children() {
+        walk_for_annotations(&child, out);
+    }
 }
 
 /// Like [`import_header`], but threads a caller-owned USR→`ClassId`
@@ -217,6 +319,10 @@ struct Importer<'a> {
     // for a decl; we use it to dedup repeat references to the same class
     // within the translation unit.
     classes: HashMap<String, ClassId>,
+    /// Inline `[[clang::annotate("rustcc::…")]]` annotations parsed
+    /// from class + method entities, keyed by fully-qualified C++
+    /// path (e.g. `ns::Foo`, `ns::Foo::bar`).
+    annotations: HashMap<String, Vec<Annotation>>,
 }
 
 impl<'a> Importer<'a> {
@@ -228,11 +334,19 @@ impl<'a> Importer<'a> {
         ctx: &'a mut CxxTypeCtx,
         classes: HashMap<String, ClassId>,
     ) -> Self {
-        Self { ctx, classes }
+        Self {
+            ctx,
+            classes,
+            annotations: HashMap::new(),
+        }
     }
 
     fn into_cache(self) -> HashMap<String, ClassId> {
         self.classes
+    }
+
+    fn into_annotations(self) -> HashMap<String, Vec<Annotation>> {
+        self.annotations
     }
 
     fn import_class(
@@ -284,6 +398,14 @@ impl<'a> Importer<'a> {
         };
         let id = self.ctx.define_class(placeholder);
         self.classes.insert(usr, id);
+
+        // Capture inline annotations (`[[clang::annotate("rustcc::…")]]`)
+        // for this class. Keyed by the class's FQN so the bindings
+        // emitter can look them up by `NestedName::display`.
+        let class_anns = read_annotations(entity);
+        if !class_anns.is_empty() {
+            self.annotations.insert(entity_fqn(entity), class_anns);
+        }
 
         // **Known v1 gap for template specializations.** libclang's
         // cursor traversal (`visit_children`) does not surface the
@@ -400,6 +522,18 @@ impl<'a> Importer<'a> {
         let name = entity.get_name().unwrap_or_default();
         let kind = entity.get_kind();
         let ctx_where = format!("{parent_name}::{name}");
+
+        // Capture inline annotations before lowering so the
+        // bindings emitter can override Rust names per-method.
+        // FQN matches what the bindings emitter constructs from
+        // `<class FQN>::<method-source-name>`. The walk uses the
+        // method entity's semantic-parent chain to recover the
+        // class FQN — we ignore `parent_name` here because that
+        // string is the class's *short* name, not the FQN.
+        let method_anns = read_annotations(entity);
+        if !method_anns.is_empty() {
+            self.annotations.insert(entity_fqn(entity), method_anns);
+        }
 
         // Parameters come from ParmDecl children.
         let mut params = Vec::new();
@@ -895,6 +1029,83 @@ fn class_has_virtual_base_chain(
         }
     }
     false
+}
+
+/// Build a `::`-joined FQN by walking semantic parents up to the
+/// translation-unit boundary. Used as the lookup key for inline
+/// annotations stored on the [`Importer`]. Mirrors what the
+/// [`AnnotationSet`] consumer in `rust_bindings` constructs from
+/// `NestedName` after lowering — same string, different source.
+///
+/// libclang reports the TU root cursor with kind `NotImplemented`
+/// rather than the (non-existent in this enum) `TranslationUnit`,
+/// and its `name` is the file path. We stop the walk on either
+/// shape, plus on a missing semantic parent, so file paths never
+/// appear in the FQN.
+fn entity_fqn(entity: &Entity<'_>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = Some(*entity);
+    while let Some(e) = cur {
+        if matches!(
+            e.get_kind(),
+            EntityKind::TranslationUnit | EntityKind::NotImplemented,
+        ) {
+            break;
+        }
+        if let Some(name) = e.get_name() {
+            if !name.is_empty() {
+                parts.push(name);
+            }
+        }
+        cur = e.get_semantic_parent();
+    }
+    parts.reverse();
+    parts.join("::")
+}
+
+/// Read inline `[[clang::annotate("rustcc::…")]]` annotations from
+/// `entity`'s direct children. Recognizes the v0 set:
+///
+/// - `rustcc::name=NewName`     → [`Annotation::Name`]
+/// - `rustcc::nullable`         → [`Annotation::Nullable`]
+/// - `rustcc::nonnull`          → [`Annotation::NonNull`]
+/// - `rustcc::skip`             → [`Annotation::Skip`]
+///
+/// Annotations whose payload doesn't match one of these patterns
+/// are silently ignored — a stricter v0.X release can promote
+/// unknowns to a diagnostic.
+fn read_annotations(entity: &Entity<'_>) -> Vec<Annotation> {
+    let mut out = Vec::new();
+    for child in entity.get_children() {
+        if child.get_kind() != EntityKind::AnnotateAttr {
+            continue;
+        }
+        // Both `get_display_name()` and `get_name()` work for
+        // `AnnotateAttr` cursors on modern libclang (>= 11). We try
+        // the more reliable display-name route first.
+        let raw = child
+            .get_display_name()
+            .or_else(|| child.get_name())
+            .unwrap_or_default();
+        if let Some(ann) = parse_rustcc_annotation(&raw) {
+            out.push(ann);
+        }
+    }
+    out
+}
+
+fn parse_rustcc_annotation(text: &str) -> Option<Annotation> {
+    let s = text.trim();
+    let rest = s.strip_prefix("rustcc::")?;
+    if let Some(value) = rest.strip_prefix("name=") {
+        return Some(Annotation::Name(value.trim().to_string()));
+    }
+    match rest {
+        "nullable" => Some(Annotation::Nullable),
+        "nonnull" => Some(Annotation::NonNull),
+        "skip" => Some(Annotation::Skip),
+        _ => None,
+    }
 }
 
 /// Walk a polymorphic class's primary vtable and stamp `vtable_index`

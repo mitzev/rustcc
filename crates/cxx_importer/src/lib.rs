@@ -30,4 +30,4 @@ pub use name_mapping::{
 pub use resolve::{EntityKey, ResolvedCursor};
 
 #[cfg(feature = "libclang")]
-pub use import::import_header;
+pub use import::{import_header, import_header_with_annotations};

@@ -9,9 +9,10 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use cxx_importer::import_header;
+use cxx_importer::{import_header, import_header_with_annotations};
 use cxx_importer::rust_bindings::{
-    generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    generate_rust_bindings, generate_rust_bindings_with_annotations,
+    BindingsBackend, RustBindingsConfig,
 };
 use rustc_abi_cxx::{
     CvQual, CxxType, CxxTypeCtx, FnSig, Ident, IntWidth, MethodName,
@@ -1614,6 +1615,64 @@ fn populates_vtable_index_on_virtual_methods() {
         "expected three distinct vtable_index values, got {indices:?}"
     );
 
+    cleanup(&header);
+}
+
+#[test]
+fn annotations_drive_class_and_method_renaming_end_to_end() {
+    // Inline `[[clang::annotate("rustcc::name=...")]]` attrs flow
+    // through the libclang walker into an `AnnotationSet`, and the
+    // bindings emitter consults it for class / method name
+    // overrides. Covers the M7 (annotations) deliverable from
+    // `docs/cxx_importer.md §14`.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct __attribute__((annotate(\"rustcc::name=Renamed\"))) Original {\n\
+         \x20   int __attribute__((annotate(\"rustcc::name=value\"))) compute() const;\n\
+         };\n",
+        "annotation_renames",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let (ids, anns) = import_header_with_annotations(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import with annotations");
+    assert_eq!(ids.len(), 1, "expected one imported class");
+
+    // Check the annotations were collected on the right keys.
+    let class_anns = anns.effective("Original");
+    assert!(
+        class_anns
+            .iter()
+            .any(|a| matches!(a, cxx_importer::Annotation::Name(n) if n == "Renamed")),
+        "expected Name(\"Renamed\") on class, got {class_anns:?}"
+    );
+    let method_anns = anns.effective("Original::compute");
+    assert!(
+        method_anns
+            .iter()
+            .any(|a| matches!(a, cxx_importer::Annotation::Name(n) if n == "value")),
+        "expected Name(\"value\") on method, got {method_anns:?}"
+    );
+
+    // And the emitter actually applies them.
+    let src = generate_rust_bindings_with_annotations(
+        &ctx,
+        &ids,
+        &anns,
+        &RustBindingsConfig::default(),
+    )
+    .expect("emit");
+    assert!(
+        src.contains("pub struct Renamed"),
+        "expected renamed `Renamed` struct:\n{src}"
+    );
+    assert!(
+        src.contains("pub fn value(&self) -> i32"),
+        "expected renamed `value()` method:\n{src}"
+    );
     cleanup(&header);
 }
 
