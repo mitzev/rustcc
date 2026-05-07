@@ -259,15 +259,352 @@ into dozens of "unknown identifier" errors downstream.
 
 ## 14. Milestones
 
+The roadmap is organized into three phases. **Phase A (M1–M10)** is the
+foundation — the design's original milestone set, mostly shipped.
+**Phase B (M11–M14)** is the smallest viable surface for "FLTK Hello
+World runs": four items the foundation can't handle today that block
+even a one-window FLTK program. **Phase C (M15–M21)** is the surface
+for "useful subset of FLTK": callbacks, custom widgets, basic styling.
+
+### Phase A — Foundation
+
 | M# | Deliverable                                                                                                               | Status |
 |----|---------------------------------------------------------------------------------------------------------------------------|--------|
 | 1  | Clang driver: parse header graph, produce `CXTranslationUnit`                                                             | ✅ shipped |
-| 2  | Lower primitive types, free functions, namespaces                                                                         | ✅ shipped |
+| 2  | Lower primitive types, free functions, namespaces                                                                         | 🟨 partial (primitive types + namespaces ✓; free functions deferred to M11) |
 | 3  | Lower POD classes with fields and non-virtual methods                                                                     | ✅ shipped |
 | 4  | Overload renaming + operator mapping                                                                                      | ✅ shipped |
-| 5  | Inheritance (non-virtual, single), `CxxBase` emission                                                                     | 🟨 partial (BaseSpec lowering ✓; upcast emission deferred) |
+| 5  | Inheritance (non-virtual, single), `CxxBase` emission                                                                     | 🟨 partial (BaseSpec lowering ✓; upcast emission deferred to M19) |
 | 6  | Virtual methods → vtable-index-aware emission                                                                             | ✅ shipped (single-inheritance; pure virtuals + secondary vtables open) |
 | 7  | Annotation processing (inline attrs + sidecar YAML)                                                                       | ✅ shipped (libclang `[[clang::annotate("rustcc::…")]]` walker + emitter wiring; sidecar YAML parser already shipped) |
 | 8  | Explicit template instantiation import                                                                                    | ✅ shipped (`HeaderGraph::template_instantiations` synthesizes a root that force-instantiates each entry) |
 | 9  | Diagnostic translator, error recovery, poisoned nodes                                                                     | ⏳ open |
-| 10 | Incremental compilation integration                              |
+| 10 | Incremental compilation integration                                                                                       | ⏳ open |
+
+### Phase B — Tier 1: FLTK "Hello World"
+
+The four items that block running a one-window FLTK program. Roughly
+4 weeks of focused work.
+
+| M#  | Deliverable                                                            | FLTK use site                                       | Effort |
+|-----|------------------------------------------------------------------------|-----------------------------------------------------|--------|
+| 11  | Free functions + static methods + static data members at TU/namespace scope | `Fl::run()`, `Fl::wait()`, `fl_color(int)`, `fl_message(...)`, `Fl::scheme_` | ~2 wk  |
+| 12  | `#define` constant capture via clang's preprocessor record             | `FL_RED`, `FL_NORMAL_LABEL`, `FL_UP_BOX`, `FL_BOLD` | ~1 wk  |
+| 13  | Forward-declared opaque types                                          | `class Fl_Widget;` referenced before its def        | ~3 d   |
+| 14  | Heap-allocation shims (`new` / `delete`)                               | `new Fl_Window(340, 180)` — widgets MUST be heap-allocated; FLTK's parent tree owns by pointer | ~1 wk  |
+
+### Phase C — Tier 2: FLTK useful subset
+
+Adds callbacks, enums, inherited methods, and string ergonomics — the
+shape of "do something interactive with FLTK." Roughly 6 weeks on top
+of Phase B.
+
+| M#  | Deliverable                                                                  | FLTK use site                                              | Effort |
+|-----|------------------------------------------------------------------------------|------------------------------------------------------------|--------|
+| 15  | Function pointer types + safe-closure callback wrappers                     | `widget->callback(my_func, user_data)` — FLTK is callback-driven | ~1.5 wk |
+| 16  | `enum class` + plain `enum` body lowering                                   | `enum class Fl_Boxtype { … }`, `enum Fl_When { … }`         | ~1 wk  |
+| 17  | Type aliases (`using` / `typedef`) emission                                 | `typedef unsigned int Fl_Color;`, `using Fl_Callback = …;`  | ~3 d   |
+| 18  | Default-argument fan-out (max-arity wrapper + documented defaults)          | `void redraw(int delay = 0)`                                | ~3 d   |
+| 19  | M5 finish — `CxxBase<T>` upcast emission OR derived-class method flattening | `Fl_Button btn; btn.show();` (inherits `Fl_Widget::show`)   | ~1.5 wk |
+| 20  | `const char*` ↔ `&CStr` / `&str` ergonomics layer                            | Labels, tooltips, file paths                                | ~1 wk  |
+| 21  | Bitfield-aware layout in `rustc_abi_cxx`                                    | Some FLTK structs use `unsigned when_:8;`-style fields. Verify `rustc_abi_cxx::layout` handles them; add support if missing. | ~3 d (probe-then-ship) |
+
+### Out of FLTK's path but still tracked
+
+These come up in *other* real-world libraries; they're not on the FLTK
+critical path but are on the larger v2 roadmap.
+
+| M#  | Deliverable                                                                  | Why                                                        |
+|-----|------------------------------------------------------------------------------|------------------------------------------------------------|
+| 22  | Multi-inheritance + virtual-base `this`-pointer adjustments + secondary vtables | Required for Qt, LLVM, Chromium. FLTK uses single inheritance only. |
+| 23  | Pure virtual handling (`__cxa_pure_virtual` shim or skip-with-marker)        | Common in any abstract-base-class-heavy library.           |
+| 24  | Method extraction on template specializations                                | Long-standing libclang gap; required for STL-using libraries. |
+| 25  | Sidecar YAML → `HeaderGraph::template_instantiations` plumbing               | Schema and API both exist; the bridge is a one-liner with the right `SidecarSchema` accessor in scope. |
+| 26  | Build-system integration (drive cmake / collect link inputs from `Cargo.toml`) | Today users build the C++ side themselves. A full `cxx_importer::build` story is a release-worthy feature on its own. |
+
+---
+
+## 15. Phase B — Tier 1 design notes (FLTK Hello World)
+
+### M11. Free functions + static methods + static data
+
+**The gap.** `walk_top_level` in `import.rs` recognizes `Namespace`,
+`StructDecl`, `ClassDecl`, `UnionDecl` — not `FunctionDecl` or
+`VarDecl`. Static methods on classes flow through the existing
+`EntityKind::Method` path but the importer's static-vs-instance
+heuristic isn't clang-flag-driven; we infer "instance" from the
+default `cv` qualifier, which is wrong for `Fl::run()` (no receiver
+at all in C++; libclang exposes `is_static_method`).
+
+**The shape.** Two new IR additions in `rustc_abi_cxx`:
+
+- `FreeFunctionDef { scope: NestedName, name: Ident, sig: FnSig }` —
+  parallel to `MethodDef` but no `enclosing_class`.
+- `VarDef { scope: NestedName, name: Ident, ty: TypeId, mutability:
+  CvQual }` — for static class members and namespace-scope `extern`
+  variables.
+
+`Importer` walks `EntityKind::FunctionDecl` and `EntityKind::VarDecl`
+at TU/namespace scope. `MethodDef` gets a `is_static: bool` populated
+from `Entity::is_static_method`. The `rust_bindings` emitter renders
+free functions as top-level `unsafe extern "C++" fn` decls plus
+inline-fn wrappers, and static fields as `pub static FOO: T` with
+`#[link_name]`.
+
+**Effort.** ~2 weeks. The bulk is the IR shape change in
+`rustc_abi_cxx` and threading the new entity kinds through
+`Driver::parse_all` + the emitter.
+
+### M12. `#define` constant capture
+
+**The gap.** `Index_TranslationUnit_DetailedPreprocessingRecord` is
+off by default in our libclang setup. Even with it on, `clang_visit`
+exposes `MacroDefinition` cursors that the current `walk_top_level`
+ignores.
+
+**The shape.**
+
+1. Pass `clang_TranslationUnit_None | clang_TranslationUnit_Detailed
+   PreprocessingRecord` to `Index::parser(...)`.
+2. New walker pass: visit `EntityKind::MacroDefinition`. Skip
+   function-like macros (no expansion-context-free way to render
+   them as Rust). For object-like macros, call
+   `clang_Cursor_Evaluate` (clang-rs exposes this as
+   `Entity::evaluate()`) to get a typed value.
+3. Recognize signed integer, unsigned integer, float, and
+   string-literal results. Reject anything else with a soft
+   diagnostic ("macro `FOO` expands to `(x + 1)`; not lowered").
+4. Emit Rust `pub const FOO: i32 = 42;` etc. into the same
+   namespace tree the bindings emitter already builds.
+
+**Caveat.** Clang's evaluator runs the macro through its own AST
+expansion. It correctly handles `#define FL_RED 88`, `#define
+FL_BOLD 1`, `#define FL_BOLD_ITALIC (FL_BOLD | FL_ITALIC)`. But
+expressions involving symbols that aren't yet defined return
+`Unevaluated`; we render those as a comment-emitted skip rather
+than failing the whole import.
+
+**Effort.** ~1 week. The libclang side is a few hundred LOC; the
+emitter side is a new `pub const` template in `rust_bindings`.
+
+### M13. Forward-declared opaque types
+
+**The gap.** `Importer::import_class` currently rejects classes
+with no definition (line 234 in `import.rs`: `if
+!entity.is_definition() { return Err(...); }`). FLTK headers
+forward-declare extensively: every `Fl_Widget*` in a function
+signature pulls in a forward decl that we currently fail on.
+
+**The shape.** When we encounter a forward-only `EntityKind::
+ClassDecl` / `StructDecl`, register an *opaque* class in the IR:
+zero size, alignment 1, `is_polymorphic: false`, no fields, no
+methods, plus a new `is_opaque: bool` flag on `ClassDef`. The
+emitter renders opaque classes as `#[repr(C)] pub struct Foo {
+_priv: [u8; 0] }` — usable through pointers only.
+
+When the same class is later imported with a full definition (in
+the same TU or via a USR-cache hit from another header), we
+"upgrade" the opaque entry to a concrete `ClassDef`. This works
+because the existing dedup keys on Clang USR.
+
+**Effort.** ~3 days. The IR shape change is small; the trickier
+part is the upgrade dance when a forward decl is followed by a
+definition.
+
+### M14. Heap-allocation shims (`new` / `delete`)
+
+**The gap.** Today's emitter does stack construction via
+`MaybeUninit::<Self>::uninit() + ctor + assume_init`. FLTK widgets
+must be heap-allocated — the parent window owns child widgets by
+pointer, and a stack-allocated widget's destructor would fire when
+its scope ends, leaving the parent with a dangling pointer.
+
+**The shape.** Emit, per non-trivial class:
+
+```cpp
+// shims.cpp (added by the existing shim generator)
+extern "C" Fl_Window* __cxx_Fl_Window_new_heap(int w, int h) {
+    return new Fl_Window(w, h);
+}
+extern "C" void __cxx_Fl_Window_delete(Fl_Window* p) {
+    delete p;
+}
+```
+
+```rust
+// bindings.rs (new emission in rust_bindings)
+impl Fl_Window {
+    pub fn new_boxed(w: i32, h: i32) -> Box<Fl_Window> {
+        unsafe {
+            let raw = __cxx_Fl_Window_new_heap(w, h);
+            Box::from_raw(raw)
+        }
+    }
+}
+// `Box<Fl_Window>` already gets the right Drop via the existing
+// `impl Drop for Fl_Window` that calls the C++ dtor.
+```
+
+The C++ shim file is the existing `shims.rs` output, just augmented
+with the heap-creation thunks. Rust side adds `pub fn new_boxed` (or
+similar) variants alongside the stack-`new`.
+
+**Why both?** Some classes are stack-friendly (simple value types
+like `Fl_Color`); some are tree-rooted in a parent that takes
+ownership. Annotation `[[rustcc::ownership("heap")]]` could
+escalate certain types to heap-only emission, but v0 of M14 just
+emits both and lets the caller pick.
+
+**Effort.** ~1 week. The shim generator already exists; the new
+work is the heap-creation thunk template plus the Rust-side
+`Box<T>`-returning wrapper.
+
+---
+
+## 16. Phase C — Tier 2 design notes (useful subset)
+
+### M15. Function pointer types + safe-closure callbacks
+
+**The gap.** `render_rust_type` in `rust_bindings.rs` doesn't
+handle `CxxType::Fn(_)` (the `MemberPtr` arm rejects it as
+unsupported). FLTK's API is callback-driven; without renderable
+function pointer types, nothing useful compiles.
+
+**The shape.** Two layers:
+
+1. **Type rendering.** Add a `CxxType::Fn` arm in `render_rust_type`
+   that emits `unsafe extern "C++" fn(*mut Fl_Widget, *mut
+   ::core::ffi::c_void)` from the `FnSig` payload. This unblocks
+   passing a raw C function as a callback today.
+
+2. **Closure-wrapping convenience.** A typical user wants to pass a
+   Rust closure, not a raw `extern "C"` function. Pattern (autocxx-
+   inspired):
+
+   ```rust
+   pub struct CallbackBox<W> {
+       callback: Box<dyn FnMut(&mut W) + 'static>,
+   }
+   impl Fl_Widget {
+       pub fn set_rust_callback<F>(&mut self, f: F)
+       where F: FnMut(&mut Self) + 'static
+       {
+           let boxed = Box::into_raw(Box::new(CallbackBox { callback: Box::new(f) }));
+           extern "C" fn trampoline(w: *mut Fl_Widget, ud: *mut c_void) {
+               let cb = unsafe { &mut *(ud as *mut CallbackBox<Fl_Widget>) };
+               (cb.callback)(unsafe { &mut *w });
+           }
+           unsafe { self.callback(trampoline, boxed as *mut c_void); }
+       }
+   }
+   ```
+
+   This lives in the `cxx` runtime crate, not in the generated
+   bindings. The generator just exposes the raw `callback(fn,
+   void*)` API; the closure layer is opt-in.
+
+**Effort.** ~1.5 weeks total: ~3 days for the type rendering, the
+rest for the closure-wrapping infrastructure.
+
+### M16. `enum class` + plain `enum` body lowering
+
+**The gap.** `NameSegment::Enum` exists in the IR, but enum *bodies*
+(constants + values) aren't lowered. The importer treats enums as
+opaque — fine for type-position uses, useless for users who need
+the constants.
+
+**The shape.** New IR: `EnumDef { name, underlying_ty: TypeId,
+constants: Vec<(Ident, i128)> }`. Importer walks
+`EntityKind::EnumConstantDecl` children of an `EntityKind::EnumDecl`.
+Emitter renders as `#[repr(<underlying>)] pub enum Fl_Boxtype {
+FL_NO_BOX = 0, FL_FLAT_BOX = 1, … }`.
+
+For C-style (non-`enum class`) enums, also emit each constant as
+`pub const FL_NO_BOX: Fl_Boxtype = Fl_Boxtype::FL_NO_BOX` so user
+code can write `FL_NO_BOX` unscoped, matching the C++ idiom.
+
+**Effort.** ~1 week.
+
+### M17. Type aliases / `using`
+
+**The gap.** `EntityKind::TypedefDecl` and `EntityKind::TypeAliasDecl`
+are skipped. `Fl_Color` (a `typedef unsigned int`) ends up referenced
+as a literal `c_uint` everywhere.
+
+**The shape.** Walk the typedefs at TU/namespace scope; resolve the
+underlying type; emit `pub type Fl_Color = u32;`. For function-type
+aliases (`using Fl_Callback = void(Fl_Widget*, void*);`), emit the
+function-pointer type alias.
+
+**Effort.** ~3 days.
+
+### M18. Default arguments
+
+**The gap.** C++ default arguments don't have a Rust analog. Today
+the importer ignores them and the emitter's wrapper takes all args
+positionally. Users see `widget.redraw(0)` even when they meant
+"default delay."
+
+**The shape.** v1: emit only the maximum-arity wrapper and capture
+the default values in a doc comment on the wrapper. v2 (later
+release): emit a `Builder` pattern when there are 3+ default args.
+
+**Effort.** ~3 days for v1.
+
+### M19. `CxxBase<T>` upcast / inherited method visibility
+
+**The gap.** `Fl_Button btn; btn.show();` — `show()` is declared on
+`Fl_Widget`. The emitter only puts methods declared on the class
+itself into the `impl` block. The user has to upcast manually,
+except there's no upcast mechanism.
+
+**The shape.** Two design choices:
+
+- **(a) `CxxBase<T>` emission** (the design doc's M5 plan): emit
+  `impl CxxBase<Fl_Widget> for Fl_Button { fn upcast(&self) ->
+  &Fl_Widget { … } }`. Users write `btn.upcast().show()`. Explicit,
+  matches Rust's "no implicit coercion" idiom.
+- **(b) Method flattening**: walk the inheritance chain at emission
+  time and copy each base method into the derived class's `impl`
+  block. Users write `btn.show()` directly. Less explicit, but
+  matches the C++ programmer's expectation.
+
+Recommendation: ship (a) first because it's smaller and lets the
+user opt-in. Add (b) as an optional emitter setting after.
+
+**Effort.** ~1.5 weeks for (a). Another ~1 week for (b) if added.
+
+### M20. `const char*` ergonomics
+
+**The gap.** FLTK passes labels and tooltips as `const char*`.
+Today's emitter renders `*const i8`; users write `b"Hello\0".as_ptr()
+as *const i8`. Painful.
+
+**The shape.** Two modes, opt-in via `RustBindingsConfig`:
+
+- `CStrErgonomics::None` (default): emit `*const i8` as today.
+- `CStrErgonomics::CStr`: render `&CStr` for input parameters,
+  `&CStr` for return types. Emitter inserts a `CStr::from_ptr(...)`
+  conversion at the wrapper's call boundary.
+- `CStrErgonomics::String`: same as `CStr` but converts at the
+  boundary to `&str` / `String`. Allocates per-call.
+
+**Effort.** ~1 week.
+
+### M21. Bitfield-aware layout
+
+**The gap.** Some FLTK structs use `unsigned when_:8;`-style
+bitfields. `rustc_abi_cxx::layout` may or may not preserve correct
+field offsets across bitfield boundaries — this needs a probe before
+we know if there's actual work. Bitfields don't have a Rust direct
+analog (Rust uses `bitfield-struct` crates), but **field offsets
+beyond the bitfield region must still match** for ABI compatibility.
+
+**The shape.** Probe first: write a libclang test that imports a
+struct with bitfields, queries `ctx.layout()`, and compares to
+Clang's own offsets via `clang_Type_getOffsetOf`. If offsets agree,
+we're good (offsets are what matters for cross-language ABI; Rust
+side just gets `_pad` opaque storage for the bitfield region). If
+they disagree, fix the layout engine.
+
+**Effort.** ~3 days probe + however much fix-up the probe surfaces.
