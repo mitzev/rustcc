@@ -15,6 +15,7 @@ use rustc_abi_cxx::ClassId;
 #[cfg(feature = "libclang")]
 use crate::diagnostics::ImportError;
 use crate::hpp::{self, HppError, HppOptions};
+use crate::rust_bindings::{self, BindingsError, RustBindingsConfig};
 use crate::shims::{self, ShimError, ShimOptions};
 
 pub struct HeaderGraph {
@@ -133,5 +134,23 @@ impl Driver {
         ctx: &rustc_abi_cxx::CxxTypeCtx,
     ) -> Result<String, HppError> {
         hpp::generate_hpp_for_rust_types(ctx)
+    }
+
+    /// Emit Rust source bridging the imported `classes` so downstream
+    /// Rust code can `use` and call them directly. The output is a
+    /// `String` the caller writes to disk (typically into `OUT_DIR`
+    /// from a `build.rs` and `include!`'d from `lib.rs`).
+    ///
+    /// Pairs with [`Driver::emit_shims`]: shims provide the C++ side
+    /// of the Rust → C++ direction, this provides the Rust side. See
+    /// `crates/cxx_importer/src/rust_bindings.rs` for backend choices
+    /// and per-backend caveats.
+    pub fn emit_rust_bindings(
+        &self,
+        ctx: &rustc_abi_cxx::CxxTypeCtx,
+        classes: &[ClassId],
+        config: &RustBindingsConfig,
+    ) -> Result<String, BindingsError> {
+        rust_bindings::generate_rust_bindings(ctx, classes, config)
     }
 }
