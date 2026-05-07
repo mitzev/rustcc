@@ -266,6 +266,7 @@ impl Driver {
             // Best-effort: ignore annotation-pass errors so a
             // sidecar problem doesn't poison the whole cache.
             let mut tmp_aliases = crate::aliases::AliasSet::default();
+            let mut tmp_enums = crate::enums::EnumSet::default();
             if let Ok(_) = crate::import::import_header_full(
                 root,
                 &argv.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -273,12 +274,13 @@ impl Driver {
                 &mut tmp_cache,
                 &mut anns,
                 &mut tmp_aliases,
+                &mut tmp_enums,
             ) {
-                // ok — annotations merged into `anns`. Aliases dropped
-                // for now: the cache record schema doesn't carry them
-                // yet (tracked as a follow-up; load_or_parse callers
-                // that want aliases use `import_header_with_extras`
-                // directly).
+                // ok — annotations merged into `anns`. Aliases +
+                // enum bodies are dropped for now: the cache record
+                // schema doesn't carry them yet (tracked as a
+                // follow-up; load_or_parse callers that want them
+                // use `import_header_with_extras` directly).
             }
         }
         *caller_annotations = anns;

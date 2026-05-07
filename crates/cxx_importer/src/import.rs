@@ -60,6 +60,7 @@ use rustc_abi_cxx::{
 use crate::aliases::{AliasSet, TypeAlias};
 use crate::annotations::{Annotation, AnnotationSet};
 use crate::diagnostics::{ImportError, SourceSpan};
+use crate::enums::{CxxEnumDef, CxxEnumVariant, EnumSet};
 
 pub fn import_header(
     source: &Path,
@@ -84,6 +85,7 @@ pub fn import_header_with_annotations(
     let mut cache = HashMap::new();
     let mut set = AnnotationSet::default();
     let mut aliases = AliasSet::default();
+    let mut enums = EnumSet::default();
     let ids = import_header_full(
         source,
         args,
@@ -91,8 +93,9 @@ pub fn import_header_with_annotations(
         &mut cache,
         &mut set,
         &mut aliases,
+        &mut enums,
     )?;
-    let _ = aliases; // discard — caller didn't ask for aliases.
+    let _ = (aliases, enums); // discard — caller wanted only annotations.
     Ok((ids, set))
 }
 
@@ -106,15 +109,18 @@ pub fn import_header_with_annotations(
 ///   parsed off classes and methods (M6).
 /// - `aliases` — `typedef` / `using` declarations at TU/namespace
 ///   scope (M17).
+/// - `enums` — `enum` / `enum class` definitions at TU/namespace
+///   scope, including variant lists (M16).
 #[derive(Default, Clone, Debug)]
 pub struct ImportExtras {
     pub annotations: AnnotationSet,
     pub aliases: AliasSet,
+    pub enums: EnumSet,
 }
 
 /// One-shot import that returns every side-table the importer can
 /// produce. Use this when you want bindings emitted with full
-/// fidelity (annotations + aliases).
+/// fidelity (annotations + aliases + enum bodies).
 pub fn import_header_with_extras(
     source: &Path,
     args: &[&str],
@@ -123,6 +129,7 @@ pub fn import_header_with_extras(
     let mut cache = HashMap::new();
     let mut annotations = AnnotationSet::default();
     let mut aliases = AliasSet::default();
+    let mut enums = EnumSet::default();
     let ids = import_header_full(
         source,
         args,
@@ -130,12 +137,14 @@ pub fn import_header_with_extras(
         &mut cache,
         &mut annotations,
         &mut aliases,
+        &mut enums,
     )?;
     Ok((
         ids,
         ImportExtras {
             annotations,
             aliases,
+            enums,
         },
     ))
 }
@@ -150,10 +159,12 @@ pub(crate) fn import_header_full(
     cache: &mut HashMap<String, ClassId>,
     annotations: &mut AnnotationSet,
     aliases: &mut AliasSet,
+    enums: &mut EnumSet,
 ) -> Result<Vec<ClassId>, ImportError> {
-    let (ids, captured_aliases) =
+    let (ids, captured_aliases, captured_enums) =
         import_header_with_cache_and_aliases(source, args, ctx, cache)?;
     aliases.entries.extend(captured_aliases);
+    enums.entries.extend(captured_enums);
     // The cache-and-annotations collection is currently re-derived
     // by re-running the importer when the caller wants annotations;
     // a follow-up release can plumb annotations through the
@@ -239,26 +250,27 @@ pub(crate) fn import_header_with_cache(
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
 ) -> Result<Vec<ClassId>, ImportError> {
-    // Aliases are silently dropped on this back-compat entry
-    // point. Callers that want them call
+    // Aliases + enums are silently dropped on this back-compat
+    // entry point. Callers that want them call
     // `import_header_with_cache_and_aliases` (or the public
     // `import_header_with_extras` wrapper) directly.
-    let (ids, _aliases) =
+    let (ids, _aliases, _enums) =
         import_header_with_cache_and_aliases(source, args, ctx, cache)?;
     Ok(ids)
 }
 
 /// Same as [`import_header_with_cache`], but also returns the
-/// list of TU/namespace-scope `typedef` / `using` aliases harvested
-/// from the same parse. Internal because the public face for this
-/// is [`import_header_with_extras`] (which bundles aliases together
-/// with annotations).
+/// list of TU/namespace-scope `typedef` / `using` aliases (M17)
+/// and `enum` / `enum class` definitions (M16) harvested from the
+/// same parse. Internal because the public face for this is
+/// [`import_header_with_extras`] (which bundles all the
+/// side-tables together with annotations).
 pub(crate) fn import_header_with_cache_and_aliases(
     source: &Path,
     args: &[&str],
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
-) -> Result<(Vec<ClassId>, Vec<TypeAlias>), ImportError> {
+) -> Result<(Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>), ImportError> {
     let clang = Clang::new().map_err(|e| ImportError::ClangDiagnostic {
         file: source.display().to_string(),
         line: 0,
@@ -299,11 +311,12 @@ pub(crate) fn import_header_with_cache_and_aliases(
     attach_methods_recursively(tu.get_entity(), &mut importer)?;
 
     // Hand the accumulated USR map back to the caller so the next
-    // import call can dedup against it. Drain aliases at the same
-    // time so they ride out alongside the class list.
+    // import call can dedup against it. Drain aliases + enums at
+    // the same time so they ride out alongside the class list.
     let aliases = std::mem::take(&mut importer.aliases);
+    let enums = std::mem::take(&mut importer.enums);
     *cache = importer.into_cache();
-    Ok((imported, aliases))
+    Ok((imported, aliases, enums))
 }
 
 fn attach_methods_recursively(
@@ -398,6 +411,24 @@ fn walk_top_level(
                 }
             }
         }
+        // M16: capture `enum`, `enum class`, `enum struct` at
+        // TU/namespace scope. Same parent-scope filter as
+        // aliases — class-scope enums are deferred.
+        EntityKind::EnumDecl => {
+            let parent_kind = entity
+                .get_semantic_parent()
+                .map(|p| p.get_kind());
+            let at_ns_scope = matches!(
+                parent_kind,
+                Some(EntityKind::Namespace)
+                    | Some(EntityKind::TranslationUnit)
+                    | Some(EntityKind::NotImplemented)
+                    | None
+            );
+            if at_ns_scope {
+                let _ = importer.collect_enum(entity);
+            }
+        }
         // M17: capture C++ `typedef T U;` and `using U = T;` at
         // TU/namespace scope. Failures are non-fatal — aliases
         // are emit-only ergonomics, so a target type we can't
@@ -448,6 +479,12 @@ struct Importer<'a> {
     /// twice; libclang gives each a stable USR which we dedup
     /// against here.
     alias_usrs: std::collections::HashSet<String>,
+    /// M16: imported enum bodies (variants + scoped flag) at
+    /// TU/namespace scope. Class-scope enums are deferred for
+    /// the same reason as class-scope aliases.
+    enums: Vec<CxxEnumDef>,
+    /// USR-keyed dedup for enums. Same rationale as `alias_usrs`.
+    enum_usrs: std::collections::HashSet<String>,
 }
 
 impl<'a> Importer<'a> {
@@ -465,6 +502,8 @@ impl<'a> Importer<'a> {
             annotations: HashMap::new(),
             aliases: Vec::new(),
             alias_usrs: std::collections::HashSet::new(),
+            enums: Vec::new(),
+            enum_usrs: std::collections::HashSet::new(),
         }
     }
 
@@ -579,6 +618,95 @@ impl<'a> Importer<'a> {
             parent: parent_segments,
             name: Ident(name),
             target,
+        });
+        Ok(())
+    }
+
+    /// M16: harvest a `enum class` / `enum struct` / plain `enum`
+    /// at TU or namespace scope. Returns `Ok(())` regardless of
+    /// outcome — failures (missing underlying type, anonymous
+    /// enum, …) silently skip just like aliases.
+    fn collect_enum(&mut self, entity: &Entity<'_>) -> Result<(), ImportError> {
+        // Forward declarations (`enum class Foo;`) carry no body.
+        // libclang reports them as definitions only after the body
+        // is seen, so this also dedups the case where the same
+        // enum appears in multiple TU roots.
+        if !entity.is_definition() {
+            return Ok(());
+        }
+        if let Some(usr) = entity.get_usr() {
+            if !self.enum_usrs.insert(usr.0) {
+                return Ok(());
+            }
+        }
+        let name = match entity.get_name() {
+            Some(n) if !n.is_empty() => n,
+            // Anonymous enums (`enum { Red, Green };`) — for v0
+            // we drop them; the variants leak as integer
+            // constants in the source but Rust has nowhere
+            // to hang them as a distinct named enum.
+            _ => return Ok(()),
+        };
+        let underlying_ty = match entity.get_enum_underlying_type() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let where_ = format!("enum `{name}`");
+        let underlying = match self.import_type(underlying_ty, &where_) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+        let scoped = entity.is_scoped();
+
+        // Walk children for `EnumConstantDecl`s. libclang exposes
+        // each variant as a child cursor; the order matches source
+        // order, which we want to preserve in emission.
+        let mut variants: Vec<CxxEnumVariant> = Vec::new();
+        for child in entity.get_children() {
+            if child.get_kind() != EntityKind::EnumConstantDecl {
+                continue;
+            }
+            let vname = match child.get_name() {
+                Some(n) => n,
+                None => continue,
+            };
+            let (signed, _unsigned) = match child.get_enum_constant_value() {
+                Some(pair) => pair,
+                None => continue,
+            };
+            variants.push(CxxEnumVariant {
+                name: vname,
+                value: signed,
+            });
+        }
+
+        // Build parent path: same shape as `collect_alias` —
+        // namespace ancestors only, in outer-to-inner order.
+        let mut parent_segments: Vec<NameSegment> = Vec::new();
+        let mut cur = entity.get_semantic_parent();
+        while let Some(e) = cur {
+            match e.get_kind() {
+                EntityKind::Namespace => {
+                    let pname = e.get_name().unwrap_or_default();
+                    if pname.is_empty() {
+                        parent_segments.push(NameSegment::AnonymousNamespace);
+                    } else {
+                        parent_segments
+                            .push(NameSegment::Namespace(Ident(pname)));
+                    }
+                }
+                _ => break,
+            }
+            cur = e.get_semantic_parent();
+        }
+        parent_segments.reverse();
+
+        self.enums.push(CxxEnumDef {
+            parent: parent_segments,
+            name: Ident(name),
+            underlying,
+            scoped,
+            variants,
         });
         Ok(())
     }

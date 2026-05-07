@@ -10,6 +10,7 @@ mod annotations;
 #[cfg(feature = "cache")]
 mod cache;
 mod diagnostics;
+pub mod enums;
 mod driver;
 pub mod hpp;
 #[cfg(feature = "libclang")]
@@ -25,6 +26,7 @@ pub mod shims;
 
 pub use aliases::{AliasSet, TypeAlias};
 pub use annotations::{Annotation, AnnotationSet, SidecarSchema};
+pub use enums::{CxxEnumDef, CxxEnumVariant, EnumSet};
 pub use macros::{MacroConst, MacroSet, MacroValue};
 pub use diagnostics::ImportError;
 pub use driver::{Driver, HeaderGraph};

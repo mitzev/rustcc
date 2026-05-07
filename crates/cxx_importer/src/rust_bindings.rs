@@ -307,40 +307,53 @@ pub fn generate_rust_bindings_with_annotations(
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
     let empty_aliases = crate::aliases::AliasSet::default();
+    let empty_enums = crate::enums::EnumSet::default();
     generate_rust_bindings_with_extras(
         ctx,
         classes,
         annotations,
         &empty_aliases,
+        &empty_enums,
         config,
     )
 }
 
-/// Emit Rust source consulting both `annotations` (M6) and the M17
-/// alias side-table. Each alias becomes a `pub type {name} =
-/// {target};` line scoped under the matching `pub mod` (or at the
-/// top level for TU-scope aliases). Aliases whose target type is
-/// not yet supported by the v0 type renderer are dropped with a
-/// `// alias ... skipped` comment rather than failing the
-/// emission.
+/// Emit Rust source consulting `annotations` (M6), the M17 alias
+/// side-table, and the M16 enum-body side-table. Each alias
+/// becomes a `pub type {name} = {target};` line scoped under the
+/// matching `pub mod`; each enum becomes either a `#[repr(int)]
+/// pub enum` (scoped + unique discriminants) or a
+/// `#[repr(transparent)] pub struct + assoc consts` (unscoped or
+/// aliasing) at the same scope.
+///
+/// Aliases whose target type is not yet supported by the v0 type
+/// renderer are dropped with a `// alias ... skipped` comment
+/// rather than failing the emission. Enums whose underlying type
+/// isn't a simple integer fall through the same way.
 ///
 /// Currently DirectExternCpp is the only backend that honors
-/// aliases — the macro-based backends (`NativeCppClassMacro`,
-/// `CxxClassMacro`) flatten everything to the top level and would
-/// need their grammar widened to expose `type` items. Tracked for
-/// a follow-up.
+/// aliases / enums — the macro-based backends
+/// (`NativeCppClassMacro`, `CxxClassMacro`) flatten everything to
+/// the top level and would need their grammar widened to expose
+/// `type` / `enum` items. Tracked for a follow-up.
 pub fn generate_rust_bindings_with_extras(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
     annotations: &AnnotationSet,
     aliases: &crate::aliases::AliasSet,
+    enums: &crate::enums::EnumSet,
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
     match config.backend {
         BindingsBackend::NativeCppClassMacro => emit_native_macro(ctx, classes, config),
-        BindingsBackend::DirectExternCpp => {
-            emit_direct_extern_cpp(ctx, classes, annotations, &aliases.entries, config)
-        }
+        BindingsBackend::DirectExternCpp => emit_direct_extern_cpp(
+            ctx,
+            classes,
+            annotations,
+            &aliases.entries,
+            &enums.entries,
+            config,
+        ),
         BindingsBackend::CxxClassMacro => emit_cxx_class_macro(ctx, classes, config),
     }
 }
@@ -461,6 +474,7 @@ fn emit_direct_extern_cpp(
     classes: &[ClassId],
     annotations: &AnnotationSet,
     aliases: &[crate::aliases::TypeAlias],
+    enums: &[crate::enums::CxxEnumDef],
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
     let mut out = String::new();
@@ -492,10 +506,10 @@ fn emit_direct_extern_cpp(
     // tree. A flat list (no `Namespace` segments) collapses to the
     // root and emits at the top level — same shape the v0 emitter
     // produced before this change, with no namespace overhead.
-    // M17 aliases get folded into the same tree at their owning
-    // namespace node so `pub type` lines emit before the class
-    // blocks at that scope.
-    let tree = build_namespace_tree_with_aliases(ctx, &classes, aliases)?;
+    // M17 aliases + M16 enum bodies get folded into the same tree
+    // at their owning namespace nodes so they emit before the
+    // class blocks at that scope.
+    let tree = build_namespace_tree_with_extras(ctx, &classes, aliases, enums)?;
     render_namespace_tree(ctx, &tree, &mut out, annotations, config, initial_indent)?;
 
     if config.crate_module.is_some() {
@@ -535,6 +549,12 @@ struct NamespaceTree {
     /// renders them as `pub type {rust_ident} = {render(target)};`
     /// before the class blocks at the same node.
     aliases: Vec<(String, rustc_abi_cxx::TypeId)>,
+    /// M16 enum bodies (`enum class Foo { ... }`) directly inside
+    /// this scope. Emission renders each as either
+    /// `#[repr(int)] pub enum` (scoped, unique discriminants) or
+    /// `#[repr(transparent)] pub struct + assoc consts` (unscoped
+    /// or aliasing variants).
+    enums: Vec<crate::enums::CxxEnumDef>,
     /// Sub-namespaces at this scope, keyed by name.
     /// `BTreeMap` for deterministic emission order.
     children: BTreeMap<String, NamespaceTree>,
@@ -544,18 +564,18 @@ fn build_namespace_tree(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
 ) -> Result<NamespaceTree, BindingsError> {
-    build_namespace_tree_with_aliases(ctx, classes, &[])
+    build_namespace_tree_with_extras(ctx, classes, &[], &[])
 }
 
 /// Same as [`build_namespace_tree`], but also folds M17 aliases
-/// into their owning namespace scope. Each alias gets keyed by its
-/// `parent` segment list using the same `Namespace` / `AnonymousNamespace`
-/// rules as classes; the leaf identifier becomes the rendered Rust
-/// type name (`pub type <leaf> = <target>;`).
-fn build_namespace_tree_with_aliases(
+/// and M16 enum bodies into their owning namespace scopes. Each
+/// alias / enum gets keyed by its `parent` segment list using
+/// the same `Namespace` / `AnonymousNamespace` rules as classes.
+fn build_namespace_tree_with_extras(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
     aliases: &[crate::aliases::TypeAlias],
+    enums: &[crate::enums::CxxEnumDef],
 ) -> Result<NamespaceTree, BindingsError> {
     let mut root = NamespaceTree::default();
     for &class_id in classes {
@@ -614,6 +634,26 @@ fn build_namespace_tree_with_aliases(
         }
         node.aliases.push((alias.name.0.clone(), alias.target));
     }
+    // M16: same routing for enum bodies.
+    for enum_def in enums {
+        let mut node = &mut root;
+        let mut prefix_ok = true;
+        for seg in &enum_def.parent {
+            let key = match seg {
+                NameSegment::Namespace(id) => id.0.clone(),
+                NameSegment::AnonymousNamespace => "__anon".to_string(),
+                _ => {
+                    prefix_ok = false;
+                    break;
+                }
+            };
+            node = node.children.entry(key).or_default();
+        }
+        if !prefix_ok {
+            continue;
+        }
+        node.enums.push(enum_def.clone());
+    }
     Ok(root)
 }
 
@@ -625,12 +665,34 @@ fn render_namespace_tree(
     config: &RustBindingsConfig,
     indent: &str,
 ) -> Result<(), BindingsError> {
+    // M16: emit imported enum bodies first — classes and aliases
+    // at this scope may reference them by name in their fields /
+    // method signatures.
+    for enum_def in &tree.enums {
+        match render_cxx_enum(ctx, enum_def, indent) {
+            Ok(block) => {
+                out.push_str(&block);
+                out.push('\n');
+            }
+            Err(BindingsError::UnsupportedType { kind, .. }) => {
+                // Underlying integer width not supported (i128 /
+                // u128 in some emitter passes), or other v0 gap.
+                // Drop with a comment — not fatal.
+                let _ = writeln!(
+                    out,
+                    "{indent}// enum `{}` skipped: {kind}",
+                    enum_def.name.0,
+                );
+            }
+            Err(other) => return Err(other),
+        }
+    }
     // M17: emit `pub type` aliases ahead of class blocks. Putting
-    // them first makes them visible to any class block emitted
-    // afterwards (and to user code) without an `use super::*`
-    // dance. Render failures (target type unsupported by
-    // `render_rust_type`) drop the alias rather than aborting:
-    // aliases are emit-only ergonomics, not correctness.
+    // them after enums so an alias of an enum lands legally; before
+    // class blocks so the classes (and user code) see the names.
+    // Render failures (target type unsupported by `render_rust_type`)
+    // drop the alias rather than aborting: aliases are emit-only
+    // ergonomics, not correctness.
     for (alias_name, target) in &tree.aliases {
         let where_ = format!("alias `{alias_name}`");
         match render_rust_type(ctx, *target, &where_) {
@@ -648,7 +710,7 @@ fn render_namespace_tree(
             }
         }
     }
-    if !tree.aliases.is_empty() {
+    if !tree.aliases.is_empty() || !tree.enums.is_empty() {
         out.push('\n');
     }
     for &class_id in &tree.classes {
@@ -1835,6 +1897,114 @@ fn render_rust_type(
             });
         }
     })
+}
+
+/// M16: render one captured C++ enum as Rust source. Picks
+/// between the idiomatic `pub enum` shape and the fall-back
+/// `pub struct + assoc consts` shape based on whether all
+/// variants are unique and the enum is `enum class`-scoped.
+///
+/// Both shapes are layout-identical (single underlying integer)
+/// so the choice is purely about Rust-side ergonomics:
+///
+/// - `pub enum` lets `match` exhaustiveness fire and supports
+///   derives, but disallows duplicate discriminants.
+/// - `pub struct` tolerates aliasing variants and is the safe
+///   default for unscoped enums users may bit-twiddle on.
+fn render_cxx_enum(
+    ctx: &CxxTypeCtx,
+    def: &crate::enums::CxxEnumDef,
+    indent: &str,
+) -> Result<String, BindingsError> {
+    let underlying_kind = ctx.type_of(def.underlying);
+    let (signed, width) = match underlying_kind {
+        CxxType::Int { signed, width } => (*signed, *width),
+        CxxType::Bool => (false, IntWidth::I8),
+        other => {
+            return Err(BindingsError::UnsupportedType {
+                where_: format!("enum `{}` underlying", def.name.0),
+                kind: format!("non-integer underlying: {other:?}"),
+            });
+        }
+    };
+    let int_repr = int_rust(signed, width);
+
+    // Detect duplicate discriminants. Aliasing happens often
+    // enough in real headers that we always check.
+    let mut seen = std::collections::HashSet::new();
+    let mut has_dups = false;
+    for v in &def.variants {
+        if !seen.insert(v.value) {
+            has_dups = true;
+            break;
+        }
+    }
+
+    // Shape selection: idiomatic `pub enum` only when scoped
+    // AND no aliasing. Anything else falls back to the
+    // `pub struct + assoc consts` shape.
+    let prefer_pub_enum = def.scoped && !has_dups;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{indent}#[allow(non_camel_case_types)]");
+    if prefer_pub_enum {
+        let _ = writeln!(out, "{indent}#[repr({int_repr})]");
+        let _ = writeln!(out, "{indent}#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]");
+        let _ = writeln!(out, "{indent}pub enum {} {{", def.name.0);
+        for v in &def.variants {
+            // Cast to keep negative discriminants legal with
+            // unsigned reprs on the C++ side (libclang signed
+            // accessor sign-extends).
+            let lit = render_enum_discriminant(v.value, signed);
+            let _ = writeln!(
+                out,
+                "{indent}    #[allow(non_camel_case_types)] {} = {lit},",
+                v.name,
+            );
+        }
+        let _ = writeln!(out, "{indent}}}");
+    } else {
+        // `#[repr(transparent)]` on the wrapper so the layout
+        // and ABI match the underlying integer exactly. The
+        // `pub` field on the inner integer lets users reach
+        // for `MyEnum(0).0` / `MyEnum(x.0 | y.0)` for the
+        // bitwise math idioms common in unscoped C++ enums.
+        let _ = writeln!(out, "{indent}#[repr(transparent)]");
+        let _ = writeln!(
+            out,
+            "{indent}#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]",
+        );
+        let _ = writeln!(
+            out,
+            "{indent}pub struct {}(pub {int_repr});",
+            def.name.0,
+        );
+        let _ = writeln!(out, "{indent}impl {} {{", def.name.0);
+        for v in &def.variants {
+            let lit = render_enum_discriminant(v.value, signed);
+            let _ = writeln!(
+                out,
+                "{indent}    #[allow(non_upper_case_globals)] pub const {}: Self = Self({lit});",
+                v.name,
+            );
+        }
+        let _ = writeln!(out, "{indent}}}");
+    }
+    Ok(out)
+}
+
+/// Render an enum discriminant literal. libclang gives us a
+/// signed `i64`; if the underlying type is unsigned we cast at
+/// the literal level so negative source values (rare but legal,
+/// e.g. `enum E : unsigned { X = -1 }`) round-trip correctly.
+fn render_enum_discriminant(value: i64, signed: bool) -> String {
+    if signed || value >= 0 {
+        format!("{value}")
+    } else {
+        // Two's-complement bit-pattern as the unsigned literal.
+        let as_u64 = value as u64;
+        format!("{as_u64}")
+    }
 }
 
 fn int_rust(signed: bool, width: IntWidth) -> &'static str {

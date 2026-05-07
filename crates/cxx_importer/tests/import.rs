@@ -2389,6 +2389,7 @@ fn m17_aliases_emit_pub_type_lines_in_bindings() {
         &classes,
         &cxx_importer::AnnotationSet::default(),
         &extras.aliases,
+        &extras.enums,
         &cfg,
     )
     .expect("emit");
@@ -2435,6 +2436,262 @@ fn m17_alias_to_unsupported_type_is_skipped_not_fatal() {
         "imports should still produce the Owner class",
     );
 
+    cleanup(&header);
+}
+
+// ============================================================
+// M16: enum class + plain enum body lowering.
+// ============================================================
+
+#[test]
+fn m16_captures_scoped_enum_with_unique_discriminants() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "enum class Color : int { Red = 1, Green = 2, Blue = 3 };\n",
+        "m16_scoped_enum_unique",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let e = extras
+        .enums
+        .iter()
+        .find(|e| e.name.0 == "Color")
+        .expect("Color enum captured");
+    assert!(e.scoped, "enum class should be scoped");
+    assert_eq!(e.variants.len(), 3);
+    assert_eq!(e.variants[0].name, "Red");
+    assert_eq!(e.variants[0].value, 1);
+    assert_eq!(e.variants[1].name, "Green");
+    assert_eq!(e.variants[1].value, 2);
+    assert_eq!(e.variants[2].name, "Blue");
+    assert_eq!(e.variants[2].value, 3);
+    assert!(matches!(
+        ctx.type_of(e.underlying),
+        CxxType::Int { signed: true, width: IntWidth::I32 },
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
+fn m16_captures_unscoped_enum() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "enum Mode { Off, On, Auto };\n",
+        "m16_unscoped_enum",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let e = extras
+        .enums
+        .iter()
+        .find(|e| e.name.0 == "Mode")
+        .expect("Mode enum captured");
+    assert!(!e.scoped, "plain enum should be unscoped");
+    let names: Vec<&str> = e.variants.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, vec!["Off", "On", "Auto"]);
+    let values: Vec<i64> = e.variants.iter().map(|v| v.value).collect();
+    assert_eq!(values, vec![0, 1, 2]);
+
+    cleanup(&header);
+}
+
+#[test]
+fn m16_captures_namespace_nested_enum() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "namespace gfx {\n\
+           enum class Boxtype : unsigned char { None = 0, Up = 1, Down = 2 };\n\
+         }\n",
+        "m16_ns_nested_enum",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let e = extras
+        .enums
+        .iter()
+        .find(|e| e.name.0 == "Boxtype")
+        .expect("Boxtype enum captured");
+    let parent_names: Vec<&str> = e
+        .parent
+        .iter()
+        .map(|seg| match seg {
+            NameSegment::Namespace(id) => id.0.as_str(),
+            _ => "<other>",
+        })
+        .collect();
+    assert_eq!(parent_names, vec!["gfx"]);
+    assert!(e.scoped);
+    assert_eq!(e.variants.len(), 3);
+    // Underlying type should be unsigned 8-bit.
+    assert!(matches!(
+        ctx.type_of(e.underlying),
+        CxxType::Int { signed: false, width: IntWidth::I8 },
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
+fn m16_emits_pub_enum_for_scoped_unique() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "enum class Color : int { Red = 1, Green = 2, Blue = 3 };\n",
+        "m16_emit_pub_enum",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(
+        src.contains("#[repr(i32)]") && src.contains("pub enum Color"),
+        "scoped+unique enum should emit as `#[repr(i32)] pub enum Color`; got:\n{src}",
+    );
+    assert!(
+        src.contains("Red = 1") && src.contains("Green = 2") && src.contains("Blue = 3"),
+        "all three variants should appear; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m16_emits_struct_with_consts_for_unscoped() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        // unscoped + non-unique forces the struct shape.
+        "enum Flags : unsigned int { F_NONE = 0, F_A = 1, F_ALSO_A = 1, F_B = 2 };\n",
+        "m16_emit_struct_consts",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(
+        src.contains("#[repr(transparent)]")
+            && src.contains("pub struct Flags(pub u32)"),
+        "unscoped/aliasing enum should emit as transparent struct; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub const F_A: Self = Self(1)")
+            && src.contains("pub const F_ALSO_A: Self = Self(1)")
+            && src.contains("pub const F_B: Self = Self(2)"),
+        "associated consts should be present including the aliasing pair; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m16_class_scope_enum_is_skipped_in_v0() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Outer {\n  enum class Mode { A, B };\n  int slot;\n};\n",
+        "m16_class_scope_enum_skipped",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    assert!(
+        extras.enums.iter().all(|e| e.name.0 != "Mode"),
+        "class-scope enum should not appear at TU scope; got: {:?}",
+        extras.enums.iter().map(|e| &e.name.0).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn m16_anonymous_enum_is_skipped_in_v0() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "enum { GLOBAL_X = 7 };\n\
+         struct Owner { int slot; };\n",
+        "m16_anon_enum_skipped",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // Anonymous enums have no name to dedup on; v0 drops them.
+    assert!(
+        extras.enums.iter().all(|e| !e.name.0.is_empty()),
+        "anonymous enum should not appear in EnumSet",
+    );
     cleanup(&header);
 }
 

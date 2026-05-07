@@ -302,7 +302,7 @@ of Phase B.
 | M#  | Deliverable                                                                  | FLTK use site                                              | Effort |
 |-----|------------------------------------------------------------------------------|------------------------------------------------------------|--------|
 | 15  | Function pointer types + safe-closure callback wrappers                     | `widget->callback(my_func, user_data)` — FLTK is callback-driven | ~1.5 wk |
-| 16  | `enum class` + plain `enum` body lowering                                   | `enum class Fl_Boxtype { … }`, `enum Fl_When { … }`         | ~1 wk  |
+| 16  | `enum class` + plain `enum` body lowering                                   | `enum class Fl_Boxtype { … }`, `enum Fl_When { … }`         | ✅ shipped (`EnumSet` side-table; emitter picks `#[repr(int)] pub enum` for scoped+unique vs. `#[repr(transparent)] pub struct + assoc consts` for unscoped/aliasing; class-scope + anonymous enums deferred) |
 | 17  | Type aliases (`using` / `typedef`) emission                                 | `typedef unsigned int Fl_Color;`, `using Fl_Callback = …;`  | ✅ shipped (`AliasSet`, `import_header_with_extras`, namespace-tree integration; emits `pub type X = Y;` inside owning `pub mod`; class-scope aliases deferred) |
 | 18  | Default-argument fan-out (max-arity wrapper + documented defaults)          | `void redraw(int delay = 0)`                                | ~3 d   |
 | 19  | M5 finish — `CxxBase<T>` upcast emission OR derived-class method flattening | `Fl_Button btn; btn.show();` (inherits `Fl_Widget::show`)   | ~1.5 wk |
