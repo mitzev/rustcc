@@ -102,12 +102,16 @@ fn imports_class_emits_bindings_links_to_cxx_and_calls_through() {
     let calc_obj = dir.join("calc.o");
     let bin = dir.join("runner");
 
-    // Tiny C++ class: ctor stores two ints, a const method returns
-    // their sum. Private fields make the size known to libclang's
-    // record-layout query (8 bytes, 4-byte aligned for two ints).
+    // Tiny C++ class inside a namespace: ctor stores two ints, a
+    // const method returns their sum. Private fields make the size
+    // known to libclang's record-layout query (8 bytes, 4-byte
+    // aligned for two ints). The namespace exercises the bindings
+    // emitter's `mod` tree path: the Rust source needs to look up
+    // the class as `ns::Calc::new(...)`.
     std::fs::write(
         &header_hpp,
         r#"#pragma once
+namespace ns {
 class Calc {
 public:
     Calc(int a, int b);
@@ -117,15 +121,18 @@ private:
     int a_;
     int b_;
 };
+}  // namespace ns
 "#,
     )
     .unwrap();
     std::fs::write(
         &calc_cpp,
         r#"#include "calc.hpp"
+namespace ns {
 Calc::Calc(int a, int b) : a_(a), b_(b) {}
 Calc::~Calc() {}
 int Calc::sum() const { return a_ + b_; }
+}  // namespace ns
 "#,
     )
     .unwrap();
@@ -159,6 +166,10 @@ int Calc::sum() const { return a_ + b_; }
 
     // Sanity: the emission contains the right shape pieces.
     assert!(
+        bindings_src.contains("pub mod ns {"),
+        "expected `pub mod ns` namespace wrap, got:\n{bindings_src}"
+    );
+    assert!(
         bindings_src.contains("#[repr(C)]"),
         "expected repr(C) struct, got:\n{bindings_src}"
     );
@@ -166,17 +177,19 @@ int Calc::sum() const { return a_ + b_; }
         bindings_src.contains("unsafe extern \"C++\""),
         "expected unsafe extern \"C++\" block, got:\n{bindings_src}"
     );
+    // Itanium mangling for `ns::Calc` ctor / dtor / sum — the
+    // namespace becomes `_ZN2ns4Calc…` rather than `_ZN4Calc…`.
     assert!(
-        bindings_src.contains("_ZN4CalcC1Eii"),
-        "expected ctor link_name, got:\n{bindings_src}"
+        bindings_src.contains("_ZN2ns4CalcC1Eii"),
+        "expected ns::Calc ctor link_name, got:\n{bindings_src}"
     );
     assert!(
-        bindings_src.contains("_ZN4CalcD1Ev"),
-        "expected dtor link_name, got:\n{bindings_src}"
+        bindings_src.contains("_ZN2ns4CalcD1Ev"),
+        "expected ns::Calc dtor link_name, got:\n{bindings_src}"
     );
     assert!(
-        bindings_src.contains("_ZNK4Calc3sumEv"),
-        "expected sum const-method link_name, got:\n{bindings_src}"
+        bindings_src.contains("_ZNK2ns4Calc3sumEv"),
+        "expected ns::Calc::sum const-method link_name, got:\n{bindings_src}"
     );
     assert!(
         bindings_src.contains("pub fn new("),
@@ -212,12 +225,14 @@ int Calc::sum() const { return a_ + b_; }
     // code so the parent can verify call-through.
     // DirectExternCpp doesn't need any proc macros or unstable
     // feature gates beyond `extern "C++"` itself, which the fork
-    // accepts as a normal ABI string.
+    // accepts as a normal ABI string. The class lives under
+    // `mod ns` thanks to the namespace-aware emitter, so the
+    // call-site uses `ns::Calc::…`.
     let main_src = format!(
         r#"include!({bindings_path:?});
 
 fn main() {{
-    let c = Calc::new(13, 24);
+    let c = ns::Calc::new(13, 24);
     let s = c.sum();
     std::process::exit(s);
 }}
