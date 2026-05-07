@@ -199,6 +199,7 @@ impl CppInteropConfig {
             roots: self.headers.clone(),
             include_paths: self.header_search_paths.clone(),
             clang_flags: self.clang_flags.clone(),
+            ..HeaderGraph::default()
         }
     }
 }
