@@ -109,6 +109,7 @@ use rustc_abi_cxx::{
 };
 
 use crate::annotations::{Annotation, AnnotationSet};
+use crate::macros::{MacroSet, MacroValue};
 use crate::name_mapping::{
     disambiguate_overloads, rust_name_for_operator, OverloadEntry,
 };
@@ -164,6 +165,18 @@ pub struct RustBindingsConfig {
     /// emitted file is part of an internal layer the downstream
     /// crate re-exports selectively.
     pub doc_hidden: bool,
+    /// Emit M14 heap-allocation thunks: `pub fn new_boxed(...) ->
+    /// ::cxx::CxxHeap<Self>` wrappers + an `unsafe impl
+    /// ::cxx::CxxDeletable for <class>` per class with a ctor.
+    /// Off by default because the generated source references the
+    /// [`::cxx`] runtime crate, which the bare `include!`-style
+    /// test path doesn't link in. Downstream users who depend on
+    /// `cxx` can opt in for heap-rooted widget support
+    /// (FLTK-style). Pairs with `Driver::emit_shims` — the C++
+    /// side always emits the `__cxx_<class>_new_heap_<i>` and
+    /// `__cxx_<class>_delete` thunks regardless, so users can
+    /// also implement their own heap wrapper if they prefer.
+    pub emit_heap_alloc: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +218,71 @@ pub fn generate_rust_bindings(
 ) -> Result<String, BindingsError> {
     let empty = AnnotationSet::default();
     generate_rust_bindings_with_annotations(ctx, classes, &empty, config)
+}
+
+/// Emit Rust source consulting both `annotations` for per-entity
+/// name overrides and `macros` (M12) for `#define` constants
+/// captured by `cxx_importer::macros::collect_macros`. Each macro
+/// entry becomes a `pub const NAME: T = VALUE;` at the top of the
+/// generated module.
+pub fn generate_rust_bindings_with_macros(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+    annotations: &AnnotationSet,
+    macros: &MacroSet,
+    config: &RustBindingsConfig,
+) -> Result<String, BindingsError> {
+    let mut out = generate_rust_bindings_with_annotations(
+        ctx,
+        classes,
+        annotations,
+        config,
+    )?;
+    if !macros.entries.is_empty() {
+        let mut header = String::new();
+        let _ = writeln!(
+            header,
+            "// M12: `#define` constants captured by `cxx_importer::macros::collect_macros`.",
+        );
+        for m in &macros.entries {
+            let line = render_macro_const(m);
+            header.push_str(&line);
+        }
+        header.push('\n');
+        // Insert after the existing emitter's leading comment.
+        // Splitting on the first blank line keeps both blocks
+        // visually distinct.
+        if let Some(idx) = out.find("\n\n") {
+            out.insert_str(idx + 2, &header);
+        } else {
+            out.insert_str(0, &header);
+        }
+    }
+    Ok(out)
+}
+
+fn render_macro_const(m: &crate::macros::MacroConst) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    match &m.value {
+        MacroValue::SignedInteger(v) => {
+            let _ = writeln!(s, "pub const {}: i64 = {v};", m.name);
+        }
+        MacroValue::UnsignedInteger(v) => {
+            let _ = writeln!(s, "pub const {}: u64 = {v};", m.name);
+        }
+        MacroValue::Float(v) => {
+            let _ = writeln!(s, "pub const {}: f64 = {v};", m.name);
+        }
+        MacroValue::String(v) => {
+            let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+            let _ = writeln!(s, "pub const {}: &str = \"{escaped}\";", m.name);
+        }
+        MacroValue::Bool(v) => {
+            let _ = writeln!(s, "pub const {}: bool = {v};", m.name);
+        }
+    }
+    s
 }
 
 /// Emit Rust source consulting `annotations` for per-entity Rust-name
@@ -619,12 +697,15 @@ fn render_direct_extern_class(
     let mut ctor_seen = 0usize;
     let mut method_blocks: Vec<MethodEmission> = Vec::with_capacity(methods.len());
     let mut has_user_dtor = false;
-    for (method, resolved_name) in methods.iter().zip(resolved_names.iter()) {
+    for (method_idx, (method, resolved_name)) in
+        methods.iter().zip(resolved_names.iter()).enumerate()
+    {
         let emission = classify_for_direct_extern(
             ctx,
             class_id,
             &class_name,
             method,
+            method_idx,
             resolved_name,
         )?;
         if matches!(emission.kind, EmissionKind::Dtor) {
@@ -710,7 +791,138 @@ fn render_direct_extern_class(
         });
     }
 
+    // M14: heap-allocation thunks. For each ctor, emit:
+    //   - An `unsafe extern "C"` decl for the matching
+    //     `__cxx_<class>_new_heap_<i>` shim from `shims.rs`.
+    //   - A `pub fn new_boxed[_<i>](args) -> ::cxx::CxxHeap<Self>`
+    //     wrapper that calls the heap shim and wraps the returned
+    //     pointer in `CxxHeap`.
+    //
+    // Plus, once per class:
+    //   - An `unsafe extern "C"` decl for `__cxx_<class>_delete`.
+    //   - An `unsafe impl ::cxx::CxxDeletable for <class>` that
+    //     routes `Drop` for `CxxHeap<Self>` through the C++
+    //     `delete` shim.
+    //
+    // Skipped when `config.emit_heap_alloc` is `false` (default)
+    // because the emission references `::cxx`. Skipped also for
+    // poisoned classes (no constructable Rust analog).
+    let ctor_emissions: Vec<(usize, &MethodEmission)> = method_blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e.kind, EmissionKind::Ctor))
+        .collect();
+    if config.emit_heap_alloc && !ctor_emissions.is_empty() {
+        let _ = writeln!(block);
+        let _ = writeln!(
+            block,
+            "{indent}// M14: heap-allocation thunks paired with `__cxx_<class>_new_heap_<i>`",
+        );
+        let _ = writeln!(
+            block,
+            "{indent}// and `__cxx_<class>_delete` shims emitted by `cxx_importer::shims`.",
+        );
+        let _ = writeln!(block, "{indent}unsafe extern \"C\" {{");
+        for (ctor_idx, _emission) in ctor_emissions.iter().enumerate() {
+            let (_, e) = _emission;
+            // Reuse the existing extern_decl_params (which start
+            // with `this: *mut <class>`) but we need a different
+            // shape for the heap shim — drop the `this` slot, use
+            // the user-arg list only.
+            let user_args = strip_first_param(&e.extern_decl_params);
+            let _ = writeln!(
+                block,
+                "{indent}    fn __cxx_{class_name}_new_heap_{ctor_idx}({user_args}) -> *mut {class_name};",
+            );
+        }
+        let _ = writeln!(
+            block,
+            "{indent}    fn __cxx_{class_name}_delete(p: *mut {class_name});",
+        );
+        let _ = writeln!(block, "{indent}}}");
+
+        // Heap-allocating wrappers and the CxxDeletable impl. Add
+        // to the existing impl block by re-opening it briefly —
+        // but the impl block was closed earlier, so emit a fresh
+        // `impl Foo` block for the heap wrappers only.
+        let _ = writeln!(block);
+        let _ = writeln!(block, "{indent}impl {class_name} {{");
+        for (ctor_idx, _emission) in ctor_emissions.iter().enumerate() {
+            let (_, e) = _emission;
+            let suffix = if ctor_emissions.len() > 1 {
+                format!("_{ctor_idx}")
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                block,
+                "{indent}    /// Heap-allocate via C++ `new {class_name}(...)`.",
+            );
+            let _ = writeln!(
+                block,
+                "{indent}    /// Returned [`::cxx::CxxHeap`] frees with C++ `delete` on drop,",
+            );
+            let _ = writeln!(
+                block,
+                "{indent}    /// keeping the new/delete pair the C++ ABI requires.",
+            );
+            let header = if e.wrapper_params.is_empty() {
+                format!(
+                    "{indent}    pub fn new_boxed{suffix}() -> ::cxx::CxxHeap<Self> {{",
+                )
+            } else {
+                format!(
+                    "{indent}    pub fn new_boxed{suffix}({params}) -> ::cxx::CxxHeap<Self> {{",
+                    params = e.wrapper_params,
+                )
+            };
+            let _ = writeln!(block, "{header}");
+            if e.forward_args.is_empty() {
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{ ::cxx::CxxHeap::from_raw(__cxx_{class_name}_new_heap_{ctor_idx}()) }}",
+                );
+            } else {
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{ ::cxx::CxxHeap::from_raw(__cxx_{class_name}_new_heap_{ctor_idx}({fwd})) }}",
+                    fwd = e.forward_args,
+                );
+            }
+            let _ = writeln!(block, "{indent}    }}");
+        }
+        let _ = writeln!(block, "{indent}}}");
+
+        let _ = writeln!(block);
+        let _ = writeln!(
+            block,
+            "{indent}unsafe impl ::cxx::CxxDeletable for {class_name} {{",
+        );
+        let _ = writeln!(
+            block,
+            "{indent}    unsafe fn cxx_delete(p: *mut Self) {{",
+        );
+        let _ = writeln!(
+            block,
+            "{indent}        unsafe {{ __cxx_{class_name}_delete(p); }}",
+        );
+        let _ = writeln!(block, "{indent}    }}");
+        let _ = writeln!(block, "{indent}}}");
+    }
+
     Ok(block)
+}
+
+/// Strip the first parameter from a comma-joined extern-decl
+/// parameter list (e.g. `"this: *mut Foo, arg0: i32"` →
+/// `"arg0: i32"`). Used to reshape a ctor's normal extern params
+/// for the heap-allocation shim, which doesn't take a `this`
+/// slot — C++ `new` synthesizes the storage internally.
+fn strip_first_param(params: &str) -> String {
+    match params.find(',') {
+        Some(comma) => params[comma + 1..].trim_start().to_string(),
+        None => String::new(),
+    }
 }
 
 /// Internal record describing one method's lowered shape: enough info
@@ -901,6 +1113,7 @@ fn classify_for_direct_extern(
     class_id: ClassId,
     class_name: &str,
     method: &MethodDef,
+    method_idx: usize,
     resolved_rust_name: &str,
 ) -> Result<MethodEmission, BindingsError> {
     let arity = method.sig.params.len();
@@ -1006,12 +1219,10 @@ fn classify_for_direct_extern(
         format!(" -> {ret_rust}")
     };
 
-    // Distinguish instance / static / virtual. The current importer
-    // doesn't mark static methods explicitly (real static-method
-    // support arrives once libclang's `is_static_method` flag gets
-    // surfaced), so we default non-virtual methods to Instance.
-    // Virtuals carry their `vtable_index` into the emission so the
-    // wrapper can synthesize a vptr load + transmute.
+    // Distinguish instance / static / virtual. M11 wires
+    // `ctx.is_method_static` for the Static path; virtuals carry
+    // their `vtable_index` for the vptr-load-and-transmute path.
+    // Everything else falls through to Instance.
     let kind = if method.virtuality == Virtuality::Virtual {
         match method.vtable_index {
             Some(vt) => EmissionKind::Virtual { vtable_index: vt },
@@ -1024,6 +1235,8 @@ fn classify_for_direct_extern(
                 });
             }
         }
+    } else if ctx.is_method_static(class_id, method_idx) {
+        EmissionKind::Static
     } else {
         EmissionKind::Instance
     };
@@ -1032,12 +1245,24 @@ fn classify_for_direct_extern(
     } else {
         WrapperReceiver::SelfMut
     };
-    let this_ty = match receiver {
-        WrapperReceiver::SelfConst => format!("this: *const {class_name}"),
-        _ => format!("this: *mut {class_name}"),
+    // M11: static methods don't take a `this` slot. Emit just the
+    // user-arg list; the wrapper will drop the receiver too.
+    let mut extern_decl = if matches!(kind, EmissionKind::Static) {
+        Vec::new()
+    } else {
+        let this_ty = match receiver {
+            WrapperReceiver::SelfConst => format!("this: *const {class_name}"),
+            _ => format!("this: *mut {class_name}"),
+        };
+        vec![this_ty]
     };
-    let mut extern_decl = vec![this_ty];
     extern_decl.extend(user_arg_decls.clone());
+
+    let final_receiver = if matches!(kind, EmissionKind::Static) {
+        WrapperReceiver::None
+    } else {
+        receiver
+    };
 
     // Mangle using the *original* C++ method name (operator code or
     // identifier) so the symbol matches what Clang produced for the
@@ -1057,7 +1282,7 @@ fn classify_for_direct_extern(
         link_name: link,
         extern_decl_params: extern_decl.join(", "),
         extern_return_clause: extern_ret_clause,
-        wrapper_receiver: receiver,
+        wrapper_receiver: final_receiver,
         wrapper_params: user_arg_decls.join(", "),
         wrapper_return: ret_rust,
         forward_args: user_forward.join(", "),
@@ -1941,6 +2166,171 @@ mod tests {
         assert!(
             !src.contains("pub struct Point"),
             "Skip-annotated class shouldn't be emitted:\n{src}"
+        );
+    }
+
+    #[test]
+    fn static_method_emits_receiver_less_wrapper_and_extern() {
+        // M11: a method marked static via `ctx.mark_method_static`
+        // emits `pub fn run() -> i32` (no `&self`) and the extern
+        // decl drops the `this` slot.
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let i32_ = ctx.intern_type(CxxType::Int {
+            signed: true,
+            width: IntWidth::I32,
+        });
+        let id = ctx.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("Fl".into()))]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![MethodDef {
+                name: MethodName::Ident(Ident("run".into())),
+                sig: FnSig {
+                    params: vec![],
+                    ret: i32_,
+                    cv: CvQual { is_const: false, is_volatile: false },
+                    ref_q: None,
+                    variadic: false,
+                    noexcept: false,
+                },
+                virtuality: Virtuality::NonVirtual,
+                vtable_index: None,
+                special: None,
+            }],
+            kind: RecordKind::Class,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        ctx.mark_method_static(id, 0);
+
+        let src = generate_rust_bindings(&ctx, &[id], &RustBindingsConfig::default())
+            .expect("emit");
+
+        // Wrapper has no receiver.
+        assert!(
+            src.contains("pub fn run() -> i32"),
+            "expected receiver-less static wrapper:\n{src}"
+        );
+        // Extern decl skips the `this` slot.
+        assert!(
+            src.contains("fn __cxx_Fl_run() -> i32;"),
+            "expected static extern with no `this`:\n{src}"
+        );
+    }
+
+    #[test]
+    fn macro_set_renders_pub_const_lines_at_top() {
+        use crate::macros::{MacroConst, MacroSet, MacroValue};
+        let (ctx, id) = point_ctx();
+        let macros = MacroSet {
+            entries: vec![
+                MacroConst {
+                    name: "FL_RED".into(),
+                    value: MacroValue::SignedInteger(88),
+                },
+                MacroConst {
+                    name: "FL_PI".into(),
+                    value: MacroValue::Float(3.14159),
+                },
+                MacroConst {
+                    name: "FL_NAME".into(),
+                    value: MacroValue::String("widget".into()),
+                },
+                MacroConst {
+                    name: "FL_FLAG".into(),
+                    value: MacroValue::Bool(true),
+                },
+            ],
+        };
+        let src = generate_rust_bindings_with_macros(
+            &ctx,
+            &[id],
+            &AnnotationSet::default(),
+            &macros,
+            &RustBindingsConfig::default(),
+        )
+        .expect("emit");
+        assert!(
+            src.contains("pub const FL_RED: i64 = 88;"),
+            "expected signed-int macro:\n{src}"
+        );
+        assert!(
+            src.contains("pub const FL_PI: f64 = 3.14159;"),
+            "expected float macro:\n{src}"
+        );
+        assert!(
+            src.contains("pub const FL_NAME: &str = \"widget\";"),
+            "expected string macro:\n{src}"
+        );
+        assert!(
+            src.contains("pub const FL_FLAG: bool = true;"),
+            "expected bool macro:\n{src}"
+        );
+    }
+
+    #[test]
+    fn empty_macro_set_does_not_inject_const_block() {
+        use crate::macros::MacroSet;
+        let (ctx, id) = point_ctx();
+        let src = generate_rust_bindings_with_macros(
+            &ctx,
+            &[id],
+            &AnnotationSet::default(),
+            &MacroSet::default(),
+            &RustBindingsConfig::default(),
+        )
+        .expect("emit");
+        assert!(
+            !src.contains("// M12:"),
+            "no macros means no M12 comment:\n{src}"
+        );
+        assert!(
+            !src.contains("pub const "),
+            "no macros means no pub const:\n{src}"
+        );
+    }
+
+    #[test]
+    fn direct_extern_cpp_emits_heap_alloc_shims_paired_with_cxx_heap() {
+        // M14: ctors get an extra `__cxx_<class>_new_heap_<i>`
+        // extern decl + a `pub fn new_boxed(...) -> ::cxx::CxxHeap<Self>`
+        // wrapper. Once per class, a `__cxx_<class>_delete` extern
+        // decl + `unsafe impl ::cxx::CxxDeletable for <class>`.
+        let (ctx, id) = point_ctx();
+        let src = generate_rust_bindings(
+            &ctx,
+            &[id],
+            &RustBindingsConfig {
+                emit_heap_alloc: true,
+                ..RustBindingsConfig::default()
+            },
+        )
+        .expect("emit");
+
+        // Heap extern block has the new_heap thunk for the single ctor.
+        assert!(
+            src.contains("fn __cxx_Point_new_heap_0(arg0: i32, arg1: i32) -> *mut Point;"),
+            "expected heap-ctor extern decl:\n{src}"
+        );
+        // Heap extern block has the delete thunk.
+        assert!(
+            src.contains("fn __cxx_Point_delete(p: *mut Point);"),
+            "expected delete extern decl:\n{src}"
+        );
+        // Heap-alloc wrapper.
+        assert!(
+            src.contains("pub fn new_boxed(arg0: i32, arg1: i32) -> ::cxx::CxxHeap<Self>"),
+            "expected heap wrapper:\n{src}"
+        );
+        // CxxDeletable impl.
+        assert!(
+            src.contains("unsafe impl ::cxx::CxxDeletable for Point"),
+            "expected CxxDeletable impl:\n{src}"
+        );
+        assert!(
+            src.contains("__cxx_Point_delete(p)"),
+            "expected delete-shim call inside cxx_delete:\n{src}"
         );
     }
 

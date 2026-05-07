@@ -14,6 +14,7 @@ pub mod hpp;
 #[cfg(feature = "libclang")]
 pub mod import;
 mod lower;
+pub mod macros;
 mod name_mapping;
 mod resolve;
 pub mod rust_bindings;
@@ -22,6 +23,7 @@ pub mod rust_stubs;
 pub mod shims;
 
 pub use annotations::{Annotation, AnnotationSet, SidecarSchema};
+pub use macros::{MacroConst, MacroSet, MacroValue};
 pub use diagnostics::ImportError;
 pub use driver::{Driver, HeaderGraph};
 pub use lower::LoweredEntity;

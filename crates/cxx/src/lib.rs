@@ -12,6 +12,7 @@
 
 mod base;
 mod boxed;
+mod heap;
 mod move_;
 mod owned;
 mod shared;
@@ -20,6 +21,7 @@ mod string;
 
 pub use base::CxxBase;
 pub use boxed::CxxBox;
+pub use heap::{CxxDeletable, CxxHeap};
 pub use move_::CxxMove;
 pub use owned::CxxOwned;
 pub use shared::CxxShared;

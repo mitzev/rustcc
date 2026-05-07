@@ -28,8 +28,8 @@ use std::fmt::Write as _;
 
 use rustc_abi_cxx::{
     ClassId, CvQual, CxxType, CxxTypeCtx, FloatKind, IntWidth, MethodDef,
-    MethodName, NameSegment, NestedName, OperatorKind, RefKind, Symbol,
-    TemplateArg, TypeId, Virtuality,
+    MethodName, NameSegment, NestedName, OperatorKind, RefKind, SpecialMember,
+    Symbol, TemplateArg, TypeId, Virtuality,
 };
 
 #[derive(Debug, Clone)]
@@ -78,6 +78,47 @@ pub fn generate_shims(
     for &class_id in opts.classes {
         let class = ctx.class(class_id);
         let class_source = render_nested_name(ctx, &class.name)?;
+
+        // M14: heap-allocation thunks. One `__cxx_<class>_new_heap_<i>`
+        // per ctor + one `__cxx_<class>_delete`. The bindings emitter
+        // pairs these with `pub fn new_boxed(...)` wrappers and
+        // `unsafe impl CxxDeletable for <class>` impls so users
+        // hold a `CxxHeap<Foo>` instead of a raw pointer.
+        //
+        // Skip poisoned / opaque classes — we have no
+        // constructable / destructable Rust analog for them.
+        if !ctx.is_poisoned(class_id) {
+            let mut ctor_idx: usize = 0;
+            for method in &class.methods {
+                let is_ctor = matches!(
+                    method.special,
+                    Some(SpecialMember::DefaultCtor)
+                        | Some(SpecialMember::OtherCtor),
+                );
+                if !is_ctor {
+                    continue;
+                }
+                let rendered = render_heap_ctor_shim(
+                    ctx,
+                    &class_source,
+                    method,
+                    ctor_idx,
+                )?;
+                out.push_str(&rendered);
+                out.push('\n');
+                ctor_idx += 1;
+            }
+            // One delete shim per class — fires C++ `delete` so the
+            // matching allocator pair is preserved across the FFI
+            // boundary.
+            let _ = writeln!(
+                out,
+                "extern \"C\" void __cxx_{}_delete({class_source}* p) noexcept {{ delete p; }}",
+                cxx_class_basename(&class.name),
+            );
+            out.push('\n');
+        }
+
         for method in &class.methods {
             // Virtuality: virtual methods would need vtable-aware
             // dispatch in the shim; for v1 only non-virtual.
@@ -104,6 +145,64 @@ pub fn generate_shims(
         }
     }
 
+    Ok(out)
+}
+
+/// Strip the leading namespace path from a `NestedName` and return
+/// just the trailing identifier — the basename used as part of the
+/// `__cxx_<class>_new_heap_<i>` / `__cxx_<class>_delete` shim
+/// symbol. Mirrors what the bindings emitter passes to
+/// `format!("__cxx_{class_name}_new_heap_{i}")`.
+fn cxx_class_basename(name: &rustc_abi_cxx::NestedName) -> String {
+    use rustc_abi_cxx::NameSegment;
+    match name.0.last() {
+        Some(NameSegment::Class(i))
+        | Some(NameSegment::Namespace(i))
+        | Some(NameSegment::Enum(i)) => i.0.clone(),
+        Some(NameSegment::TemplateSpec { name, .. }) => name.0.clone(),
+        Some(NameSegment::AnonymousNamespace) | None => "<anon>".into(),
+    }
+}
+
+/// Emit a heap-allocation thunk for one ctor: calls C++ `new
+/// <class>(args...)` and returns the raw pointer. The Rust side
+/// hands the pointer to `CxxHeap::from_raw` so subsequent drop
+/// runs the matching `__cxx_<class>_delete` thunk.
+fn render_heap_ctor_shim(
+    ctx: &CxxTypeCtx,
+    class_source: &str,
+    method: &MethodDef,
+    ctor_idx: usize,
+) -> Result<String, ShimError> {
+    let class = match class_source.rsplit("::").next() {
+        Some(s) => s.to_string(),
+        None => class_source.to_string(),
+    };
+
+    let mut params: Vec<String> = Vec::with_capacity(method.sig.params.len());
+    let mut args: Vec<String> = Vec::with_capacity(method.sig.params.len());
+    for (i, &ty_id) in method.sig.params.iter().enumerate() {
+        let ty = render_cxx_type(
+            ctx,
+            ty_id,
+            &format!("{class_source}::ctor[{ctor_idx}] arg {i}"),
+        )?;
+        params.push(format!("{ty} arg{i}"));
+        args.push(format!("arg{i}"));
+    }
+    let param_list = params.join(", ");
+    let arg_list = args.join(", ");
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "extern \"C\" {class_source}* __cxx_{class}_new_heap_{ctor_idx}({param_list}) {{",
+    );
+    let _ = writeln!(
+        out,
+        "    try {{ return new {class_source}({arg_list}); }} catch (...) {{ std::terminate(); }}",
+    );
+    let _ = writeln!(out, "}}");
     Ok(out)
 }
 
