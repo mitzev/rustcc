@@ -109,6 +109,7 @@ use rustc_abi_cxx::{
 };
 
 use crate::annotations::{Annotation, AnnotationSet};
+use crate::macros::{MacroSet, MacroValue};
 use crate::name_mapping::{
     disambiguate_overloads, rust_name_for_operator, OverloadEntry,
 };
@@ -217,6 +218,71 @@ pub fn generate_rust_bindings(
 ) -> Result<String, BindingsError> {
     let empty = AnnotationSet::default();
     generate_rust_bindings_with_annotations(ctx, classes, &empty, config)
+}
+
+/// Emit Rust source consulting both `annotations` for per-entity
+/// name overrides and `macros` (M12) for `#define` constants
+/// captured by `cxx_importer::macros::collect_macros`. Each macro
+/// entry becomes a `pub const NAME: T = VALUE;` at the top of the
+/// generated module.
+pub fn generate_rust_bindings_with_macros(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+    annotations: &AnnotationSet,
+    macros: &MacroSet,
+    config: &RustBindingsConfig,
+) -> Result<String, BindingsError> {
+    let mut out = generate_rust_bindings_with_annotations(
+        ctx,
+        classes,
+        annotations,
+        config,
+    )?;
+    if !macros.entries.is_empty() {
+        let mut header = String::new();
+        let _ = writeln!(
+            header,
+            "// M12: `#define` constants captured by `cxx_importer::macros::collect_macros`.",
+        );
+        for m in &macros.entries {
+            let line = render_macro_const(m);
+            header.push_str(&line);
+        }
+        header.push('\n');
+        // Insert after the existing emitter's leading comment.
+        // Splitting on the first blank line keeps both blocks
+        // visually distinct.
+        if let Some(idx) = out.find("\n\n") {
+            out.insert_str(idx + 2, &header);
+        } else {
+            out.insert_str(0, &header);
+        }
+    }
+    Ok(out)
+}
+
+fn render_macro_const(m: &crate::macros::MacroConst) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    match &m.value {
+        MacroValue::SignedInteger(v) => {
+            let _ = writeln!(s, "pub const {}: i64 = {v};", m.name);
+        }
+        MacroValue::UnsignedInteger(v) => {
+            let _ = writeln!(s, "pub const {}: u64 = {v};", m.name);
+        }
+        MacroValue::Float(v) => {
+            let _ = writeln!(s, "pub const {}: f64 = {v};", m.name);
+        }
+        MacroValue::String(v) => {
+            let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+            let _ = writeln!(s, "pub const {}: &str = \"{escaped}\";", m.name);
+        }
+        MacroValue::Bool(v) => {
+            let _ = writeln!(s, "pub const {}: bool = {v};", m.name);
+        }
+    }
+    s
 }
 
 /// Emit Rust source consulting `annotations` for per-entity Rust-name
@@ -2084,6 +2150,78 @@ mod tests {
         assert!(
             !src.contains("pub struct Point"),
             "Skip-annotated class shouldn't be emitted:\n{src}"
+        );
+    }
+
+    #[test]
+    fn macro_set_renders_pub_const_lines_at_top() {
+        use crate::macros::{MacroConst, MacroSet, MacroValue};
+        let (ctx, id) = point_ctx();
+        let macros = MacroSet {
+            entries: vec![
+                MacroConst {
+                    name: "FL_RED".into(),
+                    value: MacroValue::SignedInteger(88),
+                },
+                MacroConst {
+                    name: "FL_PI".into(),
+                    value: MacroValue::Float(3.14159),
+                },
+                MacroConst {
+                    name: "FL_NAME".into(),
+                    value: MacroValue::String("widget".into()),
+                },
+                MacroConst {
+                    name: "FL_FLAG".into(),
+                    value: MacroValue::Bool(true),
+                },
+            ],
+        };
+        let src = generate_rust_bindings_with_macros(
+            &ctx,
+            &[id],
+            &AnnotationSet::default(),
+            &macros,
+            &RustBindingsConfig::default(),
+        )
+        .expect("emit");
+        assert!(
+            src.contains("pub const FL_RED: i64 = 88;"),
+            "expected signed-int macro:\n{src}"
+        );
+        assert!(
+            src.contains("pub const FL_PI: f64 = 3.14159;"),
+            "expected float macro:\n{src}"
+        );
+        assert!(
+            src.contains("pub const FL_NAME: &str = \"widget\";"),
+            "expected string macro:\n{src}"
+        );
+        assert!(
+            src.contains("pub const FL_FLAG: bool = true;"),
+            "expected bool macro:\n{src}"
+        );
+    }
+
+    #[test]
+    fn empty_macro_set_does_not_inject_const_block() {
+        use crate::macros::MacroSet;
+        let (ctx, id) = point_ctx();
+        let src = generate_rust_bindings_with_macros(
+            &ctx,
+            &[id],
+            &AnnotationSet::default(),
+            &MacroSet::default(),
+            &RustBindingsConfig::default(),
+        )
+        .expect("emit");
+        assert!(
+            !src.contains("// M12:"),
+            "no macros means no M12 comment:\n{src}"
+        );
+        assert!(
+            !src.contains("pub const "),
+            "no macros means no pub const:\n{src}"
         );
     }
 

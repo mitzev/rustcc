@@ -2022,6 +2022,53 @@ fn m14_heap_shim_and_new_boxed_wrapper_pair_through_full_pipeline() {
 }
 
 #[test]
+fn m12_collect_macros_captures_object_like_define_constants() {
+    // M12: enable libclang's `detailed_preprocessing_record`,
+    // walk `MacroDefinition` cursors, evaluate object-like
+    // macros, and skip function-like ones / system-style names.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "#define FL_RED 88\n\
+         #define FL_BOLD 1\n\
+         #define FL_PI 3.14\n\
+         #define FL_NAME \"widget\"\n\
+         #define MIN(a,b) ((a) < (b) ? (a) : (b))\n",
+        "m12_macros",
+    );
+    let macros = cxx_importer::macros::collect_macros(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+    )
+    .expect("collect_macros");
+
+    use cxx_importer::macros::MacroValue;
+    assert_eq!(
+        macros.get("FL_RED").map(|m| m.value.clone()),
+        Some(MacroValue::SignedInteger(88))
+    );
+    assert_eq!(
+        macros.get("FL_BOLD").map(|m| m.value.clone()),
+        Some(MacroValue::SignedInteger(1))
+    );
+    let pi = macros.get("FL_PI").map(|m| m.value.clone());
+    match pi {
+        Some(MacroValue::Float(v)) => assert!((v - 3.14).abs() < 1e-9),
+        other => panic!("expected float for FL_PI, got {other:?}"),
+    }
+    assert_eq!(
+        macros.get("FL_NAME").map(|m| m.value.clone()),
+        Some(MacroValue::String("widget".into()))
+    );
+    // Function-like macros are skipped.
+    assert!(
+        macros.get("MIN").is_none(),
+        "function-like MIN should be skipped"
+    );
+
+    cleanup(&header);
+}
+
+#[test]
 fn imports_variadic_methods_into_fnsig() {
     // Variadic functions / methods (C-style `...` ellipsis) are
     // surfaced via `FnSig::variadic`. Required for round-tripping
