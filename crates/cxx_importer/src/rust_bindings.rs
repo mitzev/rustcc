@@ -697,12 +697,15 @@ fn render_direct_extern_class(
     let mut ctor_seen = 0usize;
     let mut method_blocks: Vec<MethodEmission> = Vec::with_capacity(methods.len());
     let mut has_user_dtor = false;
-    for (method, resolved_name) in methods.iter().zip(resolved_names.iter()) {
+    for (method_idx, (method, resolved_name)) in
+        methods.iter().zip(resolved_names.iter()).enumerate()
+    {
         let emission = classify_for_direct_extern(
             ctx,
             class_id,
             &class_name,
             method,
+            method_idx,
             resolved_name,
         )?;
         if matches!(emission.kind, EmissionKind::Dtor) {
@@ -1110,6 +1113,7 @@ fn classify_for_direct_extern(
     class_id: ClassId,
     class_name: &str,
     method: &MethodDef,
+    method_idx: usize,
     resolved_rust_name: &str,
 ) -> Result<MethodEmission, BindingsError> {
     let arity = method.sig.params.len();
@@ -1215,12 +1219,10 @@ fn classify_for_direct_extern(
         format!(" -> {ret_rust}")
     };
 
-    // Distinguish instance / static / virtual. The current importer
-    // doesn't mark static methods explicitly (real static-method
-    // support arrives once libclang's `is_static_method` flag gets
-    // surfaced), so we default non-virtual methods to Instance.
-    // Virtuals carry their `vtable_index` into the emission so the
-    // wrapper can synthesize a vptr load + transmute.
+    // Distinguish instance / static / virtual. M11 wires
+    // `ctx.is_method_static` for the Static path; virtuals carry
+    // their `vtable_index` for the vptr-load-and-transmute path.
+    // Everything else falls through to Instance.
     let kind = if method.virtuality == Virtuality::Virtual {
         match method.vtable_index {
             Some(vt) => EmissionKind::Virtual { vtable_index: vt },
@@ -1233,6 +1235,8 @@ fn classify_for_direct_extern(
                 });
             }
         }
+    } else if ctx.is_method_static(class_id, method_idx) {
+        EmissionKind::Static
     } else {
         EmissionKind::Instance
     };
@@ -1241,12 +1245,24 @@ fn classify_for_direct_extern(
     } else {
         WrapperReceiver::SelfMut
     };
-    let this_ty = match receiver {
-        WrapperReceiver::SelfConst => format!("this: *const {class_name}"),
-        _ => format!("this: *mut {class_name}"),
+    // M11: static methods don't take a `this` slot. Emit just the
+    // user-arg list; the wrapper will drop the receiver too.
+    let mut extern_decl = if matches!(kind, EmissionKind::Static) {
+        Vec::new()
+    } else {
+        let this_ty = match receiver {
+            WrapperReceiver::SelfConst => format!("this: *const {class_name}"),
+            _ => format!("this: *mut {class_name}"),
+        };
+        vec![this_ty]
     };
-    let mut extern_decl = vec![this_ty];
     extern_decl.extend(user_arg_decls.clone());
+
+    let final_receiver = if matches!(kind, EmissionKind::Static) {
+        WrapperReceiver::None
+    } else {
+        receiver
+    };
 
     // Mangle using the *original* C++ method name (operator code or
     // identifier) so the symbol matches what Clang produced for the
@@ -1266,7 +1282,7 @@ fn classify_for_direct_extern(
         link_name: link,
         extern_decl_params: extern_decl.join(", "),
         extern_return_clause: extern_ret_clause,
-        wrapper_receiver: receiver,
+        wrapper_receiver: final_receiver,
         wrapper_params: user_arg_decls.join(", "),
         wrapper_return: ret_rust,
         forward_args: user_forward.join(", "),
@@ -2150,6 +2166,56 @@ mod tests {
         assert!(
             !src.contains("pub struct Point"),
             "Skip-annotated class shouldn't be emitted:\n{src}"
+        );
+    }
+
+    #[test]
+    fn static_method_emits_receiver_less_wrapper_and_extern() {
+        // M11: a method marked static via `ctx.mark_method_static`
+        // emits `pub fn run() -> i32` (no `&self`) and the extern
+        // decl drops the `this` slot.
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let i32_ = ctx.intern_type(CxxType::Int {
+            signed: true,
+            width: IntWidth::I32,
+        });
+        let id = ctx.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("Fl".into()))]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![MethodDef {
+                name: MethodName::Ident(Ident("run".into())),
+                sig: FnSig {
+                    params: vec![],
+                    ret: i32_,
+                    cv: CvQual { is_const: false, is_volatile: false },
+                    ref_q: None,
+                    variadic: false,
+                    noexcept: false,
+                },
+                virtuality: Virtuality::NonVirtual,
+                vtable_index: None,
+                special: None,
+            }],
+            kind: RecordKind::Class,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        ctx.mark_method_static(id, 0);
+
+        let src = generate_rust_bindings(&ctx, &[id], &RustBindingsConfig::default())
+            .expect("emit");
+
+        // Wrapper has no receiver.
+        assert!(
+            src.contains("pub fn run() -> i32"),
+            "expected receiver-less static wrapper:\n{src}"
+        );
+        // Extern decl skips the `this` slot.
+        assert!(
+            src.contains("fn __cxx_Fl_run() -> i32;"),
+            "expected static extern with no `this`:\n{src}"
         );
     }
 

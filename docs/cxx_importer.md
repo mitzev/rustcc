@@ -286,12 +286,12 @@ for "useful subset of FLTK": callbacks, custom widgets, basic styling.
 The four items that block running a one-window FLTK program. Roughly
 4 weeks of focused work.
 
-| M#  | Deliverable                                                            | FLTK use site                                       | Effort |
+| M#  | Deliverable                                                            | FLTK use site                                       | Status |
 |-----|------------------------------------------------------------------------|-----------------------------------------------------|--------|
-| 11  | Free functions + static methods + static data members at TU/namespace scope | `Fl::run()`, `Fl::wait()`, `fl_color(int)`, `fl_message(...)`, `Fl::scheme_` | ~2 wk  |
-| 12  | `#define` constant capture via clang's preprocessor record             | `FL_RED`, `FL_NORMAL_LABEL`, `FL_UP_BOX`, `FL_BOLD` | ~1 wk  |
-| 13  | Forward-declared opaque types                                          | `class Fl_Widget;` referenced before its def        | ~3 d   |
-| 14  | Heap-allocation shims (`new` / `delete`)                               | `new Fl_Window(340, 180)` — widgets MUST be heap-allocated; FLTK's parent tree owns by pointer | ~1 wk  |
+| 11  | Free functions + static methods + static data members at TU/namespace scope | `Fl::run()`, `Fl::wait()`, `fl_color(int)`, `fl_message(...)`, `Fl::scheme_` | 🟨 partial — static methods on classes ✅ shipped (`ctx.mark_method_static` side-table, `EmissionKind::Static`); free functions + static data tracked as M11.b/c |
+| 12  | `#define` constant capture via clang's preprocessor record             | `FL_RED`, `FL_NORMAL_LABEL`, `FL_UP_BOX`, `FL_BOLD` | ✅ shipped (`MacroSet`, tokenize-and-parse approach) |
+| 13  | Forward-declared opaque types                                          | `class Fl_Widget;` referenced before its def        | ✅ shipped (poison-node minted on forward-only decls; upgraded in place when full def appears later) |
+| 14  | Heap-allocation shims (`new` / `delete`)                               | `new Fl_Window(340, 180)` — widgets MUST be heap-allocated; FLTK's parent tree owns by pointer | ✅ shipped (`__cxx_<class>_new_heap_<i>` + `__cxx_<class>_delete` thunks; paired with `::cxx::CxxHeap<T>` + `CxxDeletable` trait) |
 
 ### Phase C — Tier 2: FLTK useful subset
 

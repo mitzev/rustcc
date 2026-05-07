@@ -276,7 +276,17 @@ fn attach_methods_recursively(
                 && m.sig.params == method.sig.params
         });
         if !duplicate {
+            // M11: detect static methods on the just-pushed
+            // entry. Same `is_static_method()` check as in
+            // `import_class`'s child walk, deferred until after
+            // the push so we can capture the final method index.
+            let is_static = matches!(method_entity.get_kind(), EntityKind::Method)
+                && method_entity.is_static_method();
+            let method_idx = importer.ctx.class(class_id).methods.len();
             importer.ctx.class_mut(class_id).methods.push(method);
+            if is_static {
+                importer.ctx.mark_method_static(class_id, method_idx);
+            }
         }
     }
     Ok(())
@@ -509,6 +519,7 @@ impl<'a> Importer<'a> {
         let mut bases = Vec::new();
         let mut fields = Vec::new();
         let mut methods = Vec::new();
+        let mut pending_static_marks: Vec<usize> = Vec::new();
 
         // Fields: prefer `Type::get_fields()` over `entity.get_children()`.
         // The former iterates through libclang's type-visitor which
@@ -556,7 +567,26 @@ impl<'a> Importer<'a> {
                 | EntityKind::Constructor
                 | EntityKind::Destructor
                 | EntityKind::ConversionFunction => {
-                    methods.push(self.lower_method(&child, &name, id)?);
+                    let m = self.lower_method(&child, &name, id)?;
+                    // M11: capture static-method markers. libclang
+                    // exposes `is_static_method()` only on `Method`
+                    // entities (ctors / dtors / conversions can't
+                    // be static in C++). The bindings emitter
+                    // reads `ctx.is_method_static` to route static
+                    // methods through the receiver-less wrapper
+                    // path.
+                    let is_static = matches!(child.get_kind(), EntityKind::Method)
+                        && child.is_static_method();
+                    let method_idx = methods.len();
+                    methods.push(m);
+                    if is_static {
+                        // Defer the actual `mark_method_static`
+                        // call until after `class.methods` is
+                        // assigned at the end of `import_class`.
+                        // Indices captured now are stable because
+                        // we only push in this loop.
+                        pending_static_marks.push(method_idx);
+                    }
                 }
                 _ => {
                     // FieldDecl is already handled above via
@@ -595,6 +625,14 @@ impl<'a> Importer<'a> {
         // the mangled symbol directly.
         if is_polymorphic {
             populate_vtable_indices(self.ctx, id);
+        }
+
+        // M11: apply deferred static-method marks. The indices
+        // captured during the child walk match the final
+        // positions in `class.methods` because we only push
+        // (never insert mid-vec) in that loop.
+        for idx in &pending_static_marks {
+            self.ctx.mark_method_static(id, *idx);
         }
 
         // M13: if this import call upgraded a previously-poisoned

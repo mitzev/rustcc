@@ -2069,6 +2069,66 @@ fn m12_collect_macros_captures_object_like_define_constants() {
 }
 
 #[test]
+fn m11_static_methods_get_marked_and_emit_receiver_less_wrappers() {
+    // M11: `class Fl { static int run(); int wait(); };`. The
+    // importer should mark `run` as static (no receiver) but
+    // leave `wait` as a normal instance method.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "class Fl { public:\n\
+         \x20   static int run();\n\
+         \x20   int wait() const;\n\
+         };\n",
+        "m11_static",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let fl = class_ids[0];
+
+    let methods: Vec<_> = ctx.class(fl).methods.clone();
+    let run_idx = methods
+        .iter()
+        .position(|m| m.name.ident_name() == Some("run"))
+        .expect("run method");
+    let wait_idx = methods
+        .iter()
+        .position(|m| m.name.ident_name() == Some("wait"))
+        .expect("wait method");
+
+    assert!(
+        ctx.is_method_static(fl, run_idx),
+        "expected `run` to be marked static"
+    );
+    assert!(
+        !ctx.is_method_static(fl, wait_idx),
+        "expected `wait` to NOT be marked static"
+    );
+
+    // Bindings emit receiver-less wrapper for run, normal for wait.
+    let src = cxx_importer::rust_bindings::generate_rust_bindings(
+        &ctx,
+        &class_ids,
+        &cxx_importer::rust_bindings::RustBindingsConfig::default(),
+    )
+    .expect("emit");
+    assert!(
+        src.contains("pub fn run() -> i32"),
+        "expected static `run()` wrapper:\n{src}"
+    );
+    assert!(
+        src.contains("pub fn wait(&self) -> i32"),
+        "expected instance `wait(&self)` wrapper:\n{src}"
+    );
+
+    cleanup(&header);
+}
+
+#[test]
 fn imports_variadic_methods_into_fnsig() {
     // Variadic functions / methods (C-style `...` ellipsis) are
     // surfaced via `FnSig::variadic`. Required for round-tripping

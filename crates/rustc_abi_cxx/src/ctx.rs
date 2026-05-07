@@ -2,7 +2,7 @@
 //!
 //! See `docs/rustc_abi_cxx.md §4`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::target::Target;
 use crate::ty::{
@@ -27,6 +27,13 @@ pub struct CxxTypeCtx {
     /// `ClassDef` avoids touching the 70+ existing struct-literal
     /// sites in tests and the importer.
     poison_reason: HashMap<ClassId, String>,
+    /// Side-table marking class methods as static (no receiver).
+    /// `(ClassId, method_idx)` keys point into `class.methods`. Off
+    /// `MethodDef` for the same reason as `poison_reason`: the
+    /// existing struct-literal sites stay untouched while M11
+    /// can still distinguish `static Fl::run()` from instance
+    /// methods.
+    static_methods: HashSet<(ClassId, usize)>,
     /// Rust-origin enums exposed to C++ as scoped enums. No parallel
     /// for C++-origin enums yet — imported enums flow as anonymous
     /// `CxxType::Enum` instances with the variants living in the
@@ -42,6 +49,7 @@ impl CxxTypeCtx {
             classes: Vec::new(),
             class_origin: Vec::new(),
             poison_reason: HashMap::new(),
+            static_methods: HashSet::new(),
             rust_enums: Vec::new(),
             types: Vec::new(),
         }
@@ -78,6 +86,25 @@ impl CxxTypeCtx {
     /// it back to a healthy entry.
     pub fn unpoison(&mut self, id: ClassId) {
         self.poison_reason.remove(&id);
+    }
+
+    /// Mark a class method as static. M11 — without this side
+    /// channel, `MethodDef` has no way to express
+    /// `static int Fl::run()`-style methods. The bindings emitter
+    /// reads this flag and routes static methods through the
+    /// receiver-less wrapper path. Same off-`MethodDef`-for-back-
+    /// compat reasoning as `poison_reason`.
+    ///
+    /// `method_idx` is the position in `class.methods`.
+    pub fn mark_method_static(&mut self, class: ClassId, method_idx: usize) {
+        self.static_methods.insert((class, method_idx));
+    }
+
+    /// True when the importer (or a hand-built test) flagged
+    /// `class.methods[method_idx]` as a static method via
+    /// [`Self::mark_method_static`].
+    pub fn is_method_static(&self, class: ClassId, method_idx: usize) -> bool {
+        self.static_methods.contains(&(class, method_idx))
     }
 
     /// Register a Rust-origin enum for C++ exposure. Returns the
