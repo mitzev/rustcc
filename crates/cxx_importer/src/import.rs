@@ -375,10 +375,21 @@ fn attach_methods_recursively(
             // the push so we can capture the final method index.
             let is_static = matches!(method_entity.get_kind(), EntityKind::Method)
                 && method_entity.is_static_method();
+            // M18: capture the trailing-default-arg count from
+            // `lower_method`'s scratch slot before any further
+            // call clobbers it.
+            let default_count = importer.last_method_default_count;
             let method_idx = importer.ctx.class(class_id).methods.len();
             importer.ctx.class_mut(class_id).methods.push(method);
             if is_static {
                 importer.ctx.mark_method_static(class_id, method_idx);
+            }
+            if default_count > 0 {
+                importer.ctx.record_default_arg_count(
+                    class_id,
+                    method_idx,
+                    default_count,
+                );
             }
         }
     }
@@ -485,6 +496,14 @@ struct Importer<'a> {
     enums: Vec<CxxEnumDef>,
     /// USR-keyed dedup for enums. Same rationale as `alias_usrs`.
     enum_usrs: std::collections::HashSet<String>,
+    /// M18: scratch slot — `lower_method` writes the count of
+    /// trailing default-argument parameters here as a side
+    /// effect, and the call sites read it after pushing the
+    /// returned `MethodDef` to record on the ctx side-table
+    /// keyed by `(class, method_idx)`. Reset to 0 on every
+    /// `lower_method` entry so a method without defaults
+    /// doesn't pick up the previous method's count.
+    last_method_default_count: usize,
 }
 
 impl<'a> Importer<'a> {
@@ -504,6 +523,7 @@ impl<'a> Importer<'a> {
             alias_usrs: std::collections::HashSet::new(),
             enums: Vec::new(),
             enum_usrs: std::collections::HashSet::new(),
+            last_method_default_count: 0,
         }
     }
 
@@ -832,6 +852,10 @@ impl<'a> Importer<'a> {
         let mut fields = Vec::new();
         let mut methods = Vec::new();
         let mut pending_static_marks: Vec<usize> = Vec::new();
+        // M18: per-method (method_idx, default_count) pairs for
+        // recording on the ctx after the class body is assigned.
+        // Same deferral pattern as `pending_static_marks`.
+        let mut pending_default_arg_marks: Vec<(usize, usize)> = Vec::new();
 
         // Fields: prefer `Type::get_fields()` over `entity.get_children()`.
         // The former iterates through libclang's type-visitor which
@@ -922,6 +946,10 @@ impl<'a> Importer<'a> {
                     // path.
                     let is_static = matches!(child.get_kind(), EntityKind::Method)
                         && child.is_static_method();
+                    // M18: capture before `lower_method` is called
+                    // again on the next sibling (which would clobber
+                    // the scratch slot).
+                    let default_count = self.last_method_default_count;
                     let method_idx = methods.len();
                     methods.push(m);
                     if is_static {
@@ -931,6 +959,10 @@ impl<'a> Importer<'a> {
                         // Indices captured now are stable because
                         // we only push in this loop.
                         pending_static_marks.push(method_idx);
+                    }
+                    if default_count > 0 {
+                        pending_default_arg_marks
+                            .push((method_idx, default_count));
                     }
                 }
                 _ => {
@@ -980,6 +1012,11 @@ impl<'a> Importer<'a> {
             self.ctx.mark_method_static(id, *idx);
         }
 
+        // M18: apply deferred default-arg counts.
+        for (idx, count) in &pending_default_arg_marks {
+            self.ctx.record_default_arg_count(id, *idx, *count);
+        }
+
         // M13: if this import call upgraded a previously-poisoned
         // entry (forward-only → full definition), clear the poison
         // marker now that the class has real fields / methods /
@@ -998,6 +1035,11 @@ impl<'a> Importer<'a> {
         parent_name: &str,
         enclosing_class: ClassId,
     ) -> Result<MethodDef, ImportError> {
+        // Reset the M18 scratch slot — every `lower_method` call
+        // sets it as a side effect, but we want a clean baseline
+        // so an early-error path doesn't carry over the previous
+        // method's count.
+        self.last_method_default_count = 0;
         let name = entity.get_name().unwrap_or_default();
         let kind = entity.get_kind();
         let ctx_where = format!("{parent_name}::{name}");
@@ -1015,7 +1057,15 @@ impl<'a> Importer<'a> {
         }
 
         // Parameters come from ParmDecl children.
+        // M18: a ParmDecl with non-empty children carries a
+        // default-argument expression as one of those children
+        // (e.g. `IntegerLiteral`, `CXXBoolLiteralExpr`,
+        // `GNUNullExpr`, …). We don't resolve the value here —
+        // that requires constant-evaluation plumbing — but we
+        // record per-parameter "has-default" so the emitter can
+        // surface a doc comment listing optional trailing args.
         let mut params = Vec::new();
+        let mut has_default: Vec<bool> = Vec::new();
         for child in entity.get_children() {
             if child.get_kind() == EntityKind::ParmDecl {
                 let pty = child.get_type().ok_or_else(|| {
@@ -1023,12 +1073,23 @@ impl<'a> Importer<'a> {
                         what: "param without type",
                         where_: ctx_where.clone(),
                     span: None,
-                
+
                     }
                 })?;
                 params.push(self.import_type(pty, &ctx_where)?);
+                has_default.push(!child.get_children().is_empty());
             }
         }
+        // C++ defaults must occupy a contiguous tail
+        // (`f(int a, int b = 1, int c)` is illegal), so a simple
+        // suffix count is correct.
+        let trailing_defaults = has_default
+            .iter()
+            .rev()
+            .take_while(|&&b| b)
+            .count();
+        self.last_method_default_count = trailing_defaults;
+        let _ = enclosing_class;
 
         // Ctors and dtors have no source-level return type; use `void`
         // as a placeholder so downstream consumers that read `sig.ret`

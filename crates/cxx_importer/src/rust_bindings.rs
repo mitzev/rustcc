@@ -1238,6 +1238,13 @@ struct MethodEmission {
     wrapper_return: String,
     /// Argument expressions to forward to the extern call.
     forward_args: String,
+    /// M18: trailing-default-arg count from `ctx.default_arg_count`.
+    /// `0` when none; the renderer surfaces a `///` doc comment
+    /// listing how many trailing parameters were optional in the
+    /// C++ source so callers know which `Default::default()` /
+    /// `core::ptr::null()` placeholders match the original
+    /// signature.
+    default_arg_count: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1442,6 +1449,7 @@ fn classify_for_direct_extern(
                 wrapper_params: user_arg_decls.join(", "),
                 wrapper_return: "Self".into(),
                 forward_args: user_forward.join(", "),
+                default_arg_count: ctx.default_arg_count(class_id, method_idx),
             });
         }
         Some(SpecialMember::Dtor) => {
@@ -1460,6 +1468,7 @@ fn classify_for_direct_extern(
                 wrapper_params: String::new(),
                 wrapper_return: "()".into(),
                 forward_args: String::new(),
+                default_arg_count: 0,
             });
         }
         Some(SpecialMember::CopyCtor | SpecialMember::MoveCtor)
@@ -1570,6 +1579,7 @@ fn classify_for_direct_extern(
         wrapper_params: user_arg_decls.join(", "),
         wrapper_return: ret_rust,
         forward_args: user_forward.join(", "),
+        default_arg_count: ctx.default_arg_count(class_id, method_idx),
     })
 }
 
@@ -1599,6 +1609,24 @@ fn render_direct_extern_wrapper(
     // current code calls this `indent` for brevity.
     let indent = format!("{block_indent}    ");
     let indent = indent.as_str();
+    // M18: surface trailing default-arg counts as a doc comment so
+    // callers know which parameters were optional in the C++
+    // source. v0 doesn't synthesize per-arity convenience wrappers
+    // — that's tracked as M18.b — but the doc comment lets users
+    // pick sensible placeholders (`core::ptr::null()`, `0`, …)
+    // without going back to the headers.
+    if emission.default_arg_count > 0 {
+        let _ = writeln!(
+            out,
+            "{indent}/// In C++, the trailing {n} parameter{s} of this method \
+             {has} default value{s} — pass any value of the right type when calling \
+             from Rust. (M18 v0: the importer surfaces the count as a hint; per-arity \
+             convenience wrappers are tracked as M18.b.)",
+            n = emission.default_arg_count,
+            s = if emission.default_arg_count == 1 { "" } else { "s" },
+            has = if emission.default_arg_count == 1 { "has a" } else { "have" },
+        );
+    }
     match emission.kind {
         EmissionKind::Ctor => {
             // Wrapper for ctors: allocate a stack temp, call the

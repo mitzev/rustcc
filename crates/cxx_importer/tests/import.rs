@@ -2442,6 +2442,91 @@ fn m17_alias_to_unsupported_type_is_skipped_not_fatal() {
 }
 
 // ============================================================
+// M18: default-argument detection (count-only v0). Per-arity
+// convenience wrappers are tracked as M18.b.
+// ============================================================
+
+#[test]
+fn m18_records_trailing_default_arg_count_per_method() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // - `redraw(int)` has zero defaults.
+    // - `set(int, int = 1)` has one trailing default.
+    // - `paint(int = 0, int = 0)` has two trailing defaults.
+    // - `mid(int, int = 5, int)` is illegal C++ — defaults
+    //   must occupy a contiguous tail. The compiler rejects
+    //   it, so we don't try to test that path.
+    let header = temp_header(
+        "struct W {\n  void redraw(int delay);\n  void set(int a, int b = 1);\n  void paint(int x = 0, int y = 0);\n};\n",
+        "m18_default_arg_counts",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let class_id = class_ids[0];
+
+    // Look up methods by source name.
+    let class = ctx.class(class_id);
+    let idx_of = |name: &str| {
+        class
+            .methods
+            .iter()
+            .position(|m| m.name.ident_name() == Some(name))
+            .unwrap_or_else(|| panic!("method `{name}` not found"))
+    };
+
+    assert_eq!(ctx.default_arg_count(class_id, idx_of("redraw")), 0);
+    assert_eq!(ctx.default_arg_count(class_id, idx_of("set")), 1);
+    assert_eq!(ctx.default_arg_count(class_id, idx_of("paint")), 2);
+
+    cleanup(&header);
+}
+
+#[test]
+fn m18_emits_doc_comment_when_method_has_default_args() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void paint(int x = 0, int y = 0);\n  void plain(int z);\n};\n",
+        "m18_emits_doc",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // The two-default `paint` method gets a doc comment hint.
+    assert!(
+        src.contains("trailing 2 parameters") && src.contains("M18"),
+        "paint should carry M18 doc comment; got:\n{src}",
+    );
+    // The plain method (no defaults) does not — only one method
+    // should carry the M18 hint in this header.
+    let m18_count = src.matches("(M18 v0:").count();
+    assert_eq!(
+        m18_count, 1,
+        "exactly one method should carry the M18 hint; got {m18_count} in:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+// ============================================================
 // M15: function pointer types — `void (*)(int)` lowering and
 // emission. Closure-as-callback `CxxCallback<F>` runtime helper
 // lives in `crates/cxx/src/callback.rs` and is exercised by its
