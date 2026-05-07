@@ -2440,6 +2440,138 @@ fn m17_alias_to_unsupported_type_is_skipped_not_fatal() {
 }
 
 // ============================================================
+// M19: CxxBase<T> upcast emission for non-virtual inheritance.
+// ============================================================
+// Each derived class gets one `impl ::cxx::CxxBase<Base> for
+// Derived` per non-virtual base, with the offset baked in
+// using the layout engine's `base_offsets` table. Single
+// inheritance with offset 0 elides the `add(0)` for clarity;
+// non-zero offsets (multi-inheritance) keep the explicit
+// pointer arithmetic.
+
+#[test]
+fn m19_emits_upcast_impl_for_single_non_virtual_base() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Base { int a; };\n\
+         struct Derived : public Base { int b; };\n",
+        "m19_single_inheritance",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("impl ::cxx::CxxBase<Base> for Derived"),
+        "Derived should impl CxxBase<Base>; got:\n{src}",
+    );
+    assert!(
+        src.contains("fn upcast(&self) -> &Base"),
+        "upcast signature missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("fn upcast_mut(&mut self) -> &mut Base"),
+        "upcast_mut signature missing; got:\n{src}",
+    );
+    // Offset-0 path elides .add(0).
+    assert!(
+        !src.contains(".add(0)"),
+        "offset-0 upcast should elide `.add(0)` for readability; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m19_emits_upcast_impl_per_non_virtual_base_in_multi_inheritance() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct A { int x; };\n\
+         struct B { int y; };\n\
+         struct C : public A, public B { int z; };\n",
+        "m19_multi_inheritance",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("impl ::cxx::CxxBase<A> for C"),
+        "C should impl CxxBase<A>; got:\n{src}",
+    );
+    assert!(
+        src.contains("impl ::cxx::CxxBase<B> for C"),
+        "C should impl CxxBase<B>; got:\n{src}",
+    );
+    // The B base sits past A in the layout — non-zero offset.
+    assert!(
+        src.contains(".add(4)") || src.contains(".add(8)"),
+        "second base should use a pointer-add for its non-zero offset; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m19_skips_upcast_for_virtual_base() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // Virtual inheritance — base offset is dynamic via vtable.
+    // M19 v0 skips these; M22 picks them up.
+    let header = temp_header(
+        "struct Base { int a; };\n\
+         struct Derived : public virtual Base { int b; };\n",
+        "m19_virtual_base_skipped",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        !src.contains("impl ::cxx::CxxBase<Base> for Derived"),
+        "virtual-base upcast should be skipped in M19 v0; got:\n{src}",
+    );
+}
+
+// ============================================================
 // M21: bitfield-aware layout — probe-first behavior.
 // ============================================================
 //

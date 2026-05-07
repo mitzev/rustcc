@@ -940,6 +940,128 @@ fn render_direct_extern_class(
         let _ = writeln!(block, "{indent}}}");
     }
 
+    // 4.b: M19 — `CxxBase<Base>` upcast impls for every non-virtual
+    // base. Virtual bases are deferred to M22 (their offset is
+    // dynamic via the vtable; the emission shape is different).
+    // Poisoned bases are skipped — there's no Rust type to refer
+    // to. Multiple non-virtual bases each get their own impl.
+    if let Ok(layout) = ctx.layout(class_id) {
+        for base_spec in &class.bases {
+            if base_spec.virtual_ {
+                continue;
+            }
+            if ctx.is_poisoned(base_spec.class) {
+                continue;
+            }
+            let base = ctx.class(base_spec.class);
+            let base_name = match ident_of_class(base) {
+                Some(n) => n,
+                None => continue,
+            };
+            // Find the offset libclang/Itanium computed for this
+            // base. base_offsets is keyed by ClassId so we can
+            // index directly.
+            let offset = layout
+                .base_offsets
+                .iter()
+                .find_map(|(bid, off)| (*bid == base_spec.class).then_some(*off));
+            let offset = match offset {
+                Some(o) => o,
+                None => continue,
+            };
+            let _ = writeln!(block);
+            let _ = writeln!(
+                block,
+                "{indent}// M19: derived-to-base upcast (non-virtual, offset = {offset}).",
+            );
+            let _ = writeln!(
+                block,
+                "{indent}impl ::cxx::CxxBase<{base_name}> for {class_name} {{",
+            );
+            // For zero-offset bases (the common single-inheritance
+            // case) elide the `add(0)` for readability. The
+            // semantics are identical.
+            if offset == 0 {
+                let _ = writeln!(
+                    block,
+                    "{indent}    fn upcast(&self) -> &{base_name} {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        // SAFETY: primary base subobject sits at offset 0",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        //   per Itanium ABI; the cast is purely a type adjustment.",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{ &*(self as *const Self as *const {base_name}) }}",
+                );
+                let _ = writeln!(block, "{indent}    }}");
+                let _ = writeln!(
+                    block,
+                    "{indent}    fn upcast_mut(&mut self) -> &mut {base_name} {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        // SAFETY: same reasoning as upcast().",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{ &mut *(self as *mut Self as *mut {base_name}) }}",
+                );
+                let _ = writeln!(block, "{indent}    }}");
+            } else {
+                let _ = writeln!(
+                    block,
+                    "{indent}    fn upcast(&self) -> &{base_name} {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        // SAFETY: base subobject offset pinned by Itanium layout.",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}            let p = (self as *const Self as *const u8).add({offset});",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}            &*(p as *const {base_name})",
+                );
+                let _ = writeln!(block, "{indent}        }}");
+                let _ = writeln!(block, "{indent}    }}");
+                let _ = writeln!(
+                    block,
+                    "{indent}    fn upcast_mut(&mut self) -> &mut {base_name} {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        // SAFETY: same reasoning as upcast().",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}            let p = (self as *mut Self as *mut u8).add({offset});",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}            &mut *(p as *mut {base_name})",
+                );
+                let _ = writeln!(block, "{indent}        }}");
+                let _ = writeln!(block, "{indent}    }}");
+            }
+            let _ = writeln!(block, "{indent}}}");
+        }
+    }
+
     // Sanity check: more than one ctor would need disambiguator suffixes
     // on the wrapper names. v0 supports a single ctor per class.
     if ctor_seen > 1 {
