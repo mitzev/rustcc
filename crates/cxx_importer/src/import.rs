@@ -17,17 +17,23 @@
 //!   `pl`, `ix`, …), conversion functions (`operator T()`).
 //! - **Templates**: explicit class-template specializations (`vector<int>`).
 //!
-//! Self-doc gaps (still open, smaller now):
+//! Self-doc gaps (open follow-ups, smaller still):
 //!
-//! - `noexcept`, ref-qualifiers (`&` / `&&`), and variadics in
-//!   `FnSig` are extracted as defaults today (`false`, `None`,
-//!   `false`). Scheduled in the polish pass that lands alongside
-//!   this revision of the docs.
-//! - Vtable indices are computed at layout time inside
-//!   `rustc_abi_cxx::vtable`, not propagated back into per-method
-//!   `MethodDef::vtable_index`. The mangler / dispatcher reads the
-//!   index out of the layout query, so this is a metadata gap, not
-//!   a correctness one.
+//! - Annotations engine (`[[rustcc::*]]` inline + sidecar YAML).
+//!   The schema and consumer types are defined in
+//!   `crates/cxx_importer/src/annotations.rs`, but no clang-side
+//!   walker reads `[[clang::annotate(...)]]` cursors during import
+//!   yet. Tracked for a follow-up release.
+//! - Pure virtuals: `populate_vtable_indices` skips them in v0
+//!   because their slot target is the shared `__cxa_pure_virtual`
+//!   symbol and `MethodId`-based disambiguation conflicts with
+//!   the importer's eager method-vector clones. The bindings
+//!   emitter rejects pure virtuals with a clear error.
+//! - Multi-inheritance / virtual-base classes whose primary
+//!   subobject doesn't sit at offset 0 — `populate_vtable_indices`
+//!   walks the primary sub-table only, so secondary vtables
+//!   aren't reflected in `MethodDef::vtable_index`. The
+//!   single-inheritance case (the common one) works today.
 //! - Uninstantiated templates (`CXCursor_ClassTemplate`) are
 //!   skipped. Sidecar-driven explicit instantiation lands later.
 //!
