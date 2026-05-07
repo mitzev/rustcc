@@ -58,7 +58,7 @@ use rustc_abi_cxx::{
 };
 
 use crate::annotations::{Annotation, AnnotationSet};
-use crate::diagnostics::ImportError;
+use crate::diagnostics::{ImportError, SourceSpan};
 
 pub fn import_header(
     source: &Path,
@@ -349,6 +349,46 @@ impl<'a> Importer<'a> {
         self.annotations
     }
 
+    /// Register a poison node for an entity whose lowering failed
+    /// recoverably. Returns the [`ClassId`] consumers should refer
+    /// to — the class definition is empty (no fields, no methods,
+    /// no bases), and `ctx.is_poisoned(id)` returns `true` so the
+    /// bindings emitter can render an opaque struct with a doc
+    /// comment carrying `reason`.
+    fn poison_class(
+        &mut self,
+        entity: &Entity<'_>,
+        name: NestedName,
+        reason: String,
+    ) -> ClassId {
+        let placeholder = ClassDef {
+            name,
+            bases: Vec::new(),
+            fields: Vec::new(),
+            methods: Vec::new(),
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        };
+        let id = self.ctx.define_class(placeholder);
+        // Attach a span-augmented reason if the entity has a
+        // location. The `ctx.poison` side-table stores reason
+        // strings; we prefix with the C++ source location when
+        // available.
+        let reason_with_span = match span_of_entity(entity) {
+            Some(span) => format!("{span}: {reason}"),
+            None => reason,
+        };
+        self.ctx.poison(id, reason_with_span);
+        // Keep USR-cache consistency so subsequent references to
+        // the same forward-decl don't re-mint another poison node.
+        if let Some(usr) = entity.get_usr() {
+            self.classes.insert(usr.0, id);
+        }
+        id
+    }
+
     fn import_class(
         &mut self,
         entity: &Entity<'_>,
@@ -368,10 +408,21 @@ impl<'a> Importer<'a> {
         let entity = &entity;
 
         if !entity.is_definition() {
-            return Err(ImportError::UnsupportedFeature {
-                what: "forward-declared class without definition",
-                where_: entity.get_name().unwrap_or_default(),
-            });
+            // Forward-only declaration. Mint a poison node and
+            // carry on — downstream consumers see an opaque type
+            // with a doc-comment reason rather than a hard error
+            // that aborts the whole import. (M9: error recovery
+            // via poison nodes per `docs/cxx_importer.md §11`.)
+            let name = entity.get_name().unwrap_or_default();
+            return Ok(self.poison_class(
+                entity,
+                NestedName(vec![NameSegment::Class(Ident(name.clone()))]),
+                format!(
+                    "forward-declared class without definition: `{name}`. \
+                     Provide the full declaration in a header passed to \
+                     `Driver::parse_all` or in a sidecar `instantiate(...)` directive.",
+                ),
+            ));
         }
 
         let kind = match entity.get_kind() {
@@ -443,6 +494,7 @@ impl<'a> Importer<'a> {
                     ImportError::UnsupportedFeature {
                         what: "field without type",
                         where_: format!("{name}::{fname}"),
+                        span: None,
                     }
                 })?;
                 let fty = fty.get_canonical_type();
@@ -543,6 +595,8 @@ impl<'a> Importer<'a> {
                     ImportError::UnsupportedFeature {
                         what: "param without type",
                         where_: ctx_where.clone(),
+                    span: None,
+                
                     }
                 })?;
                 params.push(self.import_type(pty, &ctx_where)?);
@@ -561,6 +615,8 @@ impl<'a> Importer<'a> {
                     ImportError::UnsupportedFeature {
                         what: "method without return type",
                         where_: ctx_where.clone(),
+                    span: None,
+                
                     }
                 })?;
                 self.import_type(r, &ctx_where)?
@@ -686,12 +742,16 @@ impl<'a> Importer<'a> {
             ImportError::UnsupportedFeature {
                 what: "base specifier without type",
                 where_: parent_name.to_string(),
+                    span: None,
+                
             }
         })?;
         let base_decl = base_type.get_declaration().ok_or_else(|| {
             ImportError::UnsupportedFeature {
                 what: "base specifier resolves to a type without a declaration",
                 where_: parent_name.to_string(),
+                    span: None,
+                
             }
         })?;
         let class_id = self.import_class(&base_decl)?;
@@ -777,6 +837,8 @@ impl<'a> Importer<'a> {
             let ty = arg.ok_or_else(|| ImportError::UnsupportedFeature {
                 what: "non-type template argument",
                 where_: parent_name.to_string(),
+                    span: None,
+                
             })?;
             let id = self.import_type(ty, parent_name)?;
             out.push(TemplateArg::Type(id));
@@ -817,6 +879,8 @@ impl<'a> Importer<'a> {
                     ImportError::UnsupportedFeature {
                         what: "pointer with no pointee",
                         where_: where_.to_string(),
+                    span: None,
+                
                     }
                 })?;
                 let id = self.import_type(pointee, where_)?;
@@ -830,6 +894,8 @@ impl<'a> Importer<'a> {
                     ImportError::UnsupportedFeature {
                         what: "reference with no pointee",
                         where_: where_.to_string(),
+                    span: None,
+                
                     }
                 })?;
                 let id = self.import_type(pointee, where_)?;
@@ -844,6 +910,8 @@ impl<'a> Importer<'a> {
                     ImportError::UnsupportedFeature {
                         what: "rvalue ref with no pointee",
                         where_: where_.to_string(),
+                    span: None,
+                
                     }
                 })?;
                 let id = self.import_type(pointee, where_)?;
@@ -858,6 +926,8 @@ impl<'a> Importer<'a> {
                     ImportError::UnsupportedFeature {
                         what: "record type without declaration",
                         where_: where_.to_string(),
+                    span: None,
+                
                     }
                 })?;
                 let class_id = self.import_class(&decl)?;
@@ -868,6 +938,8 @@ impl<'a> Importer<'a> {
                     ImportError::UnsupportedFeature {
                         what: "enum type without declaration",
                         where_: where_.to_string(),
+                    span: None,
+                
                     }
                 })?;
                 let name = NestedName(self.build_nested_path(&decl)?);
@@ -877,6 +949,8 @@ impl<'a> Importer<'a> {
                         ImportError::UnsupportedFeature {
                             what: "enum without underlying type",
                             where_: where_.to_string(),
+                    span: None,
+                
                         }
                     })?;
                 let underlying_id = self.import_type(underlying, where_)?;
@@ -900,12 +974,16 @@ impl<'a> Importer<'a> {
                     ImportError::UnsupportedFeature {
                         what: "array without element type",
                         where_: where_.to_string(),
+                    span: None,
+                
                     }
                 })?;
                 let len = ty.get_size().ok_or_else(|| {
                     ImportError::UnsupportedFeature {
                         what: "array with unknown size",
                         where_: where_.to_string(),
+                    span: None,
+                
                     }
                 })?;
                 let elem_id = self.import_type(elem, where_)?;
@@ -918,6 +996,7 @@ impl<'a> Importer<'a> {
                 return Err(ImportError::UnsupportedFeature {
                     what: "unsupported clang type kind",
                     where_: format!("{where_}: {other:?}"),
+                    span: None,
                 });
             }
         };
@@ -1042,6 +1121,17 @@ fn class_has_virtual_base_chain(
 /// and its `name` is the file path. We stop the walk on either
 /// shape, plus on a missing semantic parent, so file paths never
 /// appear in the FQN.
+/// Capture the C++ source location of `entity` as a [`SourceSpan`].
+/// Returns `None` for synthetic / built-in cursors that don't have
+/// an owning file (those usually come from libclang's stdlib
+/// stubs and aren't useful in user-facing diagnostics anyway).
+pub(crate) fn span_of_entity(entity: &Entity<'_>) -> Option<SourceSpan> {
+    let loc = entity.get_location()?;
+    let file_loc = loc.get_file_location();
+    let path = file_loc.file?.get_path();
+    Some(SourceSpan::new(path, file_loc.line, file_loc.column))
+}
+
 fn entity_fqn(entity: &Entity<'_>) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut cur = Some(*entity);

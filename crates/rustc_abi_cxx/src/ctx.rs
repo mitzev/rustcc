@@ -2,6 +2,8 @@
 //!
 //! See `docs/rustc_abi_cxx.md §4`.
 
+use std::collections::HashMap;
+
 use crate::target::Target;
 use crate::ty::{
     ClassDef, ClassId, CxxType, RustEnumDef, RustEnumId, TypeId, TypeOrigin,
@@ -16,6 +18,13 @@ pub struct CxxTypeCtx {
     /// unchanged; origins flow through the `define_*` API on this
     /// context.
     class_origin: Vec<TypeOrigin>,
+    /// Side-table marking poisoned classes — entries minted from a
+    /// failed-but-recoverable lowering. The map's value is a human-
+    /// readable explanation (e.g. "virtual inheritance not
+    /// supported"). Same rationale as `class_origin`: keeping it off
+    /// `ClassDef` avoids touching the 70+ existing struct-literal
+    /// sites in tests and the importer.
+    poison_reason: HashMap<ClassId, String>,
     /// Rust-origin enums exposed to C++ as scoped enums. No parallel
     /// for C++-origin enums yet — imported enums flow as anonymous
     /// `CxxType::Enum` instances with the variants living in the
@@ -30,9 +39,33 @@ impl CxxTypeCtx {
             target,
             classes: Vec::new(),
             class_origin: Vec::new(),
+            poison_reason: HashMap::new(),
             rust_enums: Vec::new(),
             types: Vec::new(),
         }
+    }
+
+    /// Mark `id` as a poison node and record `reason` for later
+    /// diagnostic rendering. Idempotent — overwriting a previously-
+    /// recorded reason is intentional (the most recent failure
+    /// wins; the importer typically only marks each class once).
+    pub fn poison(&mut self, id: ClassId, reason: impl Into<String>) {
+        self.poison_reason.insert(id, reason.into());
+    }
+
+    /// Return the poison reason recorded on `id`, or `None` if the
+    /// class is healthy. Used by [`Self::is_poisoned`] and by
+    /// downstream emitters that include the reason in generated
+    /// doc comments.
+    pub fn poison_reason(&self, id: ClassId) -> Option<&str> {
+        self.poison_reason.get(&id).map(String::as_str)
+    }
+
+    /// True when the importer registered `id` via [`Self::poison`].
+    /// Poisoned classes have empty `methods` / `fields` and should
+    /// be rendered opaquely by emitters.
+    pub fn is_poisoned(&self, id: ClassId) -> bool {
+        self.poison_reason.contains_key(&id)
     }
 
     /// Register a Rust-origin enum for C++ exposure. Returns the
