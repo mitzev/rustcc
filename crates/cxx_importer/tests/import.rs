@@ -2442,6 +2442,122 @@ fn m17_alias_to_unsupported_type_is_skipped_not_fatal() {
 }
 
 // ============================================================
+// M20: configurable `const char*` → `*const c_char` ergonomics.
+// Default-off (preserves prior emission); opt-in via
+// `RustBindingsConfig::cstr_ergonomics`.
+// ============================================================
+
+#[test]
+fn m20_default_emission_keeps_pointer_to_i8_for_const_char() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* s);\n};\n",
+        "m20_default_off",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("arg0: *const i8") || src.contains("arg0: *const u8"),
+        "default-off should preserve the i8/u8 pointer rendering; got:\n{src}",
+    );
+    assert!(
+        !src.contains("c_char"),
+        "default-off should not reference c_char; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20_opt_in_renders_char_ptr_as_c_char() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* s);\n  const char* name();\n};\n",
+        "m20_opt_in_on",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("arg0: *const ::core::ffi::c_char"),
+        "param should render as `*const c_char`; got:\n{src}",
+    );
+    assert!(
+        src.contains("-> *const ::core::ffi::c_char"),
+        "return should render as `*const c_char`; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20_opt_in_does_not_touch_non_byte_pointers() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void take_int_ptr(const int* p);\n  void take_widget(W* p);\n};\n",
+        "m20_other_pointers_untouched",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("*const i32") || src.contains("arg0: *const i32"),
+        "int pointers should keep i32 rendering; got:\n{src}",
+    );
+    assert!(
+        src.contains("*mut W"),
+        "record pointers should keep their record name; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+// ============================================================
 // M18: default-argument detection (count-only v0). Per-arity
 // convenience wrappers are tracked as M18.b.
 // ============================================================

@@ -177,6 +177,14 @@ pub struct RustBindingsConfig {
     /// `__cxx_<class>_delete` thunks regardless, so users can
     /// also implement their own heap wrapper if they prefer.
     pub emit_heap_alloc: bool,
+    /// M20: render `char *` / `const char *` parameter and return
+    /// types as `*[const|mut] ::core::ffi::c_char` instead of the
+    /// width-based default (`*const i8` / `*const u8`). Pairs
+    /// natively with `core::ffi::CStr::as_ptr() -> *const c_char`,
+    /// so callers building C strings from Rust don't need to cast.
+    /// Off by default — preserving the prior emission shape — and
+    /// opt-in via this knob. See `docs/cxx_importer.md §16 / M20`.
+    pub cstr_ergonomics: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -869,6 +877,7 @@ fn render_direct_extern_class(
             method,
             method_idx,
             resolved_name,
+            config,
         )?;
         if matches!(emission.kind, EmissionKind::Dtor) {
             has_user_dtor = true;
@@ -1406,18 +1415,27 @@ fn classify_for_direct_extern(
     method: &MethodDef,
     method_idx: usize,
     resolved_rust_name: &str,
+    config: &RustBindingsConfig,
 ) -> Result<MethodEmission, BindingsError> {
     let arity = method.sig.params.len();
+    // M20: opt-in `c_char` rendering for `char *` / `const char *`.
+    // The `extern_decl_params` keep the default rendering so the
+    // mangled-symbol wrapper matches what the C++ side produced;
+    // only the user-facing wrapper params + return type swap.
+    let user_opts = TypeRenderOpts {
+        cstr_ergonomics: config.cstr_ergonomics,
+    };
 
     // Build user-arg decls + forward expressions. These are shared
     // across method shapes (the `this` slot is added separately).
     let mut user_arg_decls = Vec::with_capacity(arity);
     let mut user_forward = Vec::with_capacity(arity);
     for (i, &ty_id) in method.sig.params.iter().enumerate() {
-        let rust_ty = render_rust_type(
+        let rust_ty = render_rust_type_with_opts(
             ctx,
             ty_id,
             &format!("{class_name}::{:?} param {i}", method.name),
+            &user_opts,
         )?;
         user_arg_decls.push(format!("arg{i}: {rust_ty}"));
         user_forward.push(format!("arg{i}"));
@@ -1503,8 +1521,17 @@ fn classify_for_direct_extern(
 
     // Render return type for both extern + wrapper. C++ `void` →
     // Rust `()`, surfaced in the wrapper as no return clause.
-    let ret_rust =
-        render_rust_type(ctx, method.sig.ret, &format!("{class_name}::{method_name} return"))?;
+    // The cstr-ergonomics swap (M20) is layout-identical with
+    // the default `*const i8` rendering, so we let it propagate
+    // to both the extern decl and the user-facing wrapper —
+    // consistent typing across the boundary, no casts on either
+    // side.
+    let ret_rust = render_rust_type_with_opts(
+        ctx,
+        method.sig.ret,
+        &format!("{class_name}::{method_name} return"),
+        &user_opts,
+    )?;
 
     let extern_ret_clause = if ret_rust == "()" {
         String::new()
@@ -1998,6 +2025,32 @@ fn render_rust_type(
     ty: TypeId,
     where_: &str,
 ) -> Result<String, BindingsError> {
+    render_rust_type_with_opts(ctx, ty, where_, &TypeRenderOpts::default())
+}
+
+/// Per-call rendering knobs. Default reproduces the v0 emission;
+/// opt-in flags adjust specific cases for ergonomics.
+#[derive(Clone, Copy, Default)]
+struct TypeRenderOpts {
+    /// M20: when set, `char *` / `const char *` (i.e. `*[const|mut]
+    /// i8` and `*[const|mut] u8`) render as `*[const|mut]
+    /// ::core::ffi::c_char` so callers can pass `CStr::as_ptr()`
+    /// directly without casting. Aggressive — also rewrites
+    /// non-string single-byte pointer types — but that's the
+    /// trade-off the caller opted into via
+    /// `RustBindingsConfig::cstr_ergonomics`.
+    cstr_ergonomics: bool,
+}
+
+fn render_rust_type_with_opts(
+    ctx: &CxxTypeCtx,
+    ty: TypeId,
+    where_: &str,
+    opts: &TypeRenderOpts,
+) -> Result<String, BindingsError> {
+    // M20 fast-path: at the top of every pointer node we may swap
+    // the rendered pointee for `c_char`. The actual replacement
+    // happens inside the Ptr / Ref arms below.
     Ok(match ctx.type_of(ty) {
         CxxType::Void => "()".into(),
         CxxType::Bool => "bool".into(),
@@ -2013,7 +2066,11 @@ fn render_rust_type(
             }
         },
         CxxType::Ptr { pointee, cv } => {
-            let inner = render_rust_type(ctx, *pointee, where_)?;
+            let inner = if opts.cstr_ergonomics && is_byte_int(ctx, *pointee) {
+                "::core::ffi::c_char".to_string()
+            } else {
+                render_rust_type_with_opts(ctx, *pointee, where_, opts)?
+            };
             if cv.is_const {
                 format!("*const {inner}")
             } else {
@@ -2026,7 +2083,11 @@ fn render_rust_type(
             // later — until then we don't have the lifetime info to
             // promote to `&T` / `&mut T` safely).
             let _ = kind; // RefKind::LValue / RValue both lower the same.
-            let inner = render_rust_type(ctx, *pointee, where_)?;
+            let inner = if opts.cstr_ergonomics && is_byte_int(ctx, *pointee) {
+                "::core::ffi::c_char".to_string()
+            } else {
+                render_rust_type_with_opts(ctx, *pointee, where_, opts)?
+            };
             if cv.is_const {
                 format!("*const {inner}")
             } else {
@@ -2189,6 +2250,17 @@ fn render_enum_discriminant(value: i64, signed: bool) -> String {
         let as_u64 = value as u64;
         format!("{as_u64}")
     }
+}
+
+/// True when `ty` is an 8-bit integer (`signed char` / `unsigned
+/// char` / `char`). Used by M20's cstr-ergonomics renderer to
+/// decide whether a pointer's pointee should swap to
+/// `::core::ffi::c_char`.
+fn is_byte_int(ctx: &CxxTypeCtx, ty: TypeId) -> bool {
+    matches!(
+        ctx.type_of(ty),
+        CxxType::Int { width: IntWidth::I8, .. },
+    )
 }
 
 fn int_rust(signed: bool, width: IntWidth) -> &'static str {
