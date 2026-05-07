@@ -57,8 +57,10 @@ use rustc_abi_cxx::{
     Symbol, TemplateArg, TypeId, VTableEntry, Virtuality,
 };
 
+use crate::aliases::{AliasSet, TypeAlias};
 use crate::annotations::{Annotation, AnnotationSet};
 use crate::diagnostics::{ImportError, SourceSpan};
+use crate::enums::{CxxEnumDef, CxxEnumVariant, EnumSet};
 
 pub fn import_header(
     source: &Path,
@@ -82,21 +84,87 @@ pub fn import_header_with_annotations(
 ) -> Result<(Vec<ClassId>, AnnotationSet), ImportError> {
     let mut cache = HashMap::new();
     let mut set = AnnotationSet::default();
-    let ids = import_header_full(source, args, ctx, &mut cache, &mut set)?;
+    let mut aliases = AliasSet::default();
+    let mut enums = EnumSet::default();
+    let ids = import_header_full(
+        source,
+        args,
+        ctx,
+        &mut cache,
+        &mut set,
+        &mut aliases,
+        &mut enums,
+    )?;
+    let _ = (aliases, enums); // discard — caller wanted only annotations.
     Ok((ids, set))
 }
 
+/// Bundle of per-import side-tables produced alongside the class list.
+///
+/// Returned by [`import_header_with_extras`]. Each field corresponds to
+/// a side-channel that the importer harvests in addition to the bare
+/// class graph:
+///
+/// - `annotations` — `[[clang::annotate("rustcc::…")]]` markup
+///   parsed off classes and methods (M6).
+/// - `aliases` — `typedef` / `using` declarations at TU/namespace
+///   scope (M17).
+/// - `enums` — `enum` / `enum class` definitions at TU/namespace
+///   scope, including variant lists (M16).
+#[derive(Default, Clone, Debug)]
+pub struct ImportExtras {
+    pub annotations: AnnotationSet,
+    pub aliases: AliasSet,
+    pub enums: EnumSet,
+}
+
+/// One-shot import that returns every side-table the importer can
+/// produce. Use this when you want bindings emitted with full
+/// fidelity (annotations + aliases + enum bodies).
+pub fn import_header_with_extras(
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+) -> Result<(Vec<ClassId>, ImportExtras), ImportError> {
+    let mut cache = HashMap::new();
+    let mut annotations = AnnotationSet::default();
+    let mut aliases = AliasSet::default();
+    let mut enums = EnumSet::default();
+    let ids = import_header_full(
+        source,
+        args,
+        ctx,
+        &mut cache,
+        &mut annotations,
+        &mut aliases,
+        &mut enums,
+    )?;
+    Ok((
+        ids,
+        ImportExtras {
+            annotations,
+            aliases,
+            enums,
+        },
+    ))
+}
+
 /// Internal entry point used by [`Driver::parse_all`] to share its
-/// USR cache and accumulate annotations across multiple header
-/// roots in a single pass.
+/// USR cache and accumulate annotations + aliases across multiple
+/// header roots in a single pass.
 pub(crate) fn import_header_full(
     source: &Path,
     args: &[&str],
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
     annotations: &mut AnnotationSet,
+    aliases: &mut AliasSet,
+    enums: &mut EnumSet,
 ) -> Result<Vec<ClassId>, ImportError> {
-    let ids = import_header_with_cache(source, args, ctx, cache)?;
+    let (ids, captured_aliases, captured_enums) =
+        import_header_with_cache_and_aliases(source, args, ctx, cache)?;
+    aliases.entries.extend(captured_aliases);
+    enums.entries.extend(captured_enums);
     // The cache-and-annotations collection is currently re-derived
     // by re-running the importer when the caller wants annotations;
     // a follow-up release can plumb annotations through the
@@ -182,6 +250,27 @@ pub(crate) fn import_header_with_cache(
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
 ) -> Result<Vec<ClassId>, ImportError> {
+    // Aliases + enums are silently dropped on this back-compat
+    // entry point. Callers that want them call
+    // `import_header_with_cache_and_aliases` (or the public
+    // `import_header_with_extras` wrapper) directly.
+    let (ids, _aliases, _enums) =
+        import_header_with_cache_and_aliases(source, args, ctx, cache)?;
+    Ok(ids)
+}
+
+/// Same as [`import_header_with_cache`], but also returns the
+/// list of TU/namespace-scope `typedef` / `using` aliases (M17)
+/// and `enum` / `enum class` definitions (M16) harvested from the
+/// same parse. Internal because the public face for this is
+/// [`import_header_with_extras`] (which bundles all the
+/// side-tables together with annotations).
+pub(crate) fn import_header_with_cache_and_aliases(
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+    cache: &mut HashMap<String, ClassId>,
+) -> Result<(Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>), ImportError> {
     let clang = Clang::new().map_err(|e| ImportError::ClangDiagnostic {
         file: source.display().to_string(),
         line: 0,
@@ -204,7 +293,8 @@ pub(crate) fn import_header_with_cache(
         std::collections::HashSet::new();
 
     // First pass: import all class/struct/union definitions reachable
-    // from the TU, recursing into namespaces.
+    // from the TU, recursing into namespaces. Also captures
+    // TU/namespace-scope `typedef` / `using` aliases (M17).
     for child in tu.get_entity().get_children() {
         walk_top_level(&child, &mut importer, &mut imported, &mut seen)?;
     }
@@ -221,9 +311,12 @@ pub(crate) fn import_header_with_cache(
     attach_methods_recursively(tu.get_entity(), &mut importer)?;
 
     // Hand the accumulated USR map back to the caller so the next
-    // `import_header_with_cache` call can dedup against it.
+    // import call can dedup against it. Drain aliases + enums at
+    // the same time so they ride out alongside the class list.
+    let aliases = std::mem::take(&mut importer.aliases);
+    let enums = std::mem::take(&mut importer.enums);
     *cache = importer.into_cache();
-    Ok(imported)
+    Ok((imported, aliases, enums))
 }
 
 fn attach_methods_recursively(
@@ -282,10 +375,21 @@ fn attach_methods_recursively(
             // the push so we can capture the final method index.
             let is_static = matches!(method_entity.get_kind(), EntityKind::Method)
                 && method_entity.is_static_method();
+            // M18: capture the trailing-default-arg count from
+            // `lower_method`'s scratch slot before any further
+            // call clobbers it.
+            let default_count = importer.last_method_default_count;
             let method_idx = importer.ctx.class(class_id).methods.len();
             importer.ctx.class_mut(class_id).methods.push(method);
             if is_static {
                 importer.ctx.mark_method_static(class_id, method_idx);
+            }
+            if default_count > 0 {
+                importer.ctx.record_default_arg_count(
+                    class_id,
+                    method_idx,
+                    default_count,
+                );
             }
         }
     }
@@ -318,6 +422,50 @@ fn walk_top_level(
                 }
             }
         }
+        // M16: capture `enum`, `enum class`, `enum struct` at
+        // TU/namespace scope. Same parent-scope filter as
+        // aliases — class-scope enums are deferred.
+        EntityKind::EnumDecl => {
+            let parent_kind = entity
+                .get_semantic_parent()
+                .map(|p| p.get_kind());
+            let at_ns_scope = matches!(
+                parent_kind,
+                Some(EntityKind::Namespace)
+                    | Some(EntityKind::TranslationUnit)
+                    | Some(EntityKind::NotImplemented)
+                    | None
+            );
+            if at_ns_scope {
+                let _ = importer.collect_enum(entity);
+            }
+        }
+        // M17: capture C++ `typedef T U;` and `using U = T;` at
+        // TU/namespace scope. Failures are non-fatal — aliases
+        // are emit-only ergonomics, so a target type we can't
+        // import (e.g. a templated stdlib helper) just gets
+        // skipped instead of poisoning the whole TU.
+        EntityKind::TypedefDecl | EntityKind::TypeAliasDecl => {
+            // Class-scope aliases require associated-type emission
+            // we don't have yet; only namespace-scope aliases
+            // ride the v0 path. Anything whose semantic parent
+            // isn't a Namespace / TU / NotImplemented (the kind
+            // libclang reports for the TU root in some libclang
+            // builds) is dropped.
+            let parent_kind = entity
+                .get_semantic_parent()
+                .map(|p| p.get_kind());
+            let at_ns_scope = matches!(
+                parent_kind,
+                Some(EntityKind::Namespace)
+                    | Some(EntityKind::TranslationUnit)
+                    | Some(EntityKind::NotImplemented)
+                    | None
+            );
+            if at_ns_scope {
+                let _ = importer.collect_alias(entity);
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -333,6 +481,29 @@ struct Importer<'a> {
     /// from class + method entities, keyed by fully-qualified C++
     /// path (e.g. `ns::Foo`, `ns::Foo::bar`).
     annotations: HashMap<String, Vec<Annotation>>,
+    /// M17: type aliases captured at TU/namespace scope. Stored
+    /// in source-declaration order. Class-scope aliases are
+    /// deferred (see `aliases.rs` module docs).
+    aliases: Vec<TypeAlias>,
+    /// USR-keyed dedup for aliases. The same `using` declared
+    /// in a header included from two roots would otherwise emit
+    /// twice; libclang gives each a stable USR which we dedup
+    /// against here.
+    alias_usrs: std::collections::HashSet<String>,
+    /// M16: imported enum bodies (variants + scoped flag) at
+    /// TU/namespace scope. Class-scope enums are deferred for
+    /// the same reason as class-scope aliases.
+    enums: Vec<CxxEnumDef>,
+    /// USR-keyed dedup for enums. Same rationale as `alias_usrs`.
+    enum_usrs: std::collections::HashSet<String>,
+    /// M18: scratch slot — `lower_method` writes the count of
+    /// trailing default-argument parameters here as a side
+    /// effect, and the call sites read it after pushing the
+    /// returned `MethodDef` to record on the ctx side-table
+    /// keyed by `(class, method_idx)`. Reset to 0 on every
+    /// `lower_method` entry so a method without defaults
+    /// doesn't pick up the previous method's count.
+    last_method_default_count: usize,
 }
 
 impl<'a> Importer<'a> {
@@ -348,6 +519,11 @@ impl<'a> Importer<'a> {
             ctx,
             classes,
             annotations: HashMap::new(),
+            aliases: Vec::new(),
+            alias_usrs: std::collections::HashSet::new(),
+            enums: Vec::new(),
+            enum_usrs: std::collections::HashSet::new(),
+            last_method_default_count: 0,
         }
     }
 
@@ -357,6 +533,10 @@ impl<'a> Importer<'a> {
 
     fn into_annotations(self) -> HashMap<String, Vec<Annotation>> {
         self.annotations
+    }
+
+    fn into_aliases(self) -> Vec<TypeAlias> {
+        self.aliases
     }
 
     /// Register a poison node for an entity whose lowering failed
@@ -397,6 +577,158 @@ impl<'a> Importer<'a> {
             self.classes.insert(usr.0, id);
         }
         id
+    }
+
+    /// M17: harvest a `typedef`/`using` alias at TU or namespace
+    /// scope. Returns `Ok(())` whether or not the alias was
+    /// recorded — the only "errors" worth signaling here are
+    /// importer-level invariants, and target-type lookup failures
+    /// silently skip (aliases are emit-only ergonomics).
+    fn collect_alias(&mut self, entity: &Entity<'_>) -> Result<(), ImportError> {
+        // Skip duplicates: the same alias declaration in a
+        // header included from two roots otherwise emits twice.
+        if let Some(usr) = entity.get_usr() {
+            if !self.alias_usrs.insert(usr.0) {
+                return Ok(());
+            }
+        }
+        let name = match entity.get_name() {
+            Some(n) if !n.is_empty() => n,
+            _ => return Ok(()),
+        };
+        // libclang exposes the underlying type of a typedef-decl
+        // via `get_typedef_underlying_type`. For `TypeAliasDecl`
+        // (`using U = T;`) the same accessor returns the RHS.
+        let underlying = match entity.get_typedef_underlying_type() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let where_ = format!("alias `{name}`");
+        let target = match self.import_type(underlying, &where_) {
+            Ok(id) => id,
+            // Target type unsupported (e.g. references templated
+            // stdlib types). Drop the alias rather than failing
+            // the import — the user can re-add it by hand if
+            // needed.
+            Err(_) => return Ok(()),
+        };
+        // Walk semantic parents to build the namespace prefix.
+        // Stop at the first non-Namespace ancestor so class-scope
+        // aliases (which we already filtered upstream) and the
+        // TU root land with an empty prefix.
+        let mut parent_segments: Vec<NameSegment> = Vec::new();
+        let mut cur = entity.get_semantic_parent();
+        while let Some(e) = cur {
+            match e.get_kind() {
+                EntityKind::Namespace => {
+                    let pname = e.get_name().unwrap_or_default();
+                    if pname.is_empty() {
+                        parent_segments.push(NameSegment::AnonymousNamespace);
+                    } else {
+                        parent_segments
+                            .push(NameSegment::Namespace(Ident(pname)));
+                    }
+                }
+                _ => break,
+            }
+            cur = e.get_semantic_parent();
+        }
+        parent_segments.reverse();
+        self.aliases.push(TypeAlias {
+            parent: parent_segments,
+            name: Ident(name),
+            target,
+        });
+        Ok(())
+    }
+
+    /// M16: harvest a `enum class` / `enum struct` / plain `enum`
+    /// at TU or namespace scope. Returns `Ok(())` regardless of
+    /// outcome — failures (missing underlying type, anonymous
+    /// enum, …) silently skip just like aliases.
+    fn collect_enum(&mut self, entity: &Entity<'_>) -> Result<(), ImportError> {
+        // Forward declarations (`enum class Foo;`) carry no body.
+        // libclang reports them as definitions only after the body
+        // is seen, so this also dedups the case where the same
+        // enum appears in multiple TU roots.
+        if !entity.is_definition() {
+            return Ok(());
+        }
+        if let Some(usr) = entity.get_usr() {
+            if !self.enum_usrs.insert(usr.0) {
+                return Ok(());
+            }
+        }
+        let name = match entity.get_name() {
+            Some(n) if !n.is_empty() => n,
+            // Anonymous enums (`enum { Red, Green };`) — for v0
+            // we drop them; the variants leak as integer
+            // constants in the source but Rust has nowhere
+            // to hang them as a distinct named enum.
+            _ => return Ok(()),
+        };
+        let underlying_ty = match entity.get_enum_underlying_type() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let where_ = format!("enum `{name}`");
+        let underlying = match self.import_type(underlying_ty, &where_) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+        let scoped = entity.is_scoped();
+
+        // Walk children for `EnumConstantDecl`s. libclang exposes
+        // each variant as a child cursor; the order matches source
+        // order, which we want to preserve in emission.
+        let mut variants: Vec<CxxEnumVariant> = Vec::new();
+        for child in entity.get_children() {
+            if child.get_kind() != EntityKind::EnumConstantDecl {
+                continue;
+            }
+            let vname = match child.get_name() {
+                Some(n) => n,
+                None => continue,
+            };
+            let (signed, _unsigned) = match child.get_enum_constant_value() {
+                Some(pair) => pair,
+                None => continue,
+            };
+            variants.push(CxxEnumVariant {
+                name: vname,
+                value: signed,
+            });
+        }
+
+        // Build parent path: same shape as `collect_alias` —
+        // namespace ancestors only, in outer-to-inner order.
+        let mut parent_segments: Vec<NameSegment> = Vec::new();
+        let mut cur = entity.get_semantic_parent();
+        while let Some(e) = cur {
+            match e.get_kind() {
+                EntityKind::Namespace => {
+                    let pname = e.get_name().unwrap_or_default();
+                    if pname.is_empty() {
+                        parent_segments.push(NameSegment::AnonymousNamespace);
+                    } else {
+                        parent_segments
+                            .push(NameSegment::Namespace(Ident(pname)));
+                    }
+                }
+                _ => break,
+            }
+            cur = e.get_semantic_parent();
+        }
+        parent_segments.reverse();
+
+        self.enums.push(CxxEnumDef {
+            parent: parent_segments,
+            name: Ident(name),
+            underlying,
+            scoped,
+            variants,
+        });
+        Ok(())
     }
 
     fn import_class(
@@ -520,15 +852,52 @@ impl<'a> Importer<'a> {
         let mut fields = Vec::new();
         let mut methods = Vec::new();
         let mut pending_static_marks: Vec<usize> = Vec::new();
+        // M18: per-method (method_idx, default_count) pairs for
+        // recording on the ctx after the class body is assigned.
+        // Same deferral pattern as `pending_static_marks`.
+        let mut pending_default_arg_marks: Vec<(usize, usize)> = Vec::new();
 
         // Fields: prefer `Type::get_fields()` over `entity.get_children()`.
         // The former iterates through libclang's type-visitor which
         // returns instantiated fields even on template specializations,
         // whereas `get_children()` on a spec cursor sometimes comes back
         // empty.
+        //
+        // M21: detect bitfields up front. The current `rustc_abi_cxx`
+        // layout engine has no notion of bit-packing, so a struct
+        // with even one bitfield member would compute the wrong
+        // size / offsets — and silently mismatch the C++ side at
+        // runtime. Until proper Itanium bit-packing lands, we
+        // poison the whole class with a clear reason. Users see a
+        // doc-commented opaque struct instead of a layout that
+        // appears to work but corrupts the data.
         if let Some(field_entities) =
             entity.get_type().and_then(|t| t.get_fields())
         {
+            for child in &field_entities {
+                if child.is_bit_field() {
+                    let fname = child.get_name().unwrap_or_default();
+                    let width = child.get_bit_field_width().unwrap_or(0);
+                    let reason = format!(
+                        "bitfield member `{name}::{fname}` ({width}-bit) — \
+                         bitfield-aware layout (M21) is not yet implemented; \
+                         the class is exposed opaquely until support lands.",
+                    );
+                    // We've already registered the placeholder
+                    // ClassDef under `id` and inserted the USR into
+                    // `self.classes`. Poison the existing entry in
+                    // place rather than minting a fresh one — so
+                    // any earlier reference to `id` (recorded
+                    // before we discovered the bitfield) keeps
+                    // pointing at the same opaque type.
+                    let reason_with_span = match span_of_entity(entity) {
+                        Some(span) => format!("{span}: {reason}"),
+                        None => reason,
+                    };
+                    self.ctx.poison(id, reason_with_span);
+                    return Ok(id);
+                }
+            }
             for child in field_entities {
                 let fname = child.get_name().unwrap_or_default();
                 // On a template specialization, `child.get_type()` may
@@ -577,6 +946,10 @@ impl<'a> Importer<'a> {
                     // path.
                     let is_static = matches!(child.get_kind(), EntityKind::Method)
                         && child.is_static_method();
+                    // M18: capture before `lower_method` is called
+                    // again on the next sibling (which would clobber
+                    // the scratch slot).
+                    let default_count = self.last_method_default_count;
                     let method_idx = methods.len();
                     methods.push(m);
                     if is_static {
@@ -586,6 +959,10 @@ impl<'a> Importer<'a> {
                         // Indices captured now are stable because
                         // we only push in this loop.
                         pending_static_marks.push(method_idx);
+                    }
+                    if default_count > 0 {
+                        pending_default_arg_marks
+                            .push((method_idx, default_count));
                     }
                 }
                 _ => {
@@ -635,6 +1012,11 @@ impl<'a> Importer<'a> {
             self.ctx.mark_method_static(id, *idx);
         }
 
+        // M18: apply deferred default-arg counts.
+        for (idx, count) in &pending_default_arg_marks {
+            self.ctx.record_default_arg_count(id, *idx, *count);
+        }
+
         // M13: if this import call upgraded a previously-poisoned
         // entry (forward-only → full definition), clear the poison
         // marker now that the class has real fields / methods /
@@ -653,6 +1035,11 @@ impl<'a> Importer<'a> {
         parent_name: &str,
         enclosing_class: ClassId,
     ) -> Result<MethodDef, ImportError> {
+        // Reset the M18 scratch slot — every `lower_method` call
+        // sets it as a side effect, but we want a clean baseline
+        // so an early-error path doesn't carry over the previous
+        // method's count.
+        self.last_method_default_count = 0;
         let name = entity.get_name().unwrap_or_default();
         let kind = entity.get_kind();
         let ctx_where = format!("{parent_name}::{name}");
@@ -670,7 +1057,15 @@ impl<'a> Importer<'a> {
         }
 
         // Parameters come from ParmDecl children.
+        // M18: a ParmDecl with non-empty children carries a
+        // default-argument expression as one of those children
+        // (e.g. `IntegerLiteral`, `CXXBoolLiteralExpr`,
+        // `GNUNullExpr`, …). We don't resolve the value here —
+        // that requires constant-evaluation plumbing — but we
+        // record per-parameter "has-default" so the emitter can
+        // surface a doc comment listing optional trailing args.
         let mut params = Vec::new();
+        let mut has_default: Vec<bool> = Vec::new();
         for child in entity.get_children() {
             if child.get_kind() == EntityKind::ParmDecl {
                 let pty = child.get_type().ok_or_else(|| {
@@ -678,12 +1073,23 @@ impl<'a> Importer<'a> {
                         what: "param without type",
                         where_: ctx_where.clone(),
                     span: None,
-                
+
                     }
                 })?;
                 params.push(self.import_type(pty, &ctx_where)?);
+                has_default.push(!child.get_children().is_empty());
             }
         }
+        // C++ defaults must occupy a contiguous tail
+        // (`f(int a, int b = 1, int c)` is illegal), so a simple
+        // suffix count is correct.
+        let trailing_defaults = has_default
+            .iter()
+            .rev()
+            .take_while(|&&b| b)
+            .count();
+        self.last_method_default_count = trailing_defaults;
+        let _ = enclosing_class;
 
         // Ctors and dtors have no source-level return type; use `void`
         // as a placeholder so downstream consumers that read `sig.ret`
@@ -928,6 +1334,54 @@ impl<'a> Importer<'a> {
         Ok(out)
     }
 
+    /// M15: lower a `FunctionPrototype` / `FunctionNoPrototype`
+    /// libclang `Type` to a `CxxType::Fn(FnSig)`. Used for both
+    /// pointer-to-function (`void (*)(int)` collapses one layer
+    /// of `Ptr` and lands here) and bare function-typed alias
+    /// targets (`using F = void(int);`).
+    ///
+    /// Returns the `CxxType` (not yet interned) so the caller can
+    /// integrate it with surrounding pointer logic. v0 captures
+    /// param + result types and a best-effort `variadic` flag;
+    /// `noexcept` / `cv` / `ref_q` aren't part of a function
+    /// pointer's syntactic surface and stay at their defaults.
+    fn import_function_proto(
+        &mut self,
+        ty: Type<'_>,
+        where_: &str,
+    ) -> Result<CxxType, ImportError> {
+        let ret_ty = ty.get_result_type().ok_or_else(|| {
+            ImportError::UnsupportedFeature {
+                what: "function type without result type",
+                where_: where_.to_string(),
+                span: None,
+            }
+        })?;
+        let ret = self.import_type(ret_ty, where_)?;
+        let mut params: Vec<TypeId> = Vec::new();
+        if let Some(arg_tys) = ty.get_argument_types() {
+            for at in arg_tys {
+                let id = self.import_type(at, where_)?;
+                params.push(id);
+            }
+        }
+        let variadic = ty.is_variadic();
+        Ok(CxxType::Fn(FnSig {
+            params,
+            ret,
+            cv: CvQual::default(),
+            ref_q: None,
+            variadic,
+            // Function-pointer types don't carry a syntactic
+            // `noexcept` qualifier in pre-C++17 source. Even in
+            // C++17+, libclang exposes the noexcept-ness on the
+            // declaration, not the standalone type. Default to
+            // `false` (potentially-throwing); the bindings
+            // emitter renders `extern "C" fn(...)` either way.
+            noexcept: false,
+        }))
+    }
+
     fn import_type(
         &mut self,
         ty: Type<'_>,
@@ -962,14 +1416,39 @@ impl<'a> Importer<'a> {
                         what: "pointer with no pointee",
                         where_: where_.to_string(),
                     span: None,
-                
+
                     }
                 })?;
-                let id = self.import_type(pointee, where_)?;
-                CxxType::Ptr {
-                    pointee: id,
-                    cv: cv_from_type(pointee),
+                // M15: collapse pointer-to-function-type to a bare
+                // `CxxType::Fn` rather than `Ptr { pointee: Fn }`.
+                // Itanium and Rust both treat function pointers as
+                // a single ABI unit, so the extra `Ptr` indirection
+                // would lead the renderer to emit `*const fn(...)`
+                // — wrong for callbacks. Keep one level of pointer
+                // indirection (`void (*)(int)`) but drop it for
+                // higher levels (`void (**)(int)` keeps the outer
+                // Ptr around the Fn).
+                if matches!(
+                    pointee.get_kind(),
+                    TypeKind::FunctionPrototype | TypeKind::FunctionNoPrototype,
+                ) {
+                    self.import_function_proto(pointee, where_)?
+                } else {
+                    let id = self.import_type(pointee, where_)?;
+                    CxxType::Ptr {
+                        pointee: id,
+                        cv: cv_from_type(pointee),
+                    }
                 }
+            }
+            // Bare function-prototype type — usually only seen on
+            // alias targets (`using SignalHandler = void(int);`).
+            // C++ implicitly converts function-typed lvalues to
+            // function pointers at use sites, so the alias is most
+            // useful when treated as the equivalent function-pointer
+            // type from the Rust side.
+            TypeKind::FunctionPrototype | TypeKind::FunctionNoPrototype => {
+                self.import_function_proto(ty, where_)?
             }
             TypeKind::LValueReference => {
                 let pointee = ty.get_pointee_type().ok_or_else(|| {

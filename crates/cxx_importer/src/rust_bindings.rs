@@ -177,6 +177,14 @@ pub struct RustBindingsConfig {
     /// `__cxx_<class>_delete` thunks regardless, so users can
     /// also implement their own heap wrapper if they prefer.
     pub emit_heap_alloc: bool,
+    /// M20: render `char *` / `const char *` parameter and return
+    /// types as `*[const|mut] ::core::ffi::c_char` instead of the
+    /// width-based default (`*const i8` / `*const u8`). Pairs
+    /// natively with `core::ffi::CStr::as_ptr() -> *const c_char`,
+    /// so callers building C strings from Rust don't need to cast.
+    /// Off by default — preserving the prior emission shape — and
+    /// opt-in via this knob. See `docs/cxx_importer.md §16 / M20`.
+    pub cstr_ergonomics: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,11 +314,54 @@ pub fn generate_rust_bindings_with_annotations(
     annotations: &AnnotationSet,
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
+    let empty_aliases = crate::aliases::AliasSet::default();
+    let empty_enums = crate::enums::EnumSet::default();
+    generate_rust_bindings_with_extras(
+        ctx,
+        classes,
+        annotations,
+        &empty_aliases,
+        &empty_enums,
+        config,
+    )
+}
+
+/// Emit Rust source consulting `annotations` (M6), the M17 alias
+/// side-table, and the M16 enum-body side-table. Each alias
+/// becomes a `pub type {name} = {target};` line scoped under the
+/// matching `pub mod`; each enum becomes either a `#[repr(int)]
+/// pub enum` (scoped + unique discriminants) or a
+/// `#[repr(transparent)] pub struct + assoc consts` (unscoped or
+/// aliasing) at the same scope.
+///
+/// Aliases whose target type is not yet supported by the v0 type
+/// renderer are dropped with a `// alias ... skipped` comment
+/// rather than failing the emission. Enums whose underlying type
+/// isn't a simple integer fall through the same way.
+///
+/// Currently DirectExternCpp is the only backend that honors
+/// aliases / enums — the macro-based backends
+/// (`NativeCppClassMacro`, `CxxClassMacro`) flatten everything to
+/// the top level and would need their grammar widened to expose
+/// `type` / `enum` items. Tracked for a follow-up.
+pub fn generate_rust_bindings_with_extras(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+    annotations: &AnnotationSet,
+    aliases: &crate::aliases::AliasSet,
+    enums: &crate::enums::EnumSet,
+    config: &RustBindingsConfig,
+) -> Result<String, BindingsError> {
     match config.backend {
         BindingsBackend::NativeCppClassMacro => emit_native_macro(ctx, classes, config),
-        BindingsBackend::DirectExternCpp => {
-            emit_direct_extern_cpp(ctx, classes, annotations, config)
-        }
+        BindingsBackend::DirectExternCpp => emit_direct_extern_cpp(
+            ctx,
+            classes,
+            annotations,
+            &aliases.entries,
+            &enums.entries,
+            config,
+        ),
         BindingsBackend::CxxClassMacro => emit_cxx_class_macro(ctx, classes, config),
     }
 }
@@ -430,6 +481,8 @@ fn emit_direct_extern_cpp(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
     annotations: &AnnotationSet,
+    aliases: &[crate::aliases::TypeAlias],
+    enums: &[crate::enums::CxxEnumDef],
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
     let mut out = String::new();
@@ -461,7 +514,10 @@ fn emit_direct_extern_cpp(
     // tree. A flat list (no `Namespace` segments) collapses to the
     // root and emits at the top level — same shape the v0 emitter
     // produced before this change, with no namespace overhead.
-    let tree = build_namespace_tree(ctx, &classes)?;
+    // M17 aliases + M16 enum bodies get folded into the same tree
+    // at their owning namespace nodes so they emit before the
+    // class blocks at that scope.
+    let tree = build_namespace_tree_with_extras(ctx, &classes, aliases, enums)?;
     render_namespace_tree(ctx, &tree, &mut out, annotations, config, initial_indent)?;
 
     if config.crate_module.is_some() {
@@ -496,6 +552,17 @@ fn class_fqn_string(ctx: &CxxTypeCtx, class_id: ClassId) -> String {
 struct NamespaceTree {
     /// Classes directly inside this scope.
     classes: Vec<ClassId>,
+    /// M17 aliases (`typedef` / `using`) directly inside this
+    /// scope. Stored as `(rust_ident, target_typeid)`. Emission
+    /// renders them as `pub type {rust_ident} = {render(target)};`
+    /// before the class blocks at the same node.
+    aliases: Vec<(String, rustc_abi_cxx::TypeId)>,
+    /// M16 enum bodies (`enum class Foo { ... }`) directly inside
+    /// this scope. Emission renders each as either
+    /// `#[repr(int)] pub enum` (scoped, unique discriminants) or
+    /// `#[repr(transparent)] pub struct + assoc consts` (unscoped
+    /// or aliasing variants).
+    enums: Vec<crate::enums::CxxEnumDef>,
     /// Sub-namespaces at this scope, keyed by name.
     /// `BTreeMap` for deterministic emission order.
     children: BTreeMap<String, NamespaceTree>,
@@ -504,6 +571,19 @@ struct NamespaceTree {
 fn build_namespace_tree(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
+) -> Result<NamespaceTree, BindingsError> {
+    build_namespace_tree_with_extras(ctx, classes, &[], &[])
+}
+
+/// Same as [`build_namespace_tree`], but also folds M17 aliases
+/// and M16 enum bodies into their owning namespace scopes. Each
+/// alias / enum gets keyed by its `parent` segment list using
+/// the same `Namespace` / `AnonymousNamespace` rules as classes.
+fn build_namespace_tree_with_extras(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+    aliases: &[crate::aliases::TypeAlias],
+    enums: &[crate::enums::CxxEnumDef],
 ) -> Result<NamespaceTree, BindingsError> {
     let mut root = NamespaceTree::default();
     for &class_id in classes {
@@ -540,6 +620,48 @@ fn build_namespace_tree(
         }
         node.classes.push(class_id);
     }
+    // M17: drop aliases under their owning namespace node. Anything
+    // referencing a non-namespace prefix segment is silently
+    // skipped — emitter ergonomics, not correctness.
+    for alias in aliases {
+        let mut node = &mut root;
+        let mut prefix_ok = true;
+        for seg in &alias.parent {
+            let key = match seg {
+                NameSegment::Namespace(id) => id.0.clone(),
+                NameSegment::AnonymousNamespace => "__anon".to_string(),
+                _ => {
+                    prefix_ok = false;
+                    break;
+                }
+            };
+            node = node.children.entry(key).or_default();
+        }
+        if !prefix_ok {
+            continue;
+        }
+        node.aliases.push((alias.name.0.clone(), alias.target));
+    }
+    // M16: same routing for enum bodies.
+    for enum_def in enums {
+        let mut node = &mut root;
+        let mut prefix_ok = true;
+        for seg in &enum_def.parent {
+            let key = match seg {
+                NameSegment::Namespace(id) => id.0.clone(),
+                NameSegment::AnonymousNamespace => "__anon".to_string(),
+                _ => {
+                    prefix_ok = false;
+                    break;
+                }
+            };
+            node = node.children.entry(key).or_default();
+        }
+        if !prefix_ok {
+            continue;
+        }
+        node.enums.push(enum_def.clone());
+    }
     Ok(root)
 }
 
@@ -551,6 +673,54 @@ fn render_namespace_tree(
     config: &RustBindingsConfig,
     indent: &str,
 ) -> Result<(), BindingsError> {
+    // M16: emit imported enum bodies first — classes and aliases
+    // at this scope may reference them by name in their fields /
+    // method signatures.
+    for enum_def in &tree.enums {
+        match render_cxx_enum(ctx, enum_def, indent) {
+            Ok(block) => {
+                out.push_str(&block);
+                out.push('\n');
+            }
+            Err(BindingsError::UnsupportedType { kind, .. }) => {
+                // Underlying integer width not supported (i128 /
+                // u128 in some emitter passes), or other v0 gap.
+                // Drop with a comment — not fatal.
+                let _ = writeln!(
+                    out,
+                    "{indent}// enum `{}` skipped: {kind}",
+                    enum_def.name.0,
+                );
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    // M17: emit `pub type` aliases ahead of class blocks. Putting
+    // them after enums so an alias of an enum lands legally; before
+    // class blocks so the classes (and user code) see the names.
+    // Render failures (target type unsupported by `render_rust_type`)
+    // drop the alias rather than aborting: aliases are emit-only
+    // ergonomics, not correctness.
+    for (alias_name, target) in &tree.aliases {
+        let where_ = format!("alias `{alias_name}`");
+        match render_rust_type(ctx, *target, &where_) {
+            Ok(rendered) => {
+                let _ = writeln!(out, "{indent}pub type {alias_name} = {rendered};");
+            }
+            Err(_) => {
+                // Skip silently — surfacing the alias name as a
+                // doc comment lets users know it existed without
+                // breaking compilation.
+                let _ = writeln!(
+                    out,
+                    "{indent}// alias `{alias_name}` skipped: target type unsupported in v0",
+                );
+            }
+        }
+    }
+    if !tree.aliases.is_empty() || !tree.enums.is_empty() {
+        out.push('\n');
+    }
     for &class_id in &tree.classes {
         let block =
             render_direct_extern_class(ctx, class_id, annotations, config, indent)?;
@@ -707,6 +877,7 @@ fn render_direct_extern_class(
             method,
             method_idx,
             resolved_name,
+            config,
         )?;
         if matches!(emission.kind, EmissionKind::Dtor) {
             has_user_dtor = true;
@@ -776,6 +947,128 @@ fn render_direct_extern_class(
         );
         let _ = writeln!(block, "{indent}    }}");
         let _ = writeln!(block, "{indent}}}");
+    }
+
+    // 4.b: M19 — `CxxBase<Base>` upcast impls for every non-virtual
+    // base. Virtual bases are deferred to M22 (their offset is
+    // dynamic via the vtable; the emission shape is different).
+    // Poisoned bases are skipped — there's no Rust type to refer
+    // to. Multiple non-virtual bases each get their own impl.
+    if let Ok(layout) = ctx.layout(class_id) {
+        for base_spec in &class.bases {
+            if base_spec.virtual_ {
+                continue;
+            }
+            if ctx.is_poisoned(base_spec.class) {
+                continue;
+            }
+            let base = ctx.class(base_spec.class);
+            let base_name = match ident_of_class(base) {
+                Some(n) => n,
+                None => continue,
+            };
+            // Find the offset libclang/Itanium computed for this
+            // base. base_offsets is keyed by ClassId so we can
+            // index directly.
+            let offset = layout
+                .base_offsets
+                .iter()
+                .find_map(|(bid, off)| (*bid == base_spec.class).then_some(*off));
+            let offset = match offset {
+                Some(o) => o,
+                None => continue,
+            };
+            let _ = writeln!(block);
+            let _ = writeln!(
+                block,
+                "{indent}// M19: derived-to-base upcast (non-virtual, offset = {offset}).",
+            );
+            let _ = writeln!(
+                block,
+                "{indent}impl ::cxx::CxxBase<{base_name}> for {class_name} {{",
+            );
+            // For zero-offset bases (the common single-inheritance
+            // case) elide the `add(0)` for readability. The
+            // semantics are identical.
+            if offset == 0 {
+                let _ = writeln!(
+                    block,
+                    "{indent}    fn upcast(&self) -> &{base_name} {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        // SAFETY: primary base subobject sits at offset 0",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        //   per Itanium ABI; the cast is purely a type adjustment.",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{ &*(self as *const Self as *const {base_name}) }}",
+                );
+                let _ = writeln!(block, "{indent}    }}");
+                let _ = writeln!(
+                    block,
+                    "{indent}    fn upcast_mut(&mut self) -> &mut {base_name} {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        // SAFETY: same reasoning as upcast().",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{ &mut *(self as *mut Self as *mut {base_name}) }}",
+                );
+                let _ = writeln!(block, "{indent}    }}");
+            } else {
+                let _ = writeln!(
+                    block,
+                    "{indent}    fn upcast(&self) -> &{base_name} {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        // SAFETY: base subobject offset pinned by Itanium layout.",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}            let p = (self as *const Self as *const u8).add({offset});",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}            &*(p as *const {base_name})",
+                );
+                let _ = writeln!(block, "{indent}        }}");
+                let _ = writeln!(block, "{indent}    }}");
+                let _ = writeln!(
+                    block,
+                    "{indent}    fn upcast_mut(&mut self) -> &mut {base_name} {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        // SAFETY: same reasoning as upcast().",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}        unsafe {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}            let p = (self as *mut Self as *mut u8).add({offset});",
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}            &mut *(p as *mut {base_name})",
+                );
+                let _ = writeln!(block, "{indent}        }}");
+                let _ = writeln!(block, "{indent}    }}");
+            }
+            let _ = writeln!(block, "{indent}}}");
+        }
     }
 
     // Sanity check: more than one ctor would need disambiguator suffixes
@@ -954,6 +1247,13 @@ struct MethodEmission {
     wrapper_return: String,
     /// Argument expressions to forward to the extern call.
     forward_args: String,
+    /// M18: trailing-default-arg count from `ctx.default_arg_count`.
+    /// `0` when none; the renderer surfaces a `///` doc comment
+    /// listing how many trailing parameters were optional in the
+    /// C++ source so callers know which `Default::default()` /
+    /// `core::ptr::null()` placeholders match the original
+    /// signature.
+    default_arg_count: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1115,18 +1415,27 @@ fn classify_for_direct_extern(
     method: &MethodDef,
     method_idx: usize,
     resolved_rust_name: &str,
+    config: &RustBindingsConfig,
 ) -> Result<MethodEmission, BindingsError> {
     let arity = method.sig.params.len();
+    // M20: opt-in `c_char` rendering for `char *` / `const char *`.
+    // The `extern_decl_params` keep the default rendering so the
+    // mangled-symbol wrapper matches what the C++ side produced;
+    // only the user-facing wrapper params + return type swap.
+    let user_opts = TypeRenderOpts {
+        cstr_ergonomics: config.cstr_ergonomics,
+    };
 
     // Build user-arg decls + forward expressions. These are shared
     // across method shapes (the `this` slot is added separately).
     let mut user_arg_decls = Vec::with_capacity(arity);
     let mut user_forward = Vec::with_capacity(arity);
     for (i, &ty_id) in method.sig.params.iter().enumerate() {
-        let rust_ty = render_rust_type(
+        let rust_ty = render_rust_type_with_opts(
             ctx,
             ty_id,
             &format!("{class_name}::{:?} param {i}", method.name),
+            &user_opts,
         )?;
         user_arg_decls.push(format!("arg{i}: {rust_ty}"));
         user_forward.push(format!("arg{i}"));
@@ -1158,6 +1467,7 @@ fn classify_for_direct_extern(
                 wrapper_params: user_arg_decls.join(", "),
                 wrapper_return: "Self".into(),
                 forward_args: user_forward.join(", "),
+                default_arg_count: ctx.default_arg_count(class_id, method_idx),
             });
         }
         Some(SpecialMember::Dtor) => {
@@ -1176,6 +1486,7 @@ fn classify_for_direct_extern(
                 wrapper_params: String::new(),
                 wrapper_return: "()".into(),
                 forward_args: String::new(),
+                default_arg_count: 0,
             });
         }
         Some(SpecialMember::CopyCtor | SpecialMember::MoveCtor)
@@ -1210,8 +1521,17 @@ fn classify_for_direct_extern(
 
     // Render return type for both extern + wrapper. C++ `void` →
     // Rust `()`, surfaced in the wrapper as no return clause.
-    let ret_rust =
-        render_rust_type(ctx, method.sig.ret, &format!("{class_name}::{method_name} return"))?;
+    // The cstr-ergonomics swap (M20) is layout-identical with
+    // the default `*const i8` rendering, so we let it propagate
+    // to both the extern decl and the user-facing wrapper —
+    // consistent typing across the boundary, no casts on either
+    // side.
+    let ret_rust = render_rust_type_with_opts(
+        ctx,
+        method.sig.ret,
+        &format!("{class_name}::{method_name} return"),
+        &user_opts,
+    )?;
 
     let extern_ret_clause = if ret_rust == "()" {
         String::new()
@@ -1286,6 +1606,7 @@ fn classify_for_direct_extern(
         wrapper_params: user_arg_decls.join(", "),
         wrapper_return: ret_rust,
         forward_args: user_forward.join(", "),
+        default_arg_count: ctx.default_arg_count(class_id, method_idx),
     })
 }
 
@@ -1315,6 +1636,24 @@ fn render_direct_extern_wrapper(
     // current code calls this `indent` for brevity.
     let indent = format!("{block_indent}    ");
     let indent = indent.as_str();
+    // M18: surface trailing default-arg counts as a doc comment so
+    // callers know which parameters were optional in the C++
+    // source. v0 doesn't synthesize per-arity convenience wrappers
+    // — that's tracked as M18.b — but the doc comment lets users
+    // pick sensible placeholders (`core::ptr::null()`, `0`, …)
+    // without going back to the headers.
+    if emission.default_arg_count > 0 {
+        let _ = writeln!(
+            out,
+            "{indent}/// In C++, the trailing {n} parameter{s} of this method \
+             {has} default value{s} — pass any value of the right type when calling \
+             from Rust. (M18 v0: the importer surfaces the count as a hint; per-arity \
+             convenience wrappers are tracked as M18.b.)",
+            n = emission.default_arg_count,
+            s = if emission.default_arg_count == 1 { "" } else { "s" },
+            has = if emission.default_arg_count == 1 { "has a" } else { "have" },
+        );
+    }
     match emission.kind {
         EmissionKind::Ctor => {
             // Wrapper for ctors: allocate a stack temp, call the
@@ -1686,6 +2025,32 @@ fn render_rust_type(
     ty: TypeId,
     where_: &str,
 ) -> Result<String, BindingsError> {
+    render_rust_type_with_opts(ctx, ty, where_, &TypeRenderOpts::default())
+}
+
+/// Per-call rendering knobs. Default reproduces the v0 emission;
+/// opt-in flags adjust specific cases for ergonomics.
+#[derive(Clone, Copy, Default)]
+struct TypeRenderOpts {
+    /// M20: when set, `char *` / `const char *` (i.e. `*[const|mut]
+    /// i8` and `*[const|mut] u8`) render as `*[const|mut]
+    /// ::core::ffi::c_char` so callers can pass `CStr::as_ptr()`
+    /// directly without casting. Aggressive — also rewrites
+    /// non-string single-byte pointer types — but that's the
+    /// trade-off the caller opted into via
+    /// `RustBindingsConfig::cstr_ergonomics`.
+    cstr_ergonomics: bool,
+}
+
+fn render_rust_type_with_opts(
+    ctx: &CxxTypeCtx,
+    ty: TypeId,
+    where_: &str,
+    opts: &TypeRenderOpts,
+) -> Result<String, BindingsError> {
+    // M20 fast-path: at the top of every pointer node we may swap
+    // the rendered pointee for `c_char`. The actual replacement
+    // happens inside the Ptr / Ref arms below.
     Ok(match ctx.type_of(ty) {
         CxxType::Void => "()".into(),
         CxxType::Bool => "bool".into(),
@@ -1701,7 +2066,11 @@ fn render_rust_type(
             }
         },
         CxxType::Ptr { pointee, cv } => {
-            let inner = render_rust_type(ctx, *pointee, where_)?;
+            let inner = if opts.cstr_ergonomics && is_byte_int(ctx, *pointee) {
+                "::core::ffi::c_char".to_string()
+            } else {
+                render_rust_type_with_opts(ctx, *pointee, where_, opts)?
+            };
             if cv.is_const {
                 format!("*const {inner}")
             } else {
@@ -1714,7 +2083,11 @@ fn render_rust_type(
             // later — until then we don't have the lifetime info to
             // promote to `&T` / `&mut T` safely).
             let _ = kind; // RefKind::LValue / RValue both lower the same.
-            let inner = render_rust_type(ctx, *pointee, where_)?;
+            let inner = if opts.cstr_ergonomics && is_byte_int(ctx, *pointee) {
+                "::core::ffi::c_char".to_string()
+            } else {
+                render_rust_type_with_opts(ctx, *pointee, where_, opts)?
+            };
             if cv.is_const {
                 format!("*const {inner}")
             } else {
@@ -1728,6 +2101,40 @@ fn render_rust_type(
                 kind: "anonymous record".into(),
             })?
         }
+        // M15: function pointer / bare function type. Both render
+        // as Rust function-pointer types (`extern "C" fn(...) -> ret`).
+        // Variadic C functions render with `...` which Rust supports
+        // only behind `unsafe extern "C"` and require feature-gated
+        // syntax for non-`extern "C"` ABIs — keep it `extern "C"`
+        // since C++ callbacks always cross an `extern "C"` boundary.
+        CxxType::Fn(sig) => {
+            // Variadic function pointers in Rust use `...` and are
+            // currently unstable-ish in non-extern contexts — but
+            // for `extern "C" fn` the compiler accepts them.
+            let mut parts = Vec::with_capacity(sig.params.len());
+            for (i, p) in sig.params.iter().enumerate() {
+                let r = render_rust_type(ctx, *p, &format!("{where_} fnptr arg {i}"))?;
+                parts.push(r);
+            }
+            let ret = render_rust_type(ctx, sig.ret, &format!("{where_} fnptr ret"))?;
+            let args = if sig.variadic {
+                let mut v = parts;
+                v.push("...".into());
+                v.join(", ")
+            } else {
+                parts.join(", ")
+            };
+            // Wrap in `Option<...>` so the natural mapping for a
+            // C++ `void (*)()` parameter (which can be `nullptr`)
+            // works without extra ceremony — Option<extern "C"
+            // fn(...)> uses the same null-pointer-optimization
+            // representation as the bare fn pointer.
+            if matches!(ctx.type_of(sig.ret), CxxType::Void) {
+                format!("Option<unsafe extern \"C\" fn({args})>")
+            } else {
+                format!("Option<unsafe extern \"C\" fn({args}) -> {ret}>")
+            }
+        }
         other => {
             return Err(BindingsError::UnsupportedType {
                 where_: where_.into(),
@@ -1735,6 +2142,125 @@ fn render_rust_type(
             });
         }
     })
+}
+
+/// M16: render one captured C++ enum as Rust source. Picks
+/// between the idiomatic `pub enum` shape and the fall-back
+/// `pub struct + assoc consts` shape based on whether all
+/// variants are unique and the enum is `enum class`-scoped.
+///
+/// Both shapes are layout-identical (single underlying integer)
+/// so the choice is purely about Rust-side ergonomics:
+///
+/// - `pub enum` lets `match` exhaustiveness fire and supports
+///   derives, but disallows duplicate discriminants.
+/// - `pub struct` tolerates aliasing variants and is the safe
+///   default for unscoped enums users may bit-twiddle on.
+fn render_cxx_enum(
+    ctx: &CxxTypeCtx,
+    def: &crate::enums::CxxEnumDef,
+    indent: &str,
+) -> Result<String, BindingsError> {
+    let underlying_kind = ctx.type_of(def.underlying);
+    let (signed, width) = match underlying_kind {
+        CxxType::Int { signed, width } => (*signed, *width),
+        CxxType::Bool => (false, IntWidth::I8),
+        other => {
+            return Err(BindingsError::UnsupportedType {
+                where_: format!("enum `{}` underlying", def.name.0),
+                kind: format!("non-integer underlying: {other:?}"),
+            });
+        }
+    };
+    let int_repr = int_rust(signed, width);
+
+    // Detect duplicate discriminants. Aliasing happens often
+    // enough in real headers that we always check.
+    let mut seen = std::collections::HashSet::new();
+    let mut has_dups = false;
+    for v in &def.variants {
+        if !seen.insert(v.value) {
+            has_dups = true;
+            break;
+        }
+    }
+
+    // Shape selection: idiomatic `pub enum` only when scoped
+    // AND no aliasing. Anything else falls back to the
+    // `pub struct + assoc consts` shape.
+    let prefer_pub_enum = def.scoped && !has_dups;
+
+    let mut out = String::new();
+    let _ = writeln!(out, "{indent}#[allow(non_camel_case_types)]");
+    if prefer_pub_enum {
+        let _ = writeln!(out, "{indent}#[repr({int_repr})]");
+        let _ = writeln!(out, "{indent}#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]");
+        let _ = writeln!(out, "{indent}pub enum {} {{", def.name.0);
+        for v in &def.variants {
+            // Cast to keep negative discriminants legal with
+            // unsigned reprs on the C++ side (libclang signed
+            // accessor sign-extends).
+            let lit = render_enum_discriminant(v.value, signed);
+            let _ = writeln!(
+                out,
+                "{indent}    #[allow(non_camel_case_types)] {} = {lit},",
+                v.name,
+            );
+        }
+        let _ = writeln!(out, "{indent}}}");
+    } else {
+        // `#[repr(transparent)]` on the wrapper so the layout
+        // and ABI match the underlying integer exactly. The
+        // `pub` field on the inner integer lets users reach
+        // for `MyEnum(0).0` / `MyEnum(x.0 | y.0)` for the
+        // bitwise math idioms common in unscoped C++ enums.
+        let _ = writeln!(out, "{indent}#[repr(transparent)]");
+        let _ = writeln!(
+            out,
+            "{indent}#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]",
+        );
+        let _ = writeln!(
+            out,
+            "{indent}pub struct {}(pub {int_repr});",
+            def.name.0,
+        );
+        let _ = writeln!(out, "{indent}impl {} {{", def.name.0);
+        for v in &def.variants {
+            let lit = render_enum_discriminant(v.value, signed);
+            let _ = writeln!(
+                out,
+                "{indent}    #[allow(non_upper_case_globals)] pub const {}: Self = Self({lit});",
+                v.name,
+            );
+        }
+        let _ = writeln!(out, "{indent}}}");
+    }
+    Ok(out)
+}
+
+/// Render an enum discriminant literal. libclang gives us a
+/// signed `i64`; if the underlying type is unsigned we cast at
+/// the literal level so negative source values (rare but legal,
+/// e.g. `enum E : unsigned { X = -1 }`) round-trip correctly.
+fn render_enum_discriminant(value: i64, signed: bool) -> String {
+    if signed || value >= 0 {
+        format!("{value}")
+    } else {
+        // Two's-complement bit-pattern as the unsigned literal.
+        let as_u64 = value as u64;
+        format!("{as_u64}")
+    }
+}
+
+/// True when `ty` is an 8-bit integer (`signed char` / `unsigned
+/// char` / `char`). Used by M20's cstr-ergonomics renderer to
+/// decide whether a pointer's pointee should swap to
+/// `::core::ffi::c_char`.
+fn is_byte_int(ctx: &CxxTypeCtx, ty: TypeId) -> bool {
+    matches!(
+        ctx.type_of(ty),
+        CxxType::Int { width: IntWidth::I8, .. },
+    )
 }
 
 fn int_rust(signed: bool, width: IntWidth) -> &'static str {

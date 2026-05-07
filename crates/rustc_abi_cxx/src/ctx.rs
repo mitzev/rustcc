@@ -34,6 +34,12 @@ pub struct CxxTypeCtx {
     /// can still distinguish `static Fl::run()` from instance
     /// methods.
     static_methods: HashSet<(ClassId, usize)>,
+    /// M18: per-method count of trailing parameters that have C++
+    /// default values. The bindings emitter renders this as an
+    /// informational doc comment so users know which arguments
+    /// the C++ side considered optional. Stored as a side-table
+    /// for the same back-compat reasoning as `static_methods`.
+    default_arg_counts: HashMap<(ClassId, usize), usize>,
     /// Rust-origin enums exposed to C++ as scoped enums. No parallel
     /// for C++-origin enums yet — imported enums flow as anonymous
     /// `CxxType::Enum` instances with the variants living in the
@@ -50,6 +56,7 @@ impl CxxTypeCtx {
             class_origin: Vec::new(),
             poison_reason: HashMap::new(),
             static_methods: HashSet::new(),
+            default_arg_counts: HashMap::new(),
             rust_enums: Vec::new(),
             types: Vec::new(),
         }
@@ -105,6 +112,30 @@ impl CxxTypeCtx {
     /// [`Self::mark_method_static`].
     pub fn is_method_static(&self, class: ClassId, method_idx: usize) -> bool {
         self.static_methods.contains(&(class, method_idx))
+    }
+
+    /// M18: record that `class.methods[method_idx]` has `count`
+    /// trailing parameters with C++ default values. The bindings
+    /// emitter renders this as a doc comment so users know which
+    /// arguments are nominally optional in the source language.
+    pub fn record_default_arg_count(
+        &mut self,
+        class: ClassId,
+        method_idx: usize,
+        count: usize,
+    ) {
+        if count > 0 {
+            self.default_arg_counts.insert((class, method_idx), count);
+        }
+    }
+
+    /// Number of trailing parameters with C++ default values for
+    /// `class.methods[method_idx]`. Returns 0 when none recorded.
+    pub fn default_arg_count(&self, class: ClassId, method_idx: usize) -> usize {
+        self.default_arg_counts
+            .get(&(class, method_idx))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Register a Rust-origin enum for C++ exposure. Returns the

@@ -9,7 +9,11 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use cxx_importer::{import_header, import_header_with_annotations, Driver, HeaderGraph};
+use cxx_importer::{
+    import_header, import_header_with_annotations, import_header_with_extras,
+    Driver, HeaderGraph,
+};
+use cxx_importer::aliases::AliasSet;
 use cxx_importer::rust_bindings::{
     generate_rust_bindings, generate_rust_bindings_with_annotations,
     BindingsBackend, RustBindingsConfig,
@@ -2161,4 +2165,1099 @@ fn imports_variadic_methods_into_fnsig() {
         "regular(int) should not be variadic"
     );
     cleanup(&header);
+}
+
+// ============================================================
+// M17: type aliases (typedef / using).
+// ============================================================
+
+#[test]
+fn m17_captures_typedef_to_primitive_at_tu_scope() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "typedef int MyInt;\n\
+         struct Owner { int slot; };\n",
+        "m17_typedef_primitive",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "MyInt")
+        .expect("MyInt typedef captured");
+    assert!(
+        alias.parent.is_empty(),
+        "TU-scope alias should have empty parent path"
+    );
+    assert!(matches!(
+        ctx.type_of(alias.target),
+        CxxType::Int { signed: true, width: IntWidth::I32 },
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_captures_using_alias_at_tu_scope() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "using Real = double;\n\
+         struct Foo { Real r; };\n",
+        "m17_using_primitive",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "Real")
+        .expect("Real using-alias captured");
+    assert!(matches!(
+        ctx.type_of(alias.target),
+        CxxType::Float { kind: rustc_abi_cxx::FloatKind::F64 },
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_captures_alias_to_user_class() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Inner { int v; };\n\
+         using InnerAlias = Inner;\n",
+        "m17_alias_to_class",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let inner_id = *classes
+        .iter()
+        .find(|&&id| {
+            let c = ctx.class(id);
+            matches!(
+                c.name.0.last(),
+                Some(NameSegment::Class(id) | NameSegment::Namespace(id))
+                    if id.0 == "Inner"
+            )
+        })
+        .expect("Inner imported");
+
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "InnerAlias")
+        .expect("InnerAlias captured");
+    match ctx.type_of(alias.target) {
+        CxxType::Record(cid) => {
+            assert_eq!(*cid, inner_id, "alias target should resolve to Inner");
+        }
+        other => panic!("expected Record(Inner), got {other:?}"),
+    }
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_captures_namespace_nested_alias_with_parent_path() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "namespace ns {\n\
+           namespace inner {\n\
+             using Code = unsigned;\n\
+           }\n\
+         }\n",
+        "m17_ns_nested_alias",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "Code")
+        .expect("Code captured");
+
+    // Outer-to-inner ordering on `alias.parent`.
+    let parent_names: Vec<&str> = alias
+        .parent
+        .iter()
+        .map(|seg| match seg {
+            NameSegment::Namespace(id) => id.0.as_str(),
+            NameSegment::AnonymousNamespace => "<anon>",
+            _ => "<other>",
+        })
+        .collect();
+    assert_eq!(parent_names, vec!["ns", "inner"]);
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_alias_chain_resolves_to_canonical_target() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `Final` -> `Mid` -> `int`. Since import_type strips
+    // typedef sugar via canonical(), we expect every alias's
+    // target to be the same primitive `int` TypeId.
+    let header = temp_header(
+        "typedef int Mid;\n\
+         typedef Mid Final;\n",
+        "m17_alias_chain",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let mid = extras.aliases.iter().find(|a| a.name.0 == "Mid").unwrap();
+    let final_ = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "Final")
+        .unwrap();
+    assert_eq!(
+        mid.target, final_.target,
+        "both aliases should resolve to the same canonical int TypeId",
+    );
+    assert!(matches!(
+        ctx.type_of(mid.target),
+        CxxType::Int { signed: true, width: IntWidth::I32 },
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_aliases_emit_pub_type_lines_in_bindings() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "typedef int MyInt;\n\
+         namespace ns {\n\
+           using Real = double;\n\
+         }\n\
+         struct Owner { int v; };\n",
+        "m17_emit_pub_type",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(
+        src.contains("pub type MyInt = i32;"),
+        "TU-scope MyInt alias should emit at top level; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub mod ns {") && src.contains("pub type Real = f64;"),
+        "namespace-scope Real alias should emit inside `pub mod ns`; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m17_alias_to_unsupported_type_is_skipped_not_fatal() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // Member-pointer types aren't yet supported by `import_type`.
+    // The alias should silently drop instead of aborting.
+    // (Function pointers WERE the canary here pre-M15; M15 lifted
+    // that, so we use a shape M15 also doesn't cover yet.)
+    let header = temp_header(
+        "struct Holder { int field; };\n\
+         using MemPtr = int Holder::*;\n",
+        "m17_alias_unsupported_target",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import should not fail because of unsupported alias target");
+
+    // The alias must not appear (target type is unsupported in v0).
+    assert!(
+        extras.aliases.iter().all(|a| a.name.0 != "MemPtr"),
+        "alias to member-pointer type should be silently dropped; got: {:?}",
+        extras.aliases.iter().map(|a| &a.name.0).collect::<Vec<_>>(),
+    );
+    // The class still imports.
+    assert!(
+        !classes.is_empty(),
+        "imports should still produce the Holder class",
+    );
+
+    cleanup(&header);
+}
+
+// ============================================================
+// M20: configurable `const char*` → `*const c_char` ergonomics.
+// Default-off (preserves prior emission); opt-in via
+// `RustBindingsConfig::cstr_ergonomics`.
+// ============================================================
+
+#[test]
+fn m20_default_emission_keeps_pointer_to_i8_for_const_char() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* s);\n};\n",
+        "m20_default_off",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("arg0: *const i8") || src.contains("arg0: *const u8"),
+        "default-off should preserve the i8/u8 pointer rendering; got:\n{src}",
+    );
+    assert!(
+        !src.contains("c_char"),
+        "default-off should not reference c_char; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20_opt_in_renders_char_ptr_as_c_char() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* s);\n  const char* name();\n};\n",
+        "m20_opt_in_on",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("arg0: *const ::core::ffi::c_char"),
+        "param should render as `*const c_char`; got:\n{src}",
+    );
+    assert!(
+        src.contains("-> *const ::core::ffi::c_char"),
+        "return should render as `*const c_char`; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20_opt_in_does_not_touch_non_byte_pointers() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void take_int_ptr(const int* p);\n  void take_widget(W* p);\n};\n",
+        "m20_other_pointers_untouched",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("*const i32") || src.contains("arg0: *const i32"),
+        "int pointers should keep i32 rendering; got:\n{src}",
+    );
+    assert!(
+        src.contains("*mut W"),
+        "record pointers should keep their record name; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+// ============================================================
+// M18: default-argument detection (count-only v0). Per-arity
+// convenience wrappers are tracked as M18.b.
+// ============================================================
+
+#[test]
+fn m18_records_trailing_default_arg_count_per_method() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // - `redraw(int)` has zero defaults.
+    // - `set(int, int = 1)` has one trailing default.
+    // - `paint(int = 0, int = 0)` has two trailing defaults.
+    // - `mid(int, int = 5, int)` is illegal C++ — defaults
+    //   must occupy a contiguous tail. The compiler rejects
+    //   it, so we don't try to test that path.
+    let header = temp_header(
+        "struct W {\n  void redraw(int delay);\n  void set(int a, int b = 1);\n  void paint(int x = 0, int y = 0);\n};\n",
+        "m18_default_arg_counts",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let class_id = class_ids[0];
+
+    // Look up methods by source name.
+    let class = ctx.class(class_id);
+    let idx_of = |name: &str| {
+        class
+            .methods
+            .iter()
+            .position(|m| m.name.ident_name() == Some(name))
+            .unwrap_or_else(|| panic!("method `{name}` not found"))
+    };
+
+    assert_eq!(ctx.default_arg_count(class_id, idx_of("redraw")), 0);
+    assert_eq!(ctx.default_arg_count(class_id, idx_of("set")), 1);
+    assert_eq!(ctx.default_arg_count(class_id, idx_of("paint")), 2);
+
+    cleanup(&header);
+}
+
+#[test]
+fn m18_emits_doc_comment_when_method_has_default_args() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void paint(int x = 0, int y = 0);\n  void plain(int z);\n};\n",
+        "m18_emits_doc",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // The two-default `paint` method gets a doc comment hint.
+    assert!(
+        src.contains("trailing 2 parameters") && src.contains("M18"),
+        "paint should carry M18 doc comment; got:\n{src}",
+    );
+    // The plain method (no defaults) does not — only one method
+    // should carry the M18 hint in this header.
+    let m18_count = src.matches("(M18 v0:").count();
+    assert_eq!(
+        m18_count, 1,
+        "exactly one method should carry the M18 hint; got {m18_count} in:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+// ============================================================
+// M15: function pointer types — `void (*)(int)` lowering and
+// emission. Closure-as-callback `CxxCallback<F>` runtime helper
+// lives in `crates/cxx/src/callback.rs` and is exercised by its
+// own unit tests.
+// ============================================================
+
+#[test]
+fn m15_lowers_function_pointer_alias_to_fn_type() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "using SignalHandler = void(*)(int);\n\
+         struct Owner { int v; };\n",
+        "m15_fnptr_alias",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "SignalHandler")
+        .expect("SignalHandler alias captured");
+    match ctx.type_of(alias.target) {
+        CxxType::Fn(sig) => {
+            assert_eq!(sig.params.len(), 1);
+            assert!(matches!(
+                ctx.type_of(sig.params[0]),
+                CxxType::Int { signed: true, width: IntWidth::I32 },
+            ));
+            assert!(matches!(ctx.type_of(sig.ret), CxxType::Void));
+            assert!(!sig.variadic);
+        }
+        other => panic!("expected Fn, got {other:?}"),
+    }
+
+    cleanup(&header);
+}
+
+#[test]
+fn m15_lowers_bare_function_type_alias_to_fn_type() {
+    // `using F = void(int);` — the alias target is a bare
+    // `FunctionPrototype`, not a pointer-to-function. We
+    // collapse to `CxxType::Fn` regardless so the renderer
+    // can produce `extern "C" fn(...)`.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "using F = void(int);\n",
+        "m15_bare_fn_alias",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "F")
+        .expect("F alias captured");
+    assert!(matches!(ctx.type_of(alias.target), CxxType::Fn(_)));
+    cleanup(&header);
+}
+
+#[test]
+fn m15_renders_function_pointer_as_extern_c_fn_in_alias() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "using IntCallback = int(*)(int, int);\n\
+         using VoidCallback = void(*)();\n",
+        "m15_fnptr_emit",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(
+        src.contains(
+            "pub type IntCallback = Option<unsafe extern \"C\" fn(i32, i32) -> i32>"
+        ),
+        "non-void return should render with `-> ret`; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub type VoidCallback = Option<unsafe extern \"C\" fn()>"),
+        "void return should render without `-> ()`; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+// ============================================================
+// M19: CxxBase<T> upcast emission for non-virtual inheritance.
+// ============================================================
+// Each derived class gets one `impl ::cxx::CxxBase<Base> for
+// Derived` per non-virtual base, with the offset baked in
+// using the layout engine's `base_offsets` table. Single
+// inheritance with offset 0 elides the `add(0)` for clarity;
+// non-zero offsets (multi-inheritance) keep the explicit
+// pointer arithmetic.
+
+#[test]
+fn m19_emits_upcast_impl_for_single_non_virtual_base() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Base { int a; };\n\
+         struct Derived : public Base { int b; };\n",
+        "m19_single_inheritance",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("impl ::cxx::CxxBase<Base> for Derived"),
+        "Derived should impl CxxBase<Base>; got:\n{src}",
+    );
+    assert!(
+        src.contains("fn upcast(&self) -> &Base"),
+        "upcast signature missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("fn upcast_mut(&mut self) -> &mut Base"),
+        "upcast_mut signature missing; got:\n{src}",
+    );
+    // Offset-0 path elides .add(0).
+    assert!(
+        !src.contains(".add(0)"),
+        "offset-0 upcast should elide `.add(0)` for readability; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m19_emits_upcast_impl_per_non_virtual_base_in_multi_inheritance() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct A { int x; };\n\
+         struct B { int y; };\n\
+         struct C : public A, public B { int z; };\n",
+        "m19_multi_inheritance",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("impl ::cxx::CxxBase<A> for C"),
+        "C should impl CxxBase<A>; got:\n{src}",
+    );
+    assert!(
+        src.contains("impl ::cxx::CxxBase<B> for C"),
+        "C should impl CxxBase<B>; got:\n{src}",
+    );
+    // The B base sits past A in the layout — non-zero offset.
+    assert!(
+        src.contains(".add(4)") || src.contains(".add(8)"),
+        "second base should use a pointer-add for its non-zero offset; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m19_skips_upcast_for_virtual_base() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // Virtual inheritance — base offset is dynamic via vtable.
+    // M19 v0 skips these; M22 picks them up.
+    let header = temp_header(
+        "struct Base { int a; };\n\
+         struct Derived : public virtual Base { int b; };\n",
+        "m19_virtual_base_skipped",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        !src.contains("impl ::cxx::CxxBase<Base> for Derived"),
+        "virtual-base upcast should be skipped in M19 v0; got:\n{src}",
+    );
+}
+
+// ============================================================
+// M21: bitfield-aware layout — probe-first behavior.
+// ============================================================
+//
+// `rustc_abi_cxx::layout` doesn't model Itanium bitfield packing,
+// so a class with bit-packed members would compute a wrong size
+// and silently mismatch the C++ side at runtime. Until proper
+// support lands, the importer poisons any class with bitfields
+// so emission produces an opaque `pub struct` + clear doc-
+// comment reason instead of a layout that looks fine but
+// corrupts data.
+
+#[test]
+fn m21_bitfield_class_is_poisoned_with_clear_reason() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct PackedFlags {\n  unsigned a : 4;\n  unsigned b : 4;\n  unsigned c : 8;\n};\n",
+        "m21_bitfield_poisoned",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    assert_eq!(class_ids.len(), 1);
+    let id = class_ids[0];
+
+    assert!(
+        ctx.is_poisoned(id),
+        "bitfield-bearing class should be poisoned (M21 v0)",
+    );
+    let reason = ctx.poison_reason(id).expect("reason recorded");
+    assert!(
+        reason.contains("bitfield"),
+        "poison reason should mention bitfield; got: {reason}",
+    );
+    assert!(
+        reason.contains("M21"),
+        "poison reason should reference the milestone; got: {reason}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m21_bitfield_class_emits_opaque_struct_with_doc_comment() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct PackedFlags {\n  unsigned a : 4;\n  unsigned b : 4;\n};\n",
+        "m21_bitfield_emits_opaque",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("bitfield member") && src.contains("M21"),
+        "opaque struct should include the bitfield-poison reason; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub struct PackedFlags"),
+        "opaque PackedFlags struct should still emit; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+// ============================================================
+// M16: enum class + plain enum body lowering.
+// ============================================================
+
+#[test]
+fn m16_captures_scoped_enum_with_unique_discriminants() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "enum class Color : int { Red = 1, Green = 2, Blue = 3 };\n",
+        "m16_scoped_enum_unique",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let e = extras
+        .enums
+        .iter()
+        .find(|e| e.name.0 == "Color")
+        .expect("Color enum captured");
+    assert!(e.scoped, "enum class should be scoped");
+    assert_eq!(e.variants.len(), 3);
+    assert_eq!(e.variants[0].name, "Red");
+    assert_eq!(e.variants[0].value, 1);
+    assert_eq!(e.variants[1].name, "Green");
+    assert_eq!(e.variants[1].value, 2);
+    assert_eq!(e.variants[2].name, "Blue");
+    assert_eq!(e.variants[2].value, 3);
+    assert!(matches!(
+        ctx.type_of(e.underlying),
+        CxxType::Int { signed: true, width: IntWidth::I32 },
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
+fn m16_captures_unscoped_enum() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "enum Mode { Off, On, Auto };\n",
+        "m16_unscoped_enum",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let e = extras
+        .enums
+        .iter()
+        .find(|e| e.name.0 == "Mode")
+        .expect("Mode enum captured");
+    assert!(!e.scoped, "plain enum should be unscoped");
+    let names: Vec<&str> = e.variants.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, vec!["Off", "On", "Auto"]);
+    let values: Vec<i64> = e.variants.iter().map(|v| v.value).collect();
+    assert_eq!(values, vec![0, 1, 2]);
+
+    cleanup(&header);
+}
+
+#[test]
+fn m16_captures_namespace_nested_enum() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "namespace gfx {\n\
+           enum class Boxtype : unsigned char { None = 0, Up = 1, Down = 2 };\n\
+         }\n",
+        "m16_ns_nested_enum",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let e = extras
+        .enums
+        .iter()
+        .find(|e| e.name.0 == "Boxtype")
+        .expect("Boxtype enum captured");
+    let parent_names: Vec<&str> = e
+        .parent
+        .iter()
+        .map(|seg| match seg {
+            NameSegment::Namespace(id) => id.0.as_str(),
+            _ => "<other>",
+        })
+        .collect();
+    assert_eq!(parent_names, vec!["gfx"]);
+    assert!(e.scoped);
+    assert_eq!(e.variants.len(), 3);
+    // Underlying type should be unsigned 8-bit.
+    assert!(matches!(
+        ctx.type_of(e.underlying),
+        CxxType::Int { signed: false, width: IntWidth::I8 },
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
+fn m16_emits_pub_enum_for_scoped_unique() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "enum class Color : int { Red = 1, Green = 2, Blue = 3 };\n",
+        "m16_emit_pub_enum",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(
+        src.contains("#[repr(i32)]") && src.contains("pub enum Color"),
+        "scoped+unique enum should emit as `#[repr(i32)] pub enum Color`; got:\n{src}",
+    );
+    assert!(
+        src.contains("Red = 1") && src.contains("Green = 2") && src.contains("Blue = 3"),
+        "all three variants should appear; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m16_emits_struct_with_consts_for_unscoped() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        // unscoped + non-unique forces the struct shape.
+        "enum Flags : unsigned int { F_NONE = 0, F_A = 1, F_ALSO_A = 1, F_B = 2 };\n",
+        "m16_emit_struct_consts",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(
+        src.contains("#[repr(transparent)]")
+            && src.contains("pub struct Flags(pub u32)"),
+        "unscoped/aliasing enum should emit as transparent struct; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub const F_A: Self = Self(1)")
+            && src.contains("pub const F_ALSO_A: Self = Self(1)")
+            && src.contains("pub const F_B: Self = Self(2)"),
+        "associated consts should be present including the aliasing pair; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m16_class_scope_enum_is_skipped_in_v0() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Outer {\n  enum class Mode { A, B };\n  int slot;\n};\n",
+        "m16_class_scope_enum_skipped",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    assert!(
+        extras.enums.iter().all(|e| e.name.0 != "Mode"),
+        "class-scope enum should not appear at TU scope; got: {:?}",
+        extras.enums.iter().map(|e| &e.name.0).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn m16_anonymous_enum_is_skipped_in_v0() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "enum { GLOBAL_X = 7 };\n\
+         struct Owner { int slot; };\n",
+        "m16_anon_enum_skipped",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // Anonymous enums have no name to dedup on; v0 drops them.
+    assert!(
+        extras.enums.iter().all(|e| !e.name.0.is_empty()),
+        "anonymous enum should not appear in EnumSet",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m17_class_scope_typedef_is_skipped_in_v0() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // In-class aliases require associated-type emission we
+    // don't have yet (deferred per docs/cxx_importer.md §16).
+    // The walker filters them out — verify they're absent
+    // from the AliasSet.
+    let header = temp_header(
+        "struct Foo {\n  using It = int;\n  int slot;\n};\n",
+        "m17_class_scope_typedef",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    assert!(
+        extras.aliases.iter().all(|a| a.name.0 != "It"),
+        "class-scope `using It = int;` should not appear at TU scope; got: {:?}",
+        extras.aliases.iter().map(|a| &a.name.0).collect::<Vec<_>>(),
+    );
+    // Sanity: AliasSet may be empty entirely.
+    let _ = AliasSet::default();
 }
