@@ -3,18 +3,23 @@
 //! See `docs/rustc_abi_cxx.md §4`.
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClassId(pub(crate) u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FieldId(pub(crate) u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MethodId(pub(crate) u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TypeId(pub(crate) u32);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CxxType {
     Void,
     Bool,
@@ -30,6 +35,7 @@ pub enum CxxType {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum IntWidth {
     I8,
     I16,
@@ -39,6 +45,7 @@ pub enum IntWidth {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum FloatKind {
     F32,
     F64,
@@ -46,18 +53,21 @@ pub enum FloatKind {
 }
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CvQual {
     pub is_const: bool,
     pub is_volatile: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RefKind {
     Lvalue,
     Rvalue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FnSig {
     pub params: Vec<TypeId>,
     pub ret: TypeId,
@@ -68,6 +78,7 @@ pub struct FnSig {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClassDef {
     pub name: NestedName,
     pub bases: Vec<BaseSpec>,
@@ -80,6 +91,7 @@ pub struct ClassDef {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct BaseSpec {
     pub class: ClassId,
     pub virtual_: bool,
@@ -87,6 +99,7 @@ pub struct BaseSpec {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FieldDef {
     pub name: Ident,
     pub ty: TypeId,
@@ -94,6 +107,7 @@ pub struct FieldDef {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MethodDef {
     pub name: MethodName,
     pub sig: FnSig,
@@ -103,6 +117,7 @@ pub struct MethodDef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MethodName {
     Ident(Ident),
     Operator(OperatorKind),
@@ -122,6 +137,7 @@ impl MethodName {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum RecordKind {
     Class,
     Struct,
@@ -129,6 +145,7 @@ pub enum RecordKind {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Virtuality {
     NonVirtual,
     Virtual,
@@ -136,6 +153,7 @@ pub enum Virtuality {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Access {
     Public,
     Protected,
@@ -143,6 +161,7 @@ pub enum Access {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SpecialMember {
     DefaultCtor,
     CopyCtor,
@@ -158,12 +177,15 @@ pub enum SpecialMember {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Ident(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NestedName(pub Vec<NameSegment>);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum NameSegment {
     Namespace(Ident),
     Class(Ident),
@@ -180,6 +202,7 @@ pub enum NameSegment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TemplateArg {
     /// A type template argument. `Box<int>` has `[Type(int_id)]`.
     Type(TypeId),
@@ -196,6 +219,7 @@ pub enum TemplateArg {
 /// see `ClassDef` and produce results that are correct for either
 /// direction. Only the emitters and driver pipeline dispatch on origin.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TypeOrigin {
     /// Imported from a C++ header via `cxx_importer`. Method bodies are
     /// defined in the user's C++ translation units; Rust calls them
@@ -223,6 +247,7 @@ impl Default for TypeOrigin {
 /// the name alone. Variants are strings rather than fully-interned
 /// identifiers since the emit-only path doesn't require dedup.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RustEnumDef {
     /// Rust-side identifier.
     pub rust_name: String,
@@ -235,6 +260,7 @@ pub struct RustEnumDef {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RustEnumVariant {
     pub name: String,
     /// Explicit discriminant (`Red = 1`). `None` means "let C++
@@ -244,9 +270,11 @@ pub struct RustEnumVariant {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RustEnumId(pub(crate) u32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum OperatorKind {
     Plus,
     Minus,

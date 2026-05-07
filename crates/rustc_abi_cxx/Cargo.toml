@@ -7,6 +7,16 @@ license.workspace = true
 description = "Itanium C++ ABI layout, name mangling, and vtable construction."
 
 [dependencies]
+# `serde` is required for the on-disk cache layer that
+# `cxx_importer::Driver::load_or_parse` writes (M10). Behind the
+# `serde` feature so consumers that don't need the cache don't
+# pay the dep.
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
 
 [dev-dependencies]
 test_support = { path = "../test_support" }
+serde_json = "1"

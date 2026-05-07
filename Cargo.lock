@@ -87,7 +87,9 @@ dependencies = [
  "clang",
  "rustc_abi_cxx",
  "serde",
+ "serde_json",
  "serde_yaml",
+ "sha2",
  "tempfile",
 ]
 
@@ -287,6 +289,8 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 name = "rustc_abi_cxx"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "test_support",
 ]
 

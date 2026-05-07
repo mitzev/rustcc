@@ -513,6 +513,34 @@ fn render_direct_extern_class(
             where_: "class name".into(),
             kind: "anonymous or non-identifier-named class".into(),
         })?;
+
+    // Poison nodes — minted by the importer for classes whose
+    // lowering failed recoverably (forward-only declarations,
+    // unsupported features in subordinate decls, etc.) — render
+    // as opaque structs with a doc comment explaining the gap.
+    // No methods, no extern block, no Drop impl. Users can name
+    // the type and pass it through pointers; calling any method
+    // produces a "no method named X" diagnostic at compile time.
+    if let Some(reason) = ctx.poison_reason(class_id) {
+        let mut block = String::new();
+        for line in reason.lines() {
+            let _ = writeln!(block, "{indent}/// {line}");
+        }
+        let _ = writeln!(
+            block,
+            "{indent}/// (Class poisoned by `cxx_importer`; method bodies omitted.)",
+        );
+        if config.doc_hidden {
+            let _ = writeln!(block, "{indent}#[doc(hidden)]");
+        }
+        let _ = writeln!(block, "{indent}#[repr(C)]");
+        let _ = writeln!(
+            block,
+            "{indent}pub struct {class_name} {{ _opaque: [::core::mem::MaybeUninit<u8>; 0] }}",
+        );
+        return Ok(block);
+    }
+
     let layout = ctx.layout(class_id).map_err(|e| BindingsError::LayoutFailed {
         class: class_name.clone(),
         detail: format!("{e:?}"),
@@ -1913,6 +1941,57 @@ mod tests {
         assert!(
             !src.contains("pub struct Point"),
             "Skip-annotated class shouldn't be emitted:\n{src}"
+        );
+    }
+
+    #[test]
+    fn poisoned_class_emits_opaque_struct_with_reason_doc_comment() {
+        // M9: classes the importer marks as poison (recoverable
+        // lowering failures) should render as an opaque struct
+        // with the failure reason in a `///` doc comment. No
+        // extern block, no impl, no Drop.
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let id = ctx.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("BrokenWidget".into()))]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![],
+            kind: RecordKind::Class,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        ctx.poison(
+            id,
+            "widget.hpp:14:7: virtual inheritance not supported",
+        );
+
+        let src = generate_rust_bindings(&ctx, &[id], &RustBindingsConfig::default())
+            .expect("emit");
+
+        assert!(
+            src.contains("/// widget.hpp:14:7: virtual inheritance not supported"),
+            "expected reason in doc comment:\n{src}"
+        );
+        assert!(
+            src.contains("/// (Class poisoned by `cxx_importer`"),
+            "expected poison-marker comment:\n{src}"
+        );
+        assert!(
+            src.contains("pub struct BrokenWidget"),
+            "expected opaque struct decl:\n{src}"
+        );
+        assert!(
+            !src.contains("unsafe extern \"C++\""),
+            "poisoned class should have no extern block:\n{src}"
+        );
+        assert!(
+            !src.contains("impl BrokenWidget"),
+            "poisoned class should have no impl block:\n{src}"
+        );
+        assert!(
+            !src.contains("impl ::core::ops::Drop"),
+            "poisoned class should have no Drop impl:\n{src}"
         );
     }
 

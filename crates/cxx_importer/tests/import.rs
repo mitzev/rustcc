@@ -1745,6 +1745,86 @@ fn driver_force_instantiates_class_template_via_synthetic_root() {
 }
 
 #[test]
+fn forward_only_class_referenced_via_pointer_becomes_poison_node() {
+    // M9: when a field references a forward-declared class whose
+    // definition we never see, the importer should mint a poison
+    // node rather than aborting the whole import. Downstream
+    // emission renders the poisoned class as an opaque struct.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "class Foo;\n\
+         struct Bar { Foo* f; };\n",
+        "poison_forward_decl",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    // Bar is the only TU-level definition; `import_header`'s root
+    // walk surfaces just it. Foo (forward-only) is minted as a
+    // poison node by `import_type` when resolving Bar's `Foo*`
+    // field, so it lives in `ctx` but not in the returned id
+    // list.
+    let _root_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import shouldn't abort just because Foo is forward-only");
+
+    // Walk every class in the ctx (including poison nodes
+    // promoted from forward-only references via `import_type`,
+    // which `class_ids` doesn't surface because they're not
+    // root-walked TU-level definitions). Find Foo and Bar.
+    let mut foo: Option<rustc_abi_cxx::ClassId> = None;
+    let mut bar: Option<rustc_abi_cxx::ClassId> = None;
+    for id in ctx.class_ids() {
+        let class = ctx.class(id);
+        match class.name.0.last() {
+            Some(NameSegment::Class(i)) if i.0 == "Foo" => foo = Some(id),
+            Some(NameSegment::Class(i)) if i.0 == "Bar" => bar = Some(id),
+            _ => {}
+        }
+    }
+    let foo = foo.expect("Foo (forward-only) should be a poison node in the ctx");
+    let bar = bar.expect("Bar should be imported normally");
+
+    assert!(
+        ctx.is_poisoned(foo),
+        "Foo should be marked as a poison node"
+    );
+    assert!(
+        !ctx.is_poisoned(bar),
+        "Bar should not be poisoned (it has a full definition)"
+    );
+    let reason = ctx.poison_reason(foo).expect("poison reason set");
+    assert!(
+        reason.contains("forward-declared"),
+        "expected `forward-declared` in poison reason, got: {reason:?}"
+    );
+
+    // Bindings emit Foo as opaque + doc-comment, Bar as concrete.
+    // Pass both ids explicitly since `class_ids` only carries Bar.
+    let src = cxx_importer::rust_bindings::generate_rust_bindings(
+        &ctx,
+        &[foo, bar],
+        &cxx_importer::rust_bindings::RustBindingsConfig::default(),
+    )
+    .expect("emit");
+    assert!(
+        src.contains("/// (Class poisoned by `cxx_importer`"),
+        "expected poison marker doc comment:\n{src}"
+    );
+    assert!(
+        src.contains("pub struct Foo "),
+        "expected opaque Foo struct in emission:\n{src}"
+    );
+    assert!(
+        src.contains("pub struct Bar"),
+        "expected concrete Bar struct:\n{src}"
+    );
+
+    cleanup(&header);
+}
+
+#[test]
 fn imports_variadic_methods_into_fnsig() {
     // Variadic functions / methods (C-style `...` ellipsis) are
     // surfaced via `FnSig::variadic`. Required for round-tripping

@@ -28,6 +28,7 @@ use crate::ty::{
 };
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Symbol {
     Function {
         scope: NestedName,
@@ -62,6 +63,7 @@ pub enum Symbol {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CtorVariant {
     C1,
     C2,
@@ -69,6 +71,7 @@ pub enum CtorVariant {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DtorVariant {
     D0,
     D1,

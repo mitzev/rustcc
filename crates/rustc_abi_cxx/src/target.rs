@@ -3,6 +3,7 @@
 //! See `docs/rustc_abi_cxx.md §8`.
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Target {
     pub triple: String,
     pub pointer_width_bits: u32,
@@ -13,6 +14,7 @@ pub struct Target {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LongDoubleKind {
     F64,
     F80,

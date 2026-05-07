@@ -194,6 +194,106 @@ impl Driver {
     ) -> Result<String, BindingsError> {
         rust_bindings::generate_rust_bindings(ctx, classes, config)
     }
+
+    /// Cache-aware variant of [`Driver::parse_all`]. On a cache hit
+    /// (matching schema + key), loads the previously-serialized
+    /// `CxxTypeCtx` and `AnnotationSet` from `cache_path` and skips
+    /// the libclang invocation entirely. On a miss (stale cache,
+    /// schema mismatch, or first run), parses via libclang and
+    /// writes the cache for the next build.
+    ///
+    /// Cache key is the SHA-256 of every header file's bytes
+    /// joined with the clang argv, the libclang version banner,
+    /// and the cxx_importer crate version. Any change to any of
+    /// those invalidates the cache.
+    ///
+    /// `caller_ctx` is mutated in place — on a hit, it's *replaced*
+    /// with the deserialized contents; on a miss, it's populated
+    /// by the libclang parse the same way `parse_all` does.
+    /// `caller_annotations` is treated identically.
+    ///
+    /// Both arguments accept any starting state — pass freshly-
+    /// constructed values for the typical build.rs flow.
+    #[cfg(all(feature = "libclang", feature = "cache"))]
+    pub fn load_or_parse(
+        &self,
+        cache_path: &std::path::Path,
+        caller_ctx: &mut rustc_abi_cxx::CxxTypeCtx,
+        caller_annotations: &mut crate::annotations::AnnotationSet,
+    ) -> Result<Vec<ClassId>, ImportError> {
+        // Compose the same argv `parse_all` constructs so the cache
+        // key sees exactly what libclang sees.
+        let mut argv: Vec<String> = vec!["-x".into(), "c++".into()];
+        for inc in &self.graph.include_paths {
+            argv.push(format!("-I{}", inc.display()));
+        }
+        argv.extend(self.graph.clang_flags.iter().cloned());
+
+        let sorted = crate::cache::sorted_headers(&self.graph.roots);
+        let header_digest = crate::cache::hash_headers(&sorted).map_err(|e| {
+            ImportError::ClangDiagnostic {
+                file: cache_path.display().to_string(),
+                line: 0,
+                message: format!("hash_headers: {e}"),
+            }
+        })?;
+        let lc_version = crate::cache::libclang_version();
+        let key = crate::cache::compute_cache_key(&header_digest, &argv, &lc_version);
+
+        if let Some(record) = crate::cache::read_record(cache_path, &key) {
+            // Cache hit. Replace caller state with the loaded
+            // record. Note: this drops any pre-populated content
+            // on the caller's side — the standard build.rs flow
+            // passes freshly-constructed values, so this is the
+            // intended path.
+            *caller_ctx = record.ctx;
+            *caller_annotations = record.annotations;
+            return Ok(record.class_ids);
+        }
+
+        // Cache miss. Run a normal parse, then write the result
+        // back to the cache.
+        let class_ids = self.parse_all(caller_ctx)?;
+        // Re-collect annotations into a fresh set for the write.
+        // (`parse_all` doesn't surface annotations; the cache is
+        // intentionally a bit overcounting on writes — paying a
+        // second annotation walk is cheaper than restructuring
+        // `parse_all` into a `parse_all_with_annotations` that
+        // shares state.)
+        let mut anns = crate::annotations::AnnotationSet::default();
+        for root in &self.graph.roots {
+            let mut tmp_cache = std::collections::HashMap::new();
+            // Best-effort: ignore annotation-pass errors so a
+            // sidecar problem doesn't poison the whole cache.
+            if let Ok(_) = crate::import::import_header_full(
+                root,
+                &argv.iter().map(String::as_str).collect::<Vec<_>>(),
+                caller_ctx,
+                &mut tmp_cache,
+                &mut anns,
+            ) {
+                // ok — annotations merged into `anns`.
+            }
+        }
+        *caller_annotations = anns;
+
+        let record = crate::cache::CacheRecord {
+            schema: crate::cache::CACHE_SCHEMA,
+            key,
+            class_ids: class_ids.clone(),
+            ctx: caller_ctx.clone(),
+            annotations: caller_annotations.clone(),
+        };
+        crate::cache::write_record(cache_path, &record).map_err(|e| {
+            ImportError::ClangDiagnostic {
+                file: cache_path.display().to_string(),
+                line: 0,
+                message: format!("write_record: {e}"),
+            }
+        })?;
+
+        Ok(class_ids)
+    }
 }
 
 /// RAII guard for a synthetic-root temp file. Deletes the file on
