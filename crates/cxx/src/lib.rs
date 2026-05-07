@@ -12,6 +12,7 @@
 
 mod base;
 mod boxed;
+mod callback;
 mod heap;
 mod move_;
 mod owned;
@@ -21,6 +22,7 @@ mod string;
 
 pub use base::CxxBase;
 pub use boxed::CxxBox;
+pub use callback::CxxCallback;
 pub use heap::{CxxDeletable, CxxHeap};
 pub use move_::CxxMove;
 pub use owned::CxxOwned;

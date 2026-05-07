@@ -2408,12 +2408,13 @@ fn m17_aliases_emit_pub_type_lines_in_bindings() {
 #[test]
 fn m17_alias_to_unsupported_type_is_skipped_not_fatal() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
-    // `void(int)` is a function type — currently not supported by
-    // `import_type` (M15 lands later). The alias should be
-    // silently dropped rather than aborting the import.
+    // Member-pointer types aren't yet supported by `import_type`.
+    // The alias should silently drop instead of aborting.
+    // (Function pointers WERE the canary here pre-M15; M15 lifted
+    // that, so we use a shape M15 also doesn't cover yet.)
     let header = temp_header(
-        "using SignalHandler = void(int);\n\
-         struct Owner { int v; };\n",
+        "struct Holder { int field; };\n\
+         using MemPtr = int Holder::*;\n",
         "m17_alias_unsupported_target",
     );
 
@@ -2427,13 +2428,135 @@ fn m17_alias_to_unsupported_type_is_skipped_not_fatal() {
 
     // The alias must not appear (target type is unsupported in v0).
     assert!(
-        extras.aliases.iter().all(|a| a.name.0 != "SignalHandler"),
-        "alias to function type should be silently dropped",
+        extras.aliases.iter().all(|a| a.name.0 != "MemPtr"),
+        "alias to member-pointer type should be silently dropped; got: {:?}",
+        extras.aliases.iter().map(|a| &a.name.0).collect::<Vec<_>>(),
     );
     // The class still imports.
     assert!(
         !classes.is_empty(),
-        "imports should still produce the Owner class",
+        "imports should still produce the Holder class",
+    );
+
+    cleanup(&header);
+}
+
+// ============================================================
+// M15: function pointer types — `void (*)(int)` lowering and
+// emission. Closure-as-callback `CxxCallback<F>` runtime helper
+// lives in `crates/cxx/src/callback.rs` and is exercised by its
+// own unit tests.
+// ============================================================
+
+#[test]
+fn m15_lowers_function_pointer_alias_to_fn_type() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "using SignalHandler = void(*)(int);\n\
+         struct Owner { int v; };\n",
+        "m15_fnptr_alias",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "SignalHandler")
+        .expect("SignalHandler alias captured");
+    match ctx.type_of(alias.target) {
+        CxxType::Fn(sig) => {
+            assert_eq!(sig.params.len(), 1);
+            assert!(matches!(
+                ctx.type_of(sig.params[0]),
+                CxxType::Int { signed: true, width: IntWidth::I32 },
+            ));
+            assert!(matches!(ctx.type_of(sig.ret), CxxType::Void));
+            assert!(!sig.variadic);
+        }
+        other => panic!("expected Fn, got {other:?}"),
+    }
+
+    cleanup(&header);
+}
+
+#[test]
+fn m15_lowers_bare_function_type_alias_to_fn_type() {
+    // `using F = void(int);` — the alias target is a bare
+    // `FunctionPrototype`, not a pointer-to-function. We
+    // collapse to `CxxType::Fn` regardless so the renderer
+    // can produce `extern "C" fn(...)`.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "using F = void(int);\n",
+        "m15_bare_fn_alias",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "F")
+        .expect("F alias captured");
+    assert!(matches!(ctx.type_of(alias.target), CxxType::Fn(_)));
+    cleanup(&header);
+}
+
+#[test]
+fn m15_renders_function_pointer_as_extern_c_fn_in_alias() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "using IntCallback = int(*)(int, int);\n\
+         using VoidCallback = void(*)();\n",
+        "m15_fnptr_emit",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(
+        src.contains(
+            "pub type IntCallback = Option<unsafe extern \"C\" fn(i32, i32) -> i32>"
+        ),
+        "non-void return should render with `-> ret`; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub type VoidCallback = Option<unsafe extern \"C\" fn()>"),
+        "void return should render without `-> ()`; got:\n{src}",
     );
 
     cleanup(&header);

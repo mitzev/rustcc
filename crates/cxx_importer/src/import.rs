@@ -1273,6 +1273,54 @@ impl<'a> Importer<'a> {
         Ok(out)
     }
 
+    /// M15: lower a `FunctionPrototype` / `FunctionNoPrototype`
+    /// libclang `Type` to a `CxxType::Fn(FnSig)`. Used for both
+    /// pointer-to-function (`void (*)(int)` collapses one layer
+    /// of `Ptr` and lands here) and bare function-typed alias
+    /// targets (`using F = void(int);`).
+    ///
+    /// Returns the `CxxType` (not yet interned) so the caller can
+    /// integrate it with surrounding pointer logic. v0 captures
+    /// param + result types and a best-effort `variadic` flag;
+    /// `noexcept` / `cv` / `ref_q` aren't part of a function
+    /// pointer's syntactic surface and stay at their defaults.
+    fn import_function_proto(
+        &mut self,
+        ty: Type<'_>,
+        where_: &str,
+    ) -> Result<CxxType, ImportError> {
+        let ret_ty = ty.get_result_type().ok_or_else(|| {
+            ImportError::UnsupportedFeature {
+                what: "function type without result type",
+                where_: where_.to_string(),
+                span: None,
+            }
+        })?;
+        let ret = self.import_type(ret_ty, where_)?;
+        let mut params: Vec<TypeId> = Vec::new();
+        if let Some(arg_tys) = ty.get_argument_types() {
+            for at in arg_tys {
+                let id = self.import_type(at, where_)?;
+                params.push(id);
+            }
+        }
+        let variadic = ty.is_variadic();
+        Ok(CxxType::Fn(FnSig {
+            params,
+            ret,
+            cv: CvQual::default(),
+            ref_q: None,
+            variadic,
+            // Function-pointer types don't carry a syntactic
+            // `noexcept` qualifier in pre-C++17 source. Even in
+            // C++17+, libclang exposes the noexcept-ness on the
+            // declaration, not the standalone type. Default to
+            // `false` (potentially-throwing); the bindings
+            // emitter renders `extern "C" fn(...)` either way.
+            noexcept: false,
+        }))
+    }
+
     fn import_type(
         &mut self,
         ty: Type<'_>,
@@ -1307,14 +1355,39 @@ impl<'a> Importer<'a> {
                         what: "pointer with no pointee",
                         where_: where_.to_string(),
                     span: None,
-                
+
                     }
                 })?;
-                let id = self.import_type(pointee, where_)?;
-                CxxType::Ptr {
-                    pointee: id,
-                    cv: cv_from_type(pointee),
+                // M15: collapse pointer-to-function-type to a bare
+                // `CxxType::Fn` rather than `Ptr { pointee: Fn }`.
+                // Itanium and Rust both treat function pointers as
+                // a single ABI unit, so the extra `Ptr` indirection
+                // would lead the renderer to emit `*const fn(...)`
+                // — wrong for callbacks. Keep one level of pointer
+                // indirection (`void (*)(int)`) but drop it for
+                // higher levels (`void (**)(int)` keeps the outer
+                // Ptr around the Fn).
+                if matches!(
+                    pointee.get_kind(),
+                    TypeKind::FunctionPrototype | TypeKind::FunctionNoPrototype,
+                ) {
+                    self.import_function_proto(pointee, where_)?
+                } else {
+                    let id = self.import_type(pointee, where_)?;
+                    CxxType::Ptr {
+                        pointee: id,
+                        cv: cv_from_type(pointee),
+                    }
                 }
+            }
+            // Bare function-prototype type — usually only seen on
+            // alias targets (`using SignalHandler = void(int);`).
+            // C++ implicitly converts function-typed lvalues to
+            // function pointers at use sites, so the alias is most
+            // useful when treated as the equivalent function-pointer
+            // type from the Rust side.
+            TypeKind::FunctionPrototype | TypeKind::FunctionNoPrototype => {
+                self.import_function_proto(ty, where_)?
             }
             TypeKind::LValueReference => {
                 let pointee = ty.get_pointee_type().ok_or_else(|| {

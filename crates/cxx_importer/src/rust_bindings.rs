@@ -2012,6 +2012,40 @@ fn render_rust_type(
                 kind: "anonymous record".into(),
             })?
         }
+        // M15: function pointer / bare function type. Both render
+        // as Rust function-pointer types (`extern "C" fn(...) -> ret`).
+        // Variadic C functions render with `...` which Rust supports
+        // only behind `unsafe extern "C"` and require feature-gated
+        // syntax for non-`extern "C"` ABIs — keep it `extern "C"`
+        // since C++ callbacks always cross an `extern "C"` boundary.
+        CxxType::Fn(sig) => {
+            // Variadic function pointers in Rust use `...` and are
+            // currently unstable-ish in non-extern contexts — but
+            // for `extern "C" fn` the compiler accepts them.
+            let mut parts = Vec::with_capacity(sig.params.len());
+            for (i, p) in sig.params.iter().enumerate() {
+                let r = render_rust_type(ctx, *p, &format!("{where_} fnptr arg {i}"))?;
+                parts.push(r);
+            }
+            let ret = render_rust_type(ctx, sig.ret, &format!("{where_} fnptr ret"))?;
+            let args = if sig.variadic {
+                let mut v = parts;
+                v.push("...".into());
+                v.join(", ")
+            } else {
+                parts.join(", ")
+            };
+            // Wrap in `Option<...>` so the natural mapping for a
+            // C++ `void (*)()` parameter (which can be `nullptr`)
+            // works without extra ceremony — Option<extern "C"
+            // fn(...)> uses the same null-pointer-optimization
+            // representation as the bare fn pointer.
+            if matches!(ctx.type_of(sig.ret), CxxType::Void) {
+                format!("Option<unsafe extern \"C\" fn({args})>")
+            } else {
+                format!("Option<unsafe extern \"C\" fn({args}) -> {ret}>")
+            }
+        }
         other => {
             return Err(BindingsError::UnsupportedType {
                 where_: where_.into(),
