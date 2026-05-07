@@ -374,15 +374,30 @@ fn render_direct_extern_class(
     })?;
 
     // Collect methods up front — we need them for the extern block,
-    // the impl block, and the Drop check. Rejecting on virtual,
-    // operator, and conversion methods up front keeps later code
-    // simple.
+    // the impl block, and the Drop check. We accept virtuals here
+    // (their `vtable_index` was populated by the importer's
+    // post-pass); the wrapper renderer routes them through a
+    // vtable-lookup path. Pure virtuals stay rejected for v0
+    // because they don't have an own-class implementation to call.
     let methods = ctx.class(class_id).methods.clone();
     for m in &methods {
-        if m.virtuality != Virtuality::NonVirtual {
+        if m.virtuality == Virtuality::Virtual && m.vtable_index.is_none() {
             return Err(BindingsError::UnsupportedMethod {
                 where_: format!("{class_name}::{:?}", m.name),
-                why: "virtual methods deferred until vtable-aware emission lands".into(),
+                why: "virtual method without populated vtable_index — the importer's \
+                      vtable post-pass didn't recognize this slot. Likely a class \
+                      structure (multi-inheritance, virtual bases) the v0 vtable \
+                      walker doesn't yet handle."
+                    .into(),
+            });
+        }
+        if m.virtuality == Virtuality::PureVirtual {
+            return Err(BindingsError::UnsupportedMethod {
+                where_: format!("{class_name}::{:?}", m.name),
+                why: "pure virtual method (no own-class implementation to call) — \
+                      a future revision can either skip it or route to an \
+                      `__cxa_pure_virtual` shim."
+                    .into(),
             });
         }
     }
@@ -439,19 +454,25 @@ fn render_direct_extern_class(
         if matches!(emission.kind, EmissionKind::Ctor) {
             ctor_seen += 1;
         }
-        // Emit the extern decl line.
-        let _ = writeln!(
-            block,
-            "{indent}    #[link_name = \"{}\"]",
-            emission.link_name,
-        );
-        let _ = writeln!(
-            block,
-            "{indent}    fn {ext}({decl}){ret};",
-            ext = emission.extern_ident,
-            decl = emission.extern_decl_params,
-            ret = emission.extern_return_clause,
-        );
+        // Virtual methods don't get a `#[link_name]` extern decl —
+        // they're dispatched via the vtable at the call site, not
+        // by linker resolution. The wrapper does its own vptr load
+        // and transmute.
+        if !matches!(emission.kind, EmissionKind::Virtual { .. }) {
+            // Emit the extern decl line.
+            let _ = writeln!(
+                block,
+                "{indent}    #[link_name = \"{}\"]",
+                emission.link_name,
+            );
+            let _ = writeln!(
+                block,
+                "{indent}    fn {ext}({decl}){ret};",
+                ext = emission.extern_ident,
+                decl = emission.extern_decl_params,
+                ret = emission.extern_return_clause,
+            );
+        }
         method_blocks.push(emission);
     }
     let _ = writeln!(block, "{indent}}}");
@@ -548,10 +569,15 @@ struct MethodEmission {
 enum EmissionKind {
     Ctor,
     Dtor,
-    /// `&self` / `&mut self` instance method.
+    /// `&self` / `&mut self` instance method, dispatched directly
+    /// to the Itanium-mangled symbol.
     Instance,
     /// No-self static method.
     Static,
+    /// `&self` / `&mut self` virtual method, dispatched through
+    /// the C++ vtable. `vtable_index` is the rank of this method
+    /// among the primary sub-table's function-pointer slots.
+    Virtual { vtable_index: u32 },
 }
 
 /// Compute one disambiguated Rust identifier per method in `methods`,
@@ -769,13 +795,27 @@ fn classify_for_direct_extern(
         format!(" -> {ret_rust}")
     };
 
-    // Distinguish instance vs static. The current importer doesn't
-    // mark static methods explicitly, so we infer: any non-special
-    // method without a `cv` const flag and with `MethodDef::name`
-    // outside the special-member list is treated as an instance
-    // method by default. (Real static-method support arrives once
-    // libclang's `is_static_method` flag gets surfaced.)
-    let kind = EmissionKind::Instance;
+    // Distinguish instance / static / virtual. The current importer
+    // doesn't mark static methods explicitly (real static-method
+    // support arrives once libclang's `is_static_method` flag gets
+    // surfaced), so we default non-virtual methods to Instance.
+    // Virtuals carry their `vtable_index` into the emission so the
+    // wrapper can synthesize a vptr load + transmute.
+    let kind = if method.virtuality == Virtuality::Virtual {
+        match method.vtable_index {
+            Some(vt) => EmissionKind::Virtual { vtable_index: vt },
+            None => {
+                return Err(BindingsError::UnsupportedMethod {
+                    where_: format!("{class_name}::{method_name}"),
+                    why: "virtual method missing vtable_index — populate_vtable_indices \
+                          should have set it; this is an internal invariant break"
+                        .into(),
+                });
+            }
+        }
+    } else {
+        EmissionKind::Instance
+    };
     let receiver = if method.sig.cv.is_const {
         WrapperReceiver::SelfConst
     } else {
@@ -811,6 +851,19 @@ fn classify_for_direct_extern(
         wrapper_return: ret_rust,
         forward_args: user_forward.join(", "),
     })
+}
+
+/// Convert a wrapper-style parameter list (`arg0: i32, arg1: f64`)
+/// into a fn-pointer-style type list (`i32, f64`). Used to build
+/// the `unsafe extern "C++" fn(...)` type for vtable-lookup
+/// transmutes.
+fn strip_arg_names(wrapper_params: &str) -> String {
+    wrapper_params
+        .split(',')
+        .map(|p| p.trim().split(": ").nth(1).unwrap_or("").trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_direct_extern_wrapper(
@@ -914,6 +967,110 @@ fn render_direct_extern_wrapper(
                     fwd = emission.forward_args,
                 );
             }
+            let _ = writeln!(out, "{indent}}}");
+        }
+        EmissionKind::Virtual { vtable_index } => {
+            // Vtable-lookup wrapper. Reads the vptr at offset 0 of
+            // the primary subobject, indexes into the vtable, and
+            // calls through a transmuted function pointer with the
+            // right `extern "C++"` ABI so the fork's
+            // `compute_cxx_abi_info` overlay still routes
+            // record-by-value returns through the correct
+            // indirect-result register.
+            //
+            // Layout assumptions (Itanium):
+            //   - vptr lives at byte 0 of the most-derived object
+            //     (no virtual bases preceding the primary).
+            //   - The vptr in the object points at the vtable's
+            //     "address point" — past the offset-to-top + RTTI
+            //     prelude. Function-pointer slots start there.
+            //   - `vtable_index` is the function-pointer rank
+            //     populated by the importer's vtable post-pass.
+            //
+            // Multi-inheritance / virtual-base complications would
+            // require offset adjustments on the `this` pointer
+            // before the call. Left for a follow-up release;
+            // single-inheritance hierarchies (the common case)
+            // work today.
+            let receiver_kw = match emission.wrapper_receiver {
+                WrapperReceiver::SelfConst => "&self",
+                WrapperReceiver::SelfMut => "&mut self",
+                _ => unreachable!("virtual method without self receiver"),
+            };
+            let self_ptr_ty = match emission.wrapper_receiver {
+                WrapperReceiver::SelfConst => "*const Self",
+                WrapperReceiver::SelfMut => "*mut Self",
+                _ => unreachable!(),
+            };
+            let self_cast = match emission.wrapper_receiver {
+                WrapperReceiver::SelfConst => "self as *const Self",
+                WrapperReceiver::SelfMut => "self as *mut Self",
+                _ => unreachable!(),
+            };
+            let ret_clause = if emission.wrapper_return == "()" {
+                String::new()
+            } else {
+                format!(" -> {}", emission.wrapper_return)
+            };
+            let head = if emission.wrapper_params.is_empty() {
+                format!(
+                    "{indent}pub fn {name}({recv}){ret} {{",
+                    name = emission.rust_name,
+                    recv = receiver_kw,
+                    ret = ret_clause,
+                )
+            } else {
+                format!(
+                    "{indent}pub fn {name}({recv}, {params}){ret} {{",
+                    name = emission.rust_name,
+                    recv = receiver_kw,
+                    params = emission.wrapper_params,
+                    ret = ret_clause,
+                )
+            };
+            let _ = writeln!(out, "{head}");
+            let _ = writeln!(out, "{indent}    unsafe {{");
+            let _ = writeln!(
+                out,
+                "{indent}        let __this: {self_ptr_ty} = {self_cast};",
+            );
+            let _ = writeln!(
+                out,
+                "{indent}        let __vtable: *const usize = \
+                 *(__this as *const *const usize);",
+            );
+            let _ = writeln!(
+                out,
+                "{indent}        let __slot: usize = *__vtable.add({vtable_index});",
+            );
+            // Function pointer type: extern "C++" so the fork's
+            // ABI overlay applies. Param signature mirrors the
+            // wrapper, with the explicit `this` slot.
+            let fn_ptr_args = if emission.wrapper_params.is_empty() {
+                self_ptr_ty.to_string()
+            } else {
+                format!("{self_ptr_ty}, {}", strip_arg_names(&emission.wrapper_params))
+            };
+            let fn_ptr_ret = if emission.wrapper_return == "()" {
+                String::new()
+            } else {
+                format!(" -> {}", emission.wrapper_return)
+            };
+            let _ = writeln!(
+                out,
+                "{indent}        let __f: unsafe extern \"C++\" fn({fn_ptr_args}){fn_ptr_ret} = \
+                 ::core::mem::transmute(__slot);",
+            );
+            if emission.forward_args.is_empty() {
+                let _ = writeln!(out, "{indent}        __f(__this)");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{indent}        __f(__this, {fwd})",
+                    fwd = emission.forward_args,
+                );
+            }
+            let _ = writeln!(out, "{indent}    }}");
             let _ = writeln!(out, "{indent}}}");
         }
         EmissionKind::Static => {
@@ -1429,6 +1586,78 @@ mod tests {
         assert!(
             src.contains("    #[repr(C)]") || src.contains("\n    pub struct Foo"),
             "expected indented class block:\n{src}"
+        );
+    }
+
+    #[test]
+    fn virtual_method_emits_vtable_lookup_wrapper_with_transmute() {
+        // Build a polymorphic class by hand: one virtual method
+        // with a known vtable_index. The emitter should skip the
+        // extern decl for this method (no `#[link_name]`) and emit
+        // a wrapper that loads the vptr, indexes, transmutes, and
+        // calls.
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let i32_ = ctx.intern_type(CxxType::Int {
+            signed: true,
+            width: IntWidth::I32,
+        });
+        let id = ctx.define_rust_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("Shape".into()))]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![MethodDef {
+                name: MethodName::Ident(Ident("area".into())),
+                sig: FnSig {
+                    params: vec![],
+                    ret: i32_,
+                    cv: CvQual { is_const: true, is_volatile: false },
+                    ref_q: None,
+                    variadic: false,
+                    noexcept: false,
+                },
+                virtuality: Virtuality::Virtual,
+                vtable_index: Some(0),
+                special: None,
+            }],
+            kind: RecordKind::Struct,
+            is_polymorphic: true,
+            is_final: false,
+            source_alignment: None,
+        });
+
+        let src = generate_rust_bindings(&ctx, &[id], &RustBindingsConfig::default())
+            .expect("emit");
+
+        // No `#[link_name]` for the virtual method — it's not in
+        // the extern block at all.
+        assert!(
+            !src.contains("#[link_name = \"_ZNK5Shape4areaEv\"]"),
+            "virtual method should not have a #[link_name] extern decl:\n{src}"
+        );
+        // Wrapper exists, takes `&self`, returns `i32`.
+        assert!(
+            src.contains("pub fn area(&self) -> i32 {"),
+            "expected `pub fn area(&self) -> i32` wrapper:\n{src}"
+        );
+        // Vtable lookup pattern.
+        assert!(
+            src.contains("*(__this as *const *const usize)"),
+            "expected vptr load:\n{src}"
+        );
+        assert!(
+            src.contains("__vtable.add(0)"),
+            "expected vtable_index = 0 lookup:\n{src}"
+        );
+        assert!(
+            src.contains("::core::mem::transmute(__slot)"),
+            "expected transmute call:\n{src}"
+        );
+        // The transmuted fn pointer carries `extern "C++"` so the
+        // fork's ABI overlay routes by-value record returns via
+        // sret on aarch64 (P09.50).
+        assert!(
+            src.contains("unsafe extern \"C++\" fn(*const Self) -> i32"),
+            "expected extern \"C++\" fn pointer type:\n{src}"
         );
     }
 

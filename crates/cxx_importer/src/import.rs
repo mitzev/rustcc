@@ -48,7 +48,7 @@ use rustc_abi_cxx::{
     Access, BaseSpec, ClassDef, ClassId, CvQual, CxxType, CxxTypeCtx,
     FieldDef, FloatKind, FnSig, Ident, IntWidth, MethodDef, MethodName,
     NameSegment, NestedName, OperatorKind, RecordKind, RefKind, SpecialMember,
-    TemplateArg, TypeId, Virtuality,
+    Symbol, TemplateArg, TypeId, VTableEntry, Virtuality,
 };
 
 use crate::diagnostics::ImportError;
@@ -372,6 +372,15 @@ impl<'a> Importer<'a> {
         class.fields = fields;
         class.methods = methods;
         class.is_polymorphic = is_polymorphic;
+
+        // After everything is in place, walk the class's primary
+        // vtable and stamp `vtable_index` onto each virtual method
+        // we own — useful metadata for downstream emitters that
+        // want to dispatch through the vtable rather than calling
+        // the mangled symbol directly.
+        if is_polymorphic {
+            populate_vtable_indices(self.ctx, id);
+        }
 
         Ok(id)
     }
@@ -880,6 +889,91 @@ fn class_has_virtual_base_chain(
         }
     }
     false
+}
+
+/// Walk a polymorphic class's primary vtable and stamp `vtable_index`
+/// onto each virtual method the class owns or overrides.
+///
+/// The fork-side vtable layout (`CxxTypeCtx::vtable`) computes one
+/// `VTableEntry::FunctionPointer` slot per dispatchable method, in
+/// the canonical Itanium order: base virtuals first (slots that
+/// either keep base targets or get rewritten with our overriders),
+/// then any new virtuals introduced by this class.
+///
+/// Per-method `vtable_index` is the *function-pointer rank* in the
+/// primary sub-table — the count of `FunctionPointer` slots that
+/// precede this one, ignoring the virtual-base offsets, offset-to-
+/// top, and RTTI slots that lead each table.
+///
+/// We only update methods that match by Itanium-mangled symbol with
+/// what's actually in the slot. This handles two cases cleanly:
+///
+/// - A virtual we override: our class's own mangled symbol is in
+///   the slot, so we own the index.
+/// - A virtual a base owns and we don't override: the slot's
+///   target is the base's symbol, so the lookup misses and our
+///   `vtable_index` stays `None` (we never see the inherited
+///   methods on this class anyway since the importer copies
+///   methods from `child.get_children()`, not from base classes).
+///
+/// Pure virtuals are skipped in v0 — their slot target is
+/// `__cxa_pure_virtual` (a single shared symbol), so the symbol-
+/// match approach can't disambiguate them. A future revision can
+/// reach pure virtuals via the `MethodId` field once the importer
+/// stops eagerly cloning method vectors.
+fn populate_vtable_indices(ctx: &mut CxxTypeCtx, class_id: ClassId) {
+    let Some(vtable) = ctx.vtable(class_id) else {
+        return;
+    };
+    let Some(primary) = vtable.sub_tables.first() else {
+        return;
+    };
+
+    // Snapshot method symbols before mutating.
+    let class_clone = ctx.class(class_id).clone();
+    let mut wanted: Vec<Option<String>> = Vec::with_capacity(class_clone.methods.len());
+    for m in &class_clone.methods {
+        if m.virtuality == Virtuality::Virtual {
+            // Skip ConversionTo (we don't know how to mangle them
+            // here — the conversion target's TypeId would change
+            // hands and we don't want to drop a borrow on ctx).
+            let mangled = ctx.mangle(&Symbol::Method {
+                class: class_id,
+                name: m.name.clone(),
+                sig: m.sig.clone(),
+            });
+            wanted.push(Some(mangled));
+        } else {
+            wanted.push(None);
+        }
+    }
+
+    // Walk the primary sub-table, count `FunctionPointer` rank,
+    // and remember the rank of any slot whose target matches one
+    // of our methods' mangled symbols.
+    let mut updates: Vec<(usize, u32)> = Vec::new();
+    let mut fp_rank: u32 = 0;
+    for entry in &primary.entries {
+        if let VTableEntry::FunctionPointer { mangled_target, .. } = entry {
+            for (m_idx, expected) in wanted.iter().enumerate() {
+                if let Some(sym) = expected {
+                    if sym == mangled_target {
+                        updates.push((m_idx, fp_rank));
+                        // Don't break — defensively allow the same
+                        // method to appear in multiple slots if
+                        // future overload patterns require it. In
+                        // practice each method shows up once.
+                    }
+                }
+            }
+            fp_rank += 1;
+        }
+    }
+
+    let class_mut = ctx.class_mut(class_id);
+    for (m_idx, vt) in updates {
+        class_mut.methods[m_idx].vtable_index = Some(vt);
+    }
 }
 
 fn entity_usr(entity: &Entity<'_>) -> String {

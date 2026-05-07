@@ -1540,6 +1540,84 @@ fn rust_bindings_disambiguates_overloaded_plain_methods_by_param_signature() {
 }
 
 #[test]
+fn populates_vtable_index_on_virtual_methods() {
+    // Polymorphic class: vptr is at offset 0; virtual methods get
+    // vtable slots ranked by their position in the primary
+    // sub-table's function-pointer region. The importer should
+    // stamp `vtable_index` onto each virtual method we own.
+    //
+    // Layout-wise (Itanium AArch64 / SysV):
+    //   slot 0 (after offset_to_top + RTTI): area()
+    //   slot 1: side()
+    //   slot 2 (we own this; new virtual): describe()
+    //
+    // Non-virtual methods (`tag`) keep `vtable_index = None`.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Shape {\n\
+         \x20   virtual int area() const;\n\
+         \x20   virtual int side() const;\n\
+         \x20   virtual int describe() const;\n\
+         \x20   int tag() const;\n\
+         };\n",
+        "vtable_index",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let ids = import_header(&header, &["-x", "c++", "-std=c++17"], &mut ctx)
+        .expect("import");
+    let class = ctx.class(ids[0]);
+
+    let by_name = |name: &str| {
+        class
+            .methods
+            .iter()
+            .find(|m| m.name.ident_name() == Some(name))
+            .unwrap_or_else(|| panic!("method `{name}` not found"))
+    };
+
+    let area = by_name("area");
+    let side = by_name("side");
+    let describe = by_name("describe");
+    let tag = by_name("tag");
+
+    // Virtuals get a stamped index.
+    assert!(
+        area.vtable_index.is_some(),
+        "area() should have a vtable_index"
+    );
+    assert!(
+        side.vtable_index.is_some(),
+        "side() should have a vtable_index"
+    );
+    assert!(
+        describe.vtable_index.is_some(),
+        "describe() should have a vtable_index"
+    );
+
+    // Non-virtual stays None.
+    assert_eq!(
+        tag.vtable_index, None,
+        "non-virtual `tag()` should NOT have a vtable_index"
+    );
+
+    // Indices are distinct.
+    let indices: Vec<u32> = vec![area, side, describe]
+        .into_iter()
+        .map(|m| m.vtable_index.unwrap())
+        .collect();
+    let mut sorted = indices.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        3,
+        "expected three distinct vtable_index values, got {indices:?}"
+    );
+
+    cleanup(&header);
+}
+
+#[test]
 fn imports_variadic_methods_into_fnsig() {
     // Variadic functions / methods (C-style `...` ellipsis) are
     // surfaced via `FnSig::variadic`. Required for round-tripping
