@@ -1,22 +1,35 @@
-//! libclang-backed importer — POD structs, nested records, and bases.
+//! libclang-backed importer — translates a C++ translation unit into
+//! `rustc_abi_cxx`'s `CxxTypeCtx`.
 //!
-//! Current scope:
+//! Current scope (validated by the libclang-gated suite in
+//! `tests/import.rs`):
 //!
-//! - Top-level (non-nested) struct and class definitions.
-//! - Fields of primitive type, pointer/reference, and nested record
-//!   (by-value composition).
-//! - Non-virtual inheritance, single or multiple
-//!   (`struct D : A, B` — each non-primary base sits at an aligned
-//!   offset after the primary).
+//! - **Records**: top-level + namespace-nested struct / class /
+//!   union definitions. Anonymous and named namespaces.
+//! - **Fields**: primitives, pointers, references, nested records
+//!   (by-value composition), arrays, enums.
+//! - **Inheritance**: non-virtual (single + multiple), virtual
+//!   bases including diamond. Polymorphism, vtable layout, and
+//!   `is_polymorphic` propagation through base chains.
+//! - **Methods**: instance + static methods, ctors (default + copy
+//!   + move + `OtherCtor`), dtors, copy/move-assign operators,
+//!   user-declared operator overloads (with the short Itanium codes
+//!   `pl`, `ix`, …), conversion functions (`operator T()`).
+//! - **Templates**: explicit class-template specializations (`vector<int>`).
 //!
-//! Not yet handled:
+//! Self-doc gaps (still open, smaller now):
 //!
-//! - Method / ctor / dtor declarations (affects `is_polymorphic`).
-//! - Namespace scoping (classes still get a single `NameSegment::Class`).
-//! - Templates, enums, function types, member pointers, unions.
-//! - Forward-declared-only types (self-references-by-pointer would
-//!   deadlock the recursive import; classes must be defined before
-//!   they're referenced).
+//! - `noexcept`, ref-qualifiers (`&` / `&&`), and variadics in
+//!   `FnSig` are extracted as defaults today (`false`, `None`,
+//!   `false`). Scheduled in the polish pass that lands alongside
+//!   this revision of the docs.
+//! - Vtable indices are computed at layout time inside
+//!   `rustc_abi_cxx::vtable`, not propagated back into per-method
+//!   `MethodDef::vtable_index`. The mangler / dispatcher reads the
+//!   index out of the layout query, so this is a metadata gap, not
+//!   a correctness one.
+//! - Uninstantiated templates (`CXCursor_ClassTemplate`) are
+//!   skipped. Sidecar-driven explicit instantiation lands later.
 //!
 //! Recursive import: when a field or base references a record type,
 //! the importer recursively lowers that record before continuing. Each
@@ -27,7 +40,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use clang::{Clang, Entity, EntityKind, EntityVisitResult, Index, Type, TypeKind};
+use clang::{
+    Clang, Entity, EntityKind, EntityVisitResult, ExceptionSpecification, Index,
+    RefQualifier, Type, TypeKind,
+};
 use rustc_abi_cxx::{
     Access, BaseSpec, ClassDef, ClassId, CvQual, CxxType, CxxTypeCtx,
     FieldDef, FloatKind, FnSig, Ident, IntWidth, MethodDef, MethodName,
@@ -407,6 +423,41 @@ impl<'a> Importer<'a> {
             is_volatile: false,
         };
 
+        // Ref-qualifier (`Foo::bar() &` vs `&&`) and variadic-ness
+        // are properties of the *type* of the method, not the
+        // method entity itself. `entity.get_type()` returns the
+        // FunctionPrototype Type for a method, which carries both.
+        let method_type = entity.get_type();
+        let ref_q = method_type
+            .as_ref()
+            .and_then(|t| t.get_ref_qualifier())
+            .map(|r| match r {
+                RefQualifier::LValue => RefKind::Lvalue,
+                RefQualifier::RValue => RefKind::Rvalue,
+            });
+        let variadic = method_type
+            .as_ref()
+            .map(|t| t.is_variadic())
+            .unwrap_or(false);
+
+        // `noexcept` extraction. C++17 made `noexcept` part of the
+        // function type; the Itanium mangler doesn't fold it into
+        // ordinary method symbols, but it's load-bearing for
+        // pointer-to-member types and template signatures, plus it's
+        // useful surface info for downstream emitters (e.g. shim
+        // generation can drop the `try` wrapper for noexcept fns).
+        //
+        // Only `BasicNoexcept` and `ComputedNoexcept` map to
+        // `noexcept = true`. `DynamicNone` (`throw()`) was C++03
+        // syntax that doesn't participate in the type system, and
+        // `NoThrow` (`__declspec(nothrow)`) is an MSVC annotation
+        // that doesn't affect Itanium semantics.
+        let noexcept = matches!(
+            entity.get_exception_specification(),
+            Some(ExceptionSpecification::BasicNoexcept)
+                | Some(ExceptionSpecification::ComputedNoexcept),
+        );
+
         let virtuality = if entity.is_pure_virtual_method() {
             Virtuality::PureVirtual
         } else if entity.is_virtual_method() {
@@ -464,9 +515,9 @@ impl<'a> Importer<'a> {
                 params,
                 ret,
                 cv,
-                ref_q: None,
-                variadic: false,
-                noexcept: false,
+                ref_q,
+                variadic,
+                noexcept,
             },
             virtuality,
             vtable_index: None,

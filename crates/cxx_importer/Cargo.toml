@@ -13,7 +13,9 @@ rustc_abi_cxx = { path = "../rustc_abi_cxx" }
 # time. LIBCLANG_PATH env var, xcrun, and standard paths are searched.
 # `clang_3_7` unlocks `Type::get_fields()`, which we use as a reliable
 # field enumerator that works on template specializations too.
-clang = { version = "2.0", optional = true, features = ["runtime", "clang_3_7"] }
+# `clang_5_0` unlocks `Entity::get_exception_specification()` for
+# `noexcept` extraction in `import::lower_method`.
+clang = { version = "2.0", optional = true, features = ["runtime", "clang_3_7", "clang_5_0"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 

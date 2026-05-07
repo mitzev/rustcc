@@ -1347,3 +1347,119 @@ fn imports_const_pointer_preserves_cv() {
 
     cleanup(&header);
 }
+
+#[test]
+fn imports_noexcept_methods_into_fnsig() {
+    // Polish item: `noexcept` is part of the function type from
+    // C++17 onward and useful surface info for downstream emitters.
+    // We extract `BasicNoexcept` (bare `noexcept`) and
+    // `ComputedNoexcept` (`noexcept(expr)`).
+    //
+    // Known libclang limitation: the API exposes only the *kind* of
+    // exception spec, not the computed boolean value of the
+    // `noexcept(expr)` expression. So `noexcept(false)` (which
+    // semantically means the function CAN throw) is reported as
+    // `ComputedNoexcept` and gets flagged here as `noexcept = true`
+    // — a false positive. A future revision could pair this with
+    // `clang_Cursor_isFunctionInlined`-style probes or by parsing
+    // the expr node, but the cost-vs-benefit is poor for what's
+    // already a rarely-used corner of the spec.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Foo {\n\
+         \x20   void plain();\n\
+         \x20   void noex() noexcept;\n\
+         \x20   void noex_true() noexcept(true);\n\
+         };\n",
+        "noexcept_extract",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let ids = import_header(&header, &["-x", "c++", "-std=c++17"], &mut ctx)
+        .expect("import");
+    let class = ctx.class(ids[0]);
+    let by_name = |name: &str| -> bool {
+        class
+            .methods
+            .iter()
+            .find(|m| m.name.ident_name() == Some(name))
+            .unwrap_or_else(|| panic!("method `{name}` not found"))
+            .sig
+            .noexcept
+    };
+    assert!(!by_name("plain"), "plain method should not be noexcept");
+    assert!(by_name("noex"), "bare noexcept should be flagged");
+    assert!(
+        by_name("noex_true"),
+        "noexcept(true) reduces to noexcept; should be flagged"
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn imports_ref_qualified_methods_into_fnsig() {
+    // C++11 ref-qualifiers split overloads on the value category
+    // of the receiver. The importer surfaces them in
+    // `FnSig::ref_q`; the mangler uses them to disambiguate
+    // overload resolution at the symbol level.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Foo {\n\
+         \x20   void unqual();\n\
+         \x20   void lref() &;\n\
+         \x20   void rref() &&;\n\
+         };\n",
+        "refq_extract",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let ids = import_header(&header, &["-x", "c++", "-std=c++17"], &mut ctx)
+        .expect("import");
+    let class = ctx.class(ids[0]);
+    let refq_by_name = |name: &str| -> Option<rustc_abi_cxx::RefKind> {
+        class
+            .methods
+            .iter()
+            .find(|m| m.name.ident_name() == Some(name))
+            .unwrap_or_else(|| panic!("method `{name}` not found"))
+            .sig
+            .ref_q
+    };
+    assert_eq!(refq_by_name("unqual"), None);
+    assert_eq!(refq_by_name("lref"), Some(rustc_abi_cxx::RefKind::Lvalue));
+    assert_eq!(refq_by_name("rref"), Some(rustc_abi_cxx::RefKind::Rvalue));
+    cleanup(&header);
+}
+
+#[test]
+fn imports_variadic_methods_into_fnsig() {
+    // Variadic functions / methods (C-style `...` ellipsis) are
+    // surfaced via `FnSig::variadic`. Required for round-tripping
+    // C-interop methods whose signature legitimately uses the
+    // variadic shape (`printf`-style logging hooks).
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Logger {\n\
+         \x20   int log(const char* fmt, ...);\n\
+         \x20   int regular(int n);\n\
+         };\n",
+        "variadic_extract",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let ids = import_header(&header, &["-x", "c++", "-std=c++17"], &mut ctx)
+        .expect("import");
+    let class = ctx.class(ids[0]);
+    let variadic_by_name = |name: &str| -> bool {
+        class
+            .methods
+            .iter()
+            .find(|m| m.name.ident_name() == Some(name))
+            .unwrap_or_else(|| panic!("method `{name}` not found"))
+            .sig
+            .variadic
+    };
+    assert!(variadic_by_name("log"), "log(fmt, ...) should be variadic");
+    assert!(
+        !variadic_by_name("regular"),
+        "regular(int) should not be variadic"
+    );
+    cleanup(&header);
+}
