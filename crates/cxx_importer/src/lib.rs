@@ -24,7 +24,8 @@ pub use diagnostics::ImportError;
 pub use driver::{Driver, HeaderGraph};
 pub use lower::LoweredEntity;
 pub use name_mapping::{
-    disambiguate_overloads, map_class, map_method, map_namespace, SelfReceiver,
+    disambiguate_overloads, map_class, map_method, map_namespace, rust_name_for_operator,
+    OverloadEntry, SelfReceiver,
 };
 pub use resolve::{EntityKey, ResolvedCursor};
 

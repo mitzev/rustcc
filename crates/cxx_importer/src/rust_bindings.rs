@@ -108,6 +108,10 @@ use rustc_abi_cxx::{
     MethodDef, MethodName, NameSegment, SpecialMember, Symbol, TypeId, Virtuality,
 };
 
+use crate::name_mapping::{
+    disambiguate_overloads, rust_name_for_operator, OverloadEntry,
+};
+
 /// Selects the surface the emitter writes against. The three backends
 /// span two orthogonal axes:
 ///
@@ -411,11 +415,24 @@ fn render_direct_extern_class(
     //    register-passed identically to C.
     let _ = writeln!(block, "{indent}unsafe extern \"C++\" {{");
 
+    // Pre-compute the disambiguated Rust name for each method.
+    // Ctors and dtors are special-cased to `new` / `drop`; operators
+    // route through `rust_name_for_operator`; identifier-named
+    // methods keep their source name, with collisions resolved by
+    // appending a stringified parameter-type signature.
+    let resolved_names = resolve_method_names(ctx, &methods, &class_name)?;
+
     let mut ctor_seen = 0usize;
     let mut method_blocks: Vec<MethodEmission> = Vec::with_capacity(methods.len());
     let mut has_user_dtor = false;
-    for method in &methods {
-        let emission = classify_for_direct_extern(ctx, class_id, &class_name, method)?;
+    for (method, resolved_name) in methods.iter().zip(resolved_names.iter()) {
+        let emission = classify_for_direct_extern(
+            ctx,
+            class_id,
+            &class_name,
+            method,
+            resolved_name,
+        )?;
         if matches!(emission.kind, EmissionKind::Dtor) {
             has_user_dtor = true;
         }
@@ -537,6 +554,103 @@ enum EmissionKind {
     Static,
 }
 
+/// Compute one disambiguated Rust identifier per method in `methods`,
+/// in the same order. Handles three flavors:
+///
+/// - Ctor → `"new"` (every ctor in v0; multi-ctor support gets
+///   suffixes via the disambiguator pass).
+/// - Dtor → `"drop"`.
+/// - Operator → `op_<word>` / `op_<word>_mut` per
+///   [`rust_name_for_operator`].
+/// - Plain identifier → the source name.
+///
+/// After base-name selection, collisions get
+/// `<base>_<arg-type-signature>` suffixes via
+/// [`disambiguate_overloads`]. The disambiguator string is the
+/// param-type list joined by `_`, sanitized into a valid Rust
+/// identifier suffix.
+fn resolve_method_names(
+    ctx: &CxxTypeCtx,
+    methods: &[MethodDef],
+    class_name: &str,
+) -> Result<Vec<String>, BindingsError> {
+    // First pass: base name + disambiguator string per method.
+    let mut entries: Vec<(String, String)> = Vec::with_capacity(methods.len());
+    for method in methods {
+        let base = base_rust_name_for_method(method, class_name)?;
+        let disamb = stringify_param_signature(ctx, method, class_name)?;
+        entries.push((base, disamb));
+    }
+
+    // Second pass: feed into the disambiguator.
+    let entries_view: Vec<OverloadEntry<&str>> = entries
+        .iter()
+        .map(|(b, d)| OverloadEntry {
+            base_name: b.as_str(),
+            disambiguator: d.as_str(),
+        })
+        .collect();
+    let resolved = disambiguate_overloads(entries_view);
+    Ok(resolved.into_iter().map(|i| i.0).collect())
+}
+
+fn base_rust_name_for_method(
+    method: &MethodDef,
+    class_name: &str,
+) -> Result<String, BindingsError> {
+    match &method.special {
+        Some(SpecialMember::DefaultCtor | SpecialMember::OtherCtor) => Ok("new".into()),
+        Some(SpecialMember::Dtor) => Ok("drop".into()),
+        Some(other @ (SpecialMember::CopyCtor
+        | SpecialMember::MoveCtor
+        | SpecialMember::CopyAssign
+        | SpecialMember::MoveAssign)) => Err(BindingsError::UnsupportedMethod {
+            where_: format!("{class_name}::{:?}", method.name),
+            why: format!(
+                "special member `{other:?}` not yet wired (v0 covers Ctor + Dtor + \
+                 plain instance/static methods + operators)"
+            ),
+        }),
+        None => match &method.name {
+            MethodName::Ident(id) => Ok(id.0.clone()),
+            MethodName::Operator(op) => {
+                Ok(rust_name_for_operator(*op, method.sig.cv.is_const))
+            }
+            MethodName::ConversionTo(_) => Err(BindingsError::UnsupportedMethod {
+                where_: format!("{class_name}::<conversion>"),
+                why: "C++ conversion functions (operator T()) deferred — needs \
+                      separate target-type-aware lowering"
+                    .into(),
+            }),
+        },
+    }
+}
+
+/// Stringify a method's parameter type list as a stable token usable
+/// as an overload-disambiguator suffix. Keeps just enough information
+/// to differentiate signatures the C++ side considers distinct
+/// overloads. Sanitization to a valid Rust identifier happens
+/// downstream in [`name_mapping::sanitize_disambiguator`].
+fn stringify_param_signature(
+    ctx: &CxxTypeCtx,
+    method: &MethodDef,
+    class_name: &str,
+) -> Result<String, BindingsError> {
+    if method.sig.params.is_empty() {
+        return Ok(String::new());
+    }
+    let mut parts = Vec::with_capacity(method.sig.params.len());
+    for (i, &ty_id) in method.sig.params.iter().enumerate() {
+        let s = render_rust_type(
+            ctx,
+            ty_id,
+            &format!("{class_name} overload sig param {i}"),
+        )?;
+        parts.push(s);
+    }
+    Ok(parts.join("_"))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WrapperReceiver {
     SelfConst,
@@ -550,6 +664,7 @@ fn classify_for_direct_extern(
     class_id: ClassId,
     class_name: &str,
     method: &MethodDef,
+    resolved_rust_name: &str,
 ) -> Result<MethodEmission, BindingsError> {
     let arity = method.sig.params.len();
 
@@ -567,7 +682,12 @@ fn classify_for_direct_extern(
         user_forward.push(format!("arg{i}"));
     }
 
-    // Special-case ctor / dtor first.
+    // Special-case ctor / dtor first. The resolved Rust name is
+    // already `"new"` / `"drop"` for these (assigned by
+    // `resolve_method_names`), but we route through the same code
+    // path so disambiguator suffixes (e.g. multiple ctors becoming
+    // `new_int_int` / `new_double`) get propagated into the extern
+    // ident too.
     match &method.special {
         Some(SpecialMember::DefaultCtor | SpecialMember::OtherCtor) => {
             let mut decl = vec![format!("this: *mut {class_name}")];
@@ -579,8 +699,8 @@ fn classify_for_direct_extern(
             });
             return Ok(MethodEmission {
                 kind: EmissionKind::Ctor,
-                rust_name: "new".into(),
-                extern_ident: format!("__cxx_{class_name}_ctor_0"),
+                rust_name: resolved_rust_name.to_string(),
+                extern_ident: format!("__cxx_{class_name}_{resolved_rust_name}"),
                 link_name: link,
                 extern_decl_params: decl.join(", "),
                 extern_return_clause: String::new(),
@@ -597,7 +717,7 @@ fn classify_for_direct_extern(
             });
             return Ok(MethodEmission {
                 kind: EmissionKind::Dtor,
-                rust_name: "drop".into(),
+                rust_name: resolved_rust_name.to_string(),
                 extern_ident: format!("__cxx_{class_name}_dtor"),
                 link_name: link,
                 extern_decl_params: format!("this: *mut {class_name}"),
@@ -608,28 +728,32 @@ fn classify_for_direct_extern(
                 forward_args: String::new(),
             });
         }
-        Some(other) => {
+        Some(SpecialMember::CopyCtor | SpecialMember::MoveCtor)
+        | Some(SpecialMember::CopyAssign | SpecialMember::MoveAssign) => {
             return Err(BindingsError::UnsupportedMethod {
                 where_: format!("{class_name}::{:?}", method.name),
-                why: format!(
-                    "special member `{other:?}` not yet wired (v0 covers Ctor + Dtor + \
-                     plain instance/static methods)"
-                ),
+                why: "copy/move special members not yet wired (v0 covers \
+                      DefaultCtor + OtherCtor + Dtor + plain methods + operators)"
+                    .into(),
             });
         }
         None => {}
     }
 
-    // Operator + conversion-named methods deferred — tracked by
-    // their own milestone in the design doc.
-    let method_name = match &method.name {
-        MethodName::Ident(id) => id.0.clone(),
-        other => {
+    // Identifier-named or operator-named non-special method.
+    // `resolved_rust_name` already encodes the operator → `op_<word>`
+    // mapping and any disambiguator suffix; we just need the
+    // *Itanium-mangling-friendly* original name token to feed to the
+    // mangler. For operators we hand the raw `MethodName::Operator`
+    // through; for plain identifiers we use the source string.
+    let method_name = resolved_rust_name.to_string();
+    let mangler_method_name: MethodName = match &method.name {
+        MethodName::Ident(id) => MethodName::Ident(id.clone()),
+        MethodName::Operator(op) => MethodName::Operator(*op),
+        MethodName::ConversionTo(_) => {
             return Err(BindingsError::UnsupportedMethod {
-                where_: format!("{class_name}::{other:?}"),
-                why: "operator + conversion-function names deferred (v0 takes \
-                      identifier-named methods only)"
-                    .into(),
+                where_: format!("{class_name}::<conversion>"),
+                why: "C++ conversion functions (operator T()) deferred".into(),
             });
         }
     };
@@ -664,9 +788,14 @@ fn classify_for_direct_extern(
     let mut extern_decl = vec![this_ty];
     extern_decl.extend(user_arg_decls.clone());
 
+    // Mangle using the *original* C++ method name (operator code or
+    // identifier) so the symbol matches what Clang produced for the
+    // C++ object. The Rust-side identifier (`resolved_rust_name`)
+    // is what the wrapper exposes to callers; the link_name is
+    // separate and follows the C++ side verbatim.
     let link = ctx.mangle(&Symbol::Method {
         class: class_id,
-        name: MethodName::Ident(rustc_abi_cxx::Ident(method_name.clone())),
+        name: mangler_method_name,
         sig: method.sig.clone(),
     });
 

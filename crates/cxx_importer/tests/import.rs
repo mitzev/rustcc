@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use cxx_importer::import_header;
+use cxx_importer::rust_bindings::{
+    generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+};
 use rustc_abi_cxx::{
     CvQual, CxxType, CxxTypeCtx, FnSig, Ident, IntWidth, MethodName,
     NameSegment, OperatorKind, RecordKind, SpecialMember, Symbol, Target,
@@ -1426,6 +1429,113 @@ fn imports_ref_qualified_methods_into_fnsig() {
     assert_eq!(refq_by_name("unqual"), None);
     assert_eq!(refq_by_name("lref"), Some(rustc_abi_cxx::RefKind::Lvalue));
     assert_eq!(refq_by_name("rref"), Some(rustc_abi_cxx::RefKind::Rvalue));
+    cleanup(&header);
+}
+
+#[test]
+fn rust_bindings_emits_op_words_for_operators_and_distinguishes_const_mut() {
+    // Real C++ headers lean on operator overloading. The bindings
+    // emitter should route `MethodName::Operator(Plus)` →
+    // `op_add`, `Index` → `op_index` (or `op_index_mut` when the
+    // overload is non-const), comparison ops to `op_eq` / `op_lt`
+    // / etc. without `_mut` regardless of qualifier.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Vec3 {\n\
+         \x20   int x_, y_, z_;\n\
+         \x20   Vec3();\n\
+         \x20   ~Vec3();\n\
+         \x20   Vec3 operator+(const Vec3& other) const;\n\
+         \x20   bool operator==(const Vec3& other) const;\n\
+         \x20   int operator[](int i) const;\n\
+         \x20   int& operator[](int i);\n\
+         };\n",
+        "operator_bindings",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let src = generate_rust_bindings(
+        &ctx,
+        &class_ids,
+        &RustBindingsConfig {
+            backend: BindingsBackend::DirectExternCpp,
+            ..RustBindingsConfig::default()
+        },
+    )
+    .expect("emit_rust_bindings");
+
+    // `operator+` (const) → `op_add`.
+    assert!(
+        src.contains("pub fn op_add("),
+        "expected `op_add` wrapper:\n{src}"
+    );
+    // `operator==` (const) → `op_eq` (no `_mut` even when looser
+    // headers omit `const`; this header has `const`).
+    assert!(
+        src.contains("pub fn op_eq("),
+        "expected `op_eq` wrapper:\n{src}"
+    );
+    // `operator[](int) const` → `op_index`. `operator[](int)` →
+    // `op_index_mut`. Both exist as separate wrappers.
+    assert!(
+        src.contains("pub fn op_index("),
+        "expected const `op_index` wrapper:\n{src}"
+    );
+    assert!(
+        src.contains("pub fn op_index_mut("),
+        "expected non-const `op_index_mut` wrapper:\n{src}"
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn rust_bindings_disambiguates_overloaded_plain_methods_by_param_signature() {
+    // Two methods with the same source name + different param
+    // signatures must each get a unique Rust identifier in the
+    // emitted impl block. The first occurrence keeps the base
+    // name; subsequent ones append a sanitized parameter
+    // signature.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Cmp {\n\
+         \x20   int compare(int a) const;\n\
+         \x20   int compare(double a) const;\n\
+         };\n",
+        "overload_bindings",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let src = generate_rust_bindings(
+        &ctx,
+        &class_ids,
+        &RustBindingsConfig::default(),
+    )
+    .expect("emit_rust_bindings");
+
+    // First overload keeps base name.
+    assert!(
+        src.contains("pub fn compare(&self, arg0: i32)"),
+        "expected base `compare(i32)` wrapper:\n{src}"
+    );
+    // Second overload gets a disambiguator suffix.
+    assert!(
+        src.contains("pub fn compare_f64") || src.contains("pub fn compare_double"),
+        "expected disambiguated wrapper for compare(double):\n{src}"
+    );
+
     cleanup(&header);
 }
 
