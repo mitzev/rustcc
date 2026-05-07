@@ -9,7 +9,11 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use cxx_importer::{import_header, import_header_with_annotations, Driver, HeaderGraph};
+use cxx_importer::{
+    import_header, import_header_with_annotations, import_header_with_extras,
+    Driver, HeaderGraph,
+};
+use cxx_importer::aliases::AliasSet;
 use cxx_importer::rust_bindings::{
     generate_rust_bindings, generate_rust_bindings_with_annotations,
     BindingsBackend, RustBindingsConfig,
@@ -2161,4 +2165,304 @@ fn imports_variadic_methods_into_fnsig() {
         "regular(int) should not be variadic"
     );
     cleanup(&header);
+}
+
+// ============================================================
+// M17: type aliases (typedef / using).
+// ============================================================
+
+#[test]
+fn m17_captures_typedef_to_primitive_at_tu_scope() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "typedef int MyInt;\n\
+         struct Owner { int slot; };\n",
+        "m17_typedef_primitive",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "MyInt")
+        .expect("MyInt typedef captured");
+    assert!(
+        alias.parent.is_empty(),
+        "TU-scope alias should have empty parent path"
+    );
+    assert!(matches!(
+        ctx.type_of(alias.target),
+        CxxType::Int { signed: true, width: IntWidth::I32 },
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_captures_using_alias_at_tu_scope() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "using Real = double;\n\
+         struct Foo { Real r; };\n",
+        "m17_using_primitive",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "Real")
+        .expect("Real using-alias captured");
+    assert!(matches!(
+        ctx.type_of(alias.target),
+        CxxType::Float { kind: rustc_abi_cxx::FloatKind::F64 },
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_captures_alias_to_user_class() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Inner { int v; };\n\
+         using InnerAlias = Inner;\n",
+        "m17_alias_to_class",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let inner_id = *classes
+        .iter()
+        .find(|&&id| {
+            let c = ctx.class(id);
+            matches!(
+                c.name.0.last(),
+                Some(NameSegment::Class(id) | NameSegment::Namespace(id))
+                    if id.0 == "Inner"
+            )
+        })
+        .expect("Inner imported");
+
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "InnerAlias")
+        .expect("InnerAlias captured");
+    match ctx.type_of(alias.target) {
+        CxxType::Record(cid) => {
+            assert_eq!(*cid, inner_id, "alias target should resolve to Inner");
+        }
+        other => panic!("expected Record(Inner), got {other:?}"),
+    }
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_captures_namespace_nested_alias_with_parent_path() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "namespace ns {\n\
+           namespace inner {\n\
+             using Code = unsigned;\n\
+           }\n\
+         }\n",
+        "m17_ns_nested_alias",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "Code")
+        .expect("Code captured");
+
+    // Outer-to-inner ordering on `alias.parent`.
+    let parent_names: Vec<&str> = alias
+        .parent
+        .iter()
+        .map(|seg| match seg {
+            NameSegment::Namespace(id) => id.0.as_str(),
+            NameSegment::AnonymousNamespace => "<anon>",
+            _ => "<other>",
+        })
+        .collect();
+    assert_eq!(parent_names, vec!["ns", "inner"]);
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_alias_chain_resolves_to_canonical_target() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `Final` -> `Mid` -> `int`. Since import_type strips
+    // typedef sugar via canonical(), we expect every alias's
+    // target to be the same primitive `int` TypeId.
+    let header = temp_header(
+        "typedef int Mid;\n\
+         typedef Mid Final;\n",
+        "m17_alias_chain",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let mid = extras.aliases.iter().find(|a| a.name.0 == "Mid").unwrap();
+    let final_ = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "Final")
+        .unwrap();
+    assert_eq!(
+        mid.target, final_.target,
+        "both aliases should resolve to the same canonical int TypeId",
+    );
+    assert!(matches!(
+        ctx.type_of(mid.target),
+        CxxType::Int { signed: true, width: IntWidth::I32 },
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_aliases_emit_pub_type_lines_in_bindings() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "typedef int MyInt;\n\
+         namespace ns {\n\
+           using Real = double;\n\
+         }\n\
+         struct Owner { int v; };\n",
+        "m17_emit_pub_type",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(
+        src.contains("pub type MyInt = i32;"),
+        "TU-scope MyInt alias should emit at top level; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub mod ns {") && src.contains("pub type Real = f64;"),
+        "namespace-scope Real alias should emit inside `pub mod ns`; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m17_alias_to_unsupported_type_is_skipped_not_fatal() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `void(int)` is a function type — currently not supported by
+    // `import_type` (M15 lands later). The alias should be
+    // silently dropped rather than aborting the import.
+    let header = temp_header(
+        "using SignalHandler = void(int);\n\
+         struct Owner { int v; };\n",
+        "m17_alias_unsupported_target",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import should not fail because of unsupported alias target");
+
+    // The alias must not appear (target type is unsupported in v0).
+    assert!(
+        extras.aliases.iter().all(|a| a.name.0 != "SignalHandler"),
+        "alias to function type should be silently dropped",
+    );
+    // The class still imports.
+    assert!(
+        !classes.is_empty(),
+        "imports should still produce the Owner class",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m17_class_scope_typedef_is_skipped_in_v0() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // In-class aliases require associated-type emission we
+    // don't have yet (deferred per docs/cxx_importer.md §16).
+    // The walker filters them out — verify they're absent
+    // from the AliasSet.
+    let header = temp_header(
+        "struct Foo {\n  using It = int;\n  int slot;\n};\n",
+        "m17_class_scope_typedef",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    assert!(
+        extras.aliases.iter().all(|a| a.name.0 != "It"),
+        "class-scope `using It = int;` should not appear at TU scope; got: {:?}",
+        extras.aliases.iter().map(|a| &a.name.0).collect::<Vec<_>>(),
+    );
+    // Sanity: AliasSet may be empty entirely.
+    let _ = AliasSet::default();
 }

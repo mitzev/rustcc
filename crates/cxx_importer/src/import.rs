@@ -57,6 +57,7 @@ use rustc_abi_cxx::{
     Symbol, TemplateArg, TypeId, VTableEntry, Virtuality,
 };
 
+use crate::aliases::{AliasSet, TypeAlias};
 use crate::annotations::{Annotation, AnnotationSet};
 use crate::diagnostics::{ImportError, SourceSpan};
 
@@ -82,21 +83,77 @@ pub fn import_header_with_annotations(
 ) -> Result<(Vec<ClassId>, AnnotationSet), ImportError> {
     let mut cache = HashMap::new();
     let mut set = AnnotationSet::default();
-    let ids = import_header_full(source, args, ctx, &mut cache, &mut set)?;
+    let mut aliases = AliasSet::default();
+    let ids = import_header_full(
+        source,
+        args,
+        ctx,
+        &mut cache,
+        &mut set,
+        &mut aliases,
+    )?;
+    let _ = aliases; // discard — caller didn't ask for aliases.
     Ok((ids, set))
 }
 
+/// Bundle of per-import side-tables produced alongside the class list.
+///
+/// Returned by [`import_header_with_extras`]. Each field corresponds to
+/// a side-channel that the importer harvests in addition to the bare
+/// class graph:
+///
+/// - `annotations` — `[[clang::annotate("rustcc::…")]]` markup
+///   parsed off classes and methods (M6).
+/// - `aliases` — `typedef` / `using` declarations at TU/namespace
+///   scope (M17).
+#[derive(Default, Clone, Debug)]
+pub struct ImportExtras {
+    pub annotations: AnnotationSet,
+    pub aliases: AliasSet,
+}
+
+/// One-shot import that returns every side-table the importer can
+/// produce. Use this when you want bindings emitted with full
+/// fidelity (annotations + aliases).
+pub fn import_header_with_extras(
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+) -> Result<(Vec<ClassId>, ImportExtras), ImportError> {
+    let mut cache = HashMap::new();
+    let mut annotations = AnnotationSet::default();
+    let mut aliases = AliasSet::default();
+    let ids = import_header_full(
+        source,
+        args,
+        ctx,
+        &mut cache,
+        &mut annotations,
+        &mut aliases,
+    )?;
+    Ok((
+        ids,
+        ImportExtras {
+            annotations,
+            aliases,
+        },
+    ))
+}
+
 /// Internal entry point used by [`Driver::parse_all`] to share its
-/// USR cache and accumulate annotations across multiple header
-/// roots in a single pass.
+/// USR cache and accumulate annotations + aliases across multiple
+/// header roots in a single pass.
 pub(crate) fn import_header_full(
     source: &Path,
     args: &[&str],
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
     annotations: &mut AnnotationSet,
+    aliases: &mut AliasSet,
 ) -> Result<Vec<ClassId>, ImportError> {
-    let ids = import_header_with_cache(source, args, ctx, cache)?;
+    let (ids, captured_aliases) =
+        import_header_with_cache_and_aliases(source, args, ctx, cache)?;
+    aliases.entries.extend(captured_aliases);
     // The cache-and-annotations collection is currently re-derived
     // by re-running the importer when the caller wants annotations;
     // a follow-up release can plumb annotations through the
@@ -182,6 +239,26 @@ pub(crate) fn import_header_with_cache(
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
 ) -> Result<Vec<ClassId>, ImportError> {
+    // Aliases are silently dropped on this back-compat entry
+    // point. Callers that want them call
+    // `import_header_with_cache_and_aliases` (or the public
+    // `import_header_with_extras` wrapper) directly.
+    let (ids, _aliases) =
+        import_header_with_cache_and_aliases(source, args, ctx, cache)?;
+    Ok(ids)
+}
+
+/// Same as [`import_header_with_cache`], but also returns the
+/// list of TU/namespace-scope `typedef` / `using` aliases harvested
+/// from the same parse. Internal because the public face for this
+/// is [`import_header_with_extras`] (which bundles aliases together
+/// with annotations).
+pub(crate) fn import_header_with_cache_and_aliases(
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+    cache: &mut HashMap<String, ClassId>,
+) -> Result<(Vec<ClassId>, Vec<TypeAlias>), ImportError> {
     let clang = Clang::new().map_err(|e| ImportError::ClangDiagnostic {
         file: source.display().to_string(),
         line: 0,
@@ -204,7 +281,8 @@ pub(crate) fn import_header_with_cache(
         std::collections::HashSet::new();
 
     // First pass: import all class/struct/union definitions reachable
-    // from the TU, recursing into namespaces.
+    // from the TU, recursing into namespaces. Also captures
+    // TU/namespace-scope `typedef` / `using` aliases (M17).
     for child in tu.get_entity().get_children() {
         walk_top_level(&child, &mut importer, &mut imported, &mut seen)?;
     }
@@ -221,9 +299,11 @@ pub(crate) fn import_header_with_cache(
     attach_methods_recursively(tu.get_entity(), &mut importer)?;
 
     // Hand the accumulated USR map back to the caller so the next
-    // `import_header_with_cache` call can dedup against it.
+    // import call can dedup against it. Drain aliases at the same
+    // time so they ride out alongside the class list.
+    let aliases = std::mem::take(&mut importer.aliases);
     *cache = importer.into_cache();
-    Ok(imported)
+    Ok((imported, aliases))
 }
 
 fn attach_methods_recursively(
@@ -318,6 +398,32 @@ fn walk_top_level(
                 }
             }
         }
+        // M17: capture C++ `typedef T U;` and `using U = T;` at
+        // TU/namespace scope. Failures are non-fatal — aliases
+        // are emit-only ergonomics, so a target type we can't
+        // import (e.g. a templated stdlib helper) just gets
+        // skipped instead of poisoning the whole TU.
+        EntityKind::TypedefDecl | EntityKind::TypeAliasDecl => {
+            // Class-scope aliases require associated-type emission
+            // we don't have yet; only namespace-scope aliases
+            // ride the v0 path. Anything whose semantic parent
+            // isn't a Namespace / TU / NotImplemented (the kind
+            // libclang reports for the TU root in some libclang
+            // builds) is dropped.
+            let parent_kind = entity
+                .get_semantic_parent()
+                .map(|p| p.get_kind());
+            let at_ns_scope = matches!(
+                parent_kind,
+                Some(EntityKind::Namespace)
+                    | Some(EntityKind::TranslationUnit)
+                    | Some(EntityKind::NotImplemented)
+                    | None
+            );
+            if at_ns_scope {
+                let _ = importer.collect_alias(entity);
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -333,6 +439,15 @@ struct Importer<'a> {
     /// from class + method entities, keyed by fully-qualified C++
     /// path (e.g. `ns::Foo`, `ns::Foo::bar`).
     annotations: HashMap<String, Vec<Annotation>>,
+    /// M17: type aliases captured at TU/namespace scope. Stored
+    /// in source-declaration order. Class-scope aliases are
+    /// deferred (see `aliases.rs` module docs).
+    aliases: Vec<TypeAlias>,
+    /// USR-keyed dedup for aliases. The same `using` declared
+    /// in a header included from two roots would otherwise emit
+    /// twice; libclang gives each a stable USR which we dedup
+    /// against here.
+    alias_usrs: std::collections::HashSet<String>,
 }
 
 impl<'a> Importer<'a> {
@@ -348,6 +463,8 @@ impl<'a> Importer<'a> {
             ctx,
             classes,
             annotations: HashMap::new(),
+            aliases: Vec::new(),
+            alias_usrs: std::collections::HashSet::new(),
         }
     }
 
@@ -357,6 +474,10 @@ impl<'a> Importer<'a> {
 
     fn into_annotations(self) -> HashMap<String, Vec<Annotation>> {
         self.annotations
+    }
+
+    fn into_aliases(self) -> Vec<TypeAlias> {
+        self.aliases
     }
 
     /// Register a poison node for an entity whose lowering failed
@@ -397,6 +518,69 @@ impl<'a> Importer<'a> {
             self.classes.insert(usr.0, id);
         }
         id
+    }
+
+    /// M17: harvest a `typedef`/`using` alias at TU or namespace
+    /// scope. Returns `Ok(())` whether or not the alias was
+    /// recorded — the only "errors" worth signaling here are
+    /// importer-level invariants, and target-type lookup failures
+    /// silently skip (aliases are emit-only ergonomics).
+    fn collect_alias(&mut self, entity: &Entity<'_>) -> Result<(), ImportError> {
+        // Skip duplicates: the same alias declaration in a
+        // header included from two roots otherwise emits twice.
+        if let Some(usr) = entity.get_usr() {
+            if !self.alias_usrs.insert(usr.0) {
+                return Ok(());
+            }
+        }
+        let name = match entity.get_name() {
+            Some(n) if !n.is_empty() => n,
+            _ => return Ok(()),
+        };
+        // libclang exposes the underlying type of a typedef-decl
+        // via `get_typedef_underlying_type`. For `TypeAliasDecl`
+        // (`using U = T;`) the same accessor returns the RHS.
+        let underlying = match entity.get_typedef_underlying_type() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let where_ = format!("alias `{name}`");
+        let target = match self.import_type(underlying, &where_) {
+            Ok(id) => id,
+            // Target type unsupported (e.g. references templated
+            // stdlib types). Drop the alias rather than failing
+            // the import — the user can re-add it by hand if
+            // needed.
+            Err(_) => return Ok(()),
+        };
+        // Walk semantic parents to build the namespace prefix.
+        // Stop at the first non-Namespace ancestor so class-scope
+        // aliases (which we already filtered upstream) and the
+        // TU root land with an empty prefix.
+        let mut parent_segments: Vec<NameSegment> = Vec::new();
+        let mut cur = entity.get_semantic_parent();
+        while let Some(e) = cur {
+            match e.get_kind() {
+                EntityKind::Namespace => {
+                    let pname = e.get_name().unwrap_or_default();
+                    if pname.is_empty() {
+                        parent_segments.push(NameSegment::AnonymousNamespace);
+                    } else {
+                        parent_segments
+                            .push(NameSegment::Namespace(Ident(pname)));
+                    }
+                }
+                _ => break,
+            }
+            cur = e.get_semantic_parent();
+        }
+        parent_segments.reverse();
+        self.aliases.push(TypeAlias {
+            parent: parent_segments,
+            name: Ident(name),
+            target,
+        });
+        Ok(())
     }
 
     fn import_class(

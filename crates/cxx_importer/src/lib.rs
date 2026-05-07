@@ -5,6 +5,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
 
+pub mod aliases;
 mod annotations;
 #[cfg(feature = "cache")]
 mod cache;
@@ -22,6 +23,7 @@ pub mod rust_forwarders;
 pub mod rust_stubs;
 pub mod shims;
 
+pub use aliases::{AliasSet, TypeAlias};
 pub use annotations::{Annotation, AnnotationSet, SidecarSchema};
 pub use macros::{MacroConst, MacroSet, MacroValue};
 pub use diagnostics::ImportError;
@@ -34,4 +36,7 @@ pub use name_mapping::{
 pub use resolve::{EntityKey, ResolvedCursor};
 
 #[cfg(feature = "libclang")]
-pub use import::{import_header, import_header_with_annotations};
+pub use import::{
+    import_header, import_header_with_annotations, import_header_with_extras,
+    ImportExtras,
+};

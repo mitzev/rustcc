@@ -303,7 +303,7 @@ of Phase B.
 |-----|------------------------------------------------------------------------------|------------------------------------------------------------|--------|
 | 15  | Function pointer types + safe-closure callback wrappers                     | `widget->callback(my_func, user_data)` — FLTK is callback-driven | ~1.5 wk |
 | 16  | `enum class` + plain `enum` body lowering                                   | `enum class Fl_Boxtype { … }`, `enum Fl_When { … }`         | ~1 wk  |
-| 17  | Type aliases (`using` / `typedef`) emission                                 | `typedef unsigned int Fl_Color;`, `using Fl_Callback = …;`  | ~3 d   |
+| 17  | Type aliases (`using` / `typedef`) emission                                 | `typedef unsigned int Fl_Color;`, `using Fl_Callback = …;`  | ✅ shipped (`AliasSet`, `import_header_with_extras`, namespace-tree integration; emits `pub type X = Y;` inside owning `pub mod`; class-scope aliases deferred) |
 | 18  | Default-argument fan-out (max-arity wrapper + documented defaults)          | `void redraw(int delay = 0)`                                | ~3 d   |
 | 19  | M5 finish — `CxxBase<T>` upcast emission OR derived-class method flattening | `Fl_Button btn; btn.show();` (inherits `Fl_Widget::show`)   | ~1.5 wk |
 | 20  | `const char*` ↔ `&CStr` / `&str` ergonomics layer                            | Labels, tooltips, file paths                                | ~1 wk  |

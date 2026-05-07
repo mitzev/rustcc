@@ -265,14 +265,20 @@ impl Driver {
             let mut tmp_cache = std::collections::HashMap::new();
             // Best-effort: ignore annotation-pass errors so a
             // sidecar problem doesn't poison the whole cache.
+            let mut tmp_aliases = crate::aliases::AliasSet::default();
             if let Ok(_) = crate::import::import_header_full(
                 root,
                 &argv.iter().map(String::as_str).collect::<Vec<_>>(),
                 caller_ctx,
                 &mut tmp_cache,
                 &mut anns,
+                &mut tmp_aliases,
             ) {
-                // ok — annotations merged into `anns`.
+                // ok — annotations merged into `anns`. Aliases dropped
+                // for now: the cache record schema doesn't carry them
+                // yet (tracked as a follow-up; load_or_parse callers
+                // that want aliases use `import_header_with_extras`
+                // directly).
             }
         }
         *caller_annotations = anns;

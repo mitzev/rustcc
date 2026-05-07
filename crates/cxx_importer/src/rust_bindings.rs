@@ -306,10 +306,40 @@ pub fn generate_rust_bindings_with_annotations(
     annotations: &AnnotationSet,
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
+    let empty_aliases = crate::aliases::AliasSet::default();
+    generate_rust_bindings_with_extras(
+        ctx,
+        classes,
+        annotations,
+        &empty_aliases,
+        config,
+    )
+}
+
+/// Emit Rust source consulting both `annotations` (M6) and the M17
+/// alias side-table. Each alias becomes a `pub type {name} =
+/// {target};` line scoped under the matching `pub mod` (or at the
+/// top level for TU-scope aliases). Aliases whose target type is
+/// not yet supported by the v0 type renderer are dropped with a
+/// `// alias ... skipped` comment rather than failing the
+/// emission.
+///
+/// Currently DirectExternCpp is the only backend that honors
+/// aliases — the macro-based backends (`NativeCppClassMacro`,
+/// `CxxClassMacro`) flatten everything to the top level and would
+/// need their grammar widened to expose `type` items. Tracked for
+/// a follow-up.
+pub fn generate_rust_bindings_with_extras(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+    annotations: &AnnotationSet,
+    aliases: &crate::aliases::AliasSet,
+    config: &RustBindingsConfig,
+) -> Result<String, BindingsError> {
     match config.backend {
         BindingsBackend::NativeCppClassMacro => emit_native_macro(ctx, classes, config),
         BindingsBackend::DirectExternCpp => {
-            emit_direct_extern_cpp(ctx, classes, annotations, config)
+            emit_direct_extern_cpp(ctx, classes, annotations, &aliases.entries, config)
         }
         BindingsBackend::CxxClassMacro => emit_cxx_class_macro(ctx, classes, config),
     }
@@ -430,6 +460,7 @@ fn emit_direct_extern_cpp(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
     annotations: &AnnotationSet,
+    aliases: &[crate::aliases::TypeAlias],
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
     let mut out = String::new();
@@ -461,7 +492,10 @@ fn emit_direct_extern_cpp(
     // tree. A flat list (no `Namespace` segments) collapses to the
     // root and emits at the top level — same shape the v0 emitter
     // produced before this change, with no namespace overhead.
-    let tree = build_namespace_tree(ctx, &classes)?;
+    // M17 aliases get folded into the same tree at their owning
+    // namespace node so `pub type` lines emit before the class
+    // blocks at that scope.
+    let tree = build_namespace_tree_with_aliases(ctx, &classes, aliases)?;
     render_namespace_tree(ctx, &tree, &mut out, annotations, config, initial_indent)?;
 
     if config.crate_module.is_some() {
@@ -496,6 +530,11 @@ fn class_fqn_string(ctx: &CxxTypeCtx, class_id: ClassId) -> String {
 struct NamespaceTree {
     /// Classes directly inside this scope.
     classes: Vec<ClassId>,
+    /// M17 aliases (`typedef` / `using`) directly inside this
+    /// scope. Stored as `(rust_ident, target_typeid)`. Emission
+    /// renders them as `pub type {rust_ident} = {render(target)};`
+    /// before the class blocks at the same node.
+    aliases: Vec<(String, rustc_abi_cxx::TypeId)>,
     /// Sub-namespaces at this scope, keyed by name.
     /// `BTreeMap` for deterministic emission order.
     children: BTreeMap<String, NamespaceTree>,
@@ -504,6 +543,19 @@ struct NamespaceTree {
 fn build_namespace_tree(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
+) -> Result<NamespaceTree, BindingsError> {
+    build_namespace_tree_with_aliases(ctx, classes, &[])
+}
+
+/// Same as [`build_namespace_tree`], but also folds M17 aliases
+/// into their owning namespace scope. Each alias gets keyed by its
+/// `parent` segment list using the same `Namespace` / `AnonymousNamespace`
+/// rules as classes; the leaf identifier becomes the rendered Rust
+/// type name (`pub type <leaf> = <target>;`).
+fn build_namespace_tree_with_aliases(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+    aliases: &[crate::aliases::TypeAlias],
 ) -> Result<NamespaceTree, BindingsError> {
     let mut root = NamespaceTree::default();
     for &class_id in classes {
@@ -540,6 +592,28 @@ fn build_namespace_tree(
         }
         node.classes.push(class_id);
     }
+    // M17: drop aliases under their owning namespace node. Anything
+    // referencing a non-namespace prefix segment is silently
+    // skipped — emitter ergonomics, not correctness.
+    for alias in aliases {
+        let mut node = &mut root;
+        let mut prefix_ok = true;
+        for seg in &alias.parent {
+            let key = match seg {
+                NameSegment::Namespace(id) => id.0.clone(),
+                NameSegment::AnonymousNamespace => "__anon".to_string(),
+                _ => {
+                    prefix_ok = false;
+                    break;
+                }
+            };
+            node = node.children.entry(key).or_default();
+        }
+        if !prefix_ok {
+            continue;
+        }
+        node.aliases.push((alias.name.0.clone(), alias.target));
+    }
     Ok(root)
 }
 
@@ -551,6 +625,32 @@ fn render_namespace_tree(
     config: &RustBindingsConfig,
     indent: &str,
 ) -> Result<(), BindingsError> {
+    // M17: emit `pub type` aliases ahead of class blocks. Putting
+    // them first makes them visible to any class block emitted
+    // afterwards (and to user code) without an `use super::*`
+    // dance. Render failures (target type unsupported by
+    // `render_rust_type`) drop the alias rather than aborting:
+    // aliases are emit-only ergonomics, not correctness.
+    for (alias_name, target) in &tree.aliases {
+        let where_ = format!("alias `{alias_name}`");
+        match render_rust_type(ctx, *target, &where_) {
+            Ok(rendered) => {
+                let _ = writeln!(out, "{indent}pub type {alias_name} = {rendered};");
+            }
+            Err(_) => {
+                // Skip silently — surfacing the alias name as a
+                // doc comment lets users know it existed without
+                // breaking compilation.
+                let _ = writeln!(
+                    out,
+                    "{indent}// alias `{alias_name}` skipped: target type unsupported in v0",
+                );
+            }
+        }
+    }
+    if !tree.aliases.is_empty() {
+        out.push('\n');
+    }
     for &class_id in &tree.classes {
         let block =
             render_direct_extern_class(ctx, class_id, annotations, config, indent)?;
