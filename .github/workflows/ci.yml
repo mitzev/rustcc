@@ -14,7 +14,7 @@ jobs:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: -Dwarnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5  # Node 24 (v4 was Node 20 / deprecated)
 
       # rust-toolchain.toml pins the nightly this workspace builds with.
       # rustup will honor it automatically on the first cargo invocation.
@@ -41,7 +41,7 @@ jobs:
     name: fork/patches apply cleanly on pinned nightly
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5  # Node 24 (v4 was Node 20 / deprecated)
 
       - name: Run fork/build.sh --apply-only
         run: ./fork/build.sh --apply-only
