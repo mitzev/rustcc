@@ -271,12 +271,35 @@ pub(crate) fn import_header_with_cache_and_aliases(
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
 ) -> Result<(Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>), ImportError> {
+    // One-shot path: mint a fresh `Clang` for this single header
+    // parse. For multi-header builds (`Driver::parse_all`), the
+    // caller hoists `Clang::new()` to the top of the loop and
+    // calls [`import_header_with_clang`] directly — re-creating
+    // the global libclang state per header has been observed to
+    // segfault on libclang 17+ on macOS arm64 when the second
+    // parse touches AST nodes referenced by the first.
     let clang = Clang::new().map_err(|e| ImportError::ClangDiagnostic {
         file: source.display().to_string(),
         line: 0,
         message: format!("failed to initialize libclang: {e}"),
     })?;
-    let index = Index::new(&clang, false, false);
+    import_header_with_clang(&clang, source, args, ctx, cache)
+}
+
+/// Variant of [`import_header_with_cache_and_aliases`] that takes a
+/// caller-owned [`Clang`] instance instead of constructing one
+/// internally. Use this when parsing multiple headers in the same
+/// process — `Clang::new()` is the global libclang init and
+/// re-initing it per parse has been observed to segfault on
+/// libclang 17+ when ASTs from earlier parses are still in scope.
+pub(crate) fn import_header_with_clang(
+    clang: &Clang,
+    source: &Path,
+    args: &[&str],
+    ctx: &mut CxxTypeCtx,
+    cache: &mut HashMap<String, ClassId>,
+) -> Result<(Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>), ImportError> {
+    let index = Index::new(clang, false, false);
     let tu = index
         .parser(source)
         .arguments(args)
@@ -660,11 +683,15 @@ impl<'a> Importer<'a> {
             }
         }
         let name = match entity.get_name() {
-            Some(n) if !n.is_empty() => n,
+            Some(n) if !n.is_empty() && !is_synthetic_anonymous_name(&n) => n,
             // Anonymous enums (`enum { Red, Green };`) — for v0
             // we drop them; the variants leak as integer
             // constants in the source but Rust has nowhere
-            // to hang them as a distinct named enum.
+            // to hang them as a distinct named enum. Some
+            // libclang builds report anonymous enums with a
+            // synthetic name like
+            // `(unnamed enum at /.../foo.h:42:1)` instead of
+            // an empty string, so filter those too.
             _ => return Ok(()),
         };
         let underlying_ty = match entity.get_enum_underlying_type() {
@@ -1686,6 +1713,20 @@ fn class_has_virtual_base_chain(
 /// Returns `None` for synthetic / built-in cursors that don't have
 /// an owning file (those usually come from libclang's stdlib
 /// stubs and aren't useful in user-facing diagnostics anyway).
+/// True for libclang-synthesized names that aren't real C++
+/// identifiers — e.g. `(unnamed enum at /opt/.../foo.h:42:1)`,
+/// `(anonymous union at ...)`. Some libclang builds return these
+/// in `get_name()` instead of an empty string for tag-less
+/// declarations; we filter them so they don't leak into the
+/// generated Rust source as invalid identifiers.
+fn is_synthetic_anonymous_name(name: &str) -> bool {
+    name.starts_with('(')
+        || name.contains(" enum at ")
+        || name.contains(" union at ")
+        || name.contains(" struct at ")
+        || name.contains(" class at ")
+}
+
 pub(crate) fn span_of_entity(entity: &Entity<'_>) -> Option<SourceSpan> {
     let loc = entity.get_location()?;
     let file_loc = loc.get_file_location();
