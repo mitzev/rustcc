@@ -61,12 +61,12 @@ These are deliberate v0 stops; tracked in `docs/cxx_importer.md` §15–§16:
 
 ## Prebuilt binaries
 
-This release ships stage-1 toolchains for:
+This release ships stage-1 toolchains for **three of four** target triples — same shipping shape as v1.02.0 and v1.03.0:
 
-- `aarch64-apple-darwin`
-- `x86_64-apple-darwin`
-- `x86_64-unknown-linux-gnu`
-- `aarch64-unknown-linux-gnu`
+- `aarch64-apple-darwin` ✅
+- `aarch64-unknown-linux-gnu` ✅
+- `x86_64-unknown-linux-gnu` ✅
+- `x86_64-apple-darwin` ❌ — the `macos-13` (Intel) runner pool was saturated and the job never picked up a runner before timeout. Same scenario as v1.02.0 + v1.03.0; the GitHub-hosted Intel-Mac runner queue routinely refuses jobs in the rustcc release window. Intel-Mac users should use the source-build path documented in [`fork/INSTALL.md`](https://github.com/mitzev/rustcc/blob/main/fork/INSTALL.md), or wait for a follow-up `workflow_dispatch` retry that backfills this tarball into the same release.
 
 Install: see [`fork/INSTALL.md`](https://github.com/mitzev/rustcc/blob/main/fork/INSTALL.md). TL;DR:
 
