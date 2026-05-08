@@ -598,6 +598,19 @@ fn build_namespace_tree_with_extras(
         // Walk every segment except the final one, which is the
         // class identifier itself.
         let prefix = &segments[..segments.len() - 1];
+        // Class-scope inner records (`struct Outer { struct
+        // Inner { ... }; }`) and class-scope anonymous unions
+        // require associated-type emission inside the parent's
+        // `impl` block — out of v0 scope. Skip them silently
+        // rather than failing the whole emission. The user
+        // loses access to the inner type name but the parent
+        // and every other class still emit.
+        let has_class_prefix = prefix
+            .iter()
+            .any(|s| matches!(s, NameSegment::Class(_) | NameSegment::TemplateSpec { .. }));
+        if has_class_prefix {
+            continue;
+        }
         let mut node = &mut root;
         for seg in prefix {
             let key = match seg {
@@ -798,30 +811,13 @@ fn render_direct_extern_class(
     // the impl block, and the Drop check. We accept virtuals here
     // (their `vtable_index` was populated by the importer's
     // post-pass); the wrapper renderer routes them through a
-    // vtable-lookup path. Pure virtuals stay rejected for v0
-    // because they don't have an own-class implementation to call.
+    // vtable-lookup path. Pure virtuals + virtuals without
+    // vtable_index pass through to the per-method classifier
+    // below, which converts the rejection into a per-method
+    // skip-with-comment instead of a whole-class rejection.
+    // That's the resilience surface — bindings stay useful when
+    // a single method shape isn't implemented yet.
     let methods = ctx.class(class_id).methods.clone();
-    for m in &methods {
-        if m.virtuality == Virtuality::Virtual && m.vtable_index.is_none() {
-            return Err(BindingsError::UnsupportedMethod {
-                where_: format!("{class_name}::{:?}", m.name),
-                why: "virtual method without populated vtable_index — the importer's \
-                      vtable post-pass didn't recognize this slot. Likely a class \
-                      structure (multi-inheritance, virtual bases) the v0 vtable \
-                      walker doesn't yet handle."
-                    .into(),
-            });
-        }
-        if m.virtuality == Virtuality::PureVirtual {
-            return Err(BindingsError::UnsupportedMethod {
-                where_: format!("{class_name}::{:?}", m.name),
-                why: "pure virtual method (no own-class implementation to call) — \
-                      a future revision can either skip it or route to an \
-                      `__cxa_pure_virtual` shim."
-                    .into(),
-            });
-        }
-    }
 
     let mut block = String::new();
     if config.doc_hidden {
@@ -866,11 +862,30 @@ fn render_direct_extern_class(
 
     let mut ctor_seen = 0usize;
     let mut method_blocks: Vec<MethodEmission> = Vec::with_capacity(methods.len());
+    let mut skipped_methods: Vec<(String, String)> = Vec::new();
+    // Dedup: the importer can occasionally produce two
+    // `MethodDef`s for the same logical C++ method (e.g. when a
+    // method is reached both via the class's child walk AND via
+    // the post-pass `attach_methods_recursively` on out-of-class
+    // definitions, and the post-pass duplicate check misses
+    // because TypeId interning produced different ids for
+    // the same canonical type). Drop later occurrences of an
+    // extern_ident we've already emitted; the surviving emission
+    // is functionally identical so callers see no difference.
+    let mut seen_extern_idents: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     let mut has_user_dtor = false;
     for (method_idx, (method, resolved_name)) in
         methods.iter().zip(resolved_names.iter()).enumerate()
     {
-        let emission = classify_for_direct_extern(
+        // Per-method resilience: when classification fails (virtual
+        // method with unresolved vtable_index, unsupported special
+        // member, opaque return type, …), drop just *that* method
+        // and continue. The class still emits with the surviving
+        // methods. We also surface skipped methods as `///` doc
+        // comments at the top of the impl block so the user can
+        // see what's missing without the class becoming a black box.
+        let emission = match classify_for_direct_extern(
             ctx,
             class_id,
             &class_name,
@@ -878,12 +893,39 @@ fn render_direct_extern_class(
             method_idx,
             resolved_name,
             config,
-        )?;
+        ) {
+            Ok(e) => e,
+            Err(BindingsError::UnsupportedMethod { why, .. })
+            | Err(BindingsError::UnsupportedType { kind: why, .. }) => {
+                skipped_methods.push((resolved_name.clone(), why));
+                continue;
+            }
+            Err(other) => return Err(other),
+        };
         if matches!(emission.kind, EmissionKind::Dtor) {
             has_user_dtor = true;
         }
         if matches!(emission.kind, EmissionKind::Ctor) {
             ctor_seen += 1;
+            // v0 emitter only handles the first ctor; later ones
+            // would need the disambiguator suffix (`new_int_int`
+            // etc.) wired into both the wrapper name and the
+            // extern_ident. Skip with a comment for now.
+            if ctor_seen > 1 {
+                skipped_methods.push((
+                    resolved_name.clone(),
+                    "extra ctor — v0 emitter renders only one ctor per class; \
+                     overload disambiguation tracked for a follow-up"
+                        .into(),
+                ));
+                continue;
+            }
+        }
+        // Drop a duplicate extern_ident if we've already seen one
+        // — the importer occasionally produces two MethodDefs for
+        // the same logical method.
+        if !seen_extern_idents.insert(emission.extern_ident.clone()) {
+            continue;
         }
         // Virtual methods don't get a `#[link_name]` extern decl —
         // they're dispatched via the vtable at the call site, not
@@ -913,6 +955,25 @@ fn render_direct_extern_class(
     //    forwards to its extern decl with the appropriate `unsafe`
     //    block.
     let _ = writeln!(block, "{indent}impl {class_name} {{");
+    // Surface methods the emitter had to drop (unsupported method
+    // shape, unsupported parameter type, virtual-without-vtable,
+    // etc.) so users see the gap without having to dig into the
+    // C++ headers. Methods land alphabetically by Rust name.
+    if !skipped_methods.is_empty() {
+        let mut sorted = skipped_methods.clone();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let _ = writeln!(
+            block,
+            "{indent}    // {n} method{s} skipped by the v0 bindings emitter:",
+            n = sorted.len(),
+            s = if sorted.len() == 1 { "" } else { "s" },
+        );
+        for (name, why) in &sorted {
+            // Trim very long reasons so the comment block stays readable.
+            let short: String = why.chars().take(160).collect();
+            let _ = writeln!(block, "{indent}    //   {name}: {short}");
+        }
+    }
     let mut wrote_any_method = false;
     for emission in &method_blocks {
         if matches!(emission.kind, EmissionKind::Dtor) {
@@ -1071,18 +1132,12 @@ fn render_direct_extern_class(
         }
     }
 
-    // Sanity check: more than one ctor would need disambiguator suffixes
-    // on the wrapper names. v0 supports a single ctor per class.
-    if ctor_seen > 1 {
-        return Err(BindingsError::UnsupportedMethod {
-            where_: class_name.clone(),
-            why: format!(
-                "{ctor_seen} constructors imported but the v0 emitter \
-                 only supports a single ctor; overload disambiguation \
-                 is tracked for a follow-up release"
-            ),
-        });
-    }
+    // Multi-ctor classes used to fail the whole class here. The
+    // per-method skip path above now drops the extra ctors with
+    // a `///` comment; only the first ctor flows through to the
+    // wrapper + heap-alloc emission. Disambiguator suffixes for
+    // multi-ctor support are tracked for a follow-up release.
+    let _ = ctor_seen;
 
     // M14: heap-allocation thunks. For each ctor, emit:
     //   - An `unsafe extern "C"` decl for the matching
@@ -1347,30 +1402,25 @@ fn base_rust_name_for_method(
     method: &MethodDef,
     class_name: &str,
 ) -> Result<String, BindingsError> {
+    let _ = class_name; // kept for future per-class diagnostics.
     match &method.special {
         Some(SpecialMember::DefaultCtor | SpecialMember::OtherCtor) => Ok("new".into()),
         Some(SpecialMember::Dtor) => Ok("drop".into()),
-        Some(other @ (SpecialMember::CopyCtor
-        | SpecialMember::MoveCtor
-        | SpecialMember::CopyAssign
-        | SpecialMember::MoveAssign)) => Err(BindingsError::UnsupportedMethod {
-            where_: format!("{class_name}::{:?}", method.name),
-            why: format!(
-                "special member `{other:?}` not yet wired (v0 covers Ctor + Dtor + \
-                 plain instance/static methods + operators)"
-            ),
-        }),
+        // Copy/move special members + conversion functions get a
+        // reserved placeholder name. The actual rejection happens
+        // in `classify_for_direct_extern`, which converts it into
+        // a per-method skip-with-comment instead of failing the
+        // whole class.
+        Some(SpecialMember::CopyCtor) => Ok("__cxx_copy_ctor__".into()),
+        Some(SpecialMember::MoveCtor) => Ok("__cxx_move_ctor__".into()),
+        Some(SpecialMember::CopyAssign) => Ok("__cxx_copy_assign__".into()),
+        Some(SpecialMember::MoveAssign) => Ok("__cxx_move_assign__".into()),
         None => match &method.name {
             MethodName::Ident(id) => Ok(id.0.clone()),
             MethodName::Operator(op) => {
                 Ok(rust_name_for_operator(*op, method.sig.cv.is_const))
             }
-            MethodName::ConversionTo(_) => Err(BindingsError::UnsupportedMethod {
-                where_: format!("{class_name}::<conversion>"),
-                why: "C++ conversion functions (operator T()) deferred — needs \
-                      separate target-type-aware lowering"
-                    .into(),
-            }),
+            MethodName::ConversionTo(_) => Ok("__cxx_conversion__".into()),
         },
     }
 }
@@ -1417,6 +1467,31 @@ fn classify_for_direct_extern(
     resolved_rust_name: &str,
     config: &RustBindingsConfig,
 ) -> Result<MethodEmission, BindingsError> {
+    // Per-method gate that used to live at the class level: a
+    // virtual method without a populated `vtable_index` (because
+    // the v0 vtable walker doesn't reach into secondary tables /
+    // virtual bases / multi-inheritance) can't be dispatched
+    // through the vtable, and a pure virtual has no own-class
+    // body to call. Reject both with a clear reason; the caller
+    // converts this into a per-method skip-with-comment instead
+    // of failing the whole class.
+    if method.virtuality == Virtuality::Virtual && method.vtable_index.is_none() {
+        return Err(BindingsError::UnsupportedMethod {
+            where_: format!("{class_name}::{:?}", method.name),
+            why: "virtual method without populated vtable_index (v0 vtable walker \
+                  doesn't reach this slot — multi-inheritance / virtual base / \
+                  secondary vtable; tracked as M22)."
+                .into(),
+        });
+    }
+    if method.virtuality == Virtuality::PureVirtual {
+        return Err(BindingsError::UnsupportedMethod {
+            where_: format!("{class_name}::{:?}", method.name),
+            why: "pure virtual method (no own-class implementation to call); \
+                  a future revision routes to `__cxa_pure_virtual`."
+                .into(),
+        });
+    }
     let arity = method.sig.params.len();
     // M20: opt-in `c_char` rendering for `char *` / `const char *`.
     // The `extern_decl_params` keep the default rendering so the
@@ -1654,6 +1729,15 @@ fn render_direct_extern_wrapper(
             has = if emission.default_arg_count == 1 { "has a" } else { "have" },
         );
     }
+    // Escape the user-facing wrapper name with `r#` if it
+    // collides with a Rust keyword. C++ methods named `type`,
+    // `box`, `align`, etc. (every FLTK widget has these) are
+    // legal C++ but reserved in Rust; the raw-identifier form
+    // keeps the source name visible while making the wrapper
+    // compile. Extern decls + Itanium symbols use the raw
+    // `emission.rust_name` (no `r#`) since `r#` isn't a valid
+    // C identifier prefix.
+    let display_name = rust_safe_ident(&emission.rust_name);
     match emission.kind {
         EmissionKind::Ctor => {
             // Wrapper for ctors: allocate a stack temp, call the
@@ -1661,7 +1745,7 @@ fn render_direct_extern_wrapper(
             let _ = writeln!(
                 out,
                 "{indent}pub fn {name}({params}) -> Self {{",
-                name = emission.rust_name,
+                name = display_name,
                 params = emission.wrapper_params,
             );
             let _ = writeln!(
@@ -1712,14 +1796,14 @@ fn render_direct_extern_wrapper(
             let head = if emission.wrapper_params.is_empty() {
                 format!(
                     "{indent}pub fn {name}({recv}){ret} {{",
-                    name = emission.rust_name,
+                    name = display_name,
                     recv = receiver_kw,
                     ret = ret_clause,
                 )
             } else {
                 format!(
                     "{indent}pub fn {name}({recv}, {params}){ret} {{",
-                    name = emission.rust_name,
+                    name = display_name,
                     recv = receiver_kw,
                     params = emission.wrapper_params,
                     ret = ret_clause,
@@ -1790,14 +1874,14 @@ fn render_direct_extern_wrapper(
             let head = if emission.wrapper_params.is_empty() {
                 format!(
                     "{indent}pub fn {name}({recv}){ret} {{",
-                    name = emission.rust_name,
+                    name = display_name,
                     recv = receiver_kw,
                     ret = ret_clause,
                 )
             } else {
                 format!(
                     "{indent}pub fn {name}({recv}, {params}){ret} {{",
-                    name = emission.rust_name,
+                    name = display_name,
                     recv = receiver_kw,
                     params = emission.wrapper_params,
                     ret = ret_clause,
@@ -1857,7 +1941,7 @@ fn render_direct_extern_wrapper(
             let _ = writeln!(
                 out,
                 "{indent}pub fn {name}({params}){ret} {{",
-                name = emission.rust_name,
+                name = display_name,
                 params = emission.wrapper_params,
                 ret = ret_clause,
             );
@@ -2101,6 +2185,48 @@ fn render_rust_type_with_opts(
                 kind: "anonymous record".into(),
             })?
         }
+        // C++ enum reference appearing in a parameter / return /
+        // field position. Two cases:
+        //   1. The enum body was captured at TU/namespace scope by
+        //      M16 — there's a `pub enum` (or `pub struct`) by
+        //      that name in the generated bindings, so we render
+        //      with the leaf identifier.
+        //   2. Class-scope or anonymous enum — currently skipped
+        //      by M16 v0 (`enums.rs` module docs). For these we
+        //      fall back to the underlying integer type so the
+        //      ABI lines up; users lose the scoped name but
+        //      gain a working binding. Tracked as M16.b.
+        CxxType::Enum {
+            name,
+            underlying,
+            scoped: _,
+        } => {
+            // Pick the rightmost identifier segment (skip
+            // namespace prefix). If the enum's name path passes
+            // through a `Class` segment, it's a class-scope enum
+            // and we render the underlying int (case 2 above).
+            let class_scope =
+                name.0.iter().any(|s| matches!(s, NameSegment::Class(_)));
+            if class_scope {
+                render_rust_type_with_opts(ctx, *underlying, where_, opts)?
+            } else {
+                let leaf = name.0.iter().rev().find_map(|s| match s {
+                    NameSegment::Enum(id) | NameSegment::Class(id) => {
+                        Some(id.0.clone())
+                    }
+                    _ => None,
+                });
+                match leaf {
+                    Some(n) => n,
+                    None => render_rust_type_with_opts(
+                        ctx,
+                        *underlying,
+                        where_,
+                        opts,
+                    )?,
+                }
+            }
+        }
         // M15: function pointer / bare function type. Both render
         // as Rust function-pointer types (`extern "C" fn(...) -> ret`).
         // Variadic C functions render with `...` which Rust supports
@@ -2249,6 +2375,32 @@ fn render_enum_discriminant(value: i64, signed: bool) -> String {
         // Two's-complement bit-pattern as the unsigned literal.
         let as_u64 = value as u64;
         format!("{as_u64}")
+    }
+}
+
+/// Escape `name` with `r#` if it collides with a Rust keyword.
+/// FLTK is full of identifiers like `type`, `box`, `align`, …
+/// that are perfectly legal C++ but reserved in Rust; the raw-
+/// identifier form keeps the source name visible while making
+/// the binding compile.
+fn rust_safe_ident(name: &str) -> String {
+    // Subset of Rust 2021's reserved-keywords list — covers the
+    // identifiers that actually collide with real C++ method
+    // names. Adding more is harmless: `r#fn` is just `fn`.
+    const KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum",
+        "extern", "false", "fn", "for", "if", "impl", "in", "let",
+        "loop", "match", "mod", "move", "mut", "pub", "ref",
+        "return", "self", "Self", "static", "struct", "super",
+        "trait", "true", "type", "unsafe", "use", "where", "while",
+        "async", "await", "dyn", "abstract", "become", "box", "do",
+        "final", "macro", "override", "priv", "typeof", "unsized",
+        "virtual", "yield", "try",
+    ];
+    if KEYWORDS.contains(&name) {
+        format!("r#{name}")
+    } else {
+        name.to_string()
     }
 }
 

@@ -107,13 +107,29 @@ impl Driver {
             roots.push(path.clone());
         }
 
+        // Hoist `Clang::new()` above the per-header loop. libclang's
+        // global init/dispose cycle is brittle on macOS arm64
+        // (libclang 17+) — re-initing per header has been observed
+        // to segfault when the second parse touches AST state from
+        // the first. Reusing one `Clang` instance across the whole
+        // walk avoids that.
+        let clang = clang::Clang::new().map_err(|e| ImportError::ClangDiagnostic {
+            file: roots
+                .first()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            line: 0,
+            message: format!("failed to initialize libclang: {e}"),
+        })?;
         for root in &roots {
-            let ids = crate::import::import_header_with_cache(
-                root,
-                &argv_refs,
-                ctx,
-                &mut usr_cache,
-            )?;
+            let (ids, _aliases, _enums) =
+                crate::import::import_header_with_clang(
+                    &clang,
+                    root,
+                    &argv_refs,
+                    ctx,
+                    &mut usr_cache,
+                )?;
             for id in ids {
                 if seen.insert(id) {
                     all.push(id);

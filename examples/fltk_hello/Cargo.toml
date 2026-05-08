@@ -1,0 +1,19 @@
+# Standalone manifest for the FLTK probe binary. Lives outside the
+# workspace so we can include `clang`-feature deps without affecting
+# the workspace crate graph.
+
+[package]
+name = "fltk_hello_probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "probe"
+path = "probe.rs"
+
+[dependencies]
+cxx_importer = { path = "../../crates/cxx_importer", features = ["libclang"] }
+rustc_abi_cxx = { path = "../../crates/rustc_abi_cxx" }
+
+[workspace]
