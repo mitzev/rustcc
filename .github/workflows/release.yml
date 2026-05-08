@@ -61,7 +61,11 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: Checkout rustcc
-        uses: actions/checkout@v4
+        # v5 is the first Node 24 major; v4 ran Node 20 which
+        # GitHub deprecated for self-hosted + GH-hosted runners.
+        # `Swatinem/rust-cache@v2` (referenced from the CI
+        # workflow) floats to v2.9.x which is already on Node 24.
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
@@ -129,7 +133,11 @@ jobs:
       - name: Upload build artifacts (job-scoped)
         # Keep the artifacts even if the release-upload step fails,
         # so maintainers can download them from the workflow run.
-        uses: actions/upload-artifact@v4
+        # v6 is the first Node 24 major; v4/v5 ran Node 20.
+        # We deliberately stay on @v6 instead of @v7 — v7 ships a
+        # new direct-upload feature + ESM internals that's
+        # noisier than we need for plain tarball uploads.
+        uses: actions/upload-artifact@v6
         with:
           name: rustcc-${{ matrix.target }}
           path: |
