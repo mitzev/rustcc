@@ -22,7 +22,7 @@ TARGET=aarch64-apple-darwin
 VERSION=latest
 
 # Resolve `latest` to the most recent release tag. Replace with a
-# specific tag (e.g. `v1.06.0`) if you want to pin.
+# specific tag (e.g. `v1.07.0`) if you want to pin.
 if [ "$VERSION" = "latest" ]; then
   VERSION=$(curl -fsSL https://api.github.com/repos/rustcc/rustcc/releases/latest \
             | grep -m1 '"tag_name"' \
@@ -134,7 +134,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: rustcc/rustcc/.github/actions/install-rustcc@main
         with:
-          version: latest           # or a pinned tag like v1.06.0
+          version: latest           # or a pinned tag like v1.07.0
           set-default: 'true'       # makes `cargo build` use rustcc
       - run: cargo build --workspace
       - run: cargo test --workspace
