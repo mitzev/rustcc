@@ -353,6 +353,7 @@ pub fn generate_rust_bindings_with_extras(
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
     let empty_free_fns = crate::free_fns::FreeFnSet::default();
+    let empty_static_data = crate::static_data::StaticDataSet::default();
     generate_rust_bindings_full(
         ctx,
         classes,
@@ -360,16 +361,18 @@ pub fn generate_rust_bindings_with_extras(
         aliases,
         enums,
         &empty_free_fns,
+        &empty_static_data,
         config,
     )
 }
 
 /// Full-fidelity emission entry point: takes every importer side-
-/// table including the M11.b free-function set. Use this when
-/// driving from `import_header_with_extras` so `fl_message`-style
-/// free functions land in the generated source alongside class
-/// methods. Backwards-compatible wrappers
-/// ([`generate_rust_bindings_with_extras`],
+/// table including the M11.b free-function set + M11.c static
+/// data members. Use this when driving from
+/// `import_header_with_extras` so `fl_message`-style free
+/// functions and `Fl::scheme_`-style static data members land
+/// in the generated source alongside class methods. Backwards-
+/// compatible wrappers ([`generate_rust_bindings_with_extras`],
 /// [`generate_rust_bindings_with_annotations`],
 /// [`generate_rust_bindings`]) all forward here with
 /// progressively-more-defaulted side-tables.
@@ -380,6 +383,7 @@ pub fn generate_rust_bindings_full(
     aliases: &crate::aliases::AliasSet,
     enums: &crate::enums::EnumSet,
     free_fns: &crate::free_fns::FreeFnSet,
+    static_data: &crate::static_data::StaticDataSet,
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
     match config.backend {
@@ -391,6 +395,7 @@ pub fn generate_rust_bindings_full(
             &aliases.entries,
             &enums.entries,
             &free_fns.entries,
+            &static_data.entries,
             config,
         ),
         BindingsBackend::CxxClassMacro => emit_cxx_class_macro(ctx, classes, config),
@@ -515,6 +520,7 @@ fn emit_direct_extern_cpp(
     aliases: &[crate::aliases::TypeAlias],
     enums: &[crate::enums::CxxEnumDef],
     free_fns: &[crate::free_fns::FreeFnDef],
+    static_data: &[crate::static_data::StaticDataDef],
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
     let mut out = String::new();
@@ -550,7 +556,31 @@ fn emit_direct_extern_cpp(
     // get folded into the same tree at their owning namespace
     // nodes so they emit before the class blocks at that scope.
     let tree = build_namespace_tree_full(ctx, &classes, aliases, enums, free_fns)?;
-    render_namespace_tree(ctx, &tree, &mut out, annotations, config, initial_indent)?;
+
+    // M11.c: bucket static data by their owning class FQN so
+    // the per-class renderer can pick up just the entries for
+    // the class it's emitting. The FQN format matches what
+    // `class_fqn_string` returns for the same class so lookup
+    // by `class_id` works identically here and inside the
+    // class renderer.
+    let mut static_data_by_class: std::collections::BTreeMap<
+        String,
+        Vec<&crate::static_data::StaticDataDef>,
+    > = std::collections::BTreeMap::new();
+    for sd in static_data {
+        let key = parent_path_to_fqn(&sd.parent);
+        static_data_by_class.entry(key).or_default().push(sd);
+    }
+
+    render_namespace_tree(
+        ctx,
+        &tree,
+        &mut out,
+        annotations,
+        config,
+        initial_indent,
+        &static_data_by_class,
+    )?;
 
     if config.crate_module.is_some() {
         let _ = writeln!(out, "}}");
@@ -564,8 +594,16 @@ fn emit_direct_extern_cpp(
 /// annotations.
 fn class_fqn_string(ctx: &CxxTypeCtx, class_id: ClassId) -> String {
     let class = ctx.class(class_id);
-    let mut parts = Vec::with_capacity(class.name.0.len());
-    for seg in &class.name.0 {
+    parent_path_to_fqn(&class.name.0)
+}
+
+/// `::`-joined string from a `NestedName` slice. M11.c uses this
+/// to build a lookup key for static data members keyed by
+/// owning class. Identical encoding rules to
+/// [`class_fqn_string`] so the two stay interchangeable.
+fn parent_path_to_fqn(segments: &[NameSegment]) -> String {
+    let mut parts = Vec::with_capacity(segments.len());
+    for seg in segments {
         match seg {
             NameSegment::Namespace(id)
             | NameSegment::Class(id)
@@ -753,6 +791,10 @@ fn render_namespace_tree(
     annotations: &AnnotationSet,
     config: &RustBindingsConfig,
     indent: &str,
+    static_data_by_class: &std::collections::BTreeMap<
+        String,
+        Vec<&crate::static_data::StaticDataDef>,
+    >,
 ) -> Result<(), BindingsError> {
     // M16: emit imported enum bodies first — classes and aliases
     // at this scope may reference them by name in their fields /
@@ -812,15 +854,36 @@ fn render_namespace_tree(
         out.push('\n');
     }
     for &class_id in &tree.classes {
-        let block =
-            render_direct_extern_class(ctx, class_id, annotations, config, indent)?;
+        // M11.c: pull this class's static data members from the
+        // bucketed map. Empty slice (no statics) is the common
+        // case — most imported classes don't have any.
+        let class_fqn = class_fqn_string(ctx, class_id);
+        let empty: Vec<&crate::static_data::StaticDataDef> = Vec::new();
+        let class_statics: &[&crate::static_data::StaticDataDef] =
+            static_data_by_class.get(&class_fqn).unwrap_or(&empty);
+        let block = render_direct_extern_class(
+            ctx,
+            class_id,
+            annotations,
+            config,
+            indent,
+            class_statics,
+        )?;
         out.push_str(&block);
         out.push('\n');
     }
     for (name, child) in &tree.children {
         let _ = writeln!(out, "{indent}pub mod {name} {{");
         let inner_indent = format!("{indent}    ");
-        render_namespace_tree(ctx, child, out, annotations, config, &inner_indent)?;
+        render_namespace_tree(
+            ctx,
+            child,
+            out,
+            annotations,
+            config,
+            &inner_indent,
+            static_data_by_class,
+        )?;
         let _ = writeln!(out, "{indent}}}");
     }
     Ok(())
@@ -832,6 +895,7 @@ fn render_direct_extern_class(
     annotations: &AnnotationSet,
     config: &RustBindingsConfig,
     indent: &str,
+    static_data: &[&crate::static_data::StaticDataDef],
 ) -> Result<String, BindingsError> {
     let class = ctx.class(class_id);
     let class_fqn = class_fqn_string(ctx, class_id);
@@ -1025,6 +1089,45 @@ fn render_direct_extern_class(
         }
         method_blocks.push(emission);
     }
+    // M11.c: emit one `static [mut]` extern decl per captured
+    // class-scope static data member, inside the same
+    // `unsafe extern "C++" { … }` block as the methods. The
+    // `#[link_name]` carries the Itanium-mangled symbol from
+    // `Symbol::Variable`. Render failures (unsupported member
+    // type) drop the entry — the impl-block accessor isn't
+    // emitted either.
+    let mut emitted_statics: Vec<(String, String, bool, String)> = Vec::new();
+    // (rust_accessor_name, extern_ident, is_const, rendered_type)
+    for sd in static_data {
+        let where_ = format!("{class_name}::{} (static)", sd.name.0);
+        let rendered_ty = match render_rust_type(ctx, sd.ty, &where_) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        // Mangle via `Symbol::Variable` using the class's full
+        // nested name as the variable's enclosing scope.
+        let scope_path = ctx.class(class_id).name.clone();
+        let link_name = ctx.mangle(&rustc_abi_cxx::Symbol::Variable {
+            scope: scope_path,
+            name: sd.name.clone(),
+            ty: sd.ty,
+        });
+        let extern_ident =
+            format!("__cxx_static_{}_{}", class_name, sd.name.0);
+        let mut_kw = if sd.cv.is_const { "" } else { "mut " };
+        let _ = writeln!(block, "{indent}    #[link_name = \"{link_name}\"]");
+        let _ = writeln!(
+            block,
+            "{indent}    pub(super) static {mut_kw}{ext}: {rendered_ty};",
+            ext = extern_ident,
+        );
+        emitted_statics.push((
+            rust_safe_ident(&sd.name.0),
+            extern_ident,
+            sd.cv.is_const,
+            rendered_ty,
+        ));
+    }
     let _ = writeln!(block, "{indent}}}");
     let _ = writeln!(block);
 
@@ -1064,6 +1167,42 @@ fn render_direct_extern_class(
     if !wrote_any_method {
         // Empty impl block stays well-formed; emit a placeholder so
         // grep finds the type.
+    }
+    // M11.c: emit accessor functions for each captured static
+    // data member. We return raw pointers (not `&'static T`)
+    // because extern statics on the C++ side may be written from
+    // any thread without Rust's aliasing rules in scope; a
+    // safe-Rust shared reference can't be soundly produced.
+    // Users coerce to `&` only inside their own `unsafe`.
+    for (rust_name, extern_ident, is_const, rendered_ty) in &emitted_statics {
+        let inner_indent = format!("{indent}    ");
+        let ptr_ty = if *is_const {
+            format!("*const {rendered_ty}")
+        } else {
+            format!("*mut {rendered_ty}")
+        };
+        let addr_macro = if *is_const { "addr_of" } else { "addr_of_mut" };
+        let _ = writeln!(
+            block,
+            "{inner_indent}/// Pointer to the C++ static data member \
+             `{class_name}::{rust_name}` (link symbol \
+             via the parent `extern \"C++\"` block).",
+        );
+        let _ = writeln!(
+            block,
+            "{inner_indent}/// SAFETY: the underlying static is \
+             writable from C++; readers/writers on the Rust side \
+             must coordinate synchronization themselves.",
+        );
+        let _ = writeln!(
+            block,
+            "{inner_indent}pub fn {rust_name}_ptr() -> {ptr_ty} {{",
+        );
+        let _ = writeln!(
+            block,
+            "{inner_indent}    unsafe {{ ::core::ptr::{addr_macro}!({extern_ident}) as {ptr_ty} }}",
+        );
+        let _ = writeln!(block, "{inner_indent}}}");
     }
     let _ = writeln!(block, "{indent}}}");
 

@@ -3435,6 +3435,7 @@ fn m11b_emits_pub_fn_with_extern_decl_for_free_function() {
         &extras.aliases,
         &extras.enums,
         &extras.free_fns,
+        &extras.static_data,
         &cfg,
     )
     .expect("emit");
@@ -3480,5 +3481,136 @@ fn m11b_dedups_redeclared_free_function() {
         .filter(|f| f.name.0 == "dup_fn")
         .count();
     assert_eq!(count, 1, "redeclared fn should dedup to 1; got {count}");
+    cleanup(&header);
+}
+
+// ============================================================
+// M11.c: class-scope static data members.
+// ============================================================
+
+#[test]
+fn m11c_captures_class_scope_static_data() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Counter {\n  static int instances;\n  static const int default_count;\n};\n",
+        "m11c_captures",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let inst = extras
+        .static_data
+        .iter()
+        .find(|s| s.name.0 == "instances")
+        .expect("instances captured");
+    assert!(!inst.cv.is_const, "non-const static should have cv.is_const=false");
+    let default_ct = extras
+        .static_data
+        .iter()
+        .find(|s| s.name.0 == "default_count")
+        .expect("default_count captured");
+    assert!(default_ct.cv.is_const, "const static should have cv.is_const=true");
+
+    // Both should be scoped under `Counter`.
+    for s in [&inst, &default_ct] {
+        let last = s.parent.last();
+        assert!(
+            matches!(last, Some(NameSegment::Class(id)) if id.0 == "Counter"),
+            "expected parent to end with Class(Counter); got {last:?}",
+        );
+    }
+    cleanup(&header);
+}
+
+#[test]
+fn m11c_skips_non_static_data() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  int regular_field;\n  static int static_field;\n};\n",
+        "m11c_skips_nonstatic",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    assert!(
+        extras.static_data.iter().all(|s| s.name.0 != "regular_field"),
+        "regular field should not appear in StaticDataSet",
+    );
+    assert!(
+        extras.static_data.iter().any(|s| s.name.0 == "static_field"),
+        "static field should appear",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m11c_emits_extern_static_and_accessor() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_full, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Counter {\n  static int instances;\n  static const int default_count;\n  Counter();\n};\n",
+        "m11c_emits",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_full(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &extras.free_fns,
+        &extras.static_data,
+        &cfg,
+    )
+    .expect("emit");
+
+    // Itanium symbol for `Counter::instances`: _ZN7Counter9instancesE.
+    assert!(
+        src.contains("_ZN7Counter9instancesE"),
+        "expected mangled link_name for Counter::instances; got:\n{src}",
+    );
+    // Mutable static (no `const`).
+    assert!(
+        src.contains("static mut __cxx_static_Counter_instances: i32"),
+        "expected mutable extern static for instances; got:\n{src}",
+    );
+    // Const static (no `mut`).
+    assert!(
+        src.contains("static __cxx_static_Counter_default_count: i32"),
+        "expected immutable extern static for default_count; got:\n{src}",
+    );
+    // Accessor on the impl block returning `*mut i32`.
+    assert!(
+        src.contains("pub fn instances_ptr() -> *mut i32"),
+        "instances accessor missing or wrong return type; got:\n{src}",
+    );
+    // Const accessor returns `*const`.
+    assert!(
+        src.contains("pub fn default_count_ptr() -> *const i32"),
+        "default_count accessor missing or wrong return type; got:\n{src}",
+    );
+
     cleanup(&header);
 }

@@ -62,6 +62,7 @@ use crate::annotations::{Annotation, AnnotationSet};
 use crate::diagnostics::{ImportError, SourceSpan};
 use crate::enums::{CxxEnumDef, CxxEnumVariant, EnumSet};
 use crate::free_fns::{FreeFnDef, FreeFnSet};
+use crate::static_data::{StaticDataDef, StaticDataSet};
 
 pub fn import_header(
     source: &Path,
@@ -88,6 +89,7 @@ pub fn import_header_with_annotations(
     let mut aliases = AliasSet::default();
     let mut enums = EnumSet::default();
     let mut free_fns = FreeFnSet::default();
+    let mut static_data = StaticDataSet::default();
     let ids = import_header_full(
         source,
         args,
@@ -97,8 +99,9 @@ pub fn import_header_with_annotations(
         &mut aliases,
         &mut enums,
         &mut free_fns,
+        &mut static_data,
     )?;
-    let _ = (aliases, enums, free_fns); // discard — caller wanted only annotations.
+    let _ = (aliases, enums, free_fns, static_data); // discard — caller wanted only annotations.
     Ok((ids, set))
 }
 
@@ -115,12 +118,14 @@ pub fn import_header_with_annotations(
 /// - `enums` — `enum` / `enum class` definitions at TU/namespace
 ///   scope, including variant lists (M16).
 /// - `free_fns` — free functions at TU/namespace scope (M11.b).
+/// - `static_data` — class-scope static data members (M11.c).
 #[derive(Default, Clone, Debug)]
 pub struct ImportExtras {
     pub annotations: AnnotationSet,
     pub aliases: AliasSet,
     pub enums: EnumSet,
     pub free_fns: FreeFnSet,
+    pub static_data: StaticDataSet,
 }
 
 /// One-shot import that returns every side-table the importer can
@@ -136,6 +141,7 @@ pub fn import_header_with_extras(
     let mut aliases = AliasSet::default();
     let mut enums = EnumSet::default();
     let mut free_fns = FreeFnSet::default();
+    let mut static_data = StaticDataSet::default();
     let ids = import_header_full(
         source,
         args,
@@ -145,6 +151,7 @@ pub fn import_header_with_extras(
         &mut aliases,
         &mut enums,
         &mut free_fns,
+        &mut static_data,
     )?;
     Ok((
         ids,
@@ -153,6 +160,7 @@ pub fn import_header_with_extras(
             aliases,
             enums,
             free_fns,
+            static_data,
         },
     ))
 }
@@ -169,12 +177,19 @@ pub(crate) fn import_header_full(
     aliases: &mut AliasSet,
     enums: &mut EnumSet,
     free_fns: &mut FreeFnSet,
+    static_data: &mut StaticDataSet,
 ) -> Result<Vec<ClassId>, ImportError> {
-    let (ids, captured_aliases, captured_enums, captured_free_fns) =
-        import_header_with_cache_and_aliases(source, args, ctx, cache)?;
+    let (
+        ids,
+        captured_aliases,
+        captured_enums,
+        captured_free_fns,
+        captured_static_data,
+    ) = import_header_with_cache_and_aliases(source, args, ctx, cache)?;
     aliases.entries.extend(captured_aliases);
     enums.entries.extend(captured_enums);
     free_fns.entries.extend(captured_free_fns);
+    static_data.entries.extend(captured_static_data);
     // The cache-and-annotations collection is currently re-derived
     // by re-running the importer when the caller wants annotations;
     // a follow-up release can plumb annotations through the
@@ -264,7 +279,7 @@ pub(crate) fn import_header_with_cache(
     // entry point. Callers that want them call
     // `import_header_with_cache_and_aliases` (or the public
     // `import_header_with_extras` wrapper) directly.
-    let (ids, _aliases, _enums, _free_fns) =
+    let (ids, _aliases, _enums, _free_fns, _static_data) =
         import_header_with_cache_and_aliases(source, args, ctx, cache)?;
     Ok(ids)
 }
@@ -280,7 +295,10 @@ pub(crate) fn import_header_with_cache_and_aliases(
     args: &[&str],
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
-) -> Result<(Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>, Vec<FreeFnDef>), ImportError> {
+) -> Result<
+    (Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>, Vec<FreeFnDef>, Vec<StaticDataDef>),
+    ImportError,
+> {
     // One-shot path: mint a fresh `Clang` for this single header
     // parse. For multi-header builds (`Driver::parse_all`), the
     // caller hoists `Clang::new()` to the top of the loop and
@@ -308,7 +326,10 @@ pub(crate) fn import_header_with_clang(
     args: &[&str],
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
-) -> Result<(Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>, Vec<FreeFnDef>), ImportError> {
+) -> Result<
+    (Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>, Vec<FreeFnDef>, Vec<StaticDataDef>),
+    ImportError,
+> {
     let index = Index::new(clang, false, false);
     let tu = index
         .parser(source)
@@ -349,8 +370,9 @@ pub(crate) fn import_header_with_clang(
     let aliases = std::mem::take(&mut importer.aliases);
     let enums = std::mem::take(&mut importer.enums);
     let free_fns = std::mem::take(&mut importer.free_fns);
+    let static_data = std::mem::take(&mut importer.static_data);
     *cache = importer.into_cache();
-    Ok((imported, aliases, enums, free_fns))
+    Ok((imported, aliases, enums, free_fns, static_data))
 }
 
 fn attach_methods_recursively(
@@ -556,6 +578,12 @@ struct Importer<'a> {
     /// dedup-by-USR pattern as aliases / enums.
     free_fns: Vec<FreeFnDef>,
     free_fn_usrs: std::collections::HashSet<String>,
+    /// M11.c: class-scope static data members. Captured during
+    /// the per-class child walk; emission groups them under the
+    /// owning class's `impl` block. Dedup'd by USR like the
+    /// other side-tables.
+    static_data: Vec<StaticDataDef>,
+    static_data_usrs: std::collections::HashSet<String>,
     /// M18: scratch slot — `lower_method` writes the count of
     /// trailing default-argument parameters here as a side
     /// effect, and the call sites read it after pushing the
@@ -585,6 +613,8 @@ impl<'a> Importer<'a> {
             enum_usrs: std::collections::HashSet::new(),
             free_fns: Vec::new(),
             free_fn_usrs: std::collections::HashSet::new(),
+            static_data: Vec::new(),
+            static_data_usrs: std::collections::HashSet::new(),
             last_method_default_count: 0,
         }
     }
@@ -911,6 +941,47 @@ impl<'a> Importer<'a> {
         Ok(())
     }
 
+    /// M11.c: harvest one class-scope `static` data member.
+    /// `class_name` is the owning class's `NestedName` so the
+    /// emitter can group members under their class without
+    /// re-walking semantic parents. Failures (unsupported member
+    /// type, anonymous member) silently skip.
+    fn collect_static_data_member(
+        &mut self,
+        entity: &Entity<'_>,
+        class_name: &NestedName,
+    ) -> Result<(), ImportError> {
+        let name = match entity.get_name() {
+            Some(n) if !n.is_empty() => n,
+            _ => return Ok(()),
+        };
+        if let Some(usr) = entity.get_usr() {
+            if !self.static_data_usrs.insert(usr.0) {
+                return Ok(());
+            }
+        }
+        let where_ = format!("static data member `{name}`");
+        let raw_ty = match entity.get_type() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        // Capture top-level cv-qualifiers before canonicalizing
+        // (the canonical type strips typedef sugar but keeps
+        // `const` / `volatile`).
+        let cv = cv_from_type(raw_ty);
+        let ty = match self.import_type(raw_ty.get_canonical_type(), &where_) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+        self.static_data.push(StaticDataDef {
+            parent: class_name.0.clone(),
+            name: Ident(name),
+            ty,
+            cv,
+        });
+        Ok(())
+    }
+
     fn import_class(
         &mut self,
         entity: &Entity<'_>,
@@ -1143,6 +1214,28 @@ impl<'a> Importer<'a> {
                     if default_count > 0 {
                         pending_default_arg_marks
                             .push((method_idx, default_count));
+                    }
+                }
+                // M11.c: class-scope static data members
+                // (`static int counter;` inside a class body).
+                // libclang surfaces these as `VarDecl` cursors
+                // with `StorageClass::Static`. Non-static fields
+                // arrive as `FieldDecl` and are handled by the
+                // earlier `Type::get_fields()` walk; non-static
+                // VarDecls are extremely rare at class scope.
+                EntityKind::VarDecl => {
+                    let is_static = matches!(
+                        child.get_storage_class(),
+                        Some(clang::StorageClass::Static),
+                    );
+                    if is_static {
+                        let class_name_path = NestedName(
+                            self.build_nested_path(entity).unwrap_or_default(),
+                        );
+                        let _ = self.collect_static_data_member(
+                            &child,
+                            &class_name_path,
+                        );
                     }
                 }
                 _ => {

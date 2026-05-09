@@ -166,7 +166,7 @@ impl Driver {
             message: format!("failed to initialize libclang: {e}"),
         })?;
         for root in &roots {
-            let (ids, _aliases, _enums, _free_fns) =
+            let (ids, _aliases, _enums, _free_fns, _static_data) =
                 crate::import::import_header_with_clang(
                     &clang,
                     root,
@@ -328,6 +328,8 @@ impl Driver {
             let mut tmp_aliases = crate::aliases::AliasSet::default();
             let mut tmp_enums = crate::enums::EnumSet::default();
             let mut tmp_free_fns = crate::free_fns::FreeFnSet::default();
+            let mut tmp_static_data =
+                crate::static_data::StaticDataSet::default();
             if let Ok(_) = crate::import::import_header_full(
                 root,
                 &argv.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -337,13 +339,14 @@ impl Driver {
                 &mut tmp_aliases,
                 &mut tmp_enums,
                 &mut tmp_free_fns,
+                &mut tmp_static_data,
             ) {
                 // ok — annotations merged into `anns`. Aliases,
-                // enum bodies, and free functions are dropped for
-                // now: the cache record schema doesn't carry them
-                // yet (tracked as a follow-up; load_or_parse
-                // callers that want them use
-                // `import_header_with_extras` directly).
+                // enum bodies, free functions, and static data
+                // members are dropped for now: the cache record
+                // schema doesn't carry them yet (tracked as a
+                // follow-up; load_or_parse callers that want
+                // them use `import_header_with_extras` directly).
             }
         }
         *caller_annotations = anns;
