@@ -1,0 +1,100 @@
+{
+  "rustcc class with constructor": {
+    "prefix": ["cppclass", "rustcc-class"],
+    "body": [
+      "pub class ${1:ClassName} {",
+      "    ${2:value}: ${3:i32},",
+      "",
+      "    #[constructor]",
+      "    pub fn new(${4:value: i32}) -> Self {",
+      "        ${1:ClassName} { ${2:value} }",
+      "    }",
+      "",
+      "    #[cpp_virtual]",
+      "    pub fn ${5:method_name}(&self) -> ${6:i32} {",
+      "        $0",
+      "    }",
+      "}"
+    ],
+    "description": "rustcc class with a constructor and one virtual method (fork-only `class` keyword surface)."
+  },
+  "rustcc class with inheritance": {
+    "prefix": "cppclass-inherit",
+    "body": [
+      "pub class ${1:Derived} : ${2:Base} {",
+      "    ${3:extra_field}: ${4:i32},",
+      "",
+      "    #[constructor]",
+      "    pub fn new(${5:args}) -> Self {",
+      "        ${1:Derived} { __base: ${2:Base}::new(), ${3:extra_field} }",
+      "    }",
+      "",
+      "    #[cpp_virtual]",
+      "    pub fn ${6:override_method}(&self) -> ${7:i32} {",
+      "        $0",
+      "    }",
+      "}"
+    ],
+    "description": "rustcc class inheriting from a base, with one virtual override."
+  },
+  "cxx_class! macro": {
+    "prefix": ["cxxclass", "cxx-class"],
+    "body": [
+      "use rustcc_macros::cxx_class;",
+      "",
+      "cxx_class! {",
+      "    pub struct ${1:Name} {",
+      "        ${2:field}: ${3:i32},",
+      "    }",
+      "",
+      "    impl ${1:Name} {",
+      "        #[constructor]",
+      "        pub fn new() -> Self;",
+      "",
+      "        pub fn ${4:method}(&self) -> ${5:i32};",
+      "    }",
+      "}"
+    ],
+    "description": "cxx_class! proc macro (stable-rustc compatible)."
+  },
+  "swift_value! macro": {
+    "prefix": ["swiftvalue", "swift-value"],
+    "body": [
+      "use rustcc_macros::swift_value;",
+      "",
+      "#[swift_type = \"${1:Module}.${2:Type}\"]",
+      "#[repr(swift)]",
+      "swift_value! {",
+      "    pub struct ${2:Type} {",
+      "        // Fields are auto-derived from the Swift module's",
+      "        // value-witness table at link time.",
+      "    }",
+      "}"
+    ],
+    "description": "Swift value type with auto-derived Drop/Clone via metadata-driven witnesses."
+  },
+  "M26 build helper for build.rs": {
+    "prefix": ["rustcc-build", "m26-build"],
+    "body": [
+      "fn main() {",
+      "    cxx_importer::build::Build::new()",
+      "        .header(\"${1:cpp/umbrella.hpp}\")",
+      "        .include_path(\"${2:/opt/homebrew/include}\")",
+      "        .cpp_std(\"c++17\")",
+      "        .cstr_ergonomics(true)",
+      "        .link(\"${3:fltk}\")",
+      "        $0",
+      "        .compile(\"${4:bindings}\")",
+      "        .expect(\"${4:bindings} compile\");",
+      "}"
+    ],
+    "description": "Skeleton build.rs invoking the M26 Build helper for header → bindings → static archive."
+  },
+  "include! generated bindings": {
+    "prefix": "rustcc-include-bindings",
+    "body": [
+      "include!(concat!(env!(\"OUT_DIR\"), \"/bindings.rs\"));"
+    ],
+    "description": "Pull in generated bindings from cxx_importer's M26 pipeline."
+  }
+}
