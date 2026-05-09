@@ -352,6 +352,36 @@ pub fn generate_rust_bindings_with_extras(
     enums: &crate::enums::EnumSet,
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
+    let empty_free_fns = crate::free_fns::FreeFnSet::default();
+    generate_rust_bindings_full(
+        ctx,
+        classes,
+        annotations,
+        aliases,
+        enums,
+        &empty_free_fns,
+        config,
+    )
+}
+
+/// Full-fidelity emission entry point: takes every importer side-
+/// table including the M11.b free-function set. Use this when
+/// driving from `import_header_with_extras` so `fl_message`-style
+/// free functions land in the generated source alongside class
+/// methods. Backwards-compatible wrappers
+/// ([`generate_rust_bindings_with_extras`],
+/// [`generate_rust_bindings_with_annotations`],
+/// [`generate_rust_bindings`]) all forward here with
+/// progressively-more-defaulted side-tables.
+pub fn generate_rust_bindings_full(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+    annotations: &AnnotationSet,
+    aliases: &crate::aliases::AliasSet,
+    enums: &crate::enums::EnumSet,
+    free_fns: &crate::free_fns::FreeFnSet,
+    config: &RustBindingsConfig,
+) -> Result<String, BindingsError> {
     match config.backend {
         BindingsBackend::NativeCppClassMacro => emit_native_macro(ctx, classes, config),
         BindingsBackend::DirectExternCpp => emit_direct_extern_cpp(
@@ -360,6 +390,7 @@ pub fn generate_rust_bindings_with_extras(
             annotations,
             &aliases.entries,
             &enums.entries,
+            &free_fns.entries,
             config,
         ),
         BindingsBackend::CxxClassMacro => emit_cxx_class_macro(ctx, classes, config),
@@ -483,6 +514,7 @@ fn emit_direct_extern_cpp(
     annotations: &AnnotationSet,
     aliases: &[crate::aliases::TypeAlias],
     enums: &[crate::enums::CxxEnumDef],
+    free_fns: &[crate::free_fns::FreeFnDef],
     config: &RustBindingsConfig,
 ) -> Result<String, BindingsError> {
     let mut out = String::new();
@@ -514,10 +546,10 @@ fn emit_direct_extern_cpp(
     // tree. A flat list (no `Namespace` segments) collapses to the
     // root and emits at the top level — same shape the v0 emitter
     // produced before this change, with no namespace overhead.
-    // M17 aliases + M16 enum bodies get folded into the same tree
-    // at their owning namespace nodes so they emit before the
-    // class blocks at that scope.
-    let tree = build_namespace_tree_with_extras(ctx, &classes, aliases, enums)?;
+    // M17 aliases + M16 enum bodies + M11.b free functions all
+    // get folded into the same tree at their owning namespace
+    // nodes so they emit before the class blocks at that scope.
+    let tree = build_namespace_tree_full(ctx, &classes, aliases, enums, free_fns)?;
     render_namespace_tree(ctx, &tree, &mut out, annotations, config, initial_indent)?;
 
     if config.crate_module.is_some() {
@@ -563,6 +595,11 @@ struct NamespaceTree {
     /// `#[repr(transparent)] pub struct + assoc consts` (unscoped
     /// or aliasing variants).
     enums: Vec<crate::enums::CxxEnumDef>,
+    /// M11.b free functions (`Fl_Color fl_color(int)`) directly
+    /// inside this scope. Emission renders each as a top-level
+    /// `pub fn` plus a private `unsafe extern "C++"` decl with a
+    /// `#[link_name = "..."]` carrying the Itanium-mangled symbol.
+    free_fns: Vec<crate::free_fns::FreeFnDef>,
     /// Sub-namespaces at this scope, keyed by name.
     /// `BTreeMap` for deterministic emission order.
     children: BTreeMap<String, NamespaceTree>,
@@ -572,18 +609,29 @@ fn build_namespace_tree(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
 ) -> Result<NamespaceTree, BindingsError> {
-    build_namespace_tree_with_extras(ctx, classes, &[], &[])
+    build_namespace_tree_full(ctx, classes, &[], &[], &[])
 }
 
-/// Same as [`build_namespace_tree`], but also folds M17 aliases
-/// and M16 enum bodies into their owning namespace scopes. Each
-/// alias / enum gets keyed by its `parent` segment list using
-/// the same `Namespace` / `AnonymousNamespace` rules as classes.
 fn build_namespace_tree_with_extras(
     ctx: &CxxTypeCtx,
     classes: &[ClassId],
     aliases: &[crate::aliases::TypeAlias],
     enums: &[crate::enums::CxxEnumDef],
+) -> Result<NamespaceTree, BindingsError> {
+    build_namespace_tree_full(ctx, classes, aliases, enums, &[])
+}
+
+/// Same as [`build_namespace_tree`], but also folds M17 aliases,
+/// M16 enum bodies, and M11.b free functions into their owning
+/// namespace scopes. Each item gets keyed by its `parent`
+/// segment list using the same `Namespace` /
+/// `AnonymousNamespace` rules as classes.
+fn build_namespace_tree_full(
+    ctx: &CxxTypeCtx,
+    classes: &[ClassId],
+    aliases: &[crate::aliases::TypeAlias],
+    enums: &[crate::enums::CxxEnumDef],
+    free_fns: &[crate::free_fns::FreeFnDef],
 ) -> Result<NamespaceTree, BindingsError> {
     let mut root = NamespaceTree::default();
     for &class_id in classes {
@@ -675,6 +723,26 @@ fn build_namespace_tree_with_extras(
         }
         node.enums.push(enum_def.clone());
     }
+    // M11.b: same routing for free functions.
+    for ff in free_fns {
+        let mut node = &mut root;
+        let mut prefix_ok = true;
+        for seg in &ff.parent {
+            let key = match seg {
+                NameSegment::Namespace(id) => id.0.clone(),
+                NameSegment::AnonymousNamespace => "__anon".to_string(),
+                _ => {
+                    prefix_ok = false;
+                    break;
+                }
+            };
+            node = node.children.entry(key).or_default();
+        }
+        if !prefix_ok {
+            continue;
+        }
+        node.free_fns.push(ff.clone());
+    }
     Ok(root)
 }
 
@@ -732,6 +800,15 @@ fn render_namespace_tree(
         }
     }
     if !tree.aliases.is_empty() || !tree.enums.is_empty() {
+        out.push('\n');
+    }
+    // M11.b: free functions land after the enums + aliases at
+    // this scope, before the class blocks. We emit them in a
+    // single shared `unsafe extern "C++" { ... }` block followed
+    // by a per-fn safe wrapper, so the `#[link_name]` attributes
+    // sit together and the API surface is just the wrappers.
+    if !tree.free_fns.is_empty() {
+        render_free_fns(ctx, &tree.free_fns, out, indent)?;
         out.push('\n');
     }
     for &class_id in &tree.classes {
@@ -2278,6 +2355,183 @@ fn render_rust_type_with_opts(
 /// Both shapes are layout-identical (single underlying integer)
 /// so the choice is purely about Rust-side ergonomics:
 ///
+/// M11.b: render a batch of free functions at one namespace
+/// scope. Emits a single shared `unsafe extern "C++" { … }`
+/// block of decls (each carrying a `#[link_name]` with the
+/// Itanium-mangled symbol) followed by a per-fn safe wrapper
+/// that hides the `unsafe` block. Failures (param/return type
+/// the v0 renderer can't handle) drop the offending function
+/// with a `// fn `<name>` skipped:` comment, matching the
+/// per-method skip behavior on classes.
+fn render_free_fns(
+    ctx: &CxxTypeCtx,
+    fns: &[crate::free_fns::FreeFnDef],
+    out: &mut String,
+    indent: &str,
+) -> Result<(), BindingsError> {
+    use rustc_abi_cxx::{NestedName, Symbol};
+
+    // Pre-render each function's signature into wrapper-safe
+    // strings so the `extern { ... }` block and the wrapper
+    // bodies see the same forms. Drop functions whose params
+    // or return type the renderer rejects.
+    struct Rendered<'a> {
+        def: &'a crate::free_fns::FreeFnDef,
+        link_name: String,
+        extern_ident: String,
+        params: Vec<(String, String)>, // (decl, forward) per arg
+        ret_ty: String,
+        ret_is_void: bool,
+    }
+    let mut rendered: Vec<Rendered<'_>> = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
+
+    // Dedup against the same extern_ident — a function declared
+    // in two transitively-included headers would otherwise emit
+    // twice and trip Rust's E0428.
+    let mut seen_idents: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    for ff in fns {
+        let where_ = format!("free fn `{}`", ff.name.0);
+        let mut params_ok = true;
+        let mut params: Vec<(String, String)> = Vec::with_capacity(ff.sig.params.len());
+        for (i, &p) in ff.sig.params.iter().enumerate() {
+            match render_rust_type(ctx, p, &format!("{where_} arg {i}")) {
+                Ok(ty) => {
+                    params.push((format!("arg{i}: {ty}"), format!("arg{i}")));
+                }
+                Err(e) => {
+                    skipped.push((ff.name.0.clone(), format!("{e:?}")));
+                    params_ok = false;
+                    break;
+                }
+            }
+        }
+        if !params_ok {
+            continue;
+        }
+        let ret_ty = match render_rust_type(ctx, ff.sig.ret, &format!("{where_} return")) {
+            Ok(t) => t,
+            Err(e) => {
+                skipped.push((ff.name.0.clone(), format!("{e:?}")));
+                continue;
+            }
+        };
+        let ret_is_void = ret_ty == "()";
+        // Itanium-mangled link name. Build the scope from the
+        // free fn's parent namespace path; the mangler handles
+        // empty-scope (TU-root) by emitting the bare `_Z<len><name>`
+        // form.
+        let scope = NestedName(ff.def_scope().to_vec());
+        let link_name = ctx.mangle(&Symbol::Function {
+            scope,
+            name: ff.name.clone(),
+            sig: ff.sig.clone(),
+        });
+        // Pick a Rust-safe identifier for the extern_ident +
+        // wrapper. Free functions don't have a class prefix so
+        // collisions are more likely; prefix with `__cxx_` to
+        // namespace the extern.
+        let safe = rust_safe_ident(&ff.name.0);
+        let extern_ident = format!("__cxx_fn_{}", ff.name.0);
+        if !seen_idents.insert(extern_ident.clone()) {
+            continue;
+        }
+        rendered.push(Rendered {
+            def: ff,
+            link_name,
+            extern_ident,
+            params,
+            ret_ty,
+            ret_is_void,
+        });
+        let _ = safe;
+    }
+
+    if rendered.is_empty() && skipped.is_empty() {
+        return Ok(());
+    }
+
+    if !skipped.is_empty() {
+        let _ = writeln!(
+            out,
+            "{indent}// {n} free function{s} skipped by the v0 emitter:",
+            n = skipped.len(),
+            s = if skipped.len() == 1 { "" } else { "s" },
+        );
+        for (name, why) in &skipped {
+            let short: String = why.chars().take(160).collect();
+            let _ = writeln!(out, "{indent}//   {name}: {short}");
+        }
+    }
+    if rendered.is_empty() {
+        return Ok(());
+    }
+
+    // Shared extern block.
+    let _ = writeln!(out, "{indent}unsafe extern \"C++\" {{");
+    for r in &rendered {
+        let _ = writeln!(out, "{indent}    #[link_name = \"{}\"]", r.link_name);
+        let decl_params = r
+            .params
+            .iter()
+            .map(|(d, _)| d.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if r.ret_is_void {
+            let _ = writeln!(
+                out,
+                "{indent}    fn {ext}({decl_params});",
+                ext = r.extern_ident,
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "{indent}    fn {ext}({decl_params}) -> {ret};",
+                ext = r.extern_ident,
+                ret = r.ret_ty,
+            );
+        }
+    }
+    let _ = writeln!(out, "{indent}}}");
+    let _ = writeln!(out);
+
+    // Safe wrappers — one `pub fn` per imported free fn.
+    for r in &rendered {
+        let safe_name = rust_safe_ident(&r.def.name.0);
+        let wrap_params = r
+            .params
+            .iter()
+            .map(|(d, _)| d.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let fwd = r
+            .params
+            .iter()
+            .map(|(_, f)| f.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let ret_clause = if r.ret_is_void {
+            String::new()
+        } else {
+            format!(" -> {}", r.ret_ty)
+        };
+        let _ = writeln!(
+            out,
+            "{indent}pub fn {safe_name}({wrap_params}){ret_clause} {{",
+        );
+        let _ = writeln!(
+            out,
+            "{indent}    unsafe {{ {ext}({fwd}) }}",
+            ext = r.extern_ident,
+        );
+        let _ = writeln!(out, "{indent}}}");
+    }
+
+    Ok(())
+}
+
 /// - `pub enum` lets `match` exhaustiveness fire and supports
 ///   derives, but disallows duplicate discriminants.
 /// - `pub struct` tolerates aliasing variants and is the safe

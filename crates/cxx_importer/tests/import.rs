@@ -3261,3 +3261,224 @@ fn m17_class_scope_typedef_is_skipped_in_v0() {
     // Sanity: AliasSet may be empty entirely.
     let _ = AliasSet::default();
 }
+
+// ============================================================
+// M11.b: free functions at TU/namespace scope.
+// ============================================================
+
+#[test]
+fn m11b_captures_tu_scope_free_function() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "int fl_color(int idx);\n",
+        "m11b_tu_scope_fn",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let f = extras
+        .free_fns
+        .iter()
+        .find(|f| f.name.0 == "fl_color")
+        .expect("fl_color captured");
+    assert!(f.parent.is_empty(), "TU-scope fn should have empty parent");
+    assert_eq!(f.sig.params.len(), 1);
+    assert!(matches!(
+        ctx.type_of(f.sig.params[0]),
+        CxxType::Int { signed: true, width: IntWidth::I32 },
+    ));
+    assert!(matches!(
+        ctx.type_of(f.sig.ret),
+        CxxType::Int { signed: true, width: IntWidth::I32 },
+    ));
+    cleanup(&header);
+}
+
+#[test]
+fn m11b_captures_namespace_nested_function_with_parent_path() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "namespace ns {\n\
+           namespace inner {\n\
+             void say_hello(const char* who);\n\
+           }\n\
+         }\n",
+        "m11b_ns_nested_fn",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let f = extras
+        .free_fns
+        .iter()
+        .find(|f| f.name.0 == "say_hello")
+        .expect("say_hello captured");
+    let parent_names: Vec<&str> = f
+        .parent
+        .iter()
+        .map(|seg| match seg {
+            NameSegment::Namespace(id) => id.0.as_str(),
+            _ => "<other>",
+        })
+        .collect();
+    assert_eq!(parent_names, vec!["ns", "inner"]);
+    cleanup(&header);
+}
+
+#[test]
+fn m11b_skips_class_methods_and_friend_functions() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Foo {\n  void method();\n  static int static_method(int);\n};\n\
+         void real_free_fn(int x);\n",
+        "m11b_class_methods_skipped",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // Class methods (instance + static) flow through the
+    // class child-walk; they should NOT appear in the
+    // FreeFnSet.
+    assert!(
+        extras.free_fns.iter().all(|f| f.name.0 != "method"),
+        "instance method should not be captured as free fn",
+    );
+    assert!(
+        extras.free_fns.iter().all(|f| f.name.0 != "static_method"),
+        "static method should not be captured as free fn",
+    );
+    // The actual free function is captured.
+    assert!(
+        extras.free_fns.iter().any(|f| f.name.0 == "real_free_fn"),
+        "real_free_fn should be captured",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m11b_skips_compiler_builtins() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // System headers transitively pull in `__builtin_*` etc.
+    // The filter drops them so they don't pollute bindings.
+    let header = temp_header(
+        "#include <stddef.h>\n\
+         void user_fn(int x);\n",
+        "m11b_no_builtins",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    for f in extras.free_fns.iter() {
+        assert!(
+            !f.name.0.starts_with("__builtin_")
+                && !f.name.0.starts_with("__sync_")
+                && !f.name.0.starts_with("__atomic_"),
+            "compiler builtin leaked into FreeFnSet: {}",
+            f.name.0,
+        );
+    }
+    // The user-declared fn must still be captured.
+    assert!(
+        extras.free_fns.iter().any(|f| f.name.0 == "user_fn"),
+        "user_fn should be captured",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m11b_emits_pub_fn_with_extern_decl_for_free_function() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_full, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "int fl_color(int idx);\n\
+         void fl_message(const char* msg);\n",
+        "m11b_emit_free_fn",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_full(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &extras.free_fns,
+        &cfg,
+    )
+    .expect("emit");
+
+    // Both functions get a `pub fn` wrapper.
+    assert!(
+        src.contains("pub fn fl_color(arg0: i32) -> i32"),
+        "fl_color wrapper missing or wrong signature; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub fn fl_message(arg0: *const i8)")
+            || src.contains("pub fn fl_message(arg0: *const u8)"),
+        "fl_message wrapper missing; got:\n{src}",
+    );
+    // The extern block carries the Itanium symbols. fl_color's
+    // mangling: `_Z8fl_colori` (length 8 + name + i for int).
+    assert!(
+        src.contains("#[link_name = \"_Z8fl_colori\"]"),
+        "expected fl_color mangled link_name; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m11b_dedups_redeclared_free_function() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // Same function declared twice (idempotent forward decls
+    // pattern in real C headers). Should appear once.
+    let header = temp_header(
+        "int dup_fn(int);\nint dup_fn(int);\n",
+        "m11b_dedup",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let count = extras
+        .free_fns
+        .iter()
+        .filter(|f| f.name.0 == "dup_fn")
+        .count();
+    assert_eq!(count, 1, "redeclared fn should dedup to 1; got {count}");
+    cleanup(&header);
+}

@@ -61,6 +61,7 @@ use crate::aliases::{AliasSet, TypeAlias};
 use crate::annotations::{Annotation, AnnotationSet};
 use crate::diagnostics::{ImportError, SourceSpan};
 use crate::enums::{CxxEnumDef, CxxEnumVariant, EnumSet};
+use crate::free_fns::{FreeFnDef, FreeFnSet};
 
 pub fn import_header(
     source: &Path,
@@ -86,6 +87,7 @@ pub fn import_header_with_annotations(
     let mut set = AnnotationSet::default();
     let mut aliases = AliasSet::default();
     let mut enums = EnumSet::default();
+    let mut free_fns = FreeFnSet::default();
     let ids = import_header_full(
         source,
         args,
@@ -94,8 +96,9 @@ pub fn import_header_with_annotations(
         &mut set,
         &mut aliases,
         &mut enums,
+        &mut free_fns,
     )?;
-    let _ = (aliases, enums); // discard — caller wanted only annotations.
+    let _ = (aliases, enums, free_fns); // discard — caller wanted only annotations.
     Ok((ids, set))
 }
 
@@ -111,11 +114,13 @@ pub fn import_header_with_annotations(
 ///   scope (M17).
 /// - `enums` — `enum` / `enum class` definitions at TU/namespace
 ///   scope, including variant lists (M16).
+/// - `free_fns` — free functions at TU/namespace scope (M11.b).
 #[derive(Default, Clone, Debug)]
 pub struct ImportExtras {
     pub annotations: AnnotationSet,
     pub aliases: AliasSet,
     pub enums: EnumSet,
+    pub free_fns: FreeFnSet,
 }
 
 /// One-shot import that returns every side-table the importer can
@@ -130,6 +135,7 @@ pub fn import_header_with_extras(
     let mut annotations = AnnotationSet::default();
     let mut aliases = AliasSet::default();
     let mut enums = EnumSet::default();
+    let mut free_fns = FreeFnSet::default();
     let ids = import_header_full(
         source,
         args,
@@ -138,6 +144,7 @@ pub fn import_header_with_extras(
         &mut annotations,
         &mut aliases,
         &mut enums,
+        &mut free_fns,
     )?;
     Ok((
         ids,
@@ -145,6 +152,7 @@ pub fn import_header_with_extras(
             annotations,
             aliases,
             enums,
+            free_fns,
         },
     ))
 }
@@ -160,11 +168,13 @@ pub(crate) fn import_header_full(
     annotations: &mut AnnotationSet,
     aliases: &mut AliasSet,
     enums: &mut EnumSet,
+    free_fns: &mut FreeFnSet,
 ) -> Result<Vec<ClassId>, ImportError> {
-    let (ids, captured_aliases, captured_enums) =
+    let (ids, captured_aliases, captured_enums, captured_free_fns) =
         import_header_with_cache_and_aliases(source, args, ctx, cache)?;
     aliases.entries.extend(captured_aliases);
     enums.entries.extend(captured_enums);
+    free_fns.entries.extend(captured_free_fns);
     // The cache-and-annotations collection is currently re-derived
     // by re-running the importer when the caller wants annotations;
     // a follow-up release can plumb annotations through the
@@ -254,7 +264,7 @@ pub(crate) fn import_header_with_cache(
     // entry point. Callers that want them call
     // `import_header_with_cache_and_aliases` (or the public
     // `import_header_with_extras` wrapper) directly.
-    let (ids, _aliases, _enums) =
+    let (ids, _aliases, _enums, _free_fns) =
         import_header_with_cache_and_aliases(source, args, ctx, cache)?;
     Ok(ids)
 }
@@ -270,7 +280,7 @@ pub(crate) fn import_header_with_cache_and_aliases(
     args: &[&str],
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
-) -> Result<(Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>), ImportError> {
+) -> Result<(Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>, Vec<FreeFnDef>), ImportError> {
     // One-shot path: mint a fresh `Clang` for this single header
     // parse. For multi-header builds (`Driver::parse_all`), the
     // caller hoists `Clang::new()` to the top of the loop and
@@ -298,7 +308,7 @@ pub(crate) fn import_header_with_clang(
     args: &[&str],
     ctx: &mut CxxTypeCtx,
     cache: &mut HashMap<String, ClassId>,
-) -> Result<(Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>), ImportError> {
+) -> Result<(Vec<ClassId>, Vec<TypeAlias>, Vec<CxxEnumDef>, Vec<FreeFnDef>), ImportError> {
     let index = Index::new(clang, false, false);
     let tu = index
         .parser(source)
@@ -334,12 +344,13 @@ pub(crate) fn import_header_with_clang(
     attach_methods_recursively(tu.get_entity(), &mut importer)?;
 
     // Hand the accumulated USR map back to the caller so the next
-    // import call can dedup against it. Drain aliases + enums at
-    // the same time so they ride out alongside the class list.
+    // import call can dedup against it. Drain side-tables (aliases,
+    // enums, free fns) so they ride out alongside the class list.
     let aliases = std::mem::take(&mut importer.aliases);
     let enums = std::mem::take(&mut importer.enums);
+    let free_fns = std::mem::take(&mut importer.free_fns);
     *cache = importer.into_cache();
-    Ok((imported, aliases, enums))
+    Ok((imported, aliases, enums, free_fns))
 }
 
 fn attach_methods_recursively(
@@ -489,6 +500,28 @@ fn walk_top_level(
                 let _ = importer.collect_alias(entity);
             }
         }
+        // M11.b: capture free functions at TU/namespace scope.
+        // Static methods on classes already flow through the
+        // class child-walk via M11.a; this branch picks up the
+        // truly-free declarations (`fl_message`, `fl_color`) that
+        // FLTK uses heavily. Skip class-scope friend functions
+        // and operator overloads — those need extra naming
+        // machinery we don't have yet.
+        EntityKind::FunctionDecl => {
+            let parent_kind = entity
+                .get_semantic_parent()
+                .map(|p| p.get_kind());
+            let at_ns_scope = matches!(
+                parent_kind,
+                Some(EntityKind::Namespace)
+                    | Some(EntityKind::TranslationUnit)
+                    | Some(EntityKind::NotImplemented)
+                    | None
+            );
+            if at_ns_scope {
+                let _ = importer.collect_free_fn(entity);
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -519,6 +552,10 @@ struct Importer<'a> {
     enums: Vec<CxxEnumDef>,
     /// USR-keyed dedup for enums. Same rationale as `alias_usrs`.
     enum_usrs: std::collections::HashSet<String>,
+    /// M11.b: free functions at TU/namespace scope. Same
+    /// dedup-by-USR pattern as aliases / enums.
+    free_fns: Vec<FreeFnDef>,
+    free_fn_usrs: std::collections::HashSet<String>,
     /// M18: scratch slot — `lower_method` writes the count of
     /// trailing default-argument parameters here as a side
     /// effect, and the call sites read it after pushing the
@@ -546,6 +583,8 @@ impl<'a> Importer<'a> {
             alias_usrs: std::collections::HashSet::new(),
             enums: Vec::new(),
             enum_usrs: std::collections::HashSet::new(),
+            free_fns: Vec::new(),
+            free_fn_usrs: std::collections::HashSet::new(),
             last_method_default_count: 0,
         }
     }
@@ -754,6 +793,120 @@ impl<'a> Importer<'a> {
             underlying,
             scoped,
             variants,
+        });
+        Ok(())
+    }
+
+    /// M11.b: harvest a free function at TU or namespace scope.
+    /// Skips on any failure — free fns are emit-only ergonomics
+    /// just like aliases / enums; a function whose parameter type
+    /// we can't import (templated, member-pointer, etc.) gets
+    /// dropped instead of poisoning the whole TU.
+    ///
+    /// Filtered out:
+    /// - Operator overloads at namespace scope (rare; need
+    ///   identifier-mapping work we haven't done).
+    /// - Compiler-generated builtins (`__builtin_*`,
+    ///   `__sync_fetch_*`) that libclang surfaces as
+    ///   `FunctionDecl`s on some configurations.
+    /// - Variadic-only / inline body functions: kept; the
+    ///   importer captures the syntactic signature regardless.
+    fn collect_free_fn(&mut self, entity: &Entity<'_>) -> Result<(), ImportError> {
+        let name = match entity.get_name() {
+            Some(n) if !n.is_empty() => n,
+            _ => return Ok(()),
+        };
+        // Filter compiler builtins. They're never useful from
+        // Rust and FLTK headers transitively pull a few in.
+        if name.starts_with("__builtin_")
+            || name.starts_with("__sync_")
+            || name.starts_with("__atomic_")
+        {
+            return Ok(());
+        }
+        // Operator overloads at namespace scope — defer.
+        if name.starts_with("operator")
+            && name
+                .chars()
+                .nth("operator".len())
+                .is_some_and(|c| !c.is_alphanumeric() && c != '_')
+        {
+            return Ok(());
+        }
+        // Dedup by USR — the same function declared in a header
+        // included from two roots otherwise emits twice.
+        if let Some(usr) = entity.get_usr() {
+            if !self.free_fn_usrs.insert(usr.0) {
+                return Ok(());
+            }
+        }
+
+        let where_ = format!("free fn `{name}`");
+
+        // Lower the result type.
+        let ret_ty = match entity.get_result_type() {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        let ret = match self.import_type(ret_ty, &where_) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        };
+
+        // Lower parameter types from `ParmDecl` children. We use
+        // the cursor walk (not `Type::get_argument_types()`)
+        // because the cursor preserves variadic-ness via
+        // `is_variadic` on the entity type.
+        let mut params: Vec<rustc_abi_cxx::TypeId> = Vec::new();
+        for child in entity.get_children() {
+            if child.get_kind() != EntityKind::ParmDecl {
+                continue;
+            }
+            let pty = match child.get_type() {
+                Some(t) => t,
+                None => return Ok(()),
+            };
+            match self.import_type(pty, &where_) {
+                Ok(id) => params.push(id),
+                Err(_) => return Ok(()),
+            }
+        }
+        let variadic = entity
+            .get_type()
+            .map(|t| t.is_variadic())
+            .unwrap_or(false);
+
+        // Build parent path: namespace ancestors only, outer→inner.
+        let mut parent_segments: Vec<NameSegment> = Vec::new();
+        let mut cur = entity.get_semantic_parent();
+        while let Some(e) = cur {
+            match e.get_kind() {
+                EntityKind::Namespace => {
+                    let pname = e.get_name().unwrap_or_default();
+                    if pname.is_empty() {
+                        parent_segments.push(NameSegment::AnonymousNamespace);
+                    } else {
+                        parent_segments
+                            .push(NameSegment::Namespace(Ident(pname)));
+                    }
+                }
+                _ => break,
+            }
+            cur = e.get_semantic_parent();
+        }
+        parent_segments.reverse();
+
+        self.free_fns.push(FreeFnDef {
+            parent: parent_segments,
+            name: Ident(name),
+            sig: FnSig {
+                params,
+                ret,
+                cv: CvQual::default(),
+                ref_q: None,
+                variadic,
+                noexcept: false,
+            },
         });
         Ok(())
     }
