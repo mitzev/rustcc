@@ -109,6 +109,39 @@ jobs:
           cd "$CLONE_DIR"
           ./x.py build --stage 1 library
 
+      - name: Run fork/tests/run.sh against stage-1
+        # Smoke-test the just-built compiler against the
+        # `fork/tests/class_keyword/` probe matrix:
+        # 4 cpp_class probes (basic, inheritance, type_generics,
+        # const_generics) + 3 Swift probes (swift_nonpod,
+        # swift_value_attr, swift_throws). Catches regressions in
+        # the fork patches (P09.* class keyword, 13-swift-value-builtin,
+        # 14-swift-throws) before we ship a tarball — the workspace CI
+        # on stock nightly can't exercise these because the probes
+        # use fork-only features.
+        #
+        # If any probe fails, the job exits non-zero and the tarball
+        # never gets packaged or uploaded. That's deliberate: we'd
+        # rather hold a release than ship a toolchain that fails
+        # integration tests. Maintainers can still pull the
+        # workflow-scoped artifact (uploaded only on success) by
+        # re-running the job after fixing the regression.
+        env:
+          CLONE_DIR: ${{ runner.temp }}/rust-lang-rust
+        run: |
+          STAGE1_RUSTC="$CLONE_DIR/build/host/stage1/bin/rustc"
+          if [[ ! -x "$STAGE1_RUSTC" ]]; then
+            echo "error: stage-1 rustc not found at $STAGE1_RUSTC" >&2
+            exit 1
+          fi
+          # The probe Cargo.tomls invoke `cargo +nightly build`
+          # (run.sh L46), so we need a nightly cargo on PATH even
+          # though the actual compilation goes through
+          # $STAGE1_RUSTC via the env override. `--profile minimal`
+          # skips clippy/rust-docs/etc. and trims ~30s off the install.
+          rustup toolchain install nightly --profile minimal --no-self-update
+          RUSTC="$STAGE1_RUSTC" ./fork/tests/run.sh
+
       - name: Package stage-1 toolchain
         env:
           CLONE_DIR: ${{ runner.temp }}/rust-lang-rust
