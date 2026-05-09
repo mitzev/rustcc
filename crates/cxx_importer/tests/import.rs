@@ -2826,6 +2826,172 @@ fn m18b_synthesizes_for_ctor_with_nullable_label() {
     cleanup(&header);
 }
 
+// ============================================================
+// M20.b: `&CStr` smart parameter wrappers, opt-in via
+// `cstr_ergonomics: true`. For each `*const c_char` parameter
+// the importer emits a `_cstr` wrapper that takes
+// `&::core::ffi::CStr` and forwards via `.as_ptr()`.
+// ============================================================
+
+#[test]
+fn m20b_emits_cstr_wrapper_for_const_char_param_when_enabled() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* text);\n};\n",
+        "m20b_emit_cstr_wrapper",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Full wrapper still uses the raw `*const c_char` form.
+    assert!(
+        src.contains("pub fn label(&mut self, arg0: *const ::core::ffi::c_char)"),
+        "raw-pointer wrapper missing; got:\n{src}",
+    );
+    // M20.b wrapper takes `&CStr`.
+    assert!(
+        src.contains("pub fn label_cstr(&mut self, arg0: &::core::ffi::CStr)"),
+        "_cstr wrapper missing or wrong shape; got:\n{src}",
+    );
+    // Body forwards via as_ptr.
+    assert!(
+        src.contains("self.label(arg0.as_ptr())"),
+        "expected `.as_ptr()` forward; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20b_does_not_emit_when_cstr_ergonomics_disabled() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* text);\n};\n",
+        "m20b_no_cstr_when_disabled",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: false, // explicit
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        !src.contains("label_cstr"),
+        "_cstr wrapper should not emit when cstr_ergonomics is off; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m20b_handles_mixed_params_with_one_cstr_slot() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `set(int x, const char* msg, int y)` — only the middle
+    // slot is `*const c_char`; outer ints pass through.
+    let header = temp_header(
+        "struct W {\n  void set(int x, const char* msg, int y);\n};\n",
+        "m20b_mixed_params",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains(
+            "pub fn set_cstr(&mut self, arg0: i32, arg1: &::core::ffi::CStr, arg2: i32)"
+        ),
+        "_cstr wrapper signature should keep `i32` slots and swap `const char*`; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.set(arg0, arg1.as_ptr(), arg2)"),
+        "_cstr forward should `.as_ptr()` only the middle slot; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m20b_emits_for_static_methods_and_ctors() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  W(const char* title);\n  static void title(const char* t);\n};\n",
+        "m20b_static_and_ctor",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Ctor wrapper.
+    assert!(
+        src.contains("pub fn new_cstr(arg0: &::core::ffi::CStr) -> Self"),
+        "ctor _cstr wrapper missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("Self::new(arg0.as_ptr())"),
+        "ctor _cstr should call Self::new(arg0.as_ptr()); got:\n{src}",
+    );
+    // Static wrapper.
+    assert!(
+        src.contains("pub fn title_cstr(arg0: &::core::ffi::CStr)"),
+        "static _cstr wrapper missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("Self::title(arg0.as_ptr())"),
+        "static _cstr should call Self::title(arg0.as_ptr()); got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
 #[test]
 fn m18b_does_not_emit_when_method_has_no_defaults() {
     use cxx_importer::rust_bindings::{

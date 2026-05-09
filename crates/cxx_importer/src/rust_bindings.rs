@@ -1595,6 +1595,14 @@ struct MethodEmission {
     /// one default-arg type can't be safely synthesized and the
     /// convenience wrapper is suppressed.
     synthesized_default_literals: Option<Vec<String>>,
+    /// M20.b: parallel index list — for each entry, the position
+    /// in `wrapper_user_params` where a `*const c_char` parameter
+    /// lives. Populated only when `cstr_ergonomics` is on AND
+    /// at least one such parameter exists. The convenience-
+    /// wrapper renderer uses this to emit a `_cstr` variant
+    /// that takes `&::core::ffi::CStr` for each listed slot
+    /// and forwards via `as_ptr()`.
+    cstr_param_indices: Vec<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1817,6 +1825,22 @@ fn classify_for_direct_extern(
         user_forward_names.push(name);
     }
 
+    // M20.b: when cstr_ergonomics is on, scan params for
+    // `*const c_char` (i.e., the M20 rewrite of `*const i8`/`*const u8`).
+    // Each hit gets a `_cstr` convenience-wrapper slot that
+    // takes `&::core::ffi::CStr` and forwards via `as_ptr()`.
+    let cstr_param_indices: Vec<usize> = if config.cstr_ergonomics {
+        method
+            .sig
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &ty)| is_const_c_char_ptr(ctx, ty).then_some(i))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // M18.b: synthesize a Rust default literal per trailing
     // default-arg slot. If any one of them fails synthesis,
     // `synthesized_default_literals` stays `None` and the
@@ -1877,6 +1901,7 @@ fn classify_for_direct_extern(
                 wrapper_user_params: user_param_pairs.clone(),
                 wrapper_forward_arg_names: user_forward_names.clone(),
                 synthesized_default_literals: synthesized_defaults.clone(),
+                cstr_param_indices: cstr_param_indices.clone(),
             });
         }
         Some(SpecialMember::Dtor) => {
@@ -1899,6 +1924,7 @@ fn classify_for_direct_extern(
                 wrapper_user_params: Vec::new(),
                 wrapper_forward_arg_names: Vec::new(),
                 synthesized_default_literals: None,
+                cstr_param_indices: Vec::new(),
             });
         }
         Some(SpecialMember::CopyCtor | SpecialMember::MoveCtor)
@@ -2021,6 +2047,7 @@ fn classify_for_direct_extern(
         wrapper_user_params: user_param_pairs,
         wrapper_forward_arg_names: user_forward_names,
         synthesized_default_literals: synthesized_defaults,
+        cstr_param_indices,
         default_arg_count: ctx.default_arg_count(class_id, method_idx),
     })
 }
@@ -2325,7 +2352,118 @@ fn render_direct_extern_wrapper(
         }
     }
 
+    // M20.b: optional `_cstr` convenience wrapper. When
+    // `cstr_ergonomics` was on at classification time and the
+    // method has at least one `*const c_char` parameter, emit
+    // a parallel wrapper that takes `&::core::ffi::CStr` for
+    // each such slot and forwards via `.as_ptr()`. Other
+    // parameters pass through unchanged. The wrapper
+    // forwards to the full-arity safe wrapper rather than
+    // re-implementing the unsafe block.
+    //
+    // Skipped for `Dtor` (no args). For ctors / static methods
+    // / instance / virtual the same routing rules as M18.b
+    // apply (Self:: vs self.).
+    if !matches!(emission.kind, EmissionKind::Dtor) && !emission.cstr_param_indices.is_empty() {
+        render_m20b_cstr_wrapper(emission, &display_name, indent, &mut out);
+    }
+
     out
+}
+
+/// M20.b: emit a `_cstr` wrapper for methods with one or more
+/// `*const c_char` parameters. Each such parameter becomes
+/// `&::core::ffi::CStr` in the wrapper signature and forwards
+/// via `.as_ptr()`. Other parameters pass through unchanged.
+///
+/// The `_cstr` wrapper composes naturally with M18.b: a method
+/// with both default args and `const char*` parameters gets
+/// `<name>`, `<name>_with_defaults`, and `<name>_cstr`. We
+/// don't (yet) emit `<name>_cstr_with_defaults` — combining
+/// the two wrapper variants is tracked as M20.c when callers
+/// ask for it.
+fn render_m20b_cstr_wrapper(
+    emission: &MethodEmission,
+    display_name: &str,
+    indent: &str,
+    out: &mut String,
+) {
+    let cstr_indices: std::collections::HashSet<usize> =
+        emission.cstr_param_indices.iter().copied().collect();
+    // Build the wrapper params: `*const c_char` slots become
+    // `&::core::ffi::CStr`, others pass through.
+    let kept_params: Vec<String> = emission
+        .wrapper_user_params
+        .iter()
+        .enumerate()
+        .map(|(i, (n, t))| {
+            if cstr_indices.contains(&i) {
+                format!("{n}: &::core::ffi::CStr")
+            } else {
+                format!("{n}: {t}")
+            }
+        })
+        .collect();
+    // Forward args: `*const c_char` slots get `.as_ptr()`
+    // appended, others pass through.
+    let forwards: Vec<String> = emission
+        .wrapper_forward_arg_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            if cstr_indices.contains(&i) {
+                format!("{n}.as_ptr()")
+            } else {
+                n.clone()
+            }
+        })
+        .collect();
+
+    let wrapper_name = format!("{display_name}_cstr");
+    let receiver_decl = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst => Some("&self"),
+        WrapperReceiver::SelfMut => Some("&mut self"),
+        WrapperReceiver::None => None,
+        WrapperReceiver::Ctor => None,
+    };
+    let receiver_call = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst | WrapperReceiver::SelfMut => "self.",
+        WrapperReceiver::None => "Self::",
+        WrapperReceiver::Ctor => "Self::",
+    };
+    let ret_clause = if matches!(emission.kind, EmissionKind::Ctor) {
+        " -> Self".to_string()
+    } else if emission.wrapper_return == "()" {
+        String::new()
+    } else {
+        format!(" -> {}", emission.wrapper_return)
+    };
+
+    let head = match receiver_decl {
+        Some(recv) if !kept_params.is_empty() => format!(
+            "{indent}pub fn {wrapper_name}({recv}, {params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+        Some(recv) => {
+            format!("{indent}pub fn {wrapper_name}({recv}){ret_clause} {{")
+        }
+        None => format!(
+            "{indent}pub fn {wrapper_name}({params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+    };
+    let _ = writeln!(out, "{head}");
+    let _ = writeln!(
+        out,
+        "{indent}    // M20.b: `&CStr` ergonomic — forwards `.as_ptr()` per `*const c_char` slot.",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    {recv}{display_name}({args})",
+        recv = receiver_call,
+        args = forwards.join(", "),
+    );
+    let _ = writeln!(out, "{indent}}}");
 }
 
 /// M18.b: emit one convenience wrapper per "drop k trailing
@@ -3124,6 +3262,20 @@ fn rust_safe_ident(name: &str) -> String {
         format!("r#{name}")
     } else {
         name.to_string()
+    }
+}
+
+/// M20.b: true when `ty` is `*const <byte-int>`, i.e. a const
+/// pointer to a single-byte integer. Matches what M20's
+/// cstr_ergonomics rewrite turns into `*const c_char`. Used to
+/// decide whether to emit a `_cstr` convenience wrapper that
+/// takes `&::core::ffi::CStr` and forwards via `as_ptr()`.
+fn is_const_c_char_ptr(ctx: &CxxTypeCtx, ty: TypeId) -> bool {
+    match ctx.type_of(ty) {
+        CxxType::Ptr { pointee, cv } if cv.is_const => {
+            is_byte_int(ctx, *pointee)
+        }
+        _ => false,
     }
 }
 
