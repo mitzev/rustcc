@@ -4290,10 +4290,12 @@ fn ident_of_class_with_ctx(
             let mut out = name.0.clone();
             if let Some(ctx) = ctx {
                 for a in args {
-                    if let rustc_abi_cxx::TemplateArg::Type(tid) = a {
-                        out.push('_');
-                        out.push_str(&type_arg_ident(ctx, *tid));
-                    }
+                    // `TemplateArg` currently has only the `Type` variant;
+                    // use a refutable `let` so the lint `irrefutable_let_patterns`
+                    // (newly hardened to error in nightly) doesn't reject it.
+                    let rustc_abi_cxx::TemplateArg::Type(tid) = a;
+                    out.push('_');
+                    out.push_str(&type_arg_ident(ctx, *tid));
                 }
             }
             Some(out)
