@@ -40,6 +40,17 @@ pub struct CxxTypeCtx {
     /// the C++ side considered optional. Stored as a side-table
     /// for the same back-compat reasoning as `static_methods`.
     default_arg_counts: HashMap<(ClassId, usize), usize>,
+    /// M21.b: per-field bit width for bitfield members.
+    /// `(ClassId, field_idx)` points into `class.fields`. Non-
+    /// bitfield fields don't appear in this map. Stored as a
+    /// sidecar rather than on `FieldDef` for the same back-
+    /// compat reasoning as the other side-tables — every test
+    /// fixture that hand-builds a `FieldDef` literal stays
+    /// untouched. The `rustc_abi_cxx::layout` engine reads
+    /// these widths to apply Itanium bit-packing rules; the
+    /// importer populates them via
+    /// `Entity::get_bit_field_width()` on `FieldDecl` cursors.
+    bitfield_widths: HashMap<(ClassId, usize), u64>,
     /// Rust-origin enums exposed to C++ as scoped enums. No parallel
     /// for C++-origin enums yet — imported enums flow as anonymous
     /// `CxxType::Enum` instances with the variants living in the
@@ -57,6 +68,7 @@ impl CxxTypeCtx {
             poison_reason: HashMap::new(),
             static_methods: HashSet::new(),
             default_arg_counts: HashMap::new(),
+            bitfield_widths: HashMap::new(),
             rust_enums: Vec::new(),
             types: Vec::new(),
         }
@@ -136,6 +148,41 @@ impl CxxTypeCtx {
             .get(&(class, method_idx))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// M21.b: record that `class.fields[field_idx]` is a bitfield
+    /// declared with `width` bits in the C++ source. Width 0 is
+    /// permitted — it's a special "force alignment to next AU"
+    /// marker per Itanium.
+    pub fn record_bitfield_width(
+        &mut self,
+        class: ClassId,
+        field_idx: usize,
+        width: u64,
+    ) {
+        self.bitfield_widths.insert((class, field_idx), width);
+    }
+
+    /// Bitfield width for `class.fields[field_idx]`. `Some(w)`
+    /// means the field is a bitfield (including `w == 0`); `None`
+    /// means it's a regular field.
+    pub fn bitfield_width(&self, class: ClassId, field_idx: usize) -> Option<u64> {
+        self.bitfield_widths.get(&(class, field_idx)).copied()
+    }
+
+    /// True iff `class.fields[field_idx]` is a bitfield. Slim
+    /// convenience wrapper over `bitfield_width`.
+    pub fn is_bitfield(&self, class: ClassId, field_idx: usize) -> bool {
+        self.bitfield_widths.contains_key(&(class, field_idx))
+    }
+
+    /// True iff *any* field on `class` is a bitfield. Used by the
+    /// layout engine to decide whether to switch the per-field
+    /// placement loop into the bit-packed walker.
+    pub fn class_has_bitfields(&self, class: ClassId) -> bool {
+        self.bitfield_widths
+            .keys()
+            .any(|(c, _)| *c == class)
     }
 
     /// Register a Rust-origin enum for C++ exposure. Returns the

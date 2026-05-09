@@ -1772,28 +1772,30 @@ fn classify_for_direct_extern(
     resolved_rust_name: &str,
     config: &RustBindingsConfig,
 ) -> Result<MethodEmission, BindingsError> {
-    // Per-method gate that used to live at the class level: a
-    // virtual method without a populated `vtable_index` (because
-    // the v0 vtable walker doesn't reach into secondary tables /
-    // virtual bases / multi-inheritance) can't be dispatched
-    // through the vtable, and a pure virtual has no own-class
-    // body to call. Reject both with a clear reason; the caller
-    // converts this into a per-method skip-with-comment instead
-    // of failing the whole class.
-    if method.virtuality == Virtuality::Virtual && method.vtable_index.is_none() {
+    // Per-method gate: virtual methods (regular or pure) without
+    // a populated `vtable_index` can't be dispatched through the
+    // vtable. Reject those with a clear reason; the caller
+    // converts this into a per-method skip-with-comment.
+    //
+    // M23: pure virtuals WITH a vtable_index fall through to be
+    // emitted as regular virtuals. The vtable slot for an
+    // un-overridden pure virtual points to `__cxa_pure_virtual`
+    // (set by `vtable.rs` when the slot's method's virtuality
+    // is `PureVirtual`); calling such a method on the
+    // actually-abstract base class hits that symbol and
+    // terminates, which is the correct C++ semantic. If a
+    // derived class has an override in scope at runtime, the
+    // override fires.
+    if matches!(
+        method.virtuality,
+        Virtuality::Virtual | Virtuality::PureVirtual,
+    ) && method.vtable_index.is_none()
+    {
         return Err(BindingsError::UnsupportedMethod {
             where_: format!("{class_name}::{:?}", method.name),
             why: "virtual method without populated vtable_index (v0 vtable walker \
                   doesn't reach this slot — multi-inheritance / virtual base / \
                   secondary vtable; tracked as M22)."
-                .into(),
-        });
-    }
-    if method.virtuality == Virtuality::PureVirtual {
-        return Err(BindingsError::UnsupportedMethod {
-            where_: format!("{class_name}::{:?}", method.name),
-            why: "pure virtual method (no own-class implementation to call); \
-                  a future revision routes to `__cxa_pure_virtual`."
                 .into(),
         });
     }
@@ -1992,7 +1994,10 @@ fn classify_for_direct_extern(
     // `ctx.is_method_static` for the Static path; virtuals carry
     // their `vtable_index` for the vptr-load-and-transmute path.
     // Everything else falls through to Instance.
-    let kind = if method.virtuality == Virtuality::Virtual {
+    let kind = if matches!(
+        method.virtuality,
+        Virtuality::Virtual | Virtuality::PureVirtual,
+    ) {
         match method.vtable_index {
             Some(vt) => EmissionKind::Virtual { vtable_index: vt },
             None => {
@@ -2377,6 +2382,18 @@ fn render_direct_extern_wrapper(
     // apply (Self:: vs self.).
     if !matches!(emission.kind, EmissionKind::Dtor) && !emission.cstr_param_indices.is_empty() {
         render_m20b_cstr_wrapper(emission, &display_name, indent, &mut out);
+        // M20.c: extend the M20.b ergonomic surface with two
+        // higher-level convenience wrappers per cstr-bearing
+        // method:
+        //   - `_str(...)`      — takes `&str`, allocates a
+        //     `CString` per slot, panics on interior nul.
+        //   - `_opt_cstr(...)` — takes `Option<&CStr>`, maps
+        //     `None` to `core::ptr::null()`. The nullable
+        //     case dominates real C++ APIs (FLTK widget
+        //     labels, tooltips, file paths) where `nullptr`
+        //     is a valid input.
+        render_m20c_str_wrapper(emission, &display_name, indent, &mut out);
+        render_m20c_opt_cstr_wrapper(emission, &display_name, indent, &mut out);
     }
 
     out
@@ -2666,6 +2683,196 @@ fn render_m20b_cstr_wrapper(
     let _ = writeln!(
         out,
         "{indent}    // M20.b: `&CStr` ergonomic — forwards `.as_ptr()` per `*const c_char` slot.",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    {recv}{display_name}({args})",
+        recv = receiver_call,
+        args = forwards.join(", "),
+    );
+    let _ = writeln!(out, "{indent}}}");
+}
+
+/// M20.c: emit a `_str` wrapper that takes `&str` for each
+/// `*const c_char` slot. Each slot allocates a temporary
+/// `CString` (panicking on interior nul — programmer error).
+/// Other params pass through unchanged. Same routing rules as
+/// M20.b; same composition with M18.b (the `_str_with_defaults`
+/// combo is tracked as M20.d when callers ask for it).
+fn render_m20c_str_wrapper(
+    emission: &MethodEmission,
+    display_name: &str,
+    indent: &str,
+    out: &mut String,
+) {
+    let cstr_indices: std::collections::HashSet<usize> =
+        emission.cstr_param_indices.iter().copied().collect();
+    let kept_params: Vec<String> = emission
+        .wrapper_user_params
+        .iter()
+        .enumerate()
+        .map(|(i, (n, t))| {
+            if cstr_indices.contains(&i) {
+                format!("{n}: &str")
+            } else {
+                format!("{n}: {t}")
+            }
+        })
+        .collect();
+
+    let wrapper_name = format!("{display_name}_str");
+    let receiver_decl = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst => Some("&self"),
+        WrapperReceiver::SelfMut => Some("&mut self"),
+        WrapperReceiver::None => None,
+        WrapperReceiver::Ctor => None,
+    };
+    let receiver_call = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst | WrapperReceiver::SelfMut => "self.",
+        WrapperReceiver::None => "Self::",
+        WrapperReceiver::Ctor => "Self::",
+    };
+    let ret_clause = if matches!(emission.kind, EmissionKind::Ctor) {
+        " -> Self".to_string()
+    } else if emission.wrapper_return == "()" {
+        String::new()
+    } else {
+        format!(" -> {}", emission.wrapper_return)
+    };
+
+    let head = match receiver_decl {
+        Some(recv) if !kept_params.is_empty() => format!(
+            "{indent}pub fn {wrapper_name}({recv}, {params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+        Some(recv) => {
+            format!("{indent}pub fn {wrapper_name}({recv}){ret_clause} {{")
+        }
+        None => format!(
+            "{indent}pub fn {wrapper_name}({params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+    };
+    let _ = writeln!(out, "{head}");
+    let _ = writeln!(
+        out,
+        "{indent}    // M20.c: `&str` ergonomic — allocates a temporary `CString` per slot.",
+    );
+    // Allocate one CString temporary per cstr slot, named
+    // `__cs_<i>`. Panic on interior nul — same behavior as
+    // `unwrap()` on `CString::new()`. The CString stays alive
+    // until the end of the wrapper (the `.as_ptr()` call
+    // happens in the same expression, then `__cs_<i>` drops
+    // after the inner method returns).
+    for &i in &emission.cstr_param_indices {
+        let arg_name = &emission.wrapper_forward_arg_names[i];
+        let _ = writeln!(
+            out,
+            "{indent}    let __cs_{i} = ::std::ffi::CString::new({arg_name})",
+        );
+        let _ = writeln!(
+            out,
+            "{indent}        .expect(\"interior nul in &str passed to {wrapper_name}\");",
+        );
+    }
+    // Build forwards: cstr slots become `__cs_<i>.as_ptr()`,
+    // others pass through.
+    let forwards: Vec<String> = emission
+        .wrapper_forward_arg_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            if cstr_indices.contains(&i) {
+                format!("__cs_{i}.as_ptr()")
+            } else {
+                n.clone()
+            }
+        })
+        .collect();
+    let _ = writeln!(
+        out,
+        "{indent}    {recv}{display_name}({args})",
+        recv = receiver_call,
+        args = forwards.join(", "),
+    );
+    let _ = writeln!(out, "{indent}}}");
+}
+
+/// M20.c: emit an `_opt_cstr` wrapper that takes
+/// `Option<&::core::ffi::CStr>` for each `*const c_char` slot.
+/// `None` maps to `core::ptr::null()`. This is the form most
+/// real C++ APIs want when the param accepts `nullptr`
+/// (FLTK's widget labels, tooltips, file paths, etc.).
+fn render_m20c_opt_cstr_wrapper(
+    emission: &MethodEmission,
+    display_name: &str,
+    indent: &str,
+    out: &mut String,
+) {
+    let cstr_indices: std::collections::HashSet<usize> =
+        emission.cstr_param_indices.iter().copied().collect();
+    let kept_params: Vec<String> = emission
+        .wrapper_user_params
+        .iter()
+        .enumerate()
+        .map(|(i, (n, t))| {
+            if cstr_indices.contains(&i) {
+                format!("{n}: Option<&::core::ffi::CStr>")
+            } else {
+                format!("{n}: {t}")
+            }
+        })
+        .collect();
+    let forwards: Vec<String> = emission
+        .wrapper_forward_arg_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            if cstr_indices.contains(&i) {
+                format!("{n}.map_or(::core::ptr::null(), |c| c.as_ptr())")
+            } else {
+                n.clone()
+            }
+        })
+        .collect();
+
+    let wrapper_name = format!("{display_name}_opt_cstr");
+    let receiver_decl = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst => Some("&self"),
+        WrapperReceiver::SelfMut => Some("&mut self"),
+        WrapperReceiver::None => None,
+        WrapperReceiver::Ctor => None,
+    };
+    let receiver_call = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst | WrapperReceiver::SelfMut => "self.",
+        WrapperReceiver::None => "Self::",
+        WrapperReceiver::Ctor => "Self::",
+    };
+    let ret_clause = if matches!(emission.kind, EmissionKind::Ctor) {
+        " -> Self".to_string()
+    } else if emission.wrapper_return == "()" {
+        String::new()
+    } else {
+        format!(" -> {}", emission.wrapper_return)
+    };
+
+    let head = match receiver_decl {
+        Some(recv) if !kept_params.is_empty() => format!(
+            "{indent}pub fn {wrapper_name}({recv}, {params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+        Some(recv) => {
+            format!("{indent}pub fn {wrapper_name}({recv}){ret_clause} {{")
+        }
+        None => format!(
+            "{indent}pub fn {wrapper_name}({params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+    };
+    let _ = writeln!(out, "{head}");
+    let _ = writeln!(
+        out,
+        "{indent}    // M20.c: nullable `&CStr` ergonomic — `None` → `null()`.",
     );
     let _ = writeln!(
         out,

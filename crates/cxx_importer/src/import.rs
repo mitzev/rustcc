@@ -54,7 +54,7 @@ use rustc_abi_cxx::{
     Access, BaseSpec, ClassDef, ClassId, CvQual, CxxType, CxxTypeCtx,
     FieldDef, FloatKind, FnSig, Ident, IntWidth, MethodDef, MethodName,
     NameSegment, NestedName, OperatorKind, RecordKind, RefKind, SpecialMember,
-    Symbol, TemplateArg, TypeId, VTableEntry, Virtuality,
+    TemplateArg, TypeId, VTableEntry, Virtuality,
 };
 
 use crate::aliases::{AliasSet, TypeAlias};
@@ -1095,43 +1095,24 @@ impl<'a> Importer<'a> {
         // whereas `get_children()` on a spec cursor sometimes comes back
         // empty.
         //
-        // M21: detect bitfields up front. The current `rustc_abi_cxx`
-        // layout engine has no notion of bit-packing, so a struct
-        // with even one bitfield member would compute the wrong
-        // size / offsets — and silently mismatch the C++ side at
-        // runtime. Until proper Itanium bit-packing lands, we
-        // poison the whole class with a clear reason. Users see a
-        // doc-commented opaque struct instead of a layout that
-        // appears to work but corrupts the data.
+        // M21.b: bitfields now flow through the layout engine
+        // via the `ctx.bitfield_widths` sidecar. The importer
+        // captures `child.get_bit_field_width()` per bitfield
+        // member; the layout engine reads it back to apply
+        // Itanium bit-packing rules. Bitfield-bearing classes
+        // are no longer poisoned wholesale — they emit through
+        // the regular class path with their fields packed
+        // correctly. Per-field bitfield accessors on the
+        // generated Rust binding are tracked as M21.c.
+        let mut pending_bitfield_marks: Vec<(usize, u64)> = Vec::new();
         if let Some(field_entities) =
             entity.get_type().and_then(|t| t.get_fields())
         {
-            for child in &field_entities {
-                if child.is_bit_field() {
-                    let fname = child.get_name().unwrap_or_default();
-                    let width = child.get_bit_field_width().unwrap_or(0);
-                    let reason = format!(
-                        "bitfield member `{name}::{fname}` ({width}-bit) — \
-                         bitfield-aware layout (M21) is not yet implemented; \
-                         the class is exposed opaquely until support lands.",
-                    );
-                    // We've already registered the placeholder
-                    // ClassDef under `id` and inserted the USR into
-                    // `self.classes`. Poison the existing entry in
-                    // place rather than minting a fresh one — so
-                    // any earlier reference to `id` (recorded
-                    // before we discovered the bitfield) keeps
-                    // pointing at the same opaque type.
-                    let reason_with_span = match span_of_entity(entity) {
-                        Some(span) => format!("{span}: {reason}"),
-                        None => reason,
-                    };
-                    self.ctx.poison(id, reason_with_span);
-                    return Ok(id);
-                }
-            }
             for child in field_entities {
                 let fname = child.get_name().unwrap_or_default();
+                let is_bitfield = child.is_bit_field();
+                let bitfield_width =
+                    child.get_bit_field_width().map(|w| w as u64);
                 // On a template specialization, `child.get_type()` may
                 // report the template's parameter type (e.g. `T`,
                 // surfaced as `TypeKind::Unexposed`). Canonicalize the
@@ -1147,12 +1128,24 @@ impl<'a> Importer<'a> {
                 let fty = fty.get_canonical_type();
                 let ty_id = self
                     .import_type(fty, &format!("{name}::{fname}"))?;
+                let field_idx = fields.len();
                 fields.push(FieldDef {
                     name: Ident(fname),
                     ty: ty_id,
                     explicit_align: None,
                 });
+                if is_bitfield {
+                    pending_bitfield_marks
+                        .push((field_idx, bitfield_width.unwrap_or(0)));
+                }
             }
+        }
+        // Apply pending bitfield marks against the ctx now that
+        // the class has its final field indices. Done after the
+        // field-walk loop to avoid re-borrow issues.
+        for (field_idx, width) in &pending_bitfield_marks {
+            self.ctx
+                .record_bitfield_width(id, *field_idx, *width);
         }
 
         // Bases and methods: walk the child-entity list. For template
@@ -2140,50 +2133,37 @@ fn populate_vtable_indices(ctx: &mut CxxTypeCtx, class_id: ClassId) {
         return;
     };
 
-    // Snapshot method symbols before mutating.
-    let class_clone = ctx.class(class_id).clone();
-    let mut wanted: Vec<Option<String>> = Vec::with_capacity(class_clone.methods.len());
-    for m in &class_clone.methods {
-        if m.virtuality == Virtuality::Virtual {
-            // Skip ConversionTo (we don't know how to mangle them
-            // here — the conversion target's TypeId would change
-            // hands and we don't want to drop a borrow on ctx).
-            let mangled = ctx.mangle(&Symbol::Method {
-                class: class_id,
-                name: m.name.clone(),
-                sig: m.sig.clone(),
-            });
-            wanted.push(Some(mangled));
-        } else {
-            wanted.push(None);
-        }
-    }
-
-    // Walk the primary sub-table, count `FunctionPointer` rank,
-    // and remember the rank of any slot whose target matches one
-    // of our methods' mangled symbols.
+    // Walk the primary sub-table and record the function-pointer
+    // rank for every method whose `MethodId` shows up in a
+    // `FunctionPointer` slot.
+    //
+    // M23: this match-by-MethodId path covers pure-virtual
+    // methods correctly. The vtable builder routes pure
+    // virtuals to `__cxa_pure_virtual` for the slot's
+    // `mangled_target`, but the `method: MethodId` field on
+    // the slot still points back at the originating method,
+    // so the walker can assign it the correct vtable_index
+    // without mangled-symbol matching. The downstream
+    // bindings emitter then routes pure-virtual calls
+    // through the regular vtable-lookup path; if the runtime
+    // object is the actually-abstract base, the lookup hits
+    // `__cxa_pure_virtual` and terminates (matching C++
+    // semantics). If a derived override is in scope, that
+    // override fires.
     let mut updates: Vec<(usize, u32)> = Vec::new();
     let mut fp_rank: u32 = 0;
     for entry in &primary.entries {
-        if let VTableEntry::FunctionPointer { mangled_target, .. } = entry {
-            for (m_idx, expected) in wanted.iter().enumerate() {
-                if let Some(sym) = expected {
-                    if sym == mangled_target {
-                        updates.push((m_idx, fp_rank));
-                        // Don't break — defensively allow the same
-                        // method to appear in multiple slots if
-                        // future overload patterns require it. In
-                        // practice each method shows up once.
-                    }
-                }
-            }
+        if let VTableEntry::FunctionPointer { method, .. } = entry {
+            updates.push((method.as_index(), fp_rank));
             fp_rank += 1;
         }
     }
 
     let class_mut = ctx.class_mut(class_id);
     for (m_idx, vt) in updates {
-        class_mut.methods[m_idx].vtable_index = Some(vt);
+        if m_idx < class_mut.methods.len() {
+            class_mut.methods[m_idx].vtable_index = Some(vt);
+        }
     }
 }
 

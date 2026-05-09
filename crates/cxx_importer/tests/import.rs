@@ -2946,6 +2946,286 @@ fn m20b_handles_mixed_params_with_one_cstr_slot() {
     cleanup(&header);
 }
 
+// ============================================================
+// M23: pure virtual methods route through the vtable to
+// `__cxa_pure_virtual` (or to the most-derived override at
+// runtime). Closes the long-standing "pure virtual rejected"
+// gap.
+// ============================================================
+
+#[test]
+fn m23_pure_virtual_method_gets_vtable_index_and_emits() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Shape {\n  virtual int area() const = 0;\n  virtual ~Shape();\n};\n",
+        "m23_pure_virtual_emits",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // The pure-virtual `area` method should now have a
+    // populated vtable_index (even though the slot's target
+    // symbol is `__cxa_pure_virtual`).
+    let shape_id = class_ids[0];
+    let shape = ctx.class(shape_id);
+    let area = shape
+        .methods
+        .iter()
+        .find(|m| m.name.ident_name() == Some("area"))
+        .expect("area method captured");
+    assert!(
+        matches!(area.virtuality, rustc_abi_cxx::Virtuality::PureVirtual),
+        "area should be pure virtual",
+    );
+    assert!(
+        area.vtable_index.is_some(),
+        "M23: pure virtual should now get a vtable_index; got None",
+    );
+
+    // The bindings emit a wrapper (no longer skipped).
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    assert!(
+        src.contains("pub fn area(&self) -> i32"),
+        "pure-virtual `area` should emit through the vtable path; got:\n{src}",
+    );
+    // The wrapper goes through the vptr lookup machinery
+    // (look for the transmute marker or the vtable-index-
+    // specific code shape). The presence of a wrapper plus
+    // a non-trivial body confirms it.
+    let area_wrapper = src
+        .lines()
+        .skip_while(|l| !l.contains("pub fn area"))
+        .take(20)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        area_wrapper.contains("transmute") || area_wrapper.contains("vptr"),
+        "pure-virtual wrapper should dispatch via vtable; got:\n{area_wrapper}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m23_concrete_virtual_methods_keep_their_existing_emission() {
+    // Sanity: M23's MethodId-based vtable indexing must not
+    // regress regular virtuals. They still get vtable_index
+    // and still emit through the same path.
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  virtual void show();\n  virtual void hide();\n};\n",
+        "m23_concrete_virtuals_unaffected",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let class = ctx.class(class_ids[0]);
+    let show = class
+        .methods
+        .iter()
+        .find(|m| m.name.ident_name() == Some("show"))
+        .unwrap();
+    let hide = class
+        .methods
+        .iter()
+        .find(|m| m.name.ident_name() == Some("hide"))
+        .unwrap();
+    assert!(show.vtable_index.is_some(), "show should have vtable_index");
+    assert!(hide.vtable_index.is_some(), "hide should have vtable_index");
+    // The two indices should be distinct.
+    assert_ne!(show.vtable_index, hide.vtable_index);
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    assert!(src.contains("pub fn show(&mut self)"));
+    assert!(src.contains("pub fn hide(&mut self)"));
+    cleanup(&header);
+}
+
+// ============================================================
+// M20.c: `&str` + `Option<&CStr>` smart parameter wrappers,
+// also opt-in via `cstr_ergonomics: true`. Builds on M20.b's
+// detection.
+// ============================================================
+
+#[test]
+fn m20c_emits_str_wrapper_with_cstring_allocation_and_panic_on_nul() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* text);\n};\n",
+        "m20c_str_wrapper",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("pub fn label_str(&mut self, arg0: &str)"),
+        "_str wrapper signature missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("::std::ffi::CString::new(arg0)"),
+        "_str wrapper should allocate a CString; got:\n{src}",
+    );
+    assert!(
+        src.contains("interior nul in &str passed to label_str"),
+        "_str wrapper should panic on interior nul with a clear message; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.label(__cs_0.as_ptr())"),
+        "_str wrapper should forward `.as_ptr()` of the temp CString; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20c_emits_opt_cstr_wrapper_mapping_none_to_null() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void title(const char* t);\n};\n",
+        "m20c_opt_cstr_wrapper",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains(
+            "pub fn title_opt_cstr(&mut self, arg0: Option<&::core::ffi::CStr>)"
+        ),
+        "_opt_cstr wrapper signature missing; got:\n{src}",
+    );
+    assert!(
+        src.contains(
+            "self.title(arg0.map_or(::core::ptr::null(), |c| c.as_ptr()))"
+        ),
+        "_opt_cstr should map None to null and Some to as_ptr; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20c_handles_multiple_cstr_slots_with_independent_temps() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void set(const char* a, int x, const char* b);\n};\n",
+        "m20c_multi_cstr",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // _str wrapper: two CString temporaries.
+    assert!(
+        src.contains("__cs_0") && src.contains("__cs_2"),
+        "_str wrapper should allocate one CString temp per cstr slot; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.set(__cs_0.as_ptr(), arg1, __cs_2.as_ptr())"),
+        "_str wrapper should forward as_ptr() per cstr slot, keep ints raw; got:\n{src}",
+    );
+    // _opt_cstr wrapper: two map_or's.
+    assert!(
+        src.matches("map_or(::core::ptr::null(), |c| c.as_ptr())").count() >= 2,
+        "_opt_cstr should call map_or for each cstr slot; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20c_disabled_when_cstr_ergonomics_off() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* t);\n};\n",
+        "m20c_off_when_disabled",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: false,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    assert!(
+        !src.contains("label_str") && !src.contains("label_opt_cstr"),
+        "no `_str` / `_opt_cstr` wrappers when cstr_ergonomics is off; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
 #[test]
 fn m20b_emits_for_static_methods_and_ctors() {
     use cxx_importer::rust_bindings::{
@@ -3439,23 +3719,17 @@ fn m19_skips_upcast_for_virtual_base() {
 }
 
 // ============================================================
-// M21: bitfield-aware layout — probe-first behavior.
+// M21.b: Itanium bitfield packing in `rustc_abi_cxx::layout`.
+// Replaces the M21 v0 probe-and-poison behavior with real
+// per-field bit-packing.
 // ============================================================
-//
-// `rustc_abi_cxx::layout` doesn't model Itanium bitfield packing,
-// so a class with bit-packed members would compute a wrong size
-// and silently mismatch the C++ side at runtime. Until proper
-// support lands, the importer poisons any class with bitfields
-// so emission produces an opaque `pub struct` + clear doc-
-// comment reason instead of a layout that looks fine but
-// corrupts data.
 
 #[test]
-fn m21_bitfield_class_is_poisoned_with_clear_reason() {
+fn m21b_bitfield_widths_recorded_per_field_via_sidecar() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
     let header = temp_header(
         "struct PackedFlags {\n  unsigned a : 4;\n  unsigned b : 4;\n  unsigned c : 8;\n};\n",
-        "m21_bitfield_poisoned",
+        "m21b_widths_sidecar",
     );
 
     let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
@@ -3465,36 +3739,128 @@ fn m21_bitfield_class_is_poisoned_with_clear_reason() {
         &mut ctx,
     )
     .expect("import");
-    assert_eq!(class_ids.len(), 1);
     let id = class_ids[0];
-
+    // M21.b: classes are no longer poisoned for having bitfields.
     assert!(
-        ctx.is_poisoned(id),
-        "bitfield-bearing class should be poisoned (M21 v0)",
+        !ctx.is_poisoned(id),
+        "bitfield class should NOT be poisoned (M21.b)",
     );
-    let reason = ctx.poison_reason(id).expect("reason recorded");
-    assert!(
-        reason.contains("bitfield"),
-        "poison reason should mention bitfield; got: {reason}",
-    );
-    assert!(
-        reason.contains("M21"),
-        "poison reason should reference the milestone; got: {reason}",
-    );
+    // Each field has a recorded width in the side-table.
+    assert_eq!(ctx.bitfield_width(id, 0), Some(4));
+    assert_eq!(ctx.bitfield_width(id, 1), Some(4));
+    assert_eq!(ctx.bitfield_width(id, 2), Some(8));
+    assert!(ctx.class_has_bitfields(id));
     cleanup(&header);
 }
 
 #[test]
-fn m21_bitfield_class_emits_opaque_struct_with_doc_comment() {
+fn m21b_layout_packs_consecutive_same_container_bitfields_into_one_au() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        // Three bitfields sharing one 4-byte unsigned int AU.
+        "struct PackedFlags {\n  unsigned a : 4;\n  unsigned b : 4;\n  unsigned c : 8;\n};\n",
+        "m21b_pack_into_au",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let id = class_ids[0];
+    let layout = ctx.layout(id).expect("layout");
+
+    // Three bitfields, all in the same byte 0..4 AU.
+    // Field 0 starts at byte 0, bit 0, width 4.
+    assert_eq!(layout.field_offsets[0], 0);
+    assert_eq!(layout.field_bit_offsets[0], 0);
+    assert_eq!(layout.field_bit_widths[0], 4);
+    // Field 1 packs immediately after — byte 0, bit 4, width 4.
+    assert_eq!(layout.field_offsets[1], 0);
+    assert_eq!(layout.field_bit_offsets[1], 4);
+    assert_eq!(layout.field_bit_widths[1], 4);
+    // Field 2 takes the next byte — byte 1, bit 0, width 8.
+    assert_eq!(layout.field_offsets[2], 1);
+    assert_eq!(layout.field_bit_offsets[2], 0);
+    assert_eq!(layout.field_bit_widths[2], 8);
+    // The whole struct is sized at the AU boundary (4 bytes).
+    assert_eq!(layout.size_bytes, 4);
+    assert_eq!(layout.align_bytes, 4);
+    cleanup(&header);
+}
+
+#[test]
+fn m21b_layout_opens_new_au_when_bitfield_overflows_current() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        // First three fields fill the first 32-bit AU exactly
+        // (16 + 8 + 8). Fourth needs a fresh AU.
+        "struct W {\n  unsigned a : 16;\n  unsigned b : 8;\n  unsigned c : 8;\n  unsigned d : 4;\n};\n",
+        "m21b_au_overflow",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let id = class_ids[0];
+    let layout = ctx.layout(id).expect("layout");
+
+    // First AU consumes bytes 0..4.
+    assert_eq!(layout.field_offsets[0], 0);
+    assert_eq!(layout.field_offsets[1], 2); // 16/8 = 2 bytes in
+    assert_eq!(layout.field_offsets[2], 3);
+    // Fourth field opens a fresh AU at byte 4.
+    assert_eq!(layout.field_offsets[3], 4);
+    assert_eq!(layout.field_bit_offsets[3], 0);
+    // Total size: 4 (first AU) + 4 (second AU) = 8 bytes.
+    assert_eq!(layout.size_bytes, 8);
+    cleanup(&header);
+}
+
+#[test]
+fn m21b_layout_handles_non_bitfield_after_bitfield() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        // Two bitfields followed by a regular int. The int
+        // should land at the next aligned offset past the AU.
+        "struct W {\n  unsigned a : 4;\n  unsigned b : 4;\n  int after;\n};\n",
+        "m21b_mixed_bitfield_and_regular",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let id = class_ids[0];
+    let layout = ctx.layout(id).expect("layout");
+
+    assert_eq!(layout.field_offsets[0], 0);
+    assert_eq!(layout.field_offsets[1], 0);
+    // `after` is a regular int — closes any AU and lands at
+    // byte 4 (next aligned after the 4-byte AU).
+    assert_eq!(layout.field_offsets[2], 4);
+    assert_eq!(layout.field_bit_widths[2], 0);
+    // Total: 4 (AU) + 4 (int) = 8 bytes.
+    assert_eq!(layout.size_bytes, 8);
+    cleanup(&header);
+}
+
+#[test]
+fn m21b_bitfield_class_emits_through_normal_path_no_poison() {
     use cxx_importer::rust_bindings::{
         generate_rust_bindings, BindingsBackend, RustBindingsConfig,
     };
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
     let header = temp_header(
         "struct PackedFlags {\n  unsigned a : 4;\n  unsigned b : 4;\n};\n",
-        "m21_bitfield_emits_opaque",
+        "m21b_emits_normally",
     );
-
     let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
     let class_ids = import_header(
         &header,
@@ -3502,7 +3868,6 @@ fn m21_bitfield_class_emits_opaque_struct_with_doc_comment() {
         &mut ctx,
     )
     .expect("import");
-
     let cfg = RustBindingsConfig {
         backend: BindingsBackend::DirectExternCpp,
         ..RustBindingsConfig::default()
@@ -3510,12 +3875,14 @@ fn m21_bitfield_class_emits_opaque_struct_with_doc_comment() {
     let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
 
     assert!(
-        src.contains("bitfield member") && src.contains("M21"),
-        "opaque struct should include the bitfield-poison reason; got:\n{src}",
-    );
-    assert!(
         src.contains("pub struct PackedFlags"),
-        "opaque PackedFlags struct should still emit; got:\n{src}",
+        "PackedFlags should still emit; got:\n{src}",
+    );
+    // The poison-comment from M21 v0 must be gone.
+    assert!(
+        !src.contains("M21 is not yet implemented")
+            && !src.contains("Class poisoned"),
+        "no poison reason should land in M21.b output; got:\n{src}",
     );
     cleanup(&header);
 }

@@ -35,6 +35,16 @@ pub struct RecordLayout {
     pub nv_align_bytes: u64,
     pub has_vptr: bool,
     pub field_offsets: Vec<u64>,
+    /// M21.b: bit-offset *within the byte at `field_offsets[i]`*
+    /// for bitfield members. `0` for non-bitfield fields.
+    /// Combined with `field_bit_widths[i]` to fully locate a
+    /// bitfield. Always parallel to `field_offsets`.
+    pub field_bit_offsets: Vec<u8>,
+    /// M21.b: declared bitfield width per field. `0` for non-
+    /// bitfield fields (which means "field width = sizeof(ty)
+    /// bytes"); a non-zero value means the field is a bitfield
+    /// of that many bits. Always parallel to `field_offsets`.
+    pub field_bit_widths: Vec<u64>,
     pub base_offsets: Vec<(ClassId, u64)>,
     /// Virtual-base subobject offsets within this class. Populated only
     /// for the most-derived class; intermediate classes in a chain
@@ -77,9 +87,34 @@ struct LayoutState {
     dsize: u64,
     has_vptr: bool,
     field_offsets: Vec<u64>,
+    /// M21.b: parallel to `field_offsets` — the bit position
+    /// within the byte at `field_offsets[i]` where the
+    /// bitfield's bits start. 0 for non-bitfield fields.
+    field_bit_offsets: Vec<u8>,
+    /// M21.b: parallel to `field_offsets` — the declared
+    /// bitfield width in bits. 0 for non-bitfield fields.
+    field_bit_widths: Vec<u64>,
     base_offsets: Vec<(ClassId, u64)>,
     virtual_base_offsets: Vec<(ClassId, u64)>,
     empty_subobjects: Vec<(ClassId, u64)>,
+    /// M21.b: open bitfield allocation unit (AU). When some,
+    /// `(au_offset, au_size_bytes, used_bits)` describe the
+    /// AU the next bitfield can pack into iff its container
+    /// type matches. None when no AU is open (e.g. the last
+    /// placed field was a regular non-bitfield field, or the
+    /// AU got fully consumed and was closed).
+    bitfield_au: Option<BitfieldAu>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BitfieldAu {
+    /// Byte offset of the AU within the record.
+    offset: u64,
+    /// Size of the AU's container type, in bytes (1, 2, 4, 8).
+    size_bytes: u64,
+    /// Bits already consumed in the AU (always
+    /// `<= size_bytes * 8`).
+    used_bits: u64,
 }
 
 impl LayoutState {
@@ -90,9 +125,12 @@ impl LayoutState {
             dsize: 0,
             has_vptr: false,
             field_offsets: Vec::new(),
+            field_bit_offsets: Vec::new(),
+            field_bit_widths: Vec::new(),
             base_offsets: Vec::new(),
             virtual_base_offsets: Vec::new(),
             empty_subobjects: Vec::new(),
+            bitfield_au: None,
         }
     }
 }
@@ -227,6 +265,8 @@ fn compute_layout(
         nv_align_bytes: nv_align,
         has_vptr: state.has_vptr,
         field_offsets: state.field_offsets,
+        field_bit_offsets: state.field_bit_offsets,
+        field_bit_widths: state.field_bit_widths,
         base_offsets: state.base_offsets,
         virtual_base_offsets: state.virtual_base_offsets,
         empty_subobjects: state.empty_subobjects,
@@ -366,6 +406,16 @@ fn place_field(
     class_id: ClassId,
     idx: usize,
 ) -> Result<(), LayoutError> {
+    // M21.b: bitfield fast path. The sidecar `bitfield_width`
+    // returns Some(w) for bitfield members; everything else
+    // flows through the original byte-aligned placement.
+    if let Some(width) = ctx.bitfield_width(class_id, idx) {
+        return place_bitfield(ctx, state, field, class_id, idx, width);
+    }
+    // Non-bitfield: close any open AU first so the next byte-
+    // aligned field doesn't overlap with the AU's tail.
+    state.bitfield_au = None;
+
     let (size, align) = type_size_align(ctx, field.ty).map_err(|_| {
         LayoutError::UnsizedField {
             class: class_id,
@@ -381,6 +431,122 @@ fn place_field(
     state.dsize = end;
     state.align = state.align.max(align);
     state.field_offsets.push(offset);
+    state.field_bit_offsets.push(0);
+    state.field_bit_widths.push(0);
+    Ok(())
+}
+
+/// M21.b: Itanium bit-packing for one bitfield field.
+///
+/// Simplified ruleset (covers the cases v0 callers see):
+///
+/// - **AU = container type.** Each bitfield's storage unit is
+///   the size/alignment of the field's declared C++ type
+///   (`unsigned int a:4` uses a 4-byte AU). We recover the
+///   container size from `type_size_align(ctx, field.ty)`.
+/// - **Pack into the open AU when possible.** If the previous
+///   field was a bitfield AND its container size matches AND
+///   the new bits fit in the AU's remaining space, append
+///   directly.
+/// - **Otherwise open a new AU.** Align to the container's
+///   alignment, place the new AU there, reset `used_bits`.
+/// - **Width 0** is a "force boundary" marker — close any open
+///   AU and don't allocate any bits. The next bitfield starts
+///   a fresh AU.
+/// - **Oversize bitfields** (`width > AU_size_in_bits`) aren't
+///   handled in v0 — they require a wider container. The
+///   layout engine treats them as the AU-sized portion only,
+///   which is wrong but visible (the user sees one bit-width
+///   diagnostic in the doc-comment hint we add later).
+fn place_bitfield(
+    ctx: &CxxTypeCtx,
+    state: &mut LayoutState,
+    field: &FieldDef,
+    class_id: ClassId,
+    idx: usize,
+    width: u64,
+) -> Result<(), LayoutError> {
+    let (size, align) = type_size_align(ctx, field.ty).map_err(|_| {
+        LayoutError::UnsizedField {
+            class: class_id,
+            field: FieldId(idx as u32),
+        }
+    })?;
+    let align = field.explicit_align.unwrap_or(align).max(align).max(1);
+    let au_bits = size * 8;
+
+    // Width 0: force AU boundary. Close any open AU and
+    // record a zero-width slot at the next aligned offset
+    // (the slot itself doesn't reserve bits).
+    if width == 0 {
+        // Advance dsize past the open AU so the next field
+        // starts on a fresh AU.
+        if let Some(au) = state.bitfield_au.take() {
+            let au_end = au.offset + au.size_bytes;
+            state.dsize = state.dsize.max(au_end);
+        }
+        let offset = align_up(state.dsize, align);
+        state.size = state.size.max(offset);
+        state.align = state.align.max(align);
+        state.field_offsets.push(offset);
+        state.field_bit_offsets.push(0);
+        state.field_bit_widths.push(0);
+        return Ok(());
+    }
+
+    // Try to pack into the open AU. Same container size +
+    // enough room left.
+    if let Some(au) = state.bitfield_au {
+        if au.size_bytes == size && au.used_bits + width <= au_bits {
+            let bit_offset_in_byte = (au.used_bits % 8) as u8;
+            let byte_within_au = au.used_bits / 8;
+            let field_byte_offset = au.offset + byte_within_au;
+            state.field_offsets.push(field_byte_offset);
+            state.field_bit_offsets.push(bit_offset_in_byte);
+            state.field_bit_widths.push(width);
+            // Advance the AU.
+            let new_used = au.used_bits + width;
+            let updated = BitfieldAu {
+                offset: au.offset,
+                size_bytes: au.size_bytes,
+                used_bits: new_used,
+            };
+            state.bitfield_au = if new_used >= au_bits {
+                None
+            } else {
+                Some(updated)
+            };
+            // Reserve the entire AU in dsize / size, even if
+            // not fully used yet. Subsequent non-bitfield
+            // fields skip past the AU; subsequent bitfields
+            // of a different container restart cleanly.
+            let au_end = au.offset + au.size_bytes;
+            state.size = state.size.max(au_end);
+            state.dsize = state.dsize.max(au_end);
+            state.align = state.align.max(align);
+            return Ok(());
+        }
+    }
+
+    // Open a new AU at the next aligned offset.
+    let au_offset = align_up(state.dsize, align);
+    state.field_offsets.push(au_offset);
+    state.field_bit_offsets.push(0);
+    state.field_bit_widths.push(width);
+    let used_bits = width.min(au_bits); // clamp; oversize is v0 fall-back
+    state.bitfield_au = if used_bits >= au_bits {
+        None
+    } else {
+        Some(BitfieldAu {
+            offset: au_offset,
+            size_bytes: size,
+            used_bits,
+        })
+    };
+    let au_end = au_offset + size;
+    state.size = state.size.max(au_end);
+    state.dsize = state.dsize.max(au_end);
+    state.align = state.align.max(align);
     Ok(())
 }
 
@@ -401,6 +567,8 @@ fn place_union_field(
     state.size = state.size.max(size);
     state.align = state.align.max(align);
     state.field_offsets.push(0);
+    state.field_bit_offsets.push(0);
+    state.field_bit_widths.push(ctx.bitfield_width(class_id, idx).unwrap_or(0));
     Ok(())
 }
 
