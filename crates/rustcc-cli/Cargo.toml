@@ -1,0 +1,16 @@
+[package]
+name = "rustcc-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+description = "rustcc developer-experience CLI: bootstrap, scaffold, and diagnose rustcc projects"
+publish = false
+
+[[bin]]
+name = "rustcc"
+path = "src/main.rs"
+
+[dependencies]
+# Argv parsing — derive feature so subcommands stay tidy.
+clap = { version = "4", features = ["derive"] }

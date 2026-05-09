@@ -8,6 +8,7 @@ members = [
     "crates/rustcc_attr",
     "crates/rustcc_codegen",
     "crates/rustcc_macros",
+    "crates/rustcc-cli",
     "crates/test_support",
     "examples/cpp_class_demo",
     "xtask",
