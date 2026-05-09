@@ -12,6 +12,8 @@ mod cache;
 mod diagnostics;
 pub mod enums;
 mod driver;
+pub mod free_fns;
+pub mod static_data;
 pub mod hpp;
 #[cfg(feature = "libclang")]
 pub mod import;
@@ -25,8 +27,10 @@ pub mod rust_stubs;
 pub mod shims;
 
 pub use aliases::{AliasSet, TypeAlias};
-pub use annotations::{Annotation, AnnotationSet, SidecarSchema};
+pub use annotations::{load_sidecar, Annotation, AnnotationSet, SidecarSchema};
 pub use enums::{CxxEnumDef, CxxEnumVariant, EnumSet};
+pub use free_fns::{FreeFnDef, FreeFnSet};
+pub use static_data::{StaticDataDef, StaticDataSet};
 pub use macros::{MacroConst, MacroSet, MacroValue};
 pub use diagnostics::ImportError;
 pub use driver::{Driver, HeaderGraph};

@@ -46,6 +46,50 @@ impl Default for HeaderGraph {
     }
 }
 
+impl HeaderGraph {
+    /// M25: pull any `instantiations:` entries from a parsed
+    /// [`crate::annotations::SidecarSchema`] into this graph's
+    /// `template_instantiations` list. Duplicates against existing
+    /// entries are skipped. The schema's iteration order is
+    /// preserved (BTreeMap on type name, then source order within
+    /// each type's list).
+    ///
+    /// Typical pipeline:
+    ///
+    /// ```ignore
+    /// let schema = cxx_importer::annotations::load_sidecar(&path)?;
+    /// let mut graph = HeaderGraph { roots: …, .. HeaderGraph::default() };
+    /// graph.extend_from_sidecar(&schema);
+    /// let driver = Driver::new(graph);
+    /// driver.parse_all(&mut ctx)?;
+    /// ```
+    ///
+    /// Equivalent to manually appending
+    /// `schema.collect_template_instantiations()`, but dedups
+    /// against the graph's existing list so calling this twice
+    /// (or against a graph that already has hand-added entries)
+    /// is safe.
+    pub fn extend_from_sidecar(
+        &mut self,
+        schema: &crate::annotations::SidecarSchema,
+    ) {
+        // Snapshot existing entries as owned strings so we can
+        // append to `self.template_instantiations` without
+        // overlapping borrows. The dedup set stays small
+        // (typical sidecar has < 20 instantiations).
+        let existing: std::collections::HashSet<String> = self
+            .template_instantiations
+            .iter()
+            .cloned()
+            .collect();
+        for inst in schema.collect_template_instantiations() {
+            if !existing.contains(&inst) {
+                self.template_instantiations.push(inst);
+            }
+        }
+    }
+}
+
 pub struct Driver {
     graph: HeaderGraph,
 }
@@ -122,7 +166,7 @@ impl Driver {
             message: format!("failed to initialize libclang: {e}"),
         })?;
         for root in &roots {
-            let (ids, _aliases, _enums) =
+            let (ids, _aliases, _enums, _free_fns, _static_data) =
                 crate::import::import_header_with_clang(
                     &clang,
                     root,
@@ -283,6 +327,9 @@ impl Driver {
             // sidecar problem doesn't poison the whole cache.
             let mut tmp_aliases = crate::aliases::AliasSet::default();
             let mut tmp_enums = crate::enums::EnumSet::default();
+            let mut tmp_free_fns = crate::free_fns::FreeFnSet::default();
+            let mut tmp_static_data =
+                crate::static_data::StaticDataSet::default();
             if let Ok(_) = crate::import::import_header_full(
                 root,
                 &argv.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -291,12 +338,15 @@ impl Driver {
                 &mut anns,
                 &mut tmp_aliases,
                 &mut tmp_enums,
+                &mut tmp_free_fns,
+                &mut tmp_static_data,
             ) {
-                // ok — annotations merged into `anns`. Aliases +
-                // enum bodies are dropped for now: the cache record
+                // ok — annotations merged into `anns`. Aliases,
+                // enum bodies, free functions, and static data
+                // members are dropped for now: the cache record
                 // schema doesn't carry them yet (tracked as a
-                // follow-up; load_or_parse callers that want them
-                // use `import_header_with_extras` directly).
+                // follow-up; load_or_parse callers that want
+                // them use `import_header_with_extras` directly).
             }
         }
         *caller_annotations = anns;

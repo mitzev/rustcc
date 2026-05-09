@@ -3186,11 +3186,11 @@ fn m16_emits_struct_with_consts_for_unscoped() {
 }
 
 #[test]
-fn m16_class_scope_enum_is_skipped_in_v0() {
+fn m16b_class_scope_enum_captured_with_class_in_parent_path() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
     let header = temp_header(
         "struct Outer {\n  enum class Mode { A, B };\n  int slot;\n};\n",
-        "m16_class_scope_enum_skipped",
+        "m16b_class_scope_enum",
     );
 
     let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
@@ -3201,11 +3201,21 @@ fn m16_class_scope_enum_is_skipped_in_v0() {
     )
     .expect("import");
 
-    assert!(
-        extras.enums.iter().all(|e| e.name.0 != "Mode"),
-        "class-scope enum should not appear at TU scope; got: {:?}",
-        extras.enums.iter().map(|e| &e.name.0).collect::<Vec<_>>(),
-    );
+    let mode = extras
+        .enums
+        .iter()
+        .find(|e| e.name.0 == "Mode")
+        .expect("class-scope `Mode` enum should be captured (M16.b)");
+    let parent_kinds: Vec<_> = mode
+        .parent
+        .iter()
+        .map(|s| match s {
+            NameSegment::Class(id) => format!("Class({})", id.0),
+            NameSegment::Namespace(id) => format!("Namespace({})", id.0),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(parent_kinds, vec!["Class(Outer)".to_string()]);
 }
 
 #[test]
@@ -3234,15 +3244,11 @@ fn m16_anonymous_enum_is_skipped_in_v0() {
 }
 
 #[test]
-fn m17_class_scope_typedef_is_skipped_in_v0() {
+fn m17b_class_scope_typedef_captured_with_class_in_parent_path() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
-    // In-class aliases require associated-type emission we
-    // don't have yet (deferred per docs/cxx_importer.md §16).
-    // The walker filters them out — verify they're absent
-    // from the AliasSet.
     let header = temp_header(
         "struct Foo {\n  using It = int;\n  int slot;\n};\n",
-        "m17_class_scope_typedef",
+        "m17b_class_scope_typedef",
     );
 
     let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
@@ -3253,11 +3259,460 @@ fn m17_class_scope_typedef_is_skipped_in_v0() {
     )
     .expect("import");
 
-    assert!(
-        extras.aliases.iter().all(|a| a.name.0 != "It"),
-        "class-scope `using It = int;` should not appear at TU scope; got: {:?}",
-        extras.aliases.iter().map(|a| &a.name.0).collect::<Vec<_>>(),
-    );
-    // Sanity: AliasSet may be empty entirely.
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "It")
+        .expect("class-scope `using It = int;` should be captured (M17.b)");
+    let parent_kinds: Vec<_> = alias
+        .parent
+        .iter()
+        .map(|s| match s {
+            NameSegment::Class(id) => format!("Class({})", id.0),
+            NameSegment::Namespace(id) => format!("Namespace({})", id.0),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(parent_kinds, vec!["Class(Foo)".to_string()]);
     let _ = AliasSet::default();
+}
+
+#[test]
+fn m16b_class_scope_enum_emits_at_module_root_with_outer_prefix() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_full, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Widget {\n  enum class State { Off = 0, On = 1 };\n  int slot;\n};\n",
+        "m16b_emit",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_full(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &extras.free_fns,
+        &extras.static_data,
+        &cfg,
+    )
+    .expect("emit");
+
+    // Class-scope enum flattens to `Widget_State` at module root.
+    assert!(
+        src.contains("pub enum Widget_State"),
+        "expected `pub enum Widget_State` at module root; got:\n{src}",
+    );
+    assert!(
+        src.contains("Off = 0") && src.contains("On = 1"),
+        "expected variants Off = 0 and On = 1; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m17b_class_scope_typedef_emits_pub_type_with_outer_prefix() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_full, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Widget {\n  using Tag = int;\n  int slot;\n};\n",
+        "m17b_emit",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_full(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &extras.free_fns,
+        &extras.static_data,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(
+        src.contains("pub type Widget_Tag = i32;"),
+        "expected `pub type Widget_Tag = i32;` at module root; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+// ============================================================
+// M11.b: free functions at TU/namespace scope.
+// ============================================================
+
+#[test]
+fn m11b_captures_tu_scope_free_function() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "int fl_color(int idx);\n",
+        "m11b_tu_scope_fn",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let f = extras
+        .free_fns
+        .iter()
+        .find(|f| f.name.0 == "fl_color")
+        .expect("fl_color captured");
+    assert!(f.parent.is_empty(), "TU-scope fn should have empty parent");
+    assert_eq!(f.sig.params.len(), 1);
+    assert!(matches!(
+        ctx.type_of(f.sig.params[0]),
+        CxxType::Int { signed: true, width: IntWidth::I32 },
+    ));
+    assert!(matches!(
+        ctx.type_of(f.sig.ret),
+        CxxType::Int { signed: true, width: IntWidth::I32 },
+    ));
+    cleanup(&header);
+}
+
+#[test]
+fn m11b_captures_namespace_nested_function_with_parent_path() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "namespace ns {\n\
+           namespace inner {\n\
+             void say_hello(const char* who);\n\
+           }\n\
+         }\n",
+        "m11b_ns_nested_fn",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let f = extras
+        .free_fns
+        .iter()
+        .find(|f| f.name.0 == "say_hello")
+        .expect("say_hello captured");
+    let parent_names: Vec<&str> = f
+        .parent
+        .iter()
+        .map(|seg| match seg {
+            NameSegment::Namespace(id) => id.0.as_str(),
+            _ => "<other>",
+        })
+        .collect();
+    assert_eq!(parent_names, vec!["ns", "inner"]);
+    cleanup(&header);
+}
+
+#[test]
+fn m11b_skips_class_methods_and_friend_functions() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Foo {\n  void method();\n  static int static_method(int);\n};\n\
+         void real_free_fn(int x);\n",
+        "m11b_class_methods_skipped",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // Class methods (instance + static) flow through the
+    // class child-walk; they should NOT appear in the
+    // FreeFnSet.
+    assert!(
+        extras.free_fns.iter().all(|f| f.name.0 != "method"),
+        "instance method should not be captured as free fn",
+    );
+    assert!(
+        extras.free_fns.iter().all(|f| f.name.0 != "static_method"),
+        "static method should not be captured as free fn",
+    );
+    // The actual free function is captured.
+    assert!(
+        extras.free_fns.iter().any(|f| f.name.0 == "real_free_fn"),
+        "real_free_fn should be captured",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m11b_skips_compiler_builtins() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // System headers transitively pull in `__builtin_*` etc.
+    // The filter drops them so they don't pollute bindings.
+    let header = temp_header(
+        "#include <stddef.h>\n\
+         void user_fn(int x);\n",
+        "m11b_no_builtins",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    for f in extras.free_fns.iter() {
+        assert!(
+            !f.name.0.starts_with("__builtin_")
+                && !f.name.0.starts_with("__sync_")
+                && !f.name.0.starts_with("__atomic_"),
+            "compiler builtin leaked into FreeFnSet: {}",
+            f.name.0,
+        );
+    }
+    // The user-declared fn must still be captured.
+    assert!(
+        extras.free_fns.iter().any(|f| f.name.0 == "user_fn"),
+        "user_fn should be captured",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m11b_emits_pub_fn_with_extern_decl_for_free_function() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_full, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "int fl_color(int idx);\n\
+         void fl_message(const char* msg);\n",
+        "m11b_emit_free_fn",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_full(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &extras.free_fns,
+        &extras.static_data,
+        &cfg,
+    )
+    .expect("emit");
+
+    // Both functions get a `pub fn` wrapper.
+    assert!(
+        src.contains("pub fn fl_color(arg0: i32) -> i32"),
+        "fl_color wrapper missing or wrong signature; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub fn fl_message(arg0: *const i8)")
+            || src.contains("pub fn fl_message(arg0: *const u8)"),
+        "fl_message wrapper missing; got:\n{src}",
+    );
+    // The extern block carries the Itanium symbols. fl_color's
+    // mangling: `_Z8fl_colori` (length 8 + name + i for int).
+    assert!(
+        src.contains("#[link_name = \"_Z8fl_colori\"]"),
+        "expected fl_color mangled link_name; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m11b_dedups_redeclared_free_function() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // Same function declared twice (idempotent forward decls
+    // pattern in real C headers). Should appear once.
+    let header = temp_header(
+        "int dup_fn(int);\nint dup_fn(int);\n",
+        "m11b_dedup",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let count = extras
+        .free_fns
+        .iter()
+        .filter(|f| f.name.0 == "dup_fn")
+        .count();
+    assert_eq!(count, 1, "redeclared fn should dedup to 1; got {count}");
+    cleanup(&header);
+}
+
+// ============================================================
+// M11.c: class-scope static data members.
+// ============================================================
+
+#[test]
+fn m11c_captures_class_scope_static_data() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Counter {\n  static int instances;\n  static const int default_count;\n};\n",
+        "m11c_captures",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let inst = extras
+        .static_data
+        .iter()
+        .find(|s| s.name.0 == "instances")
+        .expect("instances captured");
+    assert!(!inst.cv.is_const, "non-const static should have cv.is_const=false");
+    let default_ct = extras
+        .static_data
+        .iter()
+        .find(|s| s.name.0 == "default_count")
+        .expect("default_count captured");
+    assert!(default_ct.cv.is_const, "const static should have cv.is_const=true");
+
+    // Both should be scoped under `Counter`.
+    for s in [&inst, &default_ct] {
+        let last = s.parent.last();
+        assert!(
+            matches!(last, Some(NameSegment::Class(id)) if id.0 == "Counter"),
+            "expected parent to end with Class(Counter); got {last:?}",
+        );
+    }
+    cleanup(&header);
+}
+
+#[test]
+fn m11c_skips_non_static_data() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  int regular_field;\n  static int static_field;\n};\n",
+        "m11c_skips_nonstatic",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (_classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    assert!(
+        extras.static_data.iter().all(|s| s.name.0 != "regular_field"),
+        "regular field should not appear in StaticDataSet",
+    );
+    assert!(
+        extras.static_data.iter().any(|s| s.name.0 == "static_field"),
+        "static field should appear",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m11c_emits_extern_static_and_accessor() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_full, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Counter {\n  static int instances;\n  static const int default_count;\n  Counter();\n};\n",
+        "m11c_emits",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_full(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &extras.free_fns,
+        &extras.static_data,
+        &cfg,
+    )
+    .expect("emit");
+
+    // Itanium symbol for `Counter::instances`: _ZN7Counter9instancesE.
+    assert!(
+        src.contains("_ZN7Counter9instancesE"),
+        "expected mangled link_name for Counter::instances; got:\n{src}",
+    );
+    // Mutable static (no `const`).
+    assert!(
+        src.contains("static mut __cxx_static_Counter_instances: i32"),
+        "expected mutable extern static for instances; got:\n{src}",
+    );
+    // Const static (no `mut`).
+    assert!(
+        src.contains("static __cxx_static_Counter_default_count: i32"),
+        "expected immutable extern static for default_count; got:\n{src}",
+    );
+    // Accessor on the impl block returning `*mut i32`.
+    assert!(
+        src.contains("pub fn instances_ptr() -> *mut i32"),
+        "instances accessor missing or wrong return type; got:\n{src}",
+    );
+    // Const accessor returns `*const`.
+    assert!(
+        src.contains("pub fn default_count_ptr() -> *const i32"),
+        "default_count accessor missing or wrong return type; got:\n{src}",
+    );
+
+    cleanup(&header);
 }

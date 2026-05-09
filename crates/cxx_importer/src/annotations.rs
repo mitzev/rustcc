@@ -165,6 +165,30 @@ pub struct MethodEntry {
 }
 
 impl SidecarSchema {
+    /// M25: collect every explicit template instantiation requested
+    /// across the schema's type entries. `Driver::parse_all` feeds
+    /// this list to a synthesized include-everything root that
+    /// force-instantiates each one via `template class <inst>;`,
+    /// so the spec cursors libclang surfaces afterwards flow
+    /// through the normal import path as concrete classes.
+    ///
+    /// Order matches the YAML's BTreeMap iteration (alphabetical
+    /// by type name); entries within a single type's `instantiations:`
+    /// list keep their source order. Duplicates are dropped.
+    pub fn collect_template_instantiations(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        for ty in self.types.values() {
+            for inst in &ty.instantiations {
+                if seen.insert(inst.as_str()) {
+                    out.push(inst.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// Return annotations that apply to `entity`, whether that's a
     /// type-level entity (`"std::vector"`) or a method-level entity
     /// (`"std::vector::push_back(T&&)"`).
@@ -461,5 +485,71 @@ types:
         let kinds: Vec<_> = eff.iter().map(|a| a.kind()).collect();
         assert!(kinds.contains(&AnnotationKind::Name));
         assert!(kinds.contains(&AnnotationKind::Ownership));
+    }
+
+    // ============================================================
+    // M25: sidecar `instantiations:` → HeaderGraph plumbing.
+    // ============================================================
+
+    #[test]
+    fn m25_collect_template_instantiations_aggregates_across_types() {
+        let s = parse(
+            r#"schema: 1
+types:
+  "std::vector":
+    instantiations:
+      - "std::vector<int>"
+      - "std::vector<double>"
+  "std::map":
+    instantiations:
+      - "std::map<int, int>"
+"#,
+        );
+        let insts = s.collect_template_instantiations();
+        // BTreeMap iterates types alphabetically: map before vector.
+        assert_eq!(
+            insts,
+            vec![
+                "std::map<int, int>".to_string(),
+                "std::vector<int>".to_string(),
+                "std::vector<double>".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn m25_collect_template_instantiations_dedups_duplicates() {
+        let s = parse(
+            r#"schema: 1
+types:
+  "A":
+    instantiations: ["X<int>", "X<int>", "Y<int>"]
+  "B":
+    instantiations: ["X<int>", "Z<int>"]
+"#,
+        );
+        let insts = s.collect_template_instantiations();
+        // X<int> appears in both A and B and twice in A; dedup
+        // keeps only the first occurrence.
+        assert_eq!(
+            insts,
+            vec![
+                "X<int>".to_string(),
+                "Y<int>".to_string(),
+                "Z<int>".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn m25_collect_template_instantiations_empty_when_no_instantiations() {
+        let s = parse(
+            r#"schema: 1
+types:
+  "Foo":
+    kind: value
+"#,
+        );
+        assert!(s.collect_template_instantiations().is_empty());
     }
 }
