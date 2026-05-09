@@ -971,7 +971,7 @@ fn render_direct_extern_class(
             Annotation::Name(n) => Some(n),
             _ => None,
         })
-        .or_else(|| ident_of_class(class))
+        .or_else(|| ident_of_class_with_ctx(class, Some(ctx)))
         .ok_or_else(|| BindingsError::UnsupportedType {
             where_: "class name".into(),
             kind: "anonymous or non-identifier-named class".into(),
@@ -1303,7 +1303,7 @@ fn render_direct_extern_class(
                 continue;
             }
             let base = ctx.class(base_spec.class);
-            let base_name = match ident_of_class(base) {
+            let base_name = match ident_of_class_with_ctx(base, Some(ctx)) {
                 Some(n) => n,
                 None => continue,
             };
@@ -1445,7 +1445,7 @@ fn render_direct_extern_class(
                 continue;
             }
             let base = ctx.class(base_spec.class);
-            let base_name = match ident_of_class(base) {
+            let base_name = match ident_of_class_with_ctx(base, Some(ctx)) {
                 Some(n) => n,
                 None => continue,
             };
@@ -3554,7 +3554,7 @@ fn render_class_block(
     macro_path: MacroPath,
 ) -> Result<String, BindingsError> {
     let class = ctx.class(class_id);
-    let class_name = ident_of_class(class).ok_or_else(|| BindingsError::UnsupportedType {
+    let class_name = ident_of_class_with_ctx(class, Some(ctx)).ok_or_else(|| BindingsError::UnsupportedType {
         where_: "class name".into(),
         kind: "anonymous or non-identifier-named class".into(),
     })?;
@@ -3758,9 +3758,11 @@ fn render_rust_type_with_opts(
         }
         CxxType::Record(class_id) => {
             let class = ctx.class(*class_id);
-            ident_of_class(class).ok_or_else(|| BindingsError::UnsupportedType {
-                where_: where_.into(),
-                kind: "anonymous record".into(),
+            ident_of_class_with_ctx(class, Some(ctx)).ok_or_else(|| {
+                BindingsError::UnsupportedType {
+                    where_: where_.into(),
+                    kind: "anonymous record".into(),
+                }
             })?
         }
         // C++ enum reference appearing in a parameter / return /
@@ -4266,14 +4268,83 @@ fn int_rust(signed: bool, width: IntWidth) -> &'static str {
 }
 
 fn ident_of_class(class: &rustc_abi_cxx::ClassDef) -> Option<String> {
+    ident_of_class_with_ctx(class, None)
+}
+
+/// Render a class's trailing-name-segment as a Rust identifier.
+/// For ordinary `Class` / `Namespace` segments this is just the
+/// captured identifier. For `TemplateSpec { name, args }` (M24)
+/// the args get rendered to a sanitized suffix so distinct
+/// instantiations of the same template surface as distinct Rust
+/// types — `Box<int>` → `Box_i32`, `Pair<int, double>` →
+/// `Pair_i32_f64`. Without the ctx we can't resolve TypeIds, so
+/// fall back to the bare template name (legacy behavior).
+fn ident_of_class_with_ctx(
+    class: &rustc_abi_cxx::ClassDef,
+    ctx: Option<&CxxTypeCtx>,
+) -> Option<String> {
     use rustc_abi_cxx::NameSegment;
-    // v0: take the trailing segment as the class identifier.
-    // Namespace recovery (proper `mod foo { class Bar }` nesting) is
-    // tracked for a later release.
     class.name.0.last().and_then(|seg| match seg {
         NameSegment::Class(id) | NameSegment::Namespace(id) => Some(id.0.clone()),
+        NameSegment::TemplateSpec { name, args } => {
+            let mut out = name.0.clone();
+            if let Some(ctx) = ctx {
+                for a in args {
+                    if let rustc_abi_cxx::TemplateArg::Type(tid) = a {
+                        out.push('_');
+                        out.push_str(&type_arg_ident(ctx, *tid));
+                    }
+                }
+            }
+            Some(out)
+        }
         _ => None,
     })
+}
+
+/// Sanitized type identifier for use as a suffix in a class
+/// name. Mirrors `render_rust_type`'s shape but produces only
+/// `[A-Za-z0-9_]` characters so it can sit inside a Rust ident.
+fn type_arg_ident(ctx: &CxxTypeCtx, ty: TypeId) -> String {
+    match ctx.type_of(ty) {
+        CxxType::Void => "void".into(),
+        CxxType::Bool => "bool".into(),
+        CxxType::Int { signed, width } => int_rust(*signed, *width).into(),
+        CxxType::Float { kind } => match kind {
+            FloatKind::F32 => "f32".into(),
+            FloatKind::F64 => "f64".into(),
+            FloatKind::LongDouble => "long_double".into(),
+        },
+        CxxType::Ptr { pointee, cv } => {
+            let inner = type_arg_ident(ctx, *pointee);
+            if cv.is_const {
+                format!("ptr_const_{inner}")
+            } else {
+                format!("ptr_{inner}")
+            }
+        }
+        CxxType::Ref { pointee, .. } => {
+            format!("ref_{}", type_arg_ident(ctx, *pointee))
+        }
+        CxxType::Array { elem, len } => {
+            format!("arr{len}_{}", type_arg_ident(ctx, *elem))
+        }
+        CxxType::Record(class_id) => {
+            let class = ctx.class(*class_id);
+            ident_of_class_with_ctx(class, Some(ctx))
+                .unwrap_or_else(|| "record".into())
+        }
+        CxxType::Enum { name, .. } => name
+            .0
+            .last()
+            .and_then(|s| match s {
+                rustc_abi_cxx::NameSegment::Enum(id) => Some(id.0.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "enum".into()),
+        CxxType::Fn(_) => "fn".into(),
+        CxxType::MemberPtr { .. } => "memptr".into(),
+    }
 }
 
 #[cfg(test)]

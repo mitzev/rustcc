@@ -650,6 +650,15 @@ struct Importer<'a> {
     /// `lower_method` entry so a method without defaults
     /// doesn't pick up the previous method's count.
     last_method_default_count: usize,
+    /// M24: template-parameter substitution map active when
+    /// walking a class-template specialization's methods. Keyed
+    /// by parameter name (`T`, `U`, ...) — the `lower_method`
+    /// call iterates the underlying template's *un-substituted*
+    /// method cursors, and `import_type` consults this map when
+    /// it encounters an `Unexposed` type whose declaration is a
+    /// `TemplateTypeParameter`. Reset to empty before any
+    /// non-spec class is imported.
+    current_template_subst: HashMap<String, TypeId>,
 }
 
 impl<'a> Importer<'a> {
@@ -674,6 +683,7 @@ impl<'a> Importer<'a> {
             static_data: Vec::new(),
             static_data_usrs: std::collections::HashSet::new(),
             last_method_default_count: 0,
+            current_template_subst: HashMap::new(),
         }
     }
 
@@ -1312,6 +1322,115 @@ impl<'a> Importer<'a> {
             }
         }
 
+        // M24: if this class is a *class-template specialization*
+        // (e.g. `Box<int>`), libclang's child walk on the spec
+        // cursor returns no methods — the methods only live on the
+        // underlying generic `ClassTemplate` cursor. Chain back to
+        // the template, build a substitution map (T → int, ...)
+        // from the spec's record-type template argument types,
+        // then walk the template's children for methods.
+        //
+        // Each method's signature on the template references the
+        // unsubstituted parameters (e.g. `T get() const` returns a
+        // `TypeKind::Unexposed` whose declaration is the
+        // `TemplateTypeParameter T`). `import_type`'s top-level
+        // substitution check resolves those references against
+        // `current_template_subst` before any other dispatch.
+        //
+        // Limitations (tracked as M24 follow-up):
+        // - Only top-level `T` references are substituted — nested
+        //   forms like `T*`, `Box<T>`, `pair<T, U>` fall back to
+        //   the generic dispatch, which still sees `T` as
+        //   `Unexposed` with no substitution path. Methods that
+        //   contain such forms get silently skipped via the
+        //   per-method `lower_method` continue policy from M22.
+        // - Member templates (a `template<typename U>` method
+        //   inside `Box<T>`) are not handled.
+        if methods.is_empty() {
+            if let Some(template_entity) = entity.get_template() {
+                let spec_args = entity
+                    .get_type()
+                    .and_then(|t| t.get_template_argument_types())
+                    .unwrap_or_default();
+                // Build a name → TypeId map by pairing the
+                // template's TemplateTypeParameter children with the
+                // spec's argument types in declaration order.
+                let mut subst: HashMap<String, TypeId> = HashMap::new();
+                let template_params: Vec<Entity<'_>> = template_entity
+                    .get_children()
+                    .into_iter()
+                    .filter(|c| {
+                        c.get_kind() == EntityKind::TemplateTypeParameter
+                    })
+                    .collect();
+                for (i, param) in template_params.iter().enumerate() {
+                    let pname = match param.get_name() {
+                        Some(n) => n,
+                        None => continue,
+                    };
+                    let arg = match spec_args.get(i).and_then(|t| t.as_ref()) {
+                        Some(t) => *t,
+                        None => continue,
+                    };
+                    let arg_id = match self.import_type(
+                        arg,
+                        &format!("{name}::<template arg {i}>"),
+                    ) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    subst.insert(pname, arg_id);
+                }
+                // Stash + restore. Outer `import_class` calls (e.g.
+                // recursive ones triggered via `import_type` below)
+                // would otherwise inherit our substitution map and
+                // mis-substitute their own parameters.
+                let prev_subst = std::mem::replace(
+                    &mut self.current_template_subst,
+                    subst,
+                );
+                for child in template_entity.get_children() {
+                    match child.get_kind() {
+                        EntityKind::Method
+                        | EntityKind::Constructor
+                        | EntityKind::Destructor
+                        | EntityKind::ConversionFunction => {
+                            if matches!(
+                                child.get_accessibility(),
+                                Some(clang::Accessibility::Protected)
+                                    | Some(clang::Accessibility::Private),
+                            ) {
+                                continue;
+                            }
+                            let m = match self
+                                .lower_method(&child, &name, id)
+                            {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let is_static = matches!(
+                                child.get_kind(),
+                                EntityKind::Method
+                            ) && child.is_static_method();
+                            let default_count =
+                                self.last_method_default_count;
+                            let method_idx = methods.len();
+                            methods.push(m);
+                            if is_static {
+                                pending_static_marks.push(method_idx);
+                            }
+                            if default_count > 0 {
+                                pending_default_arg_marks
+                                    .push((method_idx, default_count));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.current_template_subst = prev_subst;
+            }
+        }
+
         let self_has_virtual = methods
             .iter()
             .any(|m| m.virtuality != Virtuality::NonVirtual);
@@ -1725,6 +1844,44 @@ impl<'a> Importer<'a> {
         ty: Type<'_>,
         where_: &str,
     ) -> Result<TypeId, ImportError> {
+        // M24: when walking the underlying template's methods of a
+        // class-template specialization, type references to template
+        // parameters (`T`, `U`, ...) come through as
+        // `TypeKind::Unexposed` whose declaration is a
+        // `TemplateTypeParameter` cursor. Substitute them with the
+        // spec's argument types via the active substitution map
+        // before any other dispatch — this handles `T get()` and
+        // `void set(T)` directly. Nested forms (`T*`, `vector<T>`)
+        // fall through to the regular dispatch and only resolve
+        // after we extend the substitution to walk types
+        // recursively (tracked as M24 follow-up).
+        if !self.current_template_subst.is_empty()
+            && ty.get_kind() == TypeKind::Unexposed
+        {
+            // libclang surfaces template-parameter types in
+            // un-instantiated method signatures with an empty
+            // declaration cursor. The only stable handle is the
+            // type's display name, which matches the parameter's
+            // identifier (e.g. `T`, `U`).
+            //
+            // CV qualifiers come through as a `"const T"` /
+            // `"volatile T"` / `"const volatile T"` display.
+            // Strip the leading qualifier words before lookup so
+            // pointee-of-pointer-to-const cases (`const T*`)
+            // substitute correctly. The CV bits themselves are
+            // preserved by the parent type's `cv_from_type(pointee)`
+            // call against the ORIGINAL pointee.
+            let display = ty.get_display_name();
+            let stripped = display
+                .trim_start_matches("const ")
+                .trim_start_matches("volatile ")
+                .trim_start_matches("const ");
+            if let Some(&substituted) =
+                self.current_template_subst.get(stripped)
+            {
+                return Ok(substituted);
+            }
+        }
         // Strip elaborated-type-specifier sugar (`struct Inner`) and
         // typedefs so the match below sees the canonical kind.
         let ty = match ty.get_kind() {
