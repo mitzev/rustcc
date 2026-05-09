@@ -128,10 +128,16 @@ struct C : public A, public B {
         }
     }
     eprintln!("[probe] C has {secondary_orphans} virtual methods missing vtable_index");
-    // Pin the current shape so we can see the M22 gap shrink.
-    // After M22 lands, this assertion should be `== 0`.
+    // After the M22 third-pass fix, every virtual method on a
+    // multi-inheritance class must have a vtable_index. Without
+    // this assertion, regressions could re-introduce the
+    // primary-only walker silently.
+    assert_eq!(
+        secondary_orphans, 0,
+        "C should have all virtual methods indexed (M22 multi-inh)",
+    );
 
-    // Bindings emission: see how many methods get skipped.
+    // Bindings emission: must not skip any virtual method.
     let cfg = RustBindingsConfig {
         backend: BindingsBackend::DirectExternCpp,
         ..RustBindingsConfig::default()
@@ -139,6 +145,7 @@ struct C : public A, public B {
     let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
     let skipped = src.matches("skipped: virtual method without populated vtable_index").count();
     eprintln!("[probe] bindings emit skipped {skipped} virtual methods on multi-inh classes");
+    assert_eq!(skipped, 0, "Bindings must not skip multi-inh virtual methods");
 
     cleanup(&header);
 }
@@ -282,6 +289,14 @@ fn probe_fltk_umbrella_fl_image_state() {
     }
     eprintln!("[probe] umbrella Fl_Image virtual methods: {with_idx} with vtable_index, {without_idx} WITHOUT");
     eprintln!("[probe] sample methods missing: {samples:?}");
+    // After the M22 cache-pollution fix + third-pass fix, every
+    // virtual method on Fl_Image must have a vtable_index even
+    // when imported via the umbrella header.
+    assert_eq!(
+        without_idx, 0,
+        "Fl_Image virtual methods missing vtable_index (umbrella context) \u{2014} samples: {samples:?}",
+    );
+    assert!(class.is_polymorphic, "Fl_Image must be polymorphic in umbrella context");
 
     // Detailed dump.
     eprintln!("[probe] Fl_Image method virtualities:");
@@ -305,6 +320,92 @@ fn probe_fltk_umbrella_fl_image_state() {
             vt.sub_tables[0].entries.iter().filter(|e| matches!(e, rustc_abi_cxx::VTableEntry::FunctionPointer { .. })).count(),
         );
     }
+}
+
+/// Regression test for the M22 third-pass fix.
+///
+/// Before the fix: deriving classes (Fl_Group, Fl_Window,
+/// Fl_RGB_Image) imported via the FLTK umbrella header would end up
+/// with `dtor.vtable_index = None`, even though they're
+/// single-inheritance and declare their own virtual destructors.
+/// Root cause: `populate_vtable_indices` ran at the end of each
+/// `import_class` body walk — but a base class's body walk could
+/// recursively trigger `import_class` on a derived class via a
+/// method-parameter type lookup (e.g. Fl_Widget's `Fl_Group*
+/// parent()` triggers `import_class(Fl_Group)`). The derived class
+/// then computed its vtable against the base class in placeholder
+/// state (methods=0, polymorphic=false) → no inherited dtor slots
+/// → no vtable_index for the dtor.
+///
+/// The fix moves polymorphism convergence + populate_vtable_indices
+/// into a third pass that runs after every class body has been
+/// walked. This test pins the FLTK umbrella case so the regression
+/// cannot return.
+#[test]
+fn regression_dtor_vtable_index_in_umbrella_context() {
+    let umbrella = std::path::Path::new(
+        "/Users/ogi/rustcc/examples/fltk_hello/cpp/fltk_umbrella.hpp",
+    );
+    if !umbrella.exists() {
+        eprintln!("[probe] skipping: umbrella not found");
+        return;
+    }
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let _class_ids = import_header(
+        umbrella,
+        &["-x", "c++", "-std=c++17", "-I/opt/homebrew/include"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // Each of these single-inheritance FLTK classes declares its
+    // own virtual destructor. Post-fix, every dtor surfacing in
+    // `class.methods` must have a populated `vtable_index`.
+    let mut failures: Vec<String> = Vec::new();
+    for target in &["Fl_Widget", "Fl_Group", "Fl_Window", "Fl_Image", "Fl_RGB_Image"] {
+        let id = match ctx.class_ids().find(|&id| {
+            ctx.class(id).name.0.last().map(|s| match s {
+                rustc_abi_cxx::NameSegment::Class(i) => i.0 == *target,
+                _ => false,
+            }).unwrap_or(false)
+        }) {
+            Some(i) => i,
+            None => {
+                failures.push(format!("{target}: not imported"));
+                continue;
+            }
+        };
+        let class = ctx.class(id);
+        if !class.is_polymorphic {
+            failures.push(format!("{target}: is_polymorphic = false"));
+        }
+        let dtors: Vec<&rustc_abi_cxx::MethodDef> = class
+            .methods
+            .iter()
+            .filter(|m| matches!(m.special, Some(rustc_abi_cxx::SpecialMember::Dtor)))
+            .collect();
+        if dtors.is_empty() {
+            failures.push(format!("{target}: no dtor in methods"));
+            continue;
+        }
+        for d in dtors {
+            if d.virtuality == rustc_abi_cxx::Virtuality::NonVirtual {
+                failures.push(format!("{target}: dtor reports NonVirtual"));
+            }
+            if d.vtable_index.is_none() {
+                failures.push(format!(
+                    "{target}: dtor.vtable_index = None (the bug this test pins)"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Dtor vtable-index regression — failures:\n  {}",
+        failures.join("\n  "),
+    );
 }
 
 #[test]
