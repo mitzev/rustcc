@@ -1,0 +1,139 @@
+name: Release rust-analyzer-rustcc binaries
+
+# Builds the patched rust-analyzer for each supported host triple and
+# uploads tarballs as release assets alongside the rustcc toolchain
+# (release.yml). Triggered by:
+#   - Pushing a tag matching `v*` (e.g. `v1.07.0`), shared with release.yml
+#   - Manual `workflow_dispatch` with a release tag input
+#
+# Output: `rust-analyzer-rustcc-<triple>.tar.xz` on the same GitHub
+# release as the rustcc toolchain. Users install via:
+#
+#   $ rustcc install              # rustcc fork toolchain
+#   $ vscode: "rustcc: Install RA Fork"   # downloads + sets server.path
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (branch/tag/sha); default uses the dispatched ref'
+        required: false
+        default: ''
+      release_tag:
+        description: 'Release tag to publish to. Required for dispatch runs.'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: Build RA fork ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Install build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      # Cache the RA clone + cargo target dir between runs. The
+      # patches change rarely; the bulk of the time is recompiling
+      # rust-analyzer's dependency tree.
+      - name: Cache RA build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/rust-analyzer-rustcc
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ra-fork-${{ matrix.target }}-${{ hashFiles('fork/ra-patches/*.patch', 'fork/ra-patches/PINNED_COMMIT') }}
+          restore-keys: |
+            ra-fork-${{ matrix.target }}-
+
+      - name: Build patched rust-analyzer
+        env:
+          RA_CLONE_DIR: ${{ github.workspace }}/.ra-clone
+        run: |
+          ./fork/ra-patches/build.sh
+          test -x "$RA_CLONE_DIR/target/release/rust-analyzer"
+
+      - name: Package
+        env:
+          RA_CLONE_DIR: ${{ github.workspace }}/.ra-clone
+        run: |
+          # Tarball the binary with a small wrapper README so users
+          # know what they got.
+          STAGE_DIR="$(mktemp -d)/rust-analyzer-rustcc"
+          mkdir -p "$STAGE_DIR"
+          cp "$RA_CLONE_DIR/target/release/rust-analyzer" "$STAGE_DIR/"
+          cat > "$STAGE_DIR/README.md" <<'EOF'
+          # rust-analyzer-rustcc
+
+          Patched rust-analyzer with rustcc Phase-2 support for the
+          `class` keyword. Drop-in replacement for upstream RA.
+
+          To use:
+
+              # macOS / Linux
+              chmod +x rust-analyzer
+              # Then point your editor at the binary:
+              # VS Code (settings.json):
+              #   "rust-analyzer.server.path": "/path/to/rust-analyzer"
+
+          See the rustcc repo's `fork/ra-patches/` for the patch
+          series this binary was built from.
+          EOF
+
+          ARCHIVE="rust-analyzer-rustcc-${{ matrix.target }}.tar.xz"
+          tar -cJf "$ARCHIVE" -C "$(dirname "$STAGE_DIR")" "$(basename "$STAGE_DIR")"
+          ls -lh "$ARCHIVE"
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256" 2>/dev/null \
+            || shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Upload artifact (job-scoped)
+        uses: actions/upload-artifact@v6
+        with:
+          name: rust-analyzer-rustcc-${{ matrix.target }}
+          path: |
+            rust-analyzer-rustcc-${{ matrix.target }}.tar.xz
+            rust-analyzer-rustcc-${{ matrix.target }}.tar.xz.sha256
+          retention-days: 30
+
+      - name: Upload to GitHub Release
+        if: >
+          startsWith(github.ref, 'refs/tags/v') ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "$TAG" \
+              --notes "Prebuilt rustcc toolchain for tag $TAG."
+          fi
+          gh release upload "$TAG" \
+            "rust-analyzer-rustcc-${{ matrix.target }}.tar.xz" \
+            "rust-analyzer-rustcc-${{ matrix.target }}.tar.xz.sha256" \
+            --clobber

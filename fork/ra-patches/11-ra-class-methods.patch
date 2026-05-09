@@ -1,0 +1,1129 @@
+From 75d1ee7c465ed548acd1bc1516c4d14e927b351c Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 21:58:06 +0300
+Subject: [PATCH] P09.46-B4c: class method walking + inheritance dispatch
+
+---
+ .../src/expr_store/tests/signatures.rs        |  68 +++++++
+ crates/hir-def/src/lib.rs                     |  28 ++-
+ crates/hir-def/src/nameres/assoc.rs           |  82 ++++++++-
+ crates/hir-def/src/resolver.rs                |   5 +
+ crates/hir-ty/src/generics.rs                 |   3 +
+ crates/hir-ty/src/infer/path.rs               |  15 ++
+ crates/hir-ty/src/lower.rs                    |   6 +
+ crates/hir-ty/src/method_resolution.rs        |   3 +
+ .../hir-ty/src/method_resolution/confirm.rs   |   7 +
+ crates/hir-ty/src/method_resolution/probe.rs  | 166 +++++++++++++++++-
+ crates/hir-ty/src/next_solver/interner.rs     |   8 +
+ crates/hir-ty/src/tests/method_resolution.rs  |  61 +++++++
+ crates/hir/src/lib.rs                         |  42 ++++-
+ crates/hir/src/term_search/expr.rs            |   6 +
+ .../src/handlers/generate_function.rs         |   6 +
+ .../src/handlers/qualify_method_call.rs       |   5 +
+ crates/ide-completion/src/tests/special.rs    |  45 +++++
+ crates/ide-db/src/defs.rs                     |   6 +
+ crates/ide-db/src/imports/import_assets.rs    |   5 +
+ crates/ide-db/src/traits.rs                   |   3 +
+ crates/ide/src/doc_links.rs                   |   3 +
+ crates/ide/src/goto_definition.rs             |   6 +
+ crates/ide/src/hover/render.rs                |   6 +
+ crates/ide/src/rename.rs                      |   7 +
+ .../ide/src/syntax_highlighting/highlight.rs  |   9 +
+ 25 files changed, 594 insertions(+), 7 deletions(-)
+
+diff --git a/crates/hir-def/src/expr_store/tests/signatures.rs b/crates/hir-def/src/expr_store/tests/signatures.rs
+index d26c94fdc..fb2d5b1dd 100644
+--- a/crates/hir-def/src/expr_store/tests/signatures.rs
++++ b/crates/hir-def/src/expr_store/tests/signatures.rs
+@@ -262,3 +262,71 @@ class Cat {}
+     let cat_sig = ClassSignature::of(&db, cat);
+     assert!(cat_sig.base.is_none(), "class Cat has no parent");
+ }
++
++// rustcc Phase 2 (B.4c): direct test that methods declared inside a
++// class body are reachable via `ClassId::class_items` and that their
++// `FunctionLoc.container` reports the class as
++// `ItemContainerId::ClassId(_)`. This is the load-bearing invariant
++// for inherent-method dispatch in hir-ty.
++#[test]
++fn class_items_walks_methods_with_class_container() {
++    use crate::{
++        AdtId, AssocItemId, ItemContainerId, Lookup, ModuleDefId, nameres::crate_def_map,
++        signatures::ClassSignature, test_db::TestDB,
++    };
++    use test_fixture::WithFixture;
++
++    let db = TestDB::with_files(
++        r#"
++class Widget {
++    fn click(&self) -> u32 { 0 }
++    fn label(&self) -> u32 { 1 }
++    const KIND: u32 = 7;
++}
++"#,
++    );
++
++    let krate = db.fetch_test_crate();
++    let def_map = crate_def_map(&db, krate);
++    let mut widget = None;
++    for (_, module) in def_map.modules() {
++        for decl in module.scope.declarations() {
++            if let ModuleDefId::AdtId(AdtId::ClassId(id)) = decl {
++                let sig = ClassSignature::of(&db, id);
++                if sig.name.as_str() == "Widget" {
++                    widget = Some(id);
++                }
++            }
++        }
++    }
++    let widget = widget.expect("class Widget declared");
++
++    let items = widget.class_items(&db);
++    let names: Vec<_> = items.items.iter().map(|(n, _)| n.as_str().to_owned()).collect();
++    assert_eq!(names, vec!["click", "label", "KIND"]);
++
++    // Each function's container must be ClassId(widget).
++    let click = items.method_by_name(&hir_expand::name::Name::new_symbol_root(
++        intern::Symbol::intern("click"),
++    ));
++    let click = click.expect("click method present");
++    let click_loc = click.lookup(&db);
++    match click_loc.container {
++        ItemContainerId::ClassId(c) if c == widget => {}
++        other => panic!("click container should be ClassId(Widget), got {other:?}"),
++    }
++
++    // const KIND too — same story for ConstId.
++    let kind_assoc = items.assoc_item_by_name(&hir_expand::name::Name::new_symbol_root(
++        intern::Symbol::intern("KIND"),
++    ));
++    match kind_assoc {
++        Some(AssocItemId::ConstId(c)) => {
++            match c.lookup(&db).container {
++                ItemContainerId::ClassId(cl) if cl == widget => {}
++                other => panic!("KIND container should be ClassId(Widget), got {other:?}"),
++            }
++        }
++        other => panic!("expected const KIND, got {other:?}"),
++    }
++}
+diff --git a/crates/hir-def/src/lib.rs b/crates/hir-def/src/lib.rs
+index c8cb9cdab..a7727dd04 100644
+--- a/crates/hir-def/src/lib.rs
++++ b/crates/hir-def/src/lib.rs
+@@ -92,7 +92,7 @@ use crate::{
+     },
+     nameres::{
+         LocalDefMap,
+-        assoc::{ImplItems, TraitItems},
++        assoc::{ClassItems, ImplItems, TraitItems},
+         block_def_map, crate_def_map, crate_local_def_map,
+         diagnostics::DefDiagnostics,
+     },
+@@ -309,6 +309,23 @@ impl ClassId {
+         let r = VariantFields::with_source_map(db, self.into());
+         (&r.0, &r.1)
+     }
++
++    /// rustcc Phase 2 (B.4c): assoc items declared inside the class
++    /// body — these are the inherent methods/consts/type-aliases of
++    /// the class. Their `.lookup(db).container` is
++    /// `ItemContainerId::ClassId(self)`.
++    #[inline]
++    pub fn class_items(self, db: &dyn DefDatabase) -> &ClassItems {
++        &self.class_items_with_diagnostics(db).0
++    }
++
++    #[inline]
++    pub fn class_items_with_diagnostics(
++        self,
++        db: &dyn DefDatabase,
++    ) -> &(ClassItems, DefDiagnostics) {
++        ClassItems::of(db, self)
++    }
+ }
+ 
+ pub type EnumLoc = ItemLoc<ast::Enum>;
+@@ -666,6 +683,12 @@ pub enum ItemContainerId {
+     ModuleId(ModuleId),
+     ImplId(ImplId),
+     TraitId(TraitId),
++    /// rustcc Phase 2 (B.4c): methods declared inside a `class` body
++    /// have the class as their direct container. The class itself is a
++    /// module-equivalent owner — it has a name, generics, visibility,
++    /// and a member list — but it isn't a trait or impl, so it gets
++    /// its own variant.
++    ClassId(ClassId),
+ }
+ impl_from!(ModuleId for ItemContainerId);
+ 
+@@ -1243,6 +1266,9 @@ impl HasModule for ItemContainerId {
+             ItemContainerId::ImplId(it) => it.module(db),
+             ItemContainerId::TraitId(it) => it.module(db),
+             ItemContainerId::ExternBlockId(it) => it.module(db),
++            // rustcc Phase 2 (B.4c): class is a module-scoped item; its
++            // module is the module that lexically contains the class.
++            ItemContainerId::ClassId(it) => it.module(db),
+         }
+     }
+ }
+diff --git a/crates/hir-def/src/nameres/assoc.rs b/crates/hir-def/src/nameres/assoc.rs
+index f5a852b39..035cab93b 100644
+--- a/crates/hir-def/src/nameres/assoc.rs
++++ b/crates/hir-def/src/nameres/assoc.rs
+@@ -19,8 +19,8 @@ use syntax::{
+ use thin_vec::ThinVec;
+ 
+ use crate::{
+-    AssocItemId, AstIdWithPath, ConstLoc, FunctionId, FunctionLoc, ImplId, ItemContainerId,
+-    ItemLoc, MacroCallId, ModuleId, TraitId, TypeAliasId, TypeAliasLoc,
++    AssocItemId, AstIdWithPath, ClassId, ConstLoc, FunctionId, FunctionLoc, ImplId,
++    ItemContainerId, ItemLoc, MacroCallId, ModuleId, TraitId, TypeAliasId, TypeAliasLoc,
+     db::DefDatabase,
+     item_tree::AttrsOrCfg,
+     macro_call_as_call_id,
+@@ -132,6 +132,68 @@ impl ImplItems {
+     }
+ }
+ 
++// rustcc Phase 2 (B.4c): assoc items declared inside a class body.
++// Mirrors `ImplItems` but the container is `ItemContainerId::ClassId`,
++// so the resulting `FunctionId` / `ConstId` / `TypeAliasId` lookups
++// report the class as their direct container.
++#[derive(Debug, PartialEq, Eq)]
++pub struct ClassItems {
++    pub items: Box<[(Name, AssocItemId)]>,
++    pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
++}
++
++#[salsa::tracked]
++impl ClassItems {
++    #[salsa::tracked(returns(ref))]
++    pub fn of(db: &dyn DefDatabase, id: ClassId) -> (ClassItems, DefDiagnostics) {
++        let _p = tracing::info_span!("class_items_with_diagnostics_query").entered();
++        let ItemLoc { container: module_id, id: ast_id } = id.lookup(db);
++
++        let collector = AssocItemCollector::new(
++            db,
++            module_id,
++            ItemContainerId::ClassId(id),
++            ast_id.file_id,
++        );
++        let source = ast_id.with_value(collector.ast_id_map.get(ast_id.value)).to_node(db);
++        // Walk the class member list's `methods()` iterator. The
++        // member list is a `ClassMemberList`, distinct from the
++        // `ast::AssocItemList` that traits/impls use, so we feed the
++        // raw iterator into `collect_items_iter`.
++        let methods: Vec<_> = source
++            .class_member_list()
++            .into_iter()
++            .flat_map(|cml| cml.methods())
++            .collect();
++        let (items, macro_calls, diagnostics) = collector.collect_items_iter(methods);
++
++        (ClassItems { items, macro_calls }, DefDiagnostics::new(diagnostics))
++    }
++}
++
++impl ClassItems {
++    pub fn method_by_name(&self, name: &Name) -> Option<FunctionId> {
++        self.items.iter().find_map(|(item_name, item)| match item {
++            AssocItemId::FunctionId(t) if item_name == name => Some(*t),
++            _ => None,
++        })
++    }
++
++    pub fn assoc_item_by_name(&self, name: &Name) -> Option<AssocItemId> {
++        self.items.iter().find_map(|&(ref item_name, item)| {
++            if item_name == name {
++                Some(item)
++            } else {
++                None
++            }
++        })
++    }
++
++    pub fn macro_calls(&self) -> impl Iterator<Item = (AstId<ast::Item>, MacroCallId)> + '_ {
++        self.macro_calls.iter().copied()
++    }
++}
++
+ struct AssocItemCollector<'db> {
+     db: &'db dyn DefDatabase,
+     module_id: ModuleId,
+@@ -189,6 +251,22 @@ impl<'db> AssocItemCollector<'db> {
+         (self.items.into_boxed_slice(), self.macro_calls, self.diagnostics)
+     }
+ 
++    /// rustcc Phase 2 (B.4c): walk the assoc-items inside a
++    /// `class Foo { ... }` body. Mirrors `collect`, but takes a raw
++    /// iterator of `ast::AssocItem` because a class member list is a
++    /// `ClassMemberList`, not an `ast::AssocItemList`.
++    fn collect_items_iter(
++        mut self,
++        items: impl IntoIterator<Item = ast::AssocItem>,
++    ) -> (Box<[(Name, AssocItemId)]>, ThinVec<(AstId<ast::Item>, MacroCallId)>, Vec<DefDiagnostic>)
++    {
++        for item in items {
++            self.collect_item(item);
++        }
++        self.macro_calls.shrink_to_fit();
++        (self.items.into_boxed_slice(), self.macro_calls, self.diagnostics)
++    }
++
+     fn collect_item(&mut self, item: ast::AssocItem) {
+         let ast_id = self.ast_id_map.ast_id(&item);
+         let attrs =
+diff --git a/crates/hir-def/src/resolver.rs b/crates/hir-def/src/resolver.rs
+index 4fb5f9cec..27120bab8 100644
+--- a/crates/hir-def/src/resolver.rs
++++ b/crates/hir-def/src/resolver.rs
+@@ -1398,6 +1398,11 @@ impl HasResolver for ItemContainerId {
+             ItemContainerId::TraitId(it) => it.resolver(db),
+             ItemContainerId::ImplId(it) => it.resolver(db),
+             ItemContainerId::ExternBlockId(it) => it.resolver(db),
++            // rustcc Phase 2 (B.4c): a class is structurally an
++            // ADT-shaped item, so its resolver pushes the class's
++            // generic-param scope onto the parent module's resolver.
++            // Methods inside `class Foo<T> { ... }` therefore see `T`.
++            ItemContainerId::ClassId(it) => it.resolver(db),
+         }
+     }
+ }
+diff --git a/crates/hir-ty/src/generics.rs b/crates/hir-ty/src/generics.rs
+index b04128184..bb1c4a633 100644
+--- a/crates/hir-ty/src/generics.rs
++++ b/crates/hir-ty/src/generics.rs
+@@ -233,6 +233,9 @@ pub(crate) fn parent_generic_def(db: &dyn DefDatabase, def: GenericDefId) -> Opt
+         ItemContainerId::ImplId(it) => Some(it.into()),
+         ItemContainerId::TraitId(it) => Some(it.into()),
+         ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => None,
++        // rustcc Phase 2 (B.4c): the parent of a method/const/type
++        // declared inside a class is the class itself (an AdtId).
++        ItemContainerId::ClassId(it) => Some(hir_def::AdtId::ClassId(it).into()),
+     }
+ }
+ 
+diff --git a/crates/hir-ty/src/infer/path.rs b/crates/hir-ty/src/infer/path.rs
+index c020c9812..98cb46396 100644
+--- a/crates/hir-ty/src/infer/path.rs
++++ b/crates/hir-ty/src/infer/path.rs
+@@ -329,6 +329,21 @@ impl<'db> InferenceContext<'_, 'db> {
+                 never!("assoc item contained in module/extern block");
+                 return None;
+             }
++            // rustcc Phase 2 (B.4c): assoc-item path resolution onto a
++            // class-contained method. Mirror the impl arm by treating
++            // the class itself as the "Self" type for its inherent
++            // methods. The class's generic args are filled fresh and
++            // unified with the inferred receiver type.
++            ItemContainerId::ClassId(class_id) => {
++                let class_substs = self.table.fresh_args_for_item(id.into(), class_id.into());
++                let class_self_ty = crate::next_solver::Ty::new_adt(
++                    self.interner(),
++                    hir_def::AdtId::ClassId(class_id),
++                    class_substs,
++                );
++                _ = self.demand_eqtype(id, class_self_ty, ty);
++                class_substs
++            }
+         };
+ 
+         self.write_assoc_resolution(id, item, substs);
+diff --git a/crates/hir-ty/src/lower.rs b/crates/hir-ty/src/lower.rs
+index 4584e4ee8..9b552ef1f 100644
+--- a/crates/hir-ty/src/lower.rs
++++ b/crates/hir-ty/src/lower.rs
+@@ -151,6 +151,12 @@ impl<'db> LifetimeElisionKind<'db> {
+             ItemContainerId::TraitId(_) => {
+                 LifetimeElisionKind::StaticIfNoLifetimeInScope { only_lint: false }
+             }
++            // rustcc Phase 2 (B.4c): a `const` declared inside a class
++            // body should behave like an inherent-impl const for the
++            // purpose of lifetime elision.
++            ItemContainerId::ClassId(_) => {
++                LifetimeElisionKind::StaticIfNoLifetimeInScope { only_lint: true }
++            }
+         }
+     }
+ 
+diff --git a/crates/hir-ty/src/method_resolution.rs b/crates/hir-ty/src/method_resolution.rs
+index 2c6c7ed9a..883551a69 100644
+--- a/crates/hir-ty/src/method_resolution.rs
++++ b/crates/hir-ty/src/method_resolution.rs
+@@ -121,6 +121,9 @@ pub enum MethodError<'db> {
+ pub enum CandidateSource {
+     Impl(AnyImplId),
+     Trait(TraitId),
++    /// rustcc Phase 2 (B.4c): the candidate came from a class body's
++    /// inherent assoc-item list, not from a real `impl Foo { ... }`.
++    Class(hir_def::ClassId),
+ }
+ 
+ impl<'a, 'db> InferenceContext<'a, 'db> {
+diff --git a/crates/hir-ty/src/method_resolution/confirm.rs b/crates/hir-ty/src/method_resolution/confirm.rs
+index a29e3db18..763ef063b 100644
+--- a/crates/hir-ty/src/method_resolution/confirm.rs
++++ b/crates/hir-ty/src/method_resolution/confirm.rs
+@@ -258,6 +258,13 @@ impl<'a, 'b, 'db> ConfirmContext<'a, 'b, 'db> {
+                 self.infcx().fresh_args_for_item(self.expr.into(), impl_def_id.into())
+             }
+ 
++            // rustcc Phase 2 (B.4c): the class itself is the
++            // "container" — its own generic args are the equivalent of
++            // an impl's args.
++            probe::InherentClassPick(class_id) => {
++                self.infcx().fresh_args_for_item(self.expr.into(), class_id.into())
++            }
++
+             probe::ObjectPick(trait_def_id) => {
+                 // If the trait is not object safe (specifically, we care about when
+                 // the receiver is not valid), then there's a chance that we will not
+diff --git a/crates/hir-ty/src/method_resolution/probe.rs b/crates/hir-ty/src/method_resolution/probe.rs
+index 8a28b1672..8cd985794 100644
+--- a/crates/hir-ty/src/method_resolution/probe.rs
++++ b/crates/hir-ty/src/method_resolution/probe.rs
+@@ -4,7 +4,7 @@
+ use std::{cell::RefCell, convert::Infallible, ops::ControlFlow};
+ 
+ use hir_def::{
+-    AssocItemId, FunctionId, GenericParamId, ImplId, ItemContainerId, TraitId,
++    AssocItemId, ClassId, FunctionId, GenericParamId, ImplId, ItemContainerId, TraitId,
+     hir::generics::GenericParams,
+     signatures::{FunctionSignature, TraitFlags, TraitSignature},
+ };
+@@ -56,6 +56,10 @@ struct ProbeContext<'a, 'db, Choice> {
+     inherent_candidates: Vec<Candidate<'db>>,
+     extension_candidates: Vec<Candidate<'db>>,
+     impl_dups: FxHashSet<ImplId>,
++    /// rustcc Phase 2 (B.4c): mirror of `impl_dups` for classes — a
++    /// given class body should only contribute its assoc items once
++    /// per probe.
++    class_dups: FxHashSet<ClassId>,
+ 
+     /// List of potential private candidates. Will be trimmed to ones that
+     /// actually apply and then the result inserted into `private_candidate`
+@@ -83,6 +87,11 @@ pub struct Candidate<'db> {
+ #[derive(Debug, Clone)]
+ pub enum CandidateKind<'db> {
+     InherentImplCandidate { impl_def_id: ImplId, receiver_steps: usize },
++    /// rustcc Phase 2 (B.4c): a method declared inside a `class Foo {
++    /// ... }` body. Acts like an `InherentImplCandidate` but carries
++    /// a `ClassId` instead of an `ImplId` because no real `impl Foo`
++    /// block backs it.
++    InherentClassCandidate { class_id: ClassId, receiver_steps: usize },
+     ObjectCandidate(PolyTraitRef<'db>),
+     TraitCandidate(PolyTraitRef<'db>),
+     WhereClauseCandidate(PolyTraitRef<'db>),
+@@ -189,6 +198,9 @@ pub struct Pick<'db> {
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum PickKind<'db> {
+     InherentImplPick(ImplId),
++    /// rustcc Phase 2 (B.4c): companion to `InherentImplPick` for
++    /// methods discovered through a class body.
++    InherentClassPick(ClassId),
+     ObjectPick(TraitId),
+     TraitPick(TraitId),
+     WhereClausePick(
+@@ -826,6 +838,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
+             inherent_candidates: Vec::new(),
+             extension_candidates: Vec::new(),
+             impl_dups: FxHashSet::default(),
++            class_dups: FxHashSet::default(),
+             orig_steps_var_values,
+             steps,
+             private_candidates: Vec::new(),
+@@ -942,6 +955,12 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
+                     &SimplifiedType::Adt(def_id.into()),
+                     receiver_steps,
+                 );
++                // rustcc Phase 2 (B.4c): if the ADT is a class, also
++                // walk its body for inherent assoc items and recurse
++                // into the inheritance chain.
++                if let hir_def::AdtId::ClassId(class_id) = def_id {
++                    self.assemble_inherent_class_probe(class_id, receiver_steps);
++                }
+                 self.assemble_inherent_candidates_for_incoherent_ty(raw_self_ty, receiver_steps);
+             }
+             TyKind::Foreign(did) => {
+@@ -1027,6 +1046,74 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
+         });
+     }
+ 
++    /// rustcc Phase 2 (B.4c): walk a class body's assoc items and emit
++    /// inherent candidates for them, then recurse into the class's
++    /// `base` (if any) so that `Dog : Animal` makes `Animal`'s methods
++    /// reachable through a `Dog` receiver. Mirrors the
++    /// `assemble_inherent_impl_probe` shape for `ImplId`. Inheritance
++    /// is implemented via an explicit chain walk rather than a
++    /// synthesized `Deref` impl — this is the v0 strategy; richer
++    /// integration with `Deref`-based autoderef can come later.
++    ///
++    /// Name shadowing: C++-style "derived method shadows base method
++    /// of the same name" is enforced by carrying a `seen_names` set
++    /// through the chain walk. Names introduced by the most-derived
++    /// class are added first; on recursion into the base, any item
++    /// whose name is already in `seen_names` is skipped. This avoids
++    /// emitting ambiguous candidate pairs that would otherwise leave
++    /// the call site unresolved.
++    #[instrument(level = "debug", skip(self))]
++    fn assemble_inherent_class_probe(&mut self, class_id: ClassId, receiver_steps: usize) {
++        let mut seen_names: FxHashSet<Name> = FxHashSet::default();
++        self.assemble_inherent_class_probe_inner(class_id, receiver_steps, &mut seen_names);
++    }
++
++    fn assemble_inherent_class_probe_inner(
++        &mut self,
++        class_id: ClassId,
++        receiver_steps: usize,
++        seen_names: &mut FxHashSet<Name>,
++    ) {
++        if !self.class_dups.insert(class_id) {
++            return; // already visited
++        }
++
++        let items = class_id.class_items(self.db());
++        // Filter the items by name-shadowing first, then hand off to
++        // the standard probe pipeline so that mode/visibility filters
++        // continue to apply.
++        let filtered: Vec<(Name, AssocItemId)> = items
++            .items
++            .iter()
++            .filter_map(|(name, id)| {
++                if seen_names.contains(name) {
++                    None
++                } else {
++                    Some((name.clone(), *id))
++                }
++            })
++            .collect();
++        // Record the names introduced at this level so the base walk
++        // skips them.
++        for (name, _) in &filtered {
++            seen_names.insert(name.clone());
++        }
++        Choice::with_impl_or_trait_item(self, &filtered, |this, item| {
++            if !this.has_applicable_self(item) {
++                this.record_static_candidate(CandidateSource::Class(class_id));
++                return;
++            }
++            this.push_candidate(
++                Candidate { item, kind: InherentClassCandidate { class_id, receiver_steps } },
++                true,
++            );
++        });
++
++        if let Some(base_class_id) = base_class_of(self.db(), class_id) {
++            self.assemble_inherent_class_probe_inner(base_class_id, receiver_steps, seen_names);
++        }
++    }
++
+     #[instrument(level = "debug", skip(self))]
+     fn assemble_inherent_candidates_from_object(&mut self, self_ty: Ty<'db>) {
+         let principal = match self_ty.kind() {
+@@ -1507,6 +1594,8 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
+     fn candidate_source(&self, candidate: &Candidate<'db>, self_ty: Ty<'db>) -> CandidateSource {
+         match candidate.kind {
+             InherentImplCandidate { impl_def_id, .. } => CandidateSource::Impl(impl_def_id.into()),
++            // rustcc Phase 2 (B.4c).
++            InherentClassCandidate { class_id, .. } => CandidateSource::Class(class_id),
+             ObjectCandidate(trait_ref) | WhereClauseCandidate(trait_ref) => {
+                 CandidateSource::Trait(trait_ref.def_id().0)
+             }
+@@ -1542,6 +1631,8 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
+     fn candidate_source_from_pick(&self, pick: &Pick<'db>) -> CandidateSource {
+         match pick.kind {
+             InherentImplPick(impl_) => CandidateSource::Impl(impl_.into()),
++            // rustcc Phase 2 (B.4c).
++            InherentClassPick(class_id) => CandidateSource::Class(class_id),
+             ObjectPick(trait_) | TraitPick(trait_) => CandidateSource::Trait(trait_),
+             WhereClausePick(trait_ref) => CandidateSource::Trait(trait_ref.skip_binder().def_id.0),
+         }
+@@ -1606,6 +1697,48 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
+                     // Convert the bounds into obligations.
+                     ocx.register_obligations(impl_bounds);
+                 }
++                // rustcc Phase 2 (B.4c): mirror the impl arm but build
++                // the self-type out of the class itself rather than
++                // looking up a stored `impl_self_ty`.
++                //
++                // Inheritance subtlety: when the method came from a
++                // base class (e.g. `Dog : Animal` and we found
++                // `Animal::legs`), the method's signature thinks
++                // `Self = Animal`, but the receiver is `Dog`. To make
++                // method dispatch work without an explicit upcast on
++                // every call, we transform the method's self-type
++                // using the *receiver's* concrete `self_ty` rather
++                // than rebuilding the class type from `class_id`.
++                // This treats the inherited method as if it were
++                // re-declared on the derived class — a v0
++                // simplification that mirrors C++-style name lookup
++                // closely enough for the IDE to follow types.
++                InherentClassCandidate { class_id, .. } => {
++                    let class_args = self
++                        .infcx()
++                        .fresh_args_for_item(self.ctx.call_span, class_id.into());
++                    // We feed the receiver's concrete `self_ty` into
++                    // `xform_self_ty` as the substitute for `Self`,
++                    // so the result of the transformation already
++                    // matches the receiver — no `ocx.relate` needed.
++                    // `xform_self_ty` itself is unused after the match
++                    // for class candidates, but `xform_ret_ty` is
++                    // still consumed by the well-formed-return-type
++                    // obligation registered below.
++                    (xform_self_ty, xform_ret_ty) =
++                        self.xform_self_ty(probe.item, self_ty, class_args.as_slice());
++                    let _ = xform_self_ty;
++                    // Class generics also carry where-clause-style
++                    // bounds. Surface them like impl bounds so that
++                    // bound-driven dispatch behaves correctly.
++                    let class_bounds = GenericPredicates::query_all(self.db(), class_id.into());
++                    let class_bounds = clauses_as_obligations(
++                        class_bounds.iter_instantiated(self.interner(), class_args.as_slice()),
++                        ObligationCause::new(),
++                        self.param_env(),
++                    );
++                    ocx.register_obligations(class_bounds);
++                }
+                 TraitCandidate(poly_trait_ref) => {
+                     // Some trait methods are excluded for arrays before 2021.
+                     // (`array.into_iter()` wants a slice iterator for compatibility.)
+@@ -2091,15 +2224,46 @@ impl<'db> Candidate<'db> {
+ 
+                     WhereClausePick(trait_ref)
+                 }
++                // rustcc Phase 2 (B.4c).
++                InherentClassCandidate { class_id, .. } => InherentClassPick(class_id),
+             },
+             autoderefs: 0,
+             autoref_or_ptr_adjustment: None,
+             self_ty,
+             receiver_steps: match self.kind {
+                 InherentImplCandidate { receiver_steps, .. } => Some(receiver_steps),
++                // rustcc Phase 2 (B.4c).
++                InherentClassCandidate { receiver_steps, .. } => Some(receiver_steps),
+                 _ => None,
+             },
+             shadowed_candidates: vec![],
+         }
+     }
+ }
++
++/// rustcc Phase 2 (B.4c): resolve `class Foo : Bar { ... }`'s `Bar`
++/// type-ref to its `ClassId`, if any. Returns `None` if the class has
++/// no base, the base is not a path, or the path doesn't resolve to a
++/// class. Used by the inherent-method probe to walk the inheritance
++/// chain.
++fn base_class_of(db: &dyn HirDatabase, class_id: ClassId) -> Option<ClassId> {
++    use hir_def::{
++        AdtId,
++        resolver::{HasResolver, TypeNs},
++        signatures::ClassSignature,
++        type_ref::TypeRef,
++    };
++    let sig = ClassSignature::of(db, class_id);
++    let base_ref_id = sig.base?;
++    let type_ref = &sig.store[base_ref_id];
++    let path = match type_ref {
++        TypeRef::Path(path) => path,
++        _ => return None,
++    };
++    let resolver = class_id.resolver(db);
++    let (resolution, _, _) = resolver.resolve_path_in_type_ns(db, path)?;
++    match resolution {
++        TypeNs::AdtId(AdtId::ClassId(it)) => Some(it),
++        _ => None,
++    }
++}
+diff --git a/crates/hir-ty/src/next_solver/interner.rs b/crates/hir-ty/src/next_solver/interner.rs
+index 3d066b439..5a41e2176 100644
+--- a/crates/hir-ty/src/next_solver/interner.rs
++++ b/crates/hir-ty/src/next_solver/interner.rs
+@@ -1341,6 +1341,10 @@ impl<'db> Interner for DbInterner<'db> {
+             ItemContainerId::ImplId(it) => it.into(),
+             ItemContainerId::TraitId(it) => it.into(),
+             ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => panic!(),
++            // rustcc Phase 2 (B.4c): the parent of a method declared
++            // inside `class Foo { ... }` is the class itself, exposed
++            // through the AdtId arm.
++            ItemContainerId::ClassId(it) => hir_def::AdtId::ClassId(it).into(),
+         }
+     }
+ 
+@@ -2294,6 +2298,10 @@ impl<'db> Interner for DbInterner<'db> {
+                 }
+                 ItemContainerId::ImplId(_) => AliasTyKind::Inherent { def_id },
+                 ItemContainerId::TraitId(_) => AliasTyKind::Projection { def_id },
++                // rustcc Phase 2 (B.4c): a `type Foo = ...;` declared
++                // inside a class behaves like an inherent associated
++                // type — same `AliasTyKind` as the impl arm.
++                ItemContainerId::ClassId(_) => AliasTyKind::Inherent { def_id },
+             },
+             SolverDefId::InternedOpaqueTyId(_) => AliasTyKind::Opaque { def_id },
+             _ => unreachable!(),
+diff --git a/crates/hir-ty/src/tests/method_resolution.rs b/crates/hir-ty/src/tests/method_resolution.rs
+index fc8c1f816..2ed33ba3c 100644
+--- a/crates/hir-ty/src/tests/method_resolution.rs
++++ b/crates/hir-ty/src/tests/method_resolution.rs
+@@ -2258,3 +2258,64 @@ fn main() {
+     "#,
+     );
+ }
++
++// rustcc Phase 2 (B.4c): a class method called on a class receiver
++// resolves and returns the declared type. This exercises the new
++// `InherentClassCandidate` path in the method-resolution probe.
++#[test]
++fn class_inherent_method_dispatch() {
++    check_types(
++        r#"
++class Dog {
++    fn speak(&self) -> u32 { 1000 }
++}
++fn use_dog(d: Dog) {
++    d.speak();
++ // ^^^^^^^^^ u32
++}
++"#,
++    );
++}
++
++// rustcc Phase 2 (B.4c): inheritance walk — `Dog : Animal` makes
++// `Animal::legs` reachable through a `Dog` receiver, with the call
++// returning the base method's declared return type.
++#[test]
++fn class_inherited_method_dispatch() {
++    check_types(
++        r#"
++class Animal {
++    fn legs(&self) -> u32 { 4 }
++}
++class Dog : Animal {
++    fn speak(&self) -> u32 { 1000 }
++}
++fn use_dog(d: Dog) {
++    d.legs();
++ // ^^^^^^^^ u32
++    d.speak();
++ // ^^^^^^^^^ u32
++}
++"#,
++    );
++}
++
++// rustcc Phase 2 (B.4c): a derived class shadows a same-named method
++// from the base. The pick should land on Dog's version.
++#[test]
++fn class_derived_shadows_base_method() {
++    check_types(
++        r#"
++class Animal {
++    fn name(&self) -> u32 { 0 }
++}
++class Dog : Animal {
++    fn name(&self) -> u64 { 1 }
++}
++fn use_dog(d: Dog) {
++    d.name();
++ // ^^^^^^^^ u64
++}
++"#,
++    );
++}
+diff --git a/crates/hir/src/lib.rs b/crates/hir/src/lib.rs
+index c67e2a0c6..c55100d3f 100644
+--- a/crates/hir/src/lib.rs
++++ b/crates/hir/src/lib.rs
+@@ -3884,6 +3884,11 @@ impl From<method_resolution::CandidateId> for AssocItem {
+ pub enum AssocItemContainer {
+     Trait(Trait),
+     Impl(Impl),
++    /// rustcc Phase 2 (B.4c): a method/const/type-alias declared
++    /// directly inside a `class Foo { ... }` body. The class itself
++    /// acts as the container; there's no synthesized inherent `impl`
++    /// behind it.
++    Class(Class),
+ }
+ 
+ pub trait AsAssocItem {
+@@ -3956,6 +3961,9 @@ where
+     match id.lookup(db).container {
+         ItemContainerId::TraitId(_) | ItemContainerId::ImplId(_) => Some(ctor(DEF::from(id))),
+         ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => None,
++        // rustcc Phase 2 (B.4c): items declared directly inside a class
++        // body are inherent assoc items of the class.
++        ItemContainerId::ClassId(_) => Some(ctor(DEF::from(id))),
+     }
+ }
+ 
+@@ -3971,9 +3979,11 @@ where
+ {
+     match id.lookup(db).container {
+         ItemContainerId::ExternBlockId(_) => Some(ctor(DEF::from(id))),
+-        ItemContainerId::TraitId(_) | ItemContainerId::ImplId(_) | ItemContainerId::ModuleId(_) => {
+-            None
+-        }
++        ItemContainerId::TraitId(_)
++        | ItemContainerId::ImplId(_)
++        | ItemContainerId::ModuleId(_)
++        // rustcc Phase 2 (B.4c): class assoc items aren't extern.
++        | ItemContainerId::ClassId(_) => None,
+     }
+ }
+ 
+@@ -4052,6 +4062,8 @@ impl AssocItem {
+             ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => {
+                 panic!("invalid AssocItem")
+             }
++            // rustcc Phase 2 (B.4c): the class is the container.
++            ItemContainerId::ClassId(id) => AssocItemContainer::Class(Class { id }),
+         }
+     }
+ 
+@@ -4073,6 +4085,10 @@ impl AssocItem {
+         match self.container(db) {
+             AssocItemContainer::Trait(t) => Some(t),
+             AssocItemContainer::Impl(i) => i.trait_(db),
++            // rustcc Phase 2 (B.4c): a class doesn't implement a trait
++            // through its own body — methods declared inside `class
++            // Foo { ... }` are inherent.
++            AssocItemContainer::Class(_) => None,
+         }
+     }
+ 
+@@ -6350,6 +6366,9 @@ impl<'db> Type<'db> {
+                             let id = Function { id: AnyFunctionId::FunctionId(id) };
+                             match candidate.kind {
+                                 method_resolution::PickKind::InherentImplPick(_)
++                                // rustcc Phase 2 (B.4c): a class-body
++                                // pick is inherent.
++                                | method_resolution::PickKind::InherentClassPick(_)
+                                 | method_resolution::PickKind::ObjectPick(..)
+                                 | method_resolution::PickKind::WhereClausePick(..) => {
+                                     // Candidates from where clauses and trait objects are considered inherent.
+@@ -6376,6 +6395,11 @@ impl<'db> Type<'db> {
+                                 method_resolution::CandidateKind::InherentImplCandidate {
+                                     ..
+                                 }
++                                // rustcc Phase 2 (B.4c): a class-body
++                                // candidate is inherent.
++                                | method_resolution::CandidateKind::InherentClassCandidate {
++                                    ..
++                                }
+                                 | method_resolution::CandidateKind::ObjectCandidate(..)
+                                 | method_resolution::CandidateKind::WhereClauseCandidate(..) => {
+                                     // Candidates from where clauses and trait objects are considered inherent.
+@@ -6450,6 +6474,8 @@ impl<'db> Type<'db> {
+                             let id = candidate.item.into();
+                             match candidate.kind {
+                                 method_resolution::PickKind::InherentImplPick(_)
++                                // rustcc Phase 2 (B.4c).
++                                | method_resolution::PickKind::InherentClassPick(_)
+                                 | method_resolution::PickKind::ObjectPick(..)
+                                 | method_resolution::PickKind::WhereClausePick(..) => {
+                                     // Candidates from where clauses and trait objects are considered inherent.
+@@ -6471,6 +6497,10 @@ impl<'db> Type<'db> {
+                                 method_resolution::CandidateKind::InherentImplCandidate {
+                                     ..
+                                 }
++                                // rustcc Phase 2 (B.4c).
++                                | method_resolution::CandidateKind::InherentClassCandidate {
++                                    ..
++                                }
+                                 | method_resolution::CandidateKind::ObjectCandidate(..)
+                                 | method_resolution::CandidateKind::WhereClauseCandidate(..) => {
+                                     // Candidates from where clauses and trait objects are considered inherent.
+@@ -7318,6 +7348,9 @@ fn container_id_to_hir(c: ItemContainerId) -> ItemContainer {
+         ItemContainerId::ModuleId(id) => ItemContainer::Module(Module { id }),
+         ItemContainerId::ImplId(id) => ItemContainer::Impl(id.into()),
+         ItemContainerId::TraitId(id) => ItemContainer::Trait(Trait { id }),
++        // rustcc Phase 2 (B.4c): expose class containers to the IDE
++        // layer the same way structs/impls/traits are exposed.
++        ItemContainerId::ClassId(id) => ItemContainer::Class(Class { id }),
+     }
+ }
+ 
+@@ -7328,6 +7361,9 @@ pub enum ItemContainer {
+     Module(Module),
+     ExternBlock(ExternBlock),
+     Crate(Crate),
++    /// rustcc Phase 2 (B.4c): a `class` body containing inherent
++    /// associated items (methods, consts, type aliases).
++    Class(Class),
+ }
+ 
+ /// Subset of `ide_db::Definition` that doc links can resolve to.
+diff --git a/crates/hir/src/term_search/expr.rs b/crates/hir/src/term_search/expr.rs
+index e3d0121e4..89f3d77d6 100644
+--- a/crates/hir/src/term_search/expr.rs
++++ b/crates/hir/src/term_search/expr.rs
+@@ -396,6 +396,12 @@ fn container_name(
+                 None => self_ty.display(sema_scope.db, display_target).to_string(),
+             }
+         }
++        // rustcc Phase 2 (B.4c): the container of a class assoc item is
++        // the class itself; render its module path like an ADT.
++        crate::AssocItemContainer::Class(klass) => {
++            let adt: crate::Adt = klass.into();
++            mod_item_path_str(sema_scope, &ModuleDef::Adt(adt), cfg, edition)?
++        }
+     };
+     Ok(container_name)
+ }
+diff --git a/crates/ide-assists/src/handlers/generate_function.rs b/crates/ide-assists/src/handlers/generate_function.rs
+index e1e456fd5..311fcaf45 100644
+--- a/crates/ide-assists/src/handlers/generate_function.rs
++++ b/crates/ide-assists/src/handlers/generate_function.rs
+@@ -804,6 +804,12 @@ fn params_and_where_preds_in_scope(
+                 generic_params.extend(params);
+                 where_clauses.extend(clauses);
+             }
++            // rustcc Phase 2 (B.4c): scope-bound collection from a
++            // class container is not yet wired. Treat as no-op here;
++            // generic params on the class are not propagated into the
++            // generated free function (matching the pre-class baseline
++            // for items lexically inside non-impl/trait scopes).
++            hir::AssocItemContainer::Class(_) => {}
+         }
+     }
+ 
+diff --git a/crates/ide-assists/src/handlers/qualify_method_call.rs b/crates/ide-assists/src/handlers/qualify_method_call.rs
+index d7885d506..6362d1a73 100644
+--- a/crates/ide-assists/src/handlers/qualify_method_call.rs
++++ b/crates/ide-assists/src/handlers/qualify_method_call.rs
+@@ -76,6 +76,11 @@ fn item_for_path_search(db: &dyn HirDatabase, item: ItemInNs) -> Option<ItemInNs
+                     None => ItemInNs::from(ModuleDef::from(impl_.self_ty(db).as_adt()?)),
+                     Some(trait_) => ItemInNs::from(ModuleDef::from(trait_)),
+                 },
++                // rustcc Phase 2 (B.4c): qualify a class method as
++                // `Class::method` — point at the class itself.
++                AssocItemContainer::Class(klass) => {
++                    ItemInNs::from(ModuleDef::from(hir::Adt::from(klass)))
++                }
+             },
+             None => item,
+         },
+diff --git a/crates/ide-completion/src/tests/special.rs b/crates/ide-completion/src/tests/special.rs
+index 55059a403..aa9e606b7 100644
+--- a/crates/ide-completion/src/tests/special.rs
++++ b/crates/ide-completion/src/tests/special.rs
+@@ -1767,3 +1767,48 @@ fn foo<const N: $0>() {}
+         "#]],
+     );
+ }
++
++// rustcc Phase 2 (B.4c): methods declared inside `class Foo { ... }`
++// must show up in dot-completion on a value of the class.
++#[test]
++fn completes_class_inherent_methods_via_dot() {
++    check_no_kw(
++        r#"
++class Widget {
++    fn click(&self) -> u32 { 0 }
++    fn label(&self) -> u32 { 1 }
++}
++fn use_widget(w: Widget) {
++    w.$0
++}
++"#,
++        expect![[r#"
++            me click() fn(&self) -> u32
++            me label() fn(&self) -> u32
++        "#]],
++    );
++}
++
++// rustcc Phase 2 (B.4c): inheritance is exposed through the same
++// dot-completion path — `Dog : Animal` shows both Dog's and Animal's
++// methods on a Dog receiver.
++#[test]
++fn completes_inherited_class_methods_via_dot() {
++    check_no_kw(
++        r#"
++class Animal {
++    fn legs(&self) -> u32 { 4 }
++}
++class Dog : Animal {
++    fn speak(&self) -> u32 { 1000 }
++}
++fn use_dog(d: Dog) {
++    d.$0
++}
++"#,
++        expect![[r#"
++            me legs()  fn(&self) -> u32
++            me speak() fn(&self) -> u32
++        "#]],
++    );
++}
+diff --git a/crates/ide-db/src/defs.rs b/crates/ide-db/src/defs.rs
+index 82cff3729..10ec6485a 100644
+--- a/crates/ide-db/src/defs.rs
++++ b/crates/ide-db/src/defs.rs
+@@ -111,6 +111,12 @@ impl Definition {
+                 ItemContainer::Impl(it) => Some(it.into()),
+                 ItemContainer::Module(it) => Some(it.into()),
+                 ItemContainer::ExternBlock(_) | ItemContainer::Crate(_) => None,
++                // rustcc Phase 2 (B.4c): the enclosing definition of an
++                // item declared in a class body is the class itself
++                // (exposed as an Adt for the rest of the IDE layer).
++                ItemContainer::Class(klass) => {
++                    Some(Definition::Adt(hir::Adt::from(klass)))
++                }
+             }
+         }
+         match self {
+diff --git a/crates/ide-db/src/imports/import_assets.rs b/crates/ide-db/src/imports/import_assets.rs
+index 3d0a70fd4..4e2181f67 100644
+--- a/crates/ide-db/src/imports/import_assets.rs
++++ b/crates/ide-db/src/imports/import_assets.rs
+@@ -773,6 +773,11 @@ fn item_for_path_search_assoc(db: &RootDatabase, assoc_item: AssocItem) -> Optio
+         AssocItemContainer::Impl(impl_) => {
+             ItemInNs::from(ModuleDef::from(impl_.self_ty(db).as_adt()?))
+         }
++        // rustcc Phase 2 (B.4c): for path search, a class behaves like
++        // any other ADT — point at the class itself.
++        AssocItemContainer::Class(klass) => {
++            ItemInNs::from(ModuleDef::from(hir::Adt::from(klass)))
++        }
+     })
+ }
+ 
+diff --git a/crates/ide-db/src/traits.rs b/crates/ide-db/src/traits.rs
+index 60bdc2d82..27b98d20d 100644
+--- a/crates/ide-db/src/traits.rs
++++ b/crates/ide-db/src/traits.rs
+@@ -87,6 +87,9 @@ pub(crate) fn as_trait_assoc_def(db: &dyn HirDatabase, def: Definition) -> Optio
+     let trait_ = match assoc.container(db) {
+         hir::AssocItemContainer::Trait(_) => return Some(def),
+         hir::AssocItemContainer::Impl(i) => i.trait_(db),
++        // rustcc Phase 2 (B.4c): class assoc items are inherent — they
++        // never correspond to a trait def.
++        hir::AssocItemContainer::Class(_) => return None,
+     }?;
+     assoc_item_of_trait(db, assoc, trait_)
+ }
+diff --git a/crates/ide/src/doc_links.rs b/crates/ide/src/doc_links.rs
+index 0b6500bc6..974b1652d 100644
+--- a/crates/ide/src/doc_links.rs
++++ b/crates/ide/src/doc_links.rs
+@@ -640,6 +640,9 @@ fn filename_and_frag_for_def(
+         let def = match assoc_item.container(db) {
+             AssocItemContainer::Trait(t) => t.into(),
+             AssocItemContainer::Impl(i) => i.self_ty(db).as_adt()?.into(),
++            // rustcc Phase 2 (B.4c): doc-link to a class assoc item
++            // points at the class.
++            AssocItemContainer::Class(klass) => hir::Adt::from(klass).into(),
+         };
+         let (_, file, _) = filename_and_frag_for_def(db, def)?;
+         let frag = get_assoc_item_fragment(db, assoc_item)?;
+diff --git a/crates/ide/src/goto_definition.rs b/crates/ide/src/goto_definition.rs
+index 4890badcb..bfcd7ddf2 100644
+--- a/crates/ide/src/goto_definition.rs
++++ b/crates/ide/src/goto_definition.rs
+@@ -228,6 +228,9 @@ fn find_definition_for_known_blanket_dual_impls(
+                 .map(|f| def_to_nav(sema, f.into()));
+         }
+         hir::AssocItemContainer::Impl(_) => return None,
++        // rustcc Phase 2 (B.4c): class methods don't participate in
++        // famous-def trait dispatch fallbacks (no `parse`/`into`/etc).
++        hir::AssocItemContainer::Class(_) => return None,
+     };
+ 
+     let fn_name = f.name(sema.db);
+@@ -285,6 +288,9 @@ fn find_definition_for_comparison_operators(
+     let t = match assoc.container(sema.db) {
+         hir::AssocItemContainer::Trait(t) => t,
+         hir::AssocItemContainer::Impl(_) => return None, // Already implemented by the type
++        // rustcc Phase 2 (B.4c): class methods don't have a comparison-
++        // operator trait fallback to navigate to.
++        hir::AssocItemContainer::Class(_) => return None,
+     };
+ 
+     let fn_name = f.name(sema.db);
+diff --git a/crates/ide/src/hover/render.rs b/crates/ide/src/hover/render.rs
+index 4d712bf0f..1ba4cfe47 100644
+--- a/crates/ide/src/hover/render.rs
++++ b/crates/ide/src/hover/render.rs
+@@ -386,6 +386,8 @@ fn definition_owner_name(db: &RootDatabase, def: Definition, edition: Edition) -
+                     hir::AssocItemContainer::Impl(i) => {
+                         i.self_ty(db).as_adt().map(|adt| adt.name(db))
+                     }
++                    // rustcc Phase 2 (B.4c): class is the container.
++                    hir::AssocItemContainer::Class(klass) => Some(klass.name(db)),
+                 });
+                 match container {
+                     Some(name) => {
+@@ -404,6 +406,8 @@ fn definition_owner_name(db: &RootDatabase, def: Definition, edition: Edition) -
+                     hir::AssocItemContainer::Impl(i) => {
+                         i.self_ty(db).as_adt().map(|adt| adt.name(db))
+                     }
++                    // rustcc Phase 2 (B.4c): class is the container.
++                    hir::AssocItemContainer::Class(klass) => Some(klass.name(db)),
+                 });
+                 match container {
+                     Some(name) => {
+@@ -426,6 +430,8 @@ fn definition_owner_name(db: &RootDatabase, def: Definition, edition: Edition) -
+                     hir::AssocItemContainer::Impl(i) => {
+                         i.self_ty(db).as_adt().map(|adt| adt.name(db))
+                     }
++                    // rustcc Phase 2 (B.4c): class is the container.
++                    hir::AssocItemContainer::Class(klass) => Some(klass.name(db)),
+                 }
+             } else {
+                 return d.as_extern_assoc_item(db).map(|_| "<extern>".to_owned());
+diff --git a/crates/ide/src/rename.rs b/crates/ide/src/rename.rs
+index 2c6116f74..848b2554b 100644
+--- a/crates/ide/src/rename.rs
++++ b/crates/ide/src/rename.rs
+@@ -509,6 +509,13 @@ fn rename_to_self(
+             bail!("Cannot rename parameter to self for trait functions");
+         }
+         hir::AssocItemContainer::Impl(impl_) => impl_,
++        // rustcc Phase 2 (B.4c): renaming a class-method parameter to
++        // `self` is not yet supported through this path. The rename
++        // would need to know the class's self-ty without going through
++        // an inherent impl.
++        hir::AssocItemContainer::Class(_) => {
++            bail!("Cannot rename parameter to self for class methods (rustcc Phase 2)");
++        }
+     };
+     let first_param_ty = first_param.ty();
+     let impl_ty = impl_.self_ty(sema.db);
+diff --git a/crates/ide/src/syntax_highlighting/highlight.rs b/crates/ide/src/syntax_highlighting/highlight.rs
+index 835fb8b1a..4a2f8df0e 100644
+--- a/crates/ide/src/syntax_highlighting/highlight.rs
++++ b/crates/ide/src/syntax_highlighting/highlight.rs
+@@ -509,6 +509,9 @@ pub(super) fn highlight_def(
+                     hir::AssocItemContainer::Trait(_t) => {
+                         h |= HlMod::Trait;
+                     }
++                    // rustcc Phase 2 (B.4c): class assoc items are
++                    // inherent — no `Trait` highlight modifier.
++                    hir::AssocItemContainer::Class(_) => {}
+                 }
+             }
+ 
+@@ -556,6 +559,9 @@ pub(super) fn highlight_def(
+                     hir::AssocItemContainer::Trait(_t) => {
+                         h |= HlMod::Trait;
+                     }
++                    // rustcc Phase 2 (B.4c): class assoc items are
++                    // inherent — no `Trait` highlight modifier.
++                    hir::AssocItemContainer::Class(_) => {}
+                 }
+             }
+ 
+@@ -579,6 +585,9 @@ pub(super) fn highlight_def(
+                     hir::AssocItemContainer::Trait(_t) => {
+                         h |= HlMod::Trait;
+                     }
++                    // rustcc Phase 2 (B.4c): class assoc items are
++                    // inherent — no `Trait` highlight modifier.
++                    hir::AssocItemContainer::Class(_) => {}
+                 }
+             }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

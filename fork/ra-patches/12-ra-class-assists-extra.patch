@@ -1,0 +1,1135 @@
+From 380fd06be553273ee3f84286b6821d416b1819a8 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 22:17:40 +0300
+Subject: [PATCH] =?UTF-8?q?P09.46-B5b:=20class-aware=20assists=20=E2=80=94?=
+ =?UTF-8?q?=20find=20overriders=20+=20implement=20override=20+=20base-awar?=
+ =?UTF-8?q?e=20constructor?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three IDE assists building on B.4b (inheritance) and B.4c (methods):
+
+1. Find all overriders (ide): new navigation entry mirroring "Go to
+   implementation" but specialized to the rustcc class chain. Given a
+   method declared inside a `class Foo { ... }` body, walks all classes
+   in the crate and surfaces same-named methods on descendants. Lives
+   in crates/ide/src/find_class_overriders.rs.
+
+2. Implement override (ide-assists): on a cursor inside `class Dog :
+   Animal { ... }`, walks ancestors via `hir::Class::ancestors`, lists
+   methods not yet overridden in `Dog`, and offers one assist per
+   missing method that inserts a stub `fn` with a `todo!()` body.
+   Mirrors `add_missing_impl_members`'s shape.
+
+3. Generate constructor for class — base-aware extension: when the
+   class has a `: Base` clause and Sema resolves it, the existing
+   `generate_class_new` now flattens base fields into the param list,
+   produces a `__base: Base::new(...)` initializer, and only
+   shorthand-initializes this class's own fields.
+
+Wiring this required teaching the Sema source-to-def layer about
+class containers:
+
+  * `ChildContainer::ClassId` arm + `ChildBySource for ClassId`
+    walking `ClassItems::of` so `Sema::to_def(&ast::Fn)` resolves a
+    function declared inside a class body.
+  * `container_to_def` Item::Class arm routing CLASS_MEMBER_LIST
+    children into `ChildContainer::ClassId`.
+  * `analyze_impl` Class arm building a SourceAnalyzer keyed off
+    `GenericDefId::AdtId(AdtId::ClassId(_))`.
+  * `hir::Class::base_class`, `ancestors`, `items`, `all_in_crate`
+    helpers exposed to IDE callers.
+
+Test counts:
+  ide-assists: 2764 (was 2757, +7)
+  ide:         1297 (was 1292, +5)
+  ide-completion: 729 (unchanged)
+  hir-def:     481, hir-ty: 972 (unchanged)
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ crates/hir/src/lib.rs                         |  71 ++++
+ crates/hir/src/semantics.rs                   |  12 +
+ crates/hir/src/semantics/child_by_source.rs   |  26 +-
+ crates/hir/src/semantics/source_to_def.rs     |  28 ++
+ .../src/handlers/generate_class_new.rs        | 166 ++++++++-
+ .../src/handlers/implement_class_override.rs  | 317 ++++++++++++++++++
+ crates/ide-assists/src/lib.rs                 |   5 +
+ crates/ide/src/find_class_overriders.rs       | 248 ++++++++++++++
+ crates/ide/src/lib.rs                         |  11 +
+ 9 files changed, 866 insertions(+), 18 deletions(-)
+ create mode 100644 crates/ide-assists/src/handlers/implement_class_override.rs
+ create mode 100644 crates/ide/src/find_class_overriders.rs
+
+diff --git a/crates/hir/src/lib.rs b/crates/hir/src/lib.rs
+index c55100d3f..f02dab799 100644
+--- a/crates/hir/src/lib.rs
++++ b/crates/hir/src/lib.rs
+@@ -1921,6 +1921,77 @@ impl Class {
+     pub fn is_unstable(self, db: &dyn HirDatabase) -> bool {
+         AttrFlags::query(db, self.id.into()).contains(AttrFlags::IS_UNSTABLE)
+     }
++
++    /// rustcc Phase 2 (B.5b): direct base class of `class Foo : Bar`,
++    /// or `None` if the class has no `:` clause or the base does not
++    /// resolve to another class. Mirrors the resolution logic used by
++    /// hir-ty's `base_class_of` helper but exposed at the `hir` API
++    /// boundary so the IDE layer can walk inheritance chains.
++    pub fn base_class(self, db: &dyn HirDatabase) -> Option<Class> {
++        use hir_def::{
++            resolver::{HasResolver, TypeNs},
++            type_ref::TypeRef,
++        };
++        let sig = ClassSignature::of(db, self.id);
++        let base_ref_id = sig.base?;
++        let type_ref = &sig.store[base_ref_id];
++        let path = match type_ref {
++            TypeRef::Path(path) => path,
++            _ => return None,
++        };
++        let resolver = self.id.resolver(db);
++        let (resolution, _, _) = resolver.resolve_path_in_type_ns(db, path)?;
++        match resolution {
++            TypeNs::AdtId(AdtId::ClassId(it)) => Some(Class { id: it }),
++            _ => None,
++        }
++    }
++
++    /// rustcc Phase 2 (B.5b): walk the full inheritance chain starting
++    /// at `self.base_class()` (i.e. *not* including `self`). Stops at
++    /// the root or the first cycle.
++    pub fn ancestors(self, db: &dyn HirDatabase) -> Vec<Class> {
++        let mut out = Vec::new();
++        let mut seen = FxHashSet::default();
++        seen.insert(self.id);
++        let mut cur = self.base_class(db);
++        while let Some(c) = cur {
++            if !seen.insert(c.id) {
++                break;
++            }
++            out.push(c);
++            cur = c.base_class(db);
++        }
++        out
++    }
++
++    /// rustcc Phase 2 (B.5b): inherent assoc items declared in the
++    /// class body (methods, consts, type aliases). Mirrors
++    /// `Trait::items` / `Impl::items` for IDE callers.
++    pub fn items(self, db: &dyn HirDatabase) -> Vec<AssocItem> {
++        self.id
++            .class_items(db)
++            .items
++            .iter()
++            .map(|(_, id)| AssocItem::from(*id))
++            .collect()
++    }
++
++    /// rustcc Phase 2 (B.5b): walk every class declared in `krate`,
++    /// across all modules. Used by IDE features that need a workspace
++    /// scan (e.g. "find all overriders").
++    pub fn all_in_crate(db: &dyn HirDatabase, krate: Crate) -> Vec<Class> {
++        let mut out = Vec::new();
++        let def_map = crate_def_map(db, krate.id);
++        for (_, module) in def_map.modules() {
++            for decl in module.scope.declarations() {
++                if let ModuleDefId::AdtId(AdtId::ClassId(id)) = decl {
++                    out.push(Class { id });
++                }
++            }
++        }
++        out
++    }
+ }
+ 
+ impl HasVisibility for Class {
+diff --git a/crates/hir/src/semantics.rs b/crates/hir/src/semantics.rs
+index 62e4599fa..4dfaf2ffa 100644
+--- a/crates/hir/src/semantics.rs
++++ b/crates/hir/src/semantics.rs
+@@ -2219,6 +2219,18 @@ impl<'db> SemanticsImpl<'db> {
+                     SourceAnalyzer::new_generic_def_no_infer(self.db, it.into(), node, offset)
+                 });
+             }
++            // rustcc Phase 2 (B.5b): a class body resolves like an
++            // ADT-flavored generic def for path resolution, mirroring
++            // Struct/Enum/Union routing.
++            ChildContainer::ClassId(it) => {
++                let gen_def =
++                    hir_def::GenericDefId::AdtId(hir_def::AdtId::ClassId(it));
++                return Some(if infer {
++                    SourceAnalyzer::new_generic_def(self.db, gen_def, node, offset)
++                } else {
++                    SourceAnalyzer::new_generic_def_no_infer(self.db, gen_def, node, offset)
++                });
++            }
+             ChildContainer::GenericDefId(it) => {
+                 return Some(if infer {
+                     SourceAnalyzer::new_generic_def(self.db, it, node, offset)
+diff --git a/crates/hir/src/semantics/child_by_source.rs b/crates/hir/src/semantics/child_by_source.rs
+index 4809127e6..7d8d409db 100644
+--- a/crates/hir/src/semantics/child_by_source.rs
++++ b/crates/hir/src/semantics/child_by_source.rs
+@@ -10,7 +10,7 @@ use span::AstIdNode;
+ use syntax::{AstPtr, ast};
+ 
+ use hir_def::{
+-    AdtId, AssocItemId, AstIdLoc, DefWithBodyId, EnumId, FieldId, GenericDefId, ImplId,
++    AdtId, AssocItemId, AstIdLoc, ClassId, DefWithBodyId, EnumId, FieldId, GenericDefId, ImplId,
+     LifetimeParamId, Lookup, MacroId, ModuleDefId, ModuleId, TraitId, TypeOrConstParamId,
+     VariantId,
+     db::DefDatabase,
+@@ -85,6 +85,30 @@ impl ChildBySource for ImplId {
+     }
+ }
+ 
++// rustcc Phase 2 (B.5b): the class body is the inherent assoc-item
++// container for class methods/consts/type-aliases, mirroring the
++// `ImplId` walk above. We feed the FunctionId/ConstId/TypeAliasId
++// entries into the dyn-map so `Sema::to_def(&ast::Fn)` resolves a
++// function declared inside `class Foo { ... }`.
++impl ChildBySource for ClassId {
++    fn child_by_source_to(&self, db: &dyn DefDatabase, res: &mut DynMap, file_id: HirFileId) {
++        let items = self.class_items(db);
++        items.macro_calls().filter(|(ast_id, _)| ast_id.file_id == file_id).for_each(
++            |(ast_id, call_id)| {
++                let ptr = ast_id.to_ptr(db);
++                if let Some(ptr) = ptr.cast::<ast::MacroCall>() {
++                    res[keys::MACRO_CALL].insert(ptr, call_id);
++                } else {
++                    res[keys::ATTR_MACRO_CALL].insert(ptr, call_id);
++                }
++            },
++        );
++        items.items.iter().for_each(|&(_, item)| {
++            add_assoc_item(db, res, file_id, item);
++        });
++    }
++}
++
+ impl ChildBySource for ModuleId {
+     fn child_by_source_to(&self, db: &dyn DefDatabase, res: &mut DynMap, file_id: HirFileId) {
+         let def_map = self.def_map(db);
+diff --git a/crates/hir/src/semantics/source_to_def.rs b/crates/hir/src/semantics/source_to_def.rs
+index ae3410af1..0e42de4bc 100644
+--- a/crates/hir/src/semantics/source_to_def.rs
++++ b/crates/hir/src/semantics/source_to_def.rs
+@@ -643,6 +643,23 @@ impl SourceToDefCtx<'_, '_> {
+                         ChildContainer::GenericDefId(def.into())
+                     }
+                 }
++                // rustcc Phase 2 (B.5b): a class body is the container for
++                // its inherent fields (record-shaped, like a struct) and its
++                // inherent assoc items (methods/consts/type-aliases). When
++                // the child sits inside the CLASS_MEMBER_LIST we hand the
++                // class itself back so `child_by_source` walks both the
++                // VariantId field map and the ClassItems assoc-item map.
++                ast::Item::Class(it) => {
++                    let def = self.class_to_def(container.with_value(it))?;
++                    let is_in_body = it.class_member_list().is_some_and(|it| {
++                        it.syntax().text_range().contains(child.text_range().start())
++                    });
++                    if is_in_body {
++                        ChildContainer::ClassId(def)
++                    } else {
++                        ChildContainer::GenericDefId(GenericDefId::AdtId(AdtId::ClassId(def)))
++                    }
++                }
+                 ast::Item::Fn(it) => {
+                     let def = self.fn_to_def(container.with_value(it))?;
+                     let child_offset = child.text_range().start();
+@@ -723,6 +740,12 @@ pub(crate) enum ChildContainer {
+     ImplId(ImplId),
+     EnumId(EnumId),
+     VariantId(VariantId),
++    /// rustcc Phase 2 (B.5b): a class body acts as a container for
++    /// its inherent assoc items (methods, consts, type aliases). The
++    /// `ChildBySource for ClassId` impl walks `ClassItems::of` to
++    /// populate the dyn-map with FunctionId/ConstId/TypeAliasId
++    /// entries, mirroring the ImplId path.
++    ClassId(ClassId),
+     /// XXX: this might be the same def as, for example an `EnumId`. However,
+     /// here the children are generic parameters, and not, eg enum variants.
+     GenericDefId(GenericDefId),
+@@ -734,6 +757,7 @@ impl_from! {
+     ImplId,
+     EnumId,
+     VariantId,
++    ClassId,
+     GenericDefId
+     for ChildContainer
+ }
+@@ -748,6 +772,7 @@ impl ChildContainer {
+             ChildContainer::ImplId(it) => it.child_by_source(db, file_id),
+             ChildContainer::EnumId(it) => it.child_by_source(db, file_id),
+             ChildContainer::VariantId(it) => it.child_by_source(db, file_id),
++            ChildContainer::ClassId(it) => it.child_by_source(db, file_id),
+             ChildContainer::GenericDefId(it) => it.child_by_source(db, file_id),
+         }
+     }
+@@ -766,6 +791,9 @@ impl ChildContainer {
+                 Some(ExpressionStoreOwnerId::Signature(GenericDefId::ImplId(it)))
+             }
+             ChildContainer::VariantId(_) => None,
++            ChildContainer::ClassId(it) => Some(ExpressionStoreOwnerId::Signature(
++                GenericDefId::AdtId(AdtId::ClassId(it)),
++            )),
+             ChildContainer::GenericDefId(it) => Some(it.into()),
+         }
+     }
+diff --git a/crates/ide-assists/src/handlers/generate_class_new.rs b/crates/ide-assists/src/handlers/generate_class_new.rs
+index 56e7fec14..9fc15ad58 100644
+--- a/crates/ide-assists/src/handlers/generate_class_new.rs
++++ b/crates/ide-assists/src/handlers/generate_class_new.rs
+@@ -18,10 +18,14 @@
+ //! - We do NOT detect a pre-existing inherent `impl` for the class to splice
+ //!   into (would need `to_def`, see above).
+ //! - We do NOT detect a pre-existing `new` function (same reason).
+-//! - We do NOT walk inheritance to forward base-class fields (B.4b territory).
+ //!
+-//! When B.4b lands and `to_def(class)` starts returning a real id, this assist
+-//! should be revisited and probably folded back into `generate_new`.
++//! P09.46-B5b extension: when the class has a `: Base` clause and the
++//! base resolves through `Sema::to_def` (now available since B.4b), we
++//! walk the inheritance chain via `hir::Class::ancestors`, gather the
++//! base fields, and emit a body that delegates to `Base::new(...)`
++//! before initializing this class's own fields. The synthesized
++//! `__base` field name matches the lowering convention used by the
++//! rustcc `cxx_importer` pass.
+ 
+ use stdx::format_to;
+ use syntax::{
+@@ -61,16 +65,44 @@ pub(crate) fn generate_class_new(acc: &mut Assists, ctx: &AssistContext<'_>) ->
+ 
+     // Collect named fields. Class members can also be methods, but for the
+     // constructor only the field list matters.
+-    let fields: Vec<(String, String)> = member_list
++    let local_fields: Vec<(String, String)> = member_list
+         .fields()
+         .filter_map(|f| Some((f.name()?.to_string(), f.ty()?.syntax().text().to_string())))
+         .collect();
+ 
+     // Bail if any field has no name or no type — we'd produce broken output.
+-    if fields.is_empty() && member_list.fields().next().is_some() {
++    if local_fields.is_empty() && member_list.fields().next().is_some() {
+         return None;
+     }
+ 
++    // P09.46-B5b: detect a base class via Sema and walk its fields.
++    // `ancestors[0]` is the direct base; deeper ancestors are flattened
++    // into the same `Base::new(...)` call by relying on the base class's
++    // own constructor — we only need *direct* base field names here.
++    //
++    // If resolution fails (e.g. no `: Base` clause, or the base does
++    // not resolve to a class), `base_info` stays None and we emit the
++    // legacy single-class shape.
++    let base_info: Option<BaseInfo> = ctx.sema.to_def(&class).and_then(|c| {
++        use hir::HasSource;
++        let base = c.base_class(ctx.db())?;
++        let base_name = base.name(ctx.db()).symbol().to_string();
++        // Read base fields from the source AST. This avoids the
++        // hir-ty `TypeNs::display` plumbing (which needs a target
++        // crate / display-target) and matches how `local_fields` is
++        // collected above — keeping both branches symmetric.
++        let src = base.source(ctx.db())?;
++        let fields = src
++            .value
++            .class_member_list()?
++            .fields()
++            .filter_map(|f| {
++                Some((f.name()?.to_string(), f.ty()?.syntax().text().to_string()))
++            })
++            .collect::<Vec<_>>();
++        Some(BaseInfo { base_name, fields })
++    });
++
+     let target = class.syntax().text_range();
+ 
+     acc.add(
+@@ -111,16 +143,40 @@ pub(crate) fn generate_class_new(acc: &mut Assists, ctx: &AssistContext<'_>) ->
+                 |v| format!("{} ", v.syntax().text()),
+             );
+ 
+-            let params = fields
+-                .iter()
+-                .map(|(n, t)| format!("{n}: {t}"))
+-                .collect::<Vec<_>>()
+-                .join(", ");
+-            let init_fields = fields
+-                .iter()
+-                .map(|(n, _)| n.clone())
+-                .collect::<Vec<_>>()
+-                .join(", ");
++            // Build params: base fields first (so callers can mentally
++            // group them), then this class's own fields.
++            let mut all_params = Vec::new();
++            if let Some(b) = &base_info {
++                for (n, t) in &b.fields {
++                    all_params.push(format!("{n}: {t}"));
++                }
++            }
++            for (n, t) in &local_fields {
++                all_params.push(format!("{n}: {t}"));
++            }
++            let params = all_params.join(", ");
++
++            // Build the struct-init body. With a base, we initialize a
++            // `__base` field by delegating to `Base::new(...)`; the rest
++            // of the local fields use shorthand syntax.
++            let init_body = match &base_info {
++                Some(b) => {
++                    let base_args = b
++                        .fields
++                        .iter()
++                        .map(|(n, _)| n.clone())
++                        .collect::<Vec<_>>()
++                        .join(", ");
++                    let mut parts = vec![format!("__base: {}::new({})", b.base_name, base_args)];
++                    parts.extend(local_fields.iter().map(|(n, _)| n.clone()));
++                    parts.join(", ")
++                }
++                None => local_fields
++                    .iter()
++                    .map(|(n, _)| n.clone())
++                    .collect::<Vec<_>>()
++                    .join(", "),
++            };
+ 
+             let impl_header = match (&generics, &generic_args) {
+                 (Some(g), Some(ga)) => format!("impl{g} {name}{ga}"),
+@@ -131,10 +187,10 @@ pub(crate) fn generate_class_new(acc: &mut Assists, ctx: &AssistContext<'_>) ->
+             format_to!(out, "\n\n{class_indent}{impl_header} {{\n");
+             format_to!(out, "{body_indent}#[constructor]\n");
+             format_to!(out, "{body_indent}{vis}fn new({params}) -> Self {{\n");
+-            if init_fields.is_empty() {
++            if init_body.is_empty() {
+                 format_to!(out, "{inner_indent}{name} {{}}\n");
+             } else {
+-                format_to!(out, "{inner_indent}{name} {{ {init_fields} }}\n");
++                format_to!(out, "{inner_indent}{name} {{ {init_body} }}\n");
+             }
+             format_to!(out, "{body_indent}}}\n");
+             format_to!(out, "{class_indent}}}");
+@@ -144,6 +200,15 @@ pub(crate) fn generate_class_new(acc: &mut Assists, ctx: &AssistContext<'_>) ->
+     )
+ }
+ 
++struct BaseInfo {
++    /// Name of the direct base class (e.g. `"Animal"`). Used to spell the
++    /// `Base::new(...)` delegating call.
++    base_name: String,
++    /// Direct base fields, in declaration order. Each entry is
++    /// `(field_name, field_type_display)`.
++    fields: Vec<(String, String)>,
++}
++
+ #[cfg(test)]
+ mod tests {
+     use crate::tests::{check_assist, check_assist_not_applicable};
+@@ -264,6 +329,73 @@ mod m {
+         );
+     }
+ 
++    // P09.46-B5b: with a base class, the constructor forwards the base
++    // fields through `Base::new(...)` and stores the result in `__base`
++    // before initializing this class's own fields.
++    #[test]
++    fn generate_class_new_with_base_class() {
++        check_assist(
++            generate_class_new,
++            r#"
++class Animal {
++    tag: u32,
++}
++
++class Dog$0 : Animal {
++    bark: u32,
++}
++"#,
++            r#"
++class Animal {
++    tag: u32,
++}
++
++class Dog : Animal {
++    bark: u32,
++}
++
++impl Dog {
++    #[constructor]
++    pub fn new(tag: u32, bark: u32) -> Self {
++        Dog { __base: Animal::new(tag), bark }
++    }
++}
++"#,
++        );
++    }
++
++    // P09.46-B5b: base with no fields still triggers the delegating
++    // shape — `Base::new()` returns `Self` for the base, no extra
++    // params come from the base, and only this class's own fields
++    // appear.
++    #[test]
++    fn generate_class_new_with_empty_base_class() {
++        check_assist(
++            generate_class_new,
++            r#"
++class Animal {}
++
++class Dog$0 : Animal {
++    bark: u32,
++}
++"#,
++            r#"
++class Animal {}
++
++class Dog : Animal {
++    bark: u32,
++}
++
++impl Dog {
++    #[constructor]
++    pub fn new(bark: u32) -> Self {
++        Dog { __base: Animal::new(), bark }
++    }
++}
++"#,
++        );
++    }
++
+     #[test]
+     fn generate_class_new_not_applicable_on_struct() {
+         // The struct path is owned by upstream `generate_new`; the
+diff --git a/crates/ide-assists/src/handlers/implement_class_override.rs b/crates/ide-assists/src/handlers/implement_class_override.rs
+new file mode 100644
+index 000000000..f8fba4a4d
+--- /dev/null
++++ b/crates/ide-assists/src/handlers/implement_class_override.rs
+@@ -0,0 +1,317 @@
++//! rustcc fork (P09.46-B5b): "Implement override" assist for classes.
++//!
++//! Given a cursor inside a `class Dog : Animal { ... }` body, this assist
++//! walks the inheritance chain (`hir::Class::ancestors`) and offers one
++//! assist per inherited method that isn't yet overridden in the
++//! subclass. Each assist inserts a stub `fn` at the end of the class
++//! member list.
++//!
++//! The generated body is intentionally minimal — `todo!()` — so the user
++//! always has a clean refinement target. Synthesizing the upcast call
++//! (`self.as_animal().legs()`) is left to the user because the cross-base
++//! accessor is fork-specific and `cxx_importer` lowering currently rewrites
++//! the body anyway. A `#[cpp_virtual]` marker is emitted to mirror the
++//! base method when present; otherwise no attribute is emitted.
++//!
++//! The shape is modeled on rust-analyzer's `add_missing_impl_members`
++//! trait-impl assist: it walks the "trait" (here: ancestor chain), filters
++//! by what's already implemented, and emits one assist per missing item.
++
++use hir::{AssocItem, HasSource};
++use stdx::format_to;
++use syntax::{
++    AstNode, NodeOrToken, SyntaxKind, T,
++    ast::{self, edit::IndentLevel},
++};
++
++use crate::{AssistContext, AssistId, Assists};
++
++// Assist: implement_class_override
++//
++// Inserts a stub override for an inherited class method that is not yet
++// overridden in the subclass. One assist offer per inherited method.
++//
++// ```
++// class Animal {
++//     fn legs(&self) -> u32 { 4 }
++// }
++//
++// class Dog : Animal {$0
++// }
++// ```
++// ->
++// ```
++// class Animal {
++//     fn legs(&self) -> u32 { 4 }
++// }
++//
++// class Dog : Animal {
++//     fn legs(&self) -> u32 {
++//         todo!()
++//     }
++// }
++// ```
++pub(crate) fn implement_class_override(
++    acc: &mut Assists,
++    ctx: &AssistContext<'_>,
++) -> Option<()> {
++    let class = ctx.find_node_at_offset::<ast::Class>()?;
++    let member_list = class.class_member_list()?;
++
++    // Cursor must be inside the member list curly braces — otherwise we'd
++    // fire on the class header itself, which shadows `generate_class_new`.
++    let offset = ctx.offset();
++    if !member_list.syntax().text_range().contains_inclusive(offset) {
++        return None;
++    }
++
++    // Need a base class to override anything from.
++    if class.extends_clause().is_none() {
++        return None;
++    }
++
++    // Resolve the class to hir so we can walk inheritance + items.
++    let hir_class = ctx.sema.to_def(&class)?;
++    let ancestors = hir_class.ancestors(ctx.db());
++    if ancestors.is_empty() {
++        return None;
++    }
++
++    // Names already declared directly in this class — these are the
++    // overrides we should skip offering.
++    let already_declared: Vec<hir::Name> = hir_class
++        .items(ctx.db())
++        .into_iter()
++        .filter_map(|it| match it {
++            AssocItem::Function(f) => Some(f.name(ctx.db())),
++            _ => None,
++        })
++        .collect();
++
++    // Collect (function, declaring class) pairs from the chain. Closer
++    // ancestors win — once we've seen a name, deeper ancestors don't
++    // re-offer it (mirrors the shadowing the method-resolution probe
++    // applies in B.4c).
++    let mut seen = already_declared.clone();
++    let mut candidates: Vec<(hir::Function, hir::Class)> = Vec::new();
++    for ancestor in ancestors {
++        for item in ancestor.items(ctx.db()) {
++            if let AssocItem::Function(f) = item {
++                let name = f.name(ctx.db());
++                if seen.iter().any(|s| *s == name) {
++                    continue;
++                }
++                seen.push(name);
++                candidates.push((f, ancestor));
++            }
++        }
++    }
++
++    if candidates.is_empty() {
++        return None;
++    }
++
++    // Find the insertion point — just before the closing `}` of the
++    // member list, with class-level indentation.
++    let r_curly = member_list.r_curly_token()?;
++    let class_indent = IndentLevel::from_node(class.syntax());
++    let body_indent = class_indent + 1;
++
++    for (func, _ancestor) in candidates {
++        let func_name = func.name(ctx.db()).symbol().to_string();
++        // Pull the source AST for the base method to copy its signature
++        // verbatim. If we can't get it, fall back to a minimal stub.
++        let signature = source_signature(ctx, func)
++            .unwrap_or_else(|| format!("fn {func_name}(&self)"));
++
++        let has_cpp_virtual_attr = source_has_cpp_virtual(ctx, func);
++
++        // Compose the inserted text. We position it just before the
++        // closing curly brace; an extra leading newline keeps spacing
++        // consistent if the body already has trailing methods.
++        let assist_label = format!("Implement override for `{func_name}`");
++        let target = class.syntax().text_range();
++
++        // Capture the values we need into the closure.
++        let r_curly_offset = r_curly.text_range().start();
++        let signature_for_closure = signature.clone();
++        acc.add(
++            AssistId::generate("implement_class_override"),
++            assist_label,
++            target,
++            move |builder| {
++                let mut out = String::new();
++                // Leading newline so we don't crowd the previous item.
++                format_to!(out, "{body_indent}");
++                if has_cpp_virtual_attr {
++                    format_to!(out, "#[cpp_virtual]\n{body_indent}");
++                }
++                format_to!(out, "{signature_for_closure} {{\n");
++                format_to!(out, "{}todo!()\n", body_indent + 1);
++                format_to!(out, "{body_indent}}}\n");
++                builder.insert(r_curly_offset, out);
++            },
++        );
++    }
++
++    Some(())
++}
++
++/// Best-effort: pull the function's signature from source (`fn name(...)
++/// -> Ret`). Returns the trimmed text up to the body's `{`.
++fn source_signature(ctx: &AssistContext<'_>, func: hir::Function) -> Option<String> {
++    let source = func.source(ctx.db())?;
++    let fn_node = source.value;
++    // Walk the FN node's children, taking everything before the body.
++    let mut sig = String::new();
++    for child in fn_node.syntax().children_with_tokens() {
++        match child {
++            NodeOrToken::Node(n) if n.kind() == SyntaxKind::BLOCK_EXPR => break,
++            NodeOrToken::Token(t) if t.kind() == T!['{'] => break,
++            // Skip outer attributes — we re-emit the cpp_virtual marker
++            // ourselves and don't want to drag along doc comments.
++            NodeOrToken::Node(n) if n.kind() == SyntaxKind::ATTR => continue,
++            NodeOrToken::Token(t) if t.kind() == SyntaxKind::COMMENT => continue,
++            other => sig.push_str(&other.to_string()),
++        }
++    }
++    let trimmed = sig.trim().to_owned();
++    if trimmed.is_empty() {
++        None
++    } else {
++        Some(trimmed)
++    }
++}
++
++/// Returns true if the function source carries a `#[cpp_virtual]`
++/// attribute. The fork treats the attribute as opaque, so we read it at
++/// the syntax level.
++fn source_has_cpp_virtual(ctx: &AssistContext<'_>, func: hir::Function) -> bool {
++    let Some(source) = func.source(ctx.db()) else {
++        return false;
++    };
++    let fn_node = source.value;
++    let attrs = match fn_node.syntax().children().filter_map(ast::Attr::cast).collect::<Vec<_>>() {
++        v if v.is_empty() => return false,
++        v => v,
++    };
++    attrs.iter().any(|a| {
++        a.path()
++            .map(|p| p.syntax().text().to_string().trim() == "cpp_virtual")
++            .unwrap_or(false)
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use crate::tests::{check_assist, check_assist_not_applicable};
++
++    use super::*;
++
++    #[test]
++    fn implement_override_basic() {
++        check_assist(
++            implement_class_override,
++            r#"
++class Animal {
++    fn legs(&self) -> u32 { 4 }
++}
++
++class Dog : Animal {$0
++}
++"#,
++            r#"
++class Animal {
++    fn legs(&self) -> u32 { 4 }
++}
++
++class Dog : Animal {
++    fn legs(&self) -> u32 {
++        todo!()
++    }
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn implement_override_walks_grandparent_chain() {
++        check_assist(
++            implement_class_override,
++            r#"
++class Animal {
++    fn legs(&self) -> u32 { 4 }
++}
++
++class Mammal : Animal {
++    fn fur(&self) -> bool { true }
++}
++
++class Dog : Mammal {$0
++}
++"#,
++            r#"
++class Animal {
++    fn legs(&self) -> u32 { 4 }
++}
++
++class Mammal : Animal {
++    fn fur(&self) -> bool { true }
++}
++
++class Dog : Mammal {
++    fn fur(&self) -> bool {
++        todo!()
++    }
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn implement_override_skips_already_overridden() {
++        // `legs` is already defined in `Dog`, so the assist should
++        // not offer it. The chain has only `legs`, so nothing is
++        // applicable.
++        check_assist_not_applicable(
++            implement_class_override,
++            r#"
++class Animal {
++    fn legs(&self) -> u32 { 4 }
++}
++
++class Dog : Animal {
++    fn legs(&self) -> u32 { 4 }$0
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn implement_override_not_applicable_without_base() {
++        // No `: Base` clause — nothing to override.
++        check_assist_not_applicable(
++            implement_class_override,
++            r#"
++class Standalone {$0
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn implement_override_not_applicable_outside_body() {
++        // Cursor on the header — `generate_class_new` owns this spot.
++        check_assist_not_applicable(
++            implement_class_override,
++            r#"
++class Animal {
++    fn legs(&self) -> u32 { 4 }
++}
++
++class Dog$0 : Animal {
++}
++"#,
++        );
++    }
++}
+diff --git a/crates/ide-assists/src/lib.rs b/crates/ide-assists/src/lib.rs
+index 285967635..521cc61d2 100644
+--- a/crates/ide-assists/src/lib.rs
++++ b/crates/ide-assists/src/lib.rs
+@@ -178,6 +178,9 @@ mod handlers {
+     mod generate_new;
+     // rustcc fork (P09.46-B5): class-flavored constructor assist.
+     mod generate_class_new;
++    // rustcc fork (P09.46-B5b): scaffold an override for an inherited
++    // class method.
++    mod implement_class_override;
+     mod generate_single_field_struct_from;
+     mod generate_trait_from_impl;
+     mod inline_call;
+@@ -318,6 +321,8 @@ mod handlers {
+             generate_new::generate_new,
+             // rustcc fork (P09.46-B5).
+             generate_class_new::generate_class_new,
++            // rustcc fork (P09.46-B5b).
++            implement_class_override::implement_class_override,
+             generate_trait_from_impl::generate_trait_from_impl,
+             generate_single_field_struct_from::generate_single_field_struct_from,
+             generate_blanket_trait_impl::generate_blanket_trait_impl,
+diff --git a/crates/ide/src/find_class_overriders.rs b/crates/ide/src/find_class_overriders.rs
+new file mode 100644
+index 000000000..949cab72d
+--- /dev/null
++++ b/crates/ide/src/find_class_overriders.rs
+@@ -0,0 +1,248 @@
++//! rustcc fork (P09.46-B5b): "Find all overriders" navigation.
++//!
++//! Given a method declared inside a `class Foo { ... }` body, walk every
++//! class in the workspace and return descendants that declare a method of
++//! the same name. The result is a list of `NavigationTarget`s pointing at
++//! the overriding methods, suitable for the IDE's "Find all overriders"
++//! entry point (modeled on "Go to implementation" for traits but
++//! specialized to the class inheritance chain).
++//!
++//! Inheritance is walked through `hir::Class::ancestors()`, which uses
++//! the same `ClassSignature::base` resolution as hir-ty's method probe
++//! (B.4b/c). A class `D` "overrides" `Base::m` iff:
++//!   - `D` declares a method named `m` directly in its body, *and*
++//!   - the target's class appears somewhere in `D`'s ancestor chain.
++//!
++//! We intentionally don't filter by `#[cpp_virtual]` here — the fork
++//! treats that attribute as opaque, and any same-named method in a
++//! subclass is a legitimate override candidate from the IDE's
++//! navigation perspective. Callers that want a virtual-only filter can
++//! post-process the results.
++
++use hir::{AsAssocItem, AssocItemContainer, Semantics};
++use ide_db::{
++    RootDatabase,
++    defs::{Definition, NameClass, NameRefClass},
++    helpers::pick_best_token,
++};
++use syntax::{AstNode, SyntaxKind::*, T, ast};
++
++use crate::{FilePosition, NavigationTarget, RangeInfo, TryToNav};
++
++// Feature: Find Class Overriders
++//
++// Navigates to subclass methods that override a method declared in a
++// `class Foo { ... }` body. Mirrors "Go to implementation" but walks the
++// rustcc class inheritance chain instead of trait impls.
++pub(crate) fn find_class_overriders(
++    db: &RootDatabase,
++    FilePosition { file_id, offset }: FilePosition,
++) -> Option<RangeInfo<Vec<NavigationTarget>>> {
++    let sema = Semantics::new(db);
++    let source_file = sema.parse_guess_edition(file_id);
++    let syntax = source_file.syntax().clone();
++
++    let original_token = pick_best_token(syntax.token_at_offset(offset), |kind| match kind {
++        IDENT | T![self] => 1,
++        _ => 0,
++    })?;
++    let range = original_token.text_range();
++
++    let navs: Vec<NavigationTarget> = sema
++        .descend_into_macros_exact(original_token)
++        .iter()
++        .filter_map(|token| {
++            let def = token
++                .parent()
++                .and_then(ast::NameLike::cast)
++                .and_then(|node| match &node {
++                    ast::NameLike::Name(name) => {
++                        NameClass::classify(&sema, name).and_then(|class| match class {
++                            NameClass::Definition(it) | NameClass::ConstReference(it) => Some(it),
++                            NameClass::PatFieldShorthand { .. } => None,
++                        })
++                    }
++                    ast::NameLike::NameRef(name_ref) => NameRefClass::classify(&sema, name_ref)
++                        .and_then(|class| match class {
++                            NameRefClass::Definition(def, _) => Some(def),
++                            NameRefClass::FieldShorthand { .. }
++                            | NameRefClass::ExternCrateShorthand { .. } => None,
++                        }),
++                    ast::NameLike::Lifetime(_) => None,
++                })?;
++            let func = match def {
++                Definition::Function(f) => f,
++                _ => return None,
++            };
++            let assoc = func.as_assoc_item(sema.db)?;
++            let target_class = match assoc.container(sema.db) {
++                AssocItemContainer::Class(c) => c,
++                _ => return None,
++            };
++            let name = func.name(sema.db);
++            Some(collect_overriders(&sema, target_class, name))
++        })
++        .flatten()
++        .collect();
++
++    Some(RangeInfo { range, info: navs })
++}
++
++fn collect_overriders(
++    sema: &Semantics<'_, RootDatabase>,
++    target_class: hir::Class,
++    method_name: hir::Name,
++) -> Vec<NavigationTarget> {
++    let db = sema.db;
++    let krate = target_class.module(db).krate(db);
++    let mut out = Vec::new();
++    for class in hir::Class::all_in_crate(db, krate) {
++        if class == target_class {
++            continue;
++        }
++        // Class is a descendant iff target_class is in its ancestor chain.
++        if !class.ancestors(db).iter().any(|a| *a == target_class) {
++            continue;
++        }
++        // And it must declare a method of the same name in its own body.
++        for item in class.items(db) {
++            if let hir::AssocItem::Function(f) = item
++                && f.name(db) == method_name
++                && let Some(navs) = f.try_to_nav(sema)
++            {
++                out.extend(navs);
++            }
++        }
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use ide_db::FileRange;
++    use itertools::Itertools;
++
++    use crate::fixture;
++
++    #[track_caller]
++    fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
++        let (analysis, position, expected) = fixture::annotations(ra_fixture);
++
++        let navs = analysis
++            .find_class_overriders(position)
++            .unwrap()
++            .expect("find_class_overriders returned None")
++            .info;
++
++        let cmp = |frange: &FileRange| (frange.file_id, frange.range.start());
++
++        let actual = navs
++            .into_iter()
++            .map(|nav| FileRange { file_id: nav.file_id, range: nav.focus_or_full_range() })
++            .sorted_by_key(cmp)
++            .collect::<Vec<_>>();
++        let expected =
++            expected.into_iter().map(|(range, _)| range).sorted_by_key(cmp).collect::<Vec<_>>();
++        assert_eq!(expected, actual);
++    }
++
++    #[track_caller]
++    fn check_empty(#[rust_analyzer::rust_fixture] ra_fixture: &str) {
++        let (analysis, position, _) = fixture::annotations(ra_fixture);
++        let navs = analysis.find_class_overriders(position).unwrap();
++        let info = navs.map(|r| r.info).unwrap_or_default();
++        assert!(info.is_empty(), "expected no overriders, got {info:?}");
++    }
++
++    #[test]
++    fn finds_direct_subclass_override() {
++        check(
++            r#"
++class Animal {
++    fn legs$0(&self) -> u32 { 4 }
++}
++
++class Dog : Animal {
++    fn legs(&self) -> u32 { 4 }
++     //^^^^
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn finds_grandchild_overrider() {
++        check(
++            r#"
++class Animal {
++    fn legs$0(&self) -> u32 { 4 }
++}
++
++class Dog : Animal {
++}
++
++class Puppy : Dog {
++    fn legs(&self) -> u32 { 4 }
++     //^^^^
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn finds_multiple_overriders() {
++        check(
++            r#"
++class Animal {
++    fn legs$0(&self) -> u32 { 4 }
++}
++
++class Dog : Animal {
++    fn legs(&self) -> u32 { 4 }
++     //^^^^
++}
++
++class Cat : Animal {
++    fn legs(&self) -> u32 { 4 }
++     //^^^^
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn skips_unrelated_class_with_same_method_name() {
++        // `Robot` is not a subclass of `Animal`, so its `legs` is not
++        // an override.
++        check(
++            r#"
++class Animal {
++    fn legs$0(&self) -> u32 { 4 }
++}
++
++class Robot {
++    fn legs(&self) -> u32 { 2 }
++}
++
++class Dog : Animal {
++    fn legs(&self) -> u32 { 4 }
++     //^^^^
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn not_applicable_on_struct_method() {
++        // The cursor is on a method declared in an `impl Foo {}` block,
++        // not inside a class body.
++        check_empty(
++            r#"
++struct Foo;
++impl Foo {
++    fn bar$0(&self) {}
++}
++"#,
++        );
++    }
++}
+diff --git a/crates/ide/src/lib.rs b/crates/ide/src/lib.rs
+index e131e7bdd..1a0bf5869 100644
+--- a/crates/ide/src/lib.rs
++++ b/crates/ide/src/lib.rs
+@@ -27,6 +27,7 @@ mod extend_selection;
+ mod fetch_crates;
+ mod file_structure;
+ mod folding_ranges;
++mod find_class_overriders;
+ mod goto_declaration;
+ mod goto_definition;
+ mod goto_implementation;
+@@ -562,6 +563,16 @@ impl Analysis {
+         self.with_db(|db| goto_implementation::goto_implementation(db, config, position))
+     }
+ 
++    /// rustcc fork (P09.46-B5b): returns the subclass methods that
++    /// override the class method at `position`. Mirrors
++    /// `goto_implementation` but walks the class inheritance chain.
++    pub fn find_class_overriders(
++        &self,
++        position: FilePosition,
++    ) -> Cancellable<Option<RangeInfo<Vec<NavigationTarget>>>> {
++        self.with_db(|db| find_class_overriders::find_class_overriders(db, position))
++    }
++
+     /// Returns the type definitions for the symbol at `position`.
+     pub fn goto_type_definition(
+         &self,
+-- 
+2.50.1 (Apple Git-155)
+

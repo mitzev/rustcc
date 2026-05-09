@@ -54,6 +54,11 @@
         "command": "rustcc.showSkips",
         "title": "rustcc: Show Bindings Skips",
         "category": "rustcc"
+      },
+      {
+        "command": "rustcc.installRaFork",
+        "title": "rustcc: Install RA Fork (latest)",
+        "category": "rustcc"
       }
     ],
     "configuration": {

@@ -36,6 +36,7 @@ Type any of these prefixes for autocomplete:
 | `rustcc: Run Doctor` | Shells to `rustcc doctor` in a terminal |
 | `rustcc: Generate Bindings for Header` | If the project has a `gen_bindings` binary, runs it; otherwise prompts |
 | `rustcc: Show Bindings Skips` | Reads any `bindings.skips.json` in the workspace, summarizes by class in an output channel |
+| `rustcc: Install RA Fork (latest)` | Downloads `rust-analyzer-rustcc-<triple>.tar.xz` from the GitHub release, extracts to the extension's storage dir, sets `rust-analyzer.server.path` (workspace-scoped). One-click bootstrap of the patched RA binary that understands the `class` keyword. |
 
 ### Status bar
 

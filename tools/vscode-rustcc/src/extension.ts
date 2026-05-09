@@ -40,6 +40,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("rustcc.generateBindings", generateBindings),
     vscode.commands.registerCommand("rustcc.showSkips", showSkips),
     vscode.commands.registerCommand("rustcc.showStatus", showStatus),
+    vscode.commands.registerCommand("rustcc.installRaFork", () =>
+      installRaFork(context),
+    ),
   );
 
   // ---- Diagnostics from bindings.skips.json --------------------
@@ -200,6 +203,164 @@ async function showSkips(): Promise<void> {
 
 async function showStatus(): Promise<void> {
   runInTerminal("rustcc doctor", `${rustccCli()} doctor`);
+}
+
+// --------- RA fork installer ----------------------------------
+
+/**
+ * Download the prebuilt rust-analyzer-rustcc binary for the user's
+ * host triple and set `rust-analyzer.server.path` automatically.
+ *
+ * Mirrors the shape of `rustcc install`: shells to curl + tar +
+ * shasum (or sha256sum on Linux), drops the binary at
+ * `<extensionStorage>/ra/rust-analyzer-<version>`, then writes a
+ * workspace-scoped settings update.
+ *
+ * Asks the user for the version (latest or a pinned tag).
+ */
+async function installRaFork(
+  context: vscode.ExtensionContext,
+): Promise<void> {
+  const pick = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Latest",
+        description: "Resolve `latest` against the GitHub releases redirect",
+      },
+      {
+        label: "Pinned tag",
+        description: "Specify a release tag (e.g. v1.07.0)",
+      },
+    ],
+    {
+      placeHolder: "Which version of rust-analyzer-rustcc to install?",
+    },
+  );
+  if (!pick) return;
+  let version = "latest";
+  if (pick.label === "Pinned tag") {
+    const input = await vscode.window.showInputBox({
+      prompt: "Release tag",
+      placeHolder: "v1.07.0",
+      validateInput: (v) =>
+        /^v\d+\.\d+\.\d+/.test(v) ? null : "Expected a tag like v1.07.0",
+    });
+    if (!input) return;
+    version = input;
+  }
+
+  // Use the workspace-scoped storage for the binary cache so a
+  // multi-workspace user can override per-project. Fallbacks:
+  // globalStorageUri → ~/.vscode/extensions/rustcc.rustcc-tools-*.
+  const targetDir = vscode.Uri.joinPath(context.globalStorageUri, "ra");
+  await vscode.workspace.fs.createDirectory(targetDir);
+
+  // The terminal-based path mirrors what `rustcc install` does for
+  // the toolchain. Each command runs synchronously in the user's
+  // shell — no Node-side HTTP / archive deps means the extension
+  // bundle stays tiny.
+  const triple = await detectHostTriple();
+  if (!triple) {
+    vscode.window.showErrorMessage(
+      "rustcc: could not detect host triple via `rustc -vV`. " +
+        "Install rustc + rustup first.",
+    );
+    return;
+  }
+
+  let resolvedTag = version;
+  if (version === "latest") {
+    // GitHub redirects releases/latest to the actual tag URL.
+    // Use a small Node-side fetch to resolve.
+    try {
+      resolvedTag = await resolveLatestTag();
+    } catch (e) {
+      vscode.window.showErrorMessage(
+        `rustcc: could not resolve latest release tag: ${e}`,
+      );
+      return;
+    }
+  }
+
+  const tarball = `rust-analyzer-rustcc-${triple}.tar.xz`;
+  const sha = `${tarball}.sha256`;
+  const baseUrl = `https://github.com/rustcc/rustcc/releases/download/${resolvedTag}`;
+  const targetFs = targetDir.fsPath;
+
+  const cmd = [
+    `cd "${targetFs}"`,
+    `curl -fsSL -o ${tarball} ${baseUrl}/${tarball}`,
+    `curl -fsSL -o ${sha} ${baseUrl}/${sha}`,
+    `(shasum -a 256 --check ${sha} || sha256sum --check ${sha})`,
+    `tar -xJf ${tarball}`,
+    `rm -f ${tarball} ${sha}`,
+    `echo`,
+    `echo "rust-analyzer-rustcc ${resolvedTag} installed at ${targetFs}/rust-analyzer-rustcc/rust-analyzer"`,
+    `echo "VS Code setting rust-analyzer.server.path will be updated automatically."`,
+  ].join(" && ");
+  runInTerminal("rustcc: install RA fork", cmd);
+
+  // Wait briefly for the user's shell to finish, then point RA at
+  // the binary. The binary path is deterministic; if the curl
+  // failed, server.path will point at a non-existent file but the
+  // user gets a clear error from rust-analyzer.
+  const binaryPath = path.join(
+    targetFs,
+    "rust-analyzer-rustcc",
+    "rust-analyzer",
+  );
+  const cfg = vscode.workspace.getConfiguration("rust-analyzer");
+  await cfg.update(
+    "server.path",
+    binaryPath,
+    vscode.ConfigurationTarget.Workspace,
+  );
+
+  vscode.window.showInformationMessage(
+    `rust-analyzer.server.path set to ${binaryPath}. ` +
+      "Reload the window after the download completes.",
+  );
+}
+
+async function detectHostTriple(): Promise<string | undefined> {
+  const { exec } = await import("child_process");
+  return new Promise((resolve) => {
+    exec("rustc -vV", (err, stdout) => {
+      if (err) {
+        resolve(undefined);
+        return;
+      }
+      for (const line of stdout.split("\n")) {
+        if (line.startsWith("host: ")) {
+          resolve(line.slice(6).trim());
+          return;
+        }
+      }
+      resolve(undefined);
+    });
+  });
+}
+
+async function resolveLatestTag(): Promise<string> {
+  const { exec } = await import("child_process");
+  return new Promise((resolve, reject) => {
+    exec(
+      'curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/rustcc/rustcc/releases/latest',
+      (err, stdout) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        const trimmed = stdout.trim();
+        const tag = trimmed.split("/").pop();
+        if (!tag || !tag.startsWith("v")) {
+          reject(new Error(`unexpected redirect target: ${trimmed}`));
+          return;
+        }
+        resolve(tag);
+      },
+    );
+  });
 }
 
 // --------- Diagnostics from bindings.skips.json ---------------
