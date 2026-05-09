@@ -1,0 +1,102 @@
+From ca244d250c87f4f1f66c2207f50a5f2276cc986b Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 18:02:59 +0300
+Subject: [PATCH] P09.46-B4a: wire CLASS_MEMBER_LIST field walker for
+ VariantFields
+
+---
+ crates/hir-def/src/signatures.rs | 31 +++++++++++++++++++++++-----
+ crates/hir-def/src/src.rs        | 35 ++++++++++++++++++++++++++------
+ 2 files changed, 55 insertions(+), 11 deletions(-)
+
+diff --git a/crates/hir-def/src/signatures.rs b/crates/hir-def/src/signatures.rs
+index b10b5adc3..2d4096716 100644
+--- a/crates/hir-def/src/signatures.rs
++++ b/crates/hir-def/src/signatures.rs
+@@ -965,11 +965,32 @@ impl VariantFields {
+                 );
+                 (FieldsShape::Record, fields)
+             }
+-            // rustcc Phase 2 (B.1 stub): no Class lowering yet — B.2
+-            // wires `class { x: T, ... }` through here using the
+-            // `member_list()` getter on ast::Class.
+-            VariantId::ClassId(_) => {
+-                unimplemented!("rustcc B.2: ClassId field lowering not yet wired")
++            // rustcc Phase 2 (B.4a): walk the CLASS_MEMBER_LIST AST node
++            // and lower its record-style fields. Option A: instead of
++            // refactoring `lower_field_list` to accept the
++            // ClassMemberList shape (which would require teaching the
++            // ast::FieldList sum about it), we call the existing
++            // generic `lower_fields` helper directly with the iterator
++            // produced by `ClassMemberList::fields()`. This keeps the
++            // blast radius minimal — no changes to `lower_field_list`
++            // or any of its other callers.
++            VariantId::ClassId(id) => {
++                let loc = id.lookup(db);
++                let source = loc.source(db);
++                let file_id = source.file_id;
++                let fields = source.value.class_member_list().map(|cml| {
++                    lower_fields(
++                        db,
++                        loc.container,
++                        InFile::new(
++                            file_id,
++                            cml.fields().map(|field| (field.ty(), field)),
++                        ),
++                        |_, field| as_name_opt(field.name()),
++                        None,
++                    )
++                });
++                (FieldsShape::Record, fields.flatten())
+             }
+         };
+         match result {
+diff --git a/crates/hir-def/src/src.rs b/crates/hir-def/src/src.rs
+index dff3285e8..e0e7db793 100644
+--- a/crates/hir-def/src/src.rs
++++ b/crates/hir-def/src/src.rs
+@@ -144,12 +144,35 @@ impl HasChildSource<LocalFieldId> for VariantId {
+                 let lookup = it.lookup(db);
+                 (lookup.source(db).map(|it| it.kind()), lookup.container)
+             }
+-            // rustcc Phase 2 (B.1 stub): class child-source mapping
+-            // walks CLASS_MEMBER_LIST instead of StructKind. B.2 wires
+-            // the real walker; here unreachable since lowering doesn't
+-            // produce ClassIds yet.
+-            VariantId::ClassId(_) => {
+-                unimplemented!("rustcc B.2: ClassId child-source walker not yet wired")
++            // rustcc Phase 2 (B.4a): class child-source mapping always
++            // produces record-style field mappings. Rather than
++            // synthesizing an `ast::StructKind::Record` (which we can't
++            // — `RecordFieldList` is tied to a real syntax node), we
++            // walk `ClassMemberList::fields()` directly here and return
++            // early. The shared StructKind match below is for the
++            // struct/enum/union path only.
++            VariantId::ClassId(it) => {
++                let lookup = it.lookup(db);
++                let source = lookup.source(db);
++                let file_id = source.file_id;
++                let container = lookup.container;
++                let mut map = ArenaMap::new();
++                if let Some(cml) = source.value.class_member_list() {
++                    let cfg_options = container.krate(db).cfg_options(db);
++                    let mut idx = 0;
++                    for fd in cml.fields() {
++                        let enabled = AttrFlags::is_cfg_enabled_for(&fd, cfg_options).is_ok();
++                        if !enabled {
++                            continue;
++                        }
++                        map.insert(
++                            LocalFieldId::from_raw(la_arena::RawIdx::from(idx)),
++                            Either::Right(fd.clone()),
++                        );
++                        idx += 1;
++                    }
++                }
++                return InFile::new(file_id, map);
+             }
+         };
+         let mut map = ArenaMap::new();
+-- 
+2.50.1 (Apple Git-155)
+

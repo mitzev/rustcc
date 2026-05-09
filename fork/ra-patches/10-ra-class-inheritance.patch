@@ -1,0 +1,431 @@
+From 910b745f2637ab76c1a73fc21bc8499d5c30f3ce Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 21:27:12 +0300
+Subject: [PATCH] P09.46-B4b: class inheritance + Sema::to_def(class) -> Some
+
+---
+ crates/hir-def/src/expr_store/lower.rs        | 28 +++++++++
+ .../src/expr_store/tests/signatures.rs        | 50 ++++++++++++++++
+ crates/hir-def/src/signatures.rs              | 17 ++++--
+ crates/hir/src/semantics.rs                   |  4 ++
+ crates/hir/src/semantics/source_to_def.rs     | 19 ++++--
+ .../ide-assists/src/handlers/auto_import.rs   | 21 +++++++
+ .../src/handlers/extract_module.rs            |  9 ++-
+ crates/parser/src/grammar/items/adt.rs        | 59 ++++++++++++-------
+ crates/parser/test_data/generated/runner.rs   |  4 ++
+ .../parser/inline/ok/class_item_extends.rast  | 19 ++++++
+ .../parser/inline/ok/class_item_extends.rs    |  1 +
+ crates/syntax/src/ast/generated/nodes.rs      |  8 +++
+ 12 files changed, 203 insertions(+), 36 deletions(-)
+ create mode 100644 crates/parser/test_data/parser/inline/ok/class_item_extends.rast
+ create mode 100644 crates/parser/test_data/parser/inline/ok/class_item_extends.rs
+
+diff --git a/crates/hir-def/src/expr_store/lower.rs b/crates/hir-def/src/expr_store/lower.rs
+index fd8b50d71..0eeda57b5 100644
+--- a/crates/hir-def/src/expr_store/lower.rs
++++ b/crates/hir-def/src/expr_store/lower.rs
+@@ -264,6 +264,34 @@ pub(crate) fn lower_trait(
+     (store, source_map, params)
+ }
+ 
++// rustcc Phase 2 (B.4b): lower a `class Foo : Bar { ... }` signature.
++// Mirrors `lower_trait`/`lower_type_alias`: shares one `ExprCollector`
++// so the generic-params store and the base-type `TypeRefId` live in
++// the same `ExpressionStore`. The base is `None` for a class without
++// `: Parent`. Lowering uses `lower_type_ref_opt_disallow_impl_trait`
++// because `class Foo : impl Trait {}` is not meaningful here.
++pub(crate) fn lower_class(
++    db: &dyn DefDatabase,
++    module: ModuleId,
++    class_syntax: InFile<ast::Class>,
++    class_id: crate::ClassId,
++) -> (ExpressionStore, ExpressionStoreSourceMap, GenericParams, Option<TypeRefId>) {
++    let mut expr_collector = ExprCollector::signature(db, module, class_syntax.file_id);
++    let base = class_syntax
++        .value
++        .extends_clause()
++        .map(|ty| expr_collector.lower_type_ref_disallow_impl_trait(ty));
++    let mut collector = generics::GenericParamsCollector::new(class_id.into());
++    collector.lower(
++        &mut expr_collector,
++        class_syntax.value.generic_param_list(),
++        class_syntax.value.where_clause(),
++    );
++    let params = collector.finish();
++    let (store, source_map) = expr_collector.store.finish();
++    (store, source_map, params, base)
++}
++
+ pub(crate) fn lower_type_alias(
+     db: &dyn DefDatabase,
+     module: ModuleId,
+diff --git a/crates/hir-def/src/expr_store/tests/signatures.rs b/crates/hir-def/src/expr_store/tests/signatures.rs
+index c809412cd..d26c94fdc 100644
+--- a/crates/hir-def/src/expr_store/tests/signatures.rs
++++ b/crates/hir-def/src/expr_store/tests/signatures.rs
+@@ -212,3 +212,53 @@ fn foo(v: for<'a> Trait1 + Trait2) {}
+         "#]],
+     );
+ }
++
++// rustcc Phase 2 (B.4b): direct test that `ClassSignature::base` is
++// populated when a class has `: Parent`, and stays None otherwise.
++// This bypasses the pretty-printer (no class printer wired yet) and
++// pokes the signature directly via the same lowering path the rest
++// of hir-def uses, so it exercises the exact codepath assists/IDE
++// queries hit.
++#[test]
++fn class_signature_base() {
++    use crate::{
++        AdtId, ModuleDefId,
++        nameres::crate_def_map,
++        signatures::ClassSignature,
++        test_db::TestDB,
++    };
++    use test_fixture::WithFixture;
++
++    let db = TestDB::with_files(
++        r#"
++class Animal {}
++class Dog : Animal {}
++class Cat {}
++"#,
++    );
++
++    let krate = db.fetch_test_crate();
++    let def_map = crate_def_map(&db, krate);
++    let mut by_name: std::collections::HashMap<String, crate::ClassId> =
++        std::collections::HashMap::new();
++    for (_, module) in def_map.modules() {
++        for decl in module.scope.declarations() {
++            if let ModuleDefId::AdtId(AdtId::ClassId(id)) = decl {
++                let sig = ClassSignature::of(&db, id);
++                by_name.insert(sig.name.as_str().to_owned(), id);
++            }
++        }
++    }
++
++    let dog = by_name.get("Dog").copied().expect("class Dog declared");
++    let dog_sig = ClassSignature::of(&db, dog);
++    assert!(dog_sig.base.is_some(), "class Dog : Animal should have base populated");
++
++    let animal = by_name.get("Animal").copied().expect("class Animal declared");
++    let animal_sig = ClassSignature::of(&db, animal);
++    assert!(animal_sig.base.is_none(), "class Animal has no parent");
++
++    let cat = by_name.get("Cat").copied().expect("class Cat declared");
++    let cat_sig = ClassSignature::of(&db, cat);
++    assert!(cat_sig.base.is_none(), "class Cat has no parent");
++}
+diff --git a/crates/hir-def/src/signatures.rs b/crates/hir-def/src/signatures.rs
+index 2d4096716..4ad5b4d4f 100644
+--- a/crates/hir-def/src/signatures.rs
++++ b/crates/hir-def/src/signatures.rs
+@@ -168,6 +168,11 @@ pub struct ClassSignature {
+     pub store: ExpressionStore,
+     pub flags: StructFlags,
+     pub shape: FieldsShape,
++    /// rustcc Phase 2 (B.4b): optional base type for `class Foo : Bar`.
++    /// `None` for classes without a parent. The `TypeRefId` resolves
++    /// against the same `store` as the generic params, so anything
++    /// that walks `store` keeps working uniformly.
++    pub base: Option<TypeRefId>,
+ }
+ 
+ #[salsa::tracked]
+@@ -197,13 +202,12 @@ impl ClassSignature {
+             flags |= StructFlags::HAS_REPR;
+         }
+ 
+-        let (store, generic_params, source_map) = lower_generic_params(
++        let name = as_name_opt(source.name());
++        let (store, source_map, generic_params, base) = crate::expr_store::lower::lower_class(
+             db,
+             loc.container,
+-            id.into(),
+-            file_id,
+-            source.generic_param_list(),
+-            source.where_clause(),
++            InFile { file_id, value: source },
++            id,
+         );
+         (
+             Arc::new(ClassSignature {
+@@ -211,7 +215,8 @@ impl ClassSignature {
+                 store,
+                 flags,
+                 shape: FieldsShape::Record,
+-                name: as_name_opt(source.name()),
++                name,
++                base,
+             }),
+             source_map,
+         )
+diff --git a/crates/hir/src/semantics.rs b/crates/hir/src/semantics.rs
+index 252f4ac7f..62e4599fa 100644
+--- a/crates/hir/src/semantics.rs
++++ b/crates/hir/src/semantics.rs
+@@ -2536,6 +2536,10 @@ to_def_impls![
+     (crate::Struct, ast::Struct, struct_to_def),
+     (crate::Enum, ast::Enum, enum_to_def),
+     (crate::Union, ast::Union, union_to_def),
++    // rustcc Phase 2 (B.4b): Sema::to_def(&class) now returns Some,
++    // unlocking resolution-heavy assists/diagnostics on classes
++    // without their having to special-case the AST kind.
++    (crate::Class, ast::Class, class_to_def),
+     (crate::Trait, ast::Trait, trait_to_def),
+     (crate::Impl, ast::Impl, impl_to_def),
+     (crate::TypeAlias, ast::TypeAlias, type_alias_to_def),
+diff --git a/crates/hir/src/semantics/source_to_def.rs b/crates/hir/src/semantics/source_to_def.rs
+index 0f57cddc9..ae3410af1 100644
+--- a/crates/hir/src/semantics/source_to_def.rs
++++ b/crates/hir/src/semantics/source_to_def.rs
+@@ -88,7 +88,7 @@
+ use base_db::relevant_crates;
+ use either::Either;
+ use hir_def::{
+-    AdtId, BlockId, BuiltinDeriveImplId, ConstId, ConstParamId, DefWithBodyId, EnumId,
++    AdtId, BlockId, BuiltinDeriveImplId, ClassId, ConstId, ConstParamId, DefWithBodyId, EnumId,
+     EnumVariantId, ExpressionStoreOwnerId, ExternBlockId, ExternCrateId, FieldId, FunctionId,
+     GenericDefId, GenericParamId, ImplId, LifetimeParamId, Lookup, MacroId, ModuleId, StaticId,
+     StructId, TraitId, TypeAliasId, TypeParamId, UnionId, UseId, VariantId,
+@@ -259,6 +259,12 @@ impl SourceToDefCtx<'_, '_> {
+     pub(super) fn struct_to_def(&mut self, src: InFile<&ast::Struct>) -> Option<StructId> {
+         self.to_def(src, keys::STRUCT)
+     }
++    // rustcc Phase 2 (B.4b): mirror struct_to_def for class. The
++    // child_by_source walker already inserts CLASS entries, so the
++    // dyn_map lookup just works once we route through it.
++    pub(super) fn class_to_def(&mut self, src: InFile<&ast::Class>) -> Option<ClassId> {
++        self.to_def(src, keys::CLASS)
++    }
+     pub(super) fn enum_to_def(&mut self, src: InFile<&ast::Enum>) -> Option<EnumId> {
+         self.to_def(src, keys::ENUM)
+     }
+@@ -321,11 +327,12 @@ impl SourceToDefCtx<'_, '_> {
+                 self.struct_to_def(InFile::new(file_id, it)).map(AdtId::StructId)
+             }
+             ast::Adt::Union(it) => self.union_to_def(InFile::new(file_id, it)).map(AdtId::UnionId),
+-            // rustcc fork: Phase 1 — class items have no item-tree
+-            // entry (see `item_tree/lower.rs`), so source-to-def
+-            // returns None. Phase 2 will map `class` to a
+-            // synthesized `StructId` here.
+-            ast::Adt::Class(_) => None,
++            // rustcc Phase 2 (B.4b): class items now have a real
++            // ClassId via the item-tree slot; route through the
++            // dyn_map like other ADTs.
++            ast::Adt::Class(it) => {
++                self.class_to_def(InFile::new(file_id, it)).map(AdtId::ClassId)
++            }
+         }
+     }
+ 
+diff --git a/crates/ide-assists/src/handlers/auto_import.rs b/crates/ide-assists/src/handlers/auto_import.rs
+index b2cba0742..c48c86dad 100644
+--- a/crates/ide-assists/src/handlers/auto_import.rs
++++ b/crates/ide-assists/src/handlers/auto_import.rs
+@@ -735,6 +735,27 @@ fn main() {
+         )
+     }
+ 
++    // rustcc Phase 2 (B.4b): with `Sema::to_def(class)` returning Some,
++    // resolution-heavy assists like auto_import "just work" on classes
++    // — the assist asks for the path resolution at cursor and the
++    // semantics layer follows the same code path it does for structs.
++    // Before B.4b, `to_def(class)` returned None and the type's
++    // identity was opaque to assist machinery.
++    #[test]
++    fn auto_import_target_inside_class() {
++        check_assist_target(
++            auto_import,
++            r"
++            class AssistInfo {
++                group_label: Option<$0GroupLabel>,
++            }
++
++            mod m { pub struct GroupLabel; }
++            ",
++            "GroupLabel",
++        )
++    }
++
+     #[test]
+     fn not_applicable_when_path_start_is_imported() {
+         check_assist_not_applicable(
+diff --git a/crates/ide-assists/src/handlers/extract_module.rs b/crates/ide-assists/src/handlers/extract_module.rs
+index 5075c073c..8120e2047 100644
+--- a/crates/ide-assists/src/handlers/extract_module.rs
++++ b/crates/ide-assists/src/handlers/extract_module.rs
+@@ -1841,6 +1841,11 @@ mod foo {
+     // B.4b lands a synthesized `StructId` mapping. Once that lands the inner
+     // fields will pick up `pub(crate)` automatically; for now we pin the
+     // structural extraction down with a class-level visibility check.
++    //
++    // B.4b update: `Sema::to_def(class)` now returns Some, so `adt_fields`
++    // collection from `ast::Adt::Class` actually flows into the
++    // `change_visibility` walk and field visibility gets promoted alongside
++    // the class itself, matching the struct/union behaviour.
+     #[test]
+     fn test_extract_module_with_class() {
+         check_assist(
+@@ -1857,8 +1862,8 @@ mod foo {
+             mod bar {
+                 mod modname {
+                     pub(crate) class Widget {
+-                        x: i32,
+-                        y: i32,
++                        pub(crate) x: i32,
++                        pub(crate) y: i32,
+                     }
+                 }
+             }
+diff --git a/crates/parser/src/grammar/items/adt.rs b/crates/parser/src/grammar/items/adt.rs
+index d8e8e1e8a..4f46cf8fe 100644
+--- a/crates/parser/src/grammar/items/adt.rs
++++ b/crates/parser/src/grammar/items/adt.rs
+@@ -67,6 +67,8 @@ pub(super) fn klass(p: &mut Parser<'_>, m: Marker) {
+     p.bump_remap(T![class]);
+     name_r(p, ITEM_RECOVERY_SET);
+     generic_params::opt_generic_param_list(p);
++    // test class_item_extends
++    // class Dog : Animal {}
+     if p.at(T![:]) {
+         p.bump(T![:]);
+         types::type_(p);
+@@ -163,32 +165,45 @@ fn looks_like_field_at(p: &Parser<'_>) -> bool {
+     }
+     if tok == T![pub] {
+         // `pub fn` / `pub const` → method; `pub(crate) ...` → also
+-        // could be either. Look past the visibility.
+-        let mut j = i + 1;
+-        if p.nth(j) == T!['('] {
+-            // pub(crate), pub(super), etc. — scan to matching `)`.
+-            let mut depth = 1usize;
+-            j += 1;
+-            while depth > 0 {
+-                match p.nth(j) {
+-                    T!['('] => depth += 1,
+-                    T![')'] => depth -= 1,
+-                    EOF => return false,
+-                    _ => {}
+-                }
+-                j += 1;
+-                if j > 256 {
+-                    return false;
+-                }
++        // could be either. Look past the visibility — but the
++        // parser only allows `nth(0..=3)`, so once we'd need to
++        // peek past position 3 we have to default. Past `pub(...)`
++        // we default to "field": false-positives on methods like
++        // `pub(crate) fn foo` would just fall through to
++        // `class_record_field` and surface as a normal parse
++        // error at the missing `:`, which is recoverable. The
++        // happy path here is the assist-generated
++        // `pub(crate) ident: type` where defaulting to field is
++        // exactly right.
++        let next = p.nth(i + 1);
++        if next != T!['('] {
++            // `pub <something>`: visible at nth(i+1).
++            if starts_method(next) {
++                return false;
+             }
++            // `pub ident :` → field.
++            return next == IDENT && p.nth(i + 2) == T![:];
+         }
+-        if starts_method(p.nth(j)) {
+-            return false;
+-        }
+-        if p.nth(j) == IDENT && p.nth(j + 1) == T![:] {
++        // `pub(<...>)`: we can probe nth(i+2) and nth(i+3) only.
++        // Recognise the common shapes `pub(crate)`, `pub(super)`,
++        // `pub(self)`. Anything more elaborate (e.g. `pub(in
++        // path::to)`) blows past our lookahead window — default
++        // to "field" in that case so methods are at most a
++        // recoverable parse error, not a hard panic.
++        let inside = p.nth(i + 2);
++        let close = p.nth(i + 3);
++        if close == T![')']
++            && matches!(inside, T![crate] | T![super] | T![self])
++        {
++            // We've consumed all 4 lookahead slots; we cannot
++            // see what comes after the closing `)`. Default to
++            // field — assist output is the dominant generator
++            // of `pub(crate)` here.
+             return true;
+         }
+-        return false;
++        // Anything else inside `pub(...)`: out of lookahead.
++        // Default to field for the same reason.
++        return true;
+     }
+     // `ident :` without visibility — a record field.
+     tok == IDENT && p.nth(i + 1) == T![:]
+diff --git a/crates/parser/test_data/generated/runner.rs b/crates/parser/test_data/generated/runner.rs
+index f363a2be1..e439a943b 100644
+--- a/crates/parser/test_data/generated/runner.rs
++++ b/crates/parser/test_data/generated/runner.rs
+@@ -105,6 +105,10 @@ mod ok {
+     #[test]
+     fn class_item() { run_and_expect_no_errors("test_data/parser/inline/ok/class_item.rs"); }
+     #[test]
++    fn class_item_extends() {
++        run_and_expect_no_errors("test_data/parser/inline/ok/class_item_extends.rs");
++    }
++    #[test]
+     fn closure_binder() {
+         run_and_expect_no_errors("test_data/parser/inline/ok/closure_binder.rs");
+     }
+diff --git a/crates/parser/test_data/parser/inline/ok/class_item_extends.rast b/crates/parser/test_data/parser/inline/ok/class_item_extends.rast
+new file mode 100644
+index 000000000..04a59483b
+--- /dev/null
++++ b/crates/parser/test_data/parser/inline/ok/class_item_extends.rast
+@@ -0,0 +1,19 @@
++SOURCE_FILE
++  CLASS
++    CLASS_KW "class"
++    WHITESPACE " "
++    NAME
++      IDENT "Dog"
++    WHITESPACE " "
++    COLON ":"
++    WHITESPACE " "
++    PATH_TYPE
++      PATH
++        PATH_SEGMENT
++          NAME_REF
++            IDENT "Animal"
++    WHITESPACE " "
++    CLASS_MEMBER_LIST
++      L_CURLY "{"
++      R_CURLY "}"
++  WHITESPACE "\n"
+diff --git a/crates/parser/test_data/parser/inline/ok/class_item_extends.rs b/crates/parser/test_data/parser/inline/ok/class_item_extends.rs
+new file mode 100644
+index 000000000..5d51ad3db
+--- /dev/null
++++ b/crates/parser/test_data/parser/inline/ok/class_item_extends.rs
+@@ -0,0 +1 @@
++class Dog : Animal {}
+diff --git a/crates/syntax/src/ast/generated/nodes.rs b/crates/syntax/src/ast/generated/nodes.rs
+index 03c2f2c0b..30cc9c6cf 100644
+--- a/crates/syntax/src/ast/generated/nodes.rs
++++ b/crates/syntax/src/ast/generated/nodes.rs
+@@ -453,6 +453,14 @@ impl Class {
+     pub fn colon_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![:]) }
+     #[inline]
+     pub fn class_token(&self) -> Option<SyntaxToken> { support::token(&self.syntax, T![class]) }
++    // rustcc Phase 2 (B.4b): the `Bar` in `class Foo : Bar { ... }`.
++    // The path-after-`:` is parsed as a PATH_TYPE child of CLASS,
++    // sibling of CLASS_MEMBER_LIST. `support::child::<Type>` finds it
++    // because Type is the only Type-shaped child of CLASS — generic
++    // params live under GENERIC_PARAM_LIST and where-clause types
++    // live under WHERE_CLAUSE, so neither is a direct Type child.
++    #[inline]
++    pub fn extends_clause(&self) -> Option<Type> { support::child(&self.syntax) }
+ }
+ pub struct ClassMemberList {
+     pub(crate) syntax: SyntaxNode,
+-- 
+2.50.1 (Apple Git-155)
+

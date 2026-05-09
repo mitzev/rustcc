@@ -1,0 +1,403 @@
+From 174fba686493d2c6e926ed000c94536bb30b8e0a Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 17:45:10 +0300
+Subject: [PATCH] P09.46-B2: wire ClassSignature lowering + item-tree Class
+ slot
+
+---
+ crates/hir-def/src/expr_store.rs        | 27 ++++----
+ crates/hir-def/src/hir/generics.rs      | 21 ++++---
+ crates/hir-def/src/item_tree.rs         | 18 ++++++
+ crates/hir-def/src/item_tree/lower.rs   | 30 ++++++---
+ crates/hir-def/src/item_tree/pretty.rs  | 17 ++++-
+ crates/hir-def/src/nameres/collector.rs | 29 +++++++--
+ crates/hir-def/src/signatures.rs        | 83 ++++++++++++++++++++++++-
+ 7 files changed, 183 insertions(+), 42 deletions(-)
+
+diff --git a/crates/hir-def/src/expr_store.rs b/crates/hir-def/src/expr_store.rs
+index 72b643f63..a8d3e5b4c 100644
+--- a/crates/hir-def/src/expr_store.rs
++++ b/crates/hir-def/src/expr_store.rs
+@@ -431,18 +431,18 @@ impl ExpressionStore {
+         match def {
+             ExpressionStoreOwnerId::Signature(def) => {
+                 use crate::signatures::{
+-                    ConstSignature, EnumSignature, FunctionSignature, ImplSignature,
+-                    StaticSignature, StructSignature, TraitSignature, TypeAliasSignature,
+-                    UnionSignature,
++                    ClassSignature, ConstSignature, EnumSignature, FunctionSignature,
++                    ImplSignature, StaticSignature, StructSignature, TraitSignature,
++                    TypeAliasSignature, UnionSignature,
+                 };
+                 match def {
+                     GenericDefId::AdtId(AdtId::EnumId(id)) => &EnumSignature::of(db, id).store,
+                     GenericDefId::AdtId(AdtId::StructId(id)) => &StructSignature::of(db, id).store,
+                     GenericDefId::AdtId(AdtId::UnionId(id)) => &UnionSignature::of(db, id).store,
+-                    // rustcc Phase 2 (B.1 stub) — see generics.rs for the matching arm.
+-                    GenericDefId::AdtId(AdtId::ClassId(_)) => {
+-                        unimplemented!("rustcc B.2: ClassSignature lowering not yet wired")
+-                    }
++                    // rustcc Phase 2 (B.2): ClassSignature is now real,
++                    // so an AdtId::ClassId can hand back its store the
++                    // same way a StructId does.
++                    GenericDefId::AdtId(AdtId::ClassId(id)) => &ClassSignature::of(db, id).store,
+                     GenericDefId::ConstId(id) => &ConstSignature::of(db, id).store,
+                     GenericDefId::FunctionId(id) => &FunctionSignature::of(db, id).store,
+                     GenericDefId::ImplId(id) => &ImplSignature::of(db, id).store,
+@@ -465,9 +465,9 @@ impl ExpressionStore {
+         match def {
+             ExpressionStoreOwnerId::Signature(def) => {
+                 use crate::signatures::{
+-                    ConstSignature, EnumSignature, FunctionSignature, ImplSignature,
+-                    StaticSignature, StructSignature, TraitSignature, TypeAliasSignature,
+-                    UnionSignature,
++                    ClassSignature, ConstSignature, EnumSignature, FunctionSignature,
++                    ImplSignature, StaticSignature, StructSignature, TraitSignature,
++                    TypeAliasSignature, UnionSignature,
+                 };
+                 match def {
+                     GenericDefId::AdtId(AdtId::EnumId(id)) => {
+@@ -482,9 +482,10 @@ impl ExpressionStore {
+                         let sig = UnionSignature::with_source_map(db, id);
+                         (&sig.0.store, &sig.1)
+                     }
+-                    // rustcc Phase 2 (B.1 stub).
+-                    GenericDefId::AdtId(AdtId::ClassId(_)) => {
+-                        unimplemented!("rustcc B.2: ClassSignature lowering not yet wired")
++                    // rustcc Phase 2 (B.2).
++                    GenericDefId::AdtId(AdtId::ClassId(id)) => {
++                        let sig = ClassSignature::with_source_map(db, id);
++                        (&sig.0.store, &sig.1)
+                     }
+                     GenericDefId::ConstId(id) => {
+                         let sig = ConstSignature::with_source_map(db, id);
+diff --git a/crates/hir-def/src/hir/generics.rs b/crates/hir-def/src/hir/generics.rs
+index 691215c8a..16667a3b5 100644
+--- a/crates/hir-def/src/hir/generics.rs
++++ b/crates/hir-def/src/hir/generics.rs
+@@ -11,8 +11,8 @@ use crate::{
+     db::DefDatabase,
+     expr_store::{ExpressionStore, ExpressionStoreSourceMap},
+     signatures::{
+-        ConstSignature, EnumSignature, FunctionSignature, ImplSignature, StaticSignature,
+-        StructSignature, TraitSignature, TypeAliasSignature, UnionSignature,
++        ClassSignature, ConstSignature, EnumSignature, FunctionSignature, ImplSignature,
++        StaticSignature, StructSignature, TraitSignature, TypeAliasSignature, UnionSignature,
+     },
+     type_ref::{ConstRef, LifetimeRefId, TypeBound, TypeRefId},
+ };
+@@ -209,11 +209,11 @@ impl GenericParams {
+                 let sig = UnionSignature::of(db, id);
+                 (&sig.generic_params, &sig.store)
+             }
+-            // rustcc Phase 2 (B.1 stub): no ClassSignature::of yet —
+-            // lowering doesn't produce ClassIds, so this arm is
+-            // unreachable at runtime. B.2 wires real ClassSignature.
+-            GenericDefId::AdtId(AdtId::ClassId(_)) => {
+-                unimplemented!("rustcc B.2: ClassSignature lowering not yet wired")
++            // rustcc Phase 2 (B.2): a class has the same generic-param
++            // / where-clause shape as a struct.
++            GenericDefId::AdtId(AdtId::ClassId(id)) => {
++                let sig = ClassSignature::of(db, id);
++                (&sig.generic_params, &sig.store)
+             }
+             GenericDefId::ConstId(id) => {
+                 let sig = ConstSignature::of(db, id);
+@@ -259,9 +259,10 @@ impl GenericParams {
+                 let (sig, sm) = UnionSignature::with_source_map(db, id);
+                 (&sig.generic_params, &sig.store, sm)
+             }
+-            // rustcc Phase 2 (B.1 stub) — see with_store above.
+-            GenericDefId::AdtId(AdtId::ClassId(_)) => {
+-                unimplemented!("rustcc B.2: ClassSignature lowering not yet wired")
++            // rustcc Phase 2 (B.2) — see with_store above.
++            GenericDefId::AdtId(AdtId::ClassId(id)) => {
++                let (sig, sm) = ClassSignature::with_source_map(db, id);
++                (&sig.generic_params, &sig.store, sm)
+             }
+             GenericDefId::ConstId(id) => {
+                 let (sig, sm) = ConstSignature::with_source_map(db, id);
+diff --git a/crates/hir-def/src/item_tree.rs b/crates/hir-def/src/item_tree.rs
+index e7ab2b390..365218f09 100644
+--- a/crates/hir-def/src/item_tree.rs
++++ b/crates/hir-def/src/item_tree.rs
+@@ -294,6 +294,11 @@ enum SmallModItem {
+     Trait(Trait),
+     TypeAlias(TypeAlias),
+     Union(Union),
++    // rustcc Phase 2 (B.2): item-tree slot for `class Foo { ... }`.
++    // Stored alongside the other small mod items because a Class
++    // entry is the same shape as a Trait/Function entry — name +
++    // visibility — and fits in 3 usize on 64-bit.
++    Class(Class),
+ }
+ 
+ #[derive(Debug, Clone, Eq, PartialEq)]
+@@ -422,6 +427,9 @@ ModItemId ->
+     TypeAlias in small_data -> ast::TypeAlias,
+     Union in small_data -> ast::Union,
+     Use in big_data -> ast::Use,
++    // rustcc Phase 2 (B.2): hook the `class` AST into the item tree
++    // dispatch.  Sits in `small_data` like Struct/Trait/Function.
++    Class in small_data -> ast::Class,
+ }
+ 
+ impl Index<RawVisibilityId> for ItemTree {
+@@ -531,6 +539,16 @@ pub struct Struct {
+     pub shape: FieldsShape,
+ }
+ 
++// rustcc Phase 2 (B.2): item-tree representation for a `class`.
++// Field shape is implicitly Record (curly-brace member list) so we
++// don't store it. v0 has no inheritance/virtuality state here —
++// those land via B.4's class-specific signature/flag work.
++#[derive(Debug, Clone, Eq, PartialEq)]
++pub struct Class {
++    pub name: Name,
++    pub(crate) visibility: RawVisibilityId,
++}
++
+ #[derive(Debug, Clone, Eq, PartialEq)]
+ pub struct Union {
+     pub name: Name,
+diff --git a/crates/hir-def/src/item_tree/lower.rs b/crates/hir-def/src/item_tree/lower.rs
+index 74319d62e..c46f81c9d 100644
+--- a/crates/hir-def/src/item_tree/lower.rs
++++ b/crates/hir-def/src/item_tree/lower.rs
+@@ -20,7 +20,7 @@ use syntax::{
+ use crate::{
+     db::DefDatabase,
+     item_tree::{
+-        BigModItem, Const, Enum, ExternBlock, ExternCrate, FieldsShape, Function, Impl,
++        BigModItem, Class, Const, Enum, ExternBlock, ExternCrate, FieldsShape, Function, Impl,
+         ImportAlias, Interned, ItemTree, ItemTreeAstId, Macro2, MacroCall, MacroRules, Mod,
+         ModItemId, ModKind, ModPath, RawVisibility, RawVisibilityId, SmallModItem, Static, Struct,
+         StructKind, Trait, TypeAlias, Union, Use, UseTree, UseTreeKind, VisibilityExplicitness,
+@@ -152,15 +152,11 @@ impl<'db> Ctx<'db> {
+             ast::Item::ExternBlock(ast) => self.lower_extern_block(ast).into(),
+             // FIXME: Handle `global_asm!()`.
+             ast::Item::AsmExpr(_) => return None,
+-            // rustcc fork: Phase 1 deliberately does not wire
+-            // `class` items into the item tree. The syntax tree
+-            // contains the CLASS node (parser accepts it), and
+-            // surrounding items parse cleanly — but HIR-level
+-            // features (hover on class name, go-to-def targeting
+-            // the class, completion of class members) are
+-            // deferred to Phase 2, which will synthesize a
+-            // `Struct` + inherent `Impl` pair at this point.
+-            ast::Item::Class(_) => return None,
++            // rustcc Phase 2 (B.2): wire `class Foo { ... }` through
++            // item-tree lowering. The class becomes a real ModItemId
++            // entry with name + visibility; field/method lowering on
++            // the CLASS_MEMBER_LIST is deferred to B.4.
++            ast::Item::Class(ast) => self.lower_class(ast)?.into(),
+         };
+         let attrs = self.lower_attrs(item);
+         self.add_attrs(mod_item.ast_id(), attrs);
+@@ -185,6 +181,20 @@ impl<'db> Ctx<'db> {
+         Some(ast_id)
+     }
+ 
++    // rustcc Phase 2 (B.2): mirror of `lower_struct`. A `class` has
++    // record-style fields (curly-brace member list) so we don't carry
++    // a FieldsShape on the item-tree entry — downstream consumers
++    // (ClassSignature, VariantFields) hard-code Record for ClassId.
++    fn lower_class(&mut self, klass: &ast::Class) -> Option<ItemTreeAstId<Class>> {
++        let visibility = self.lower_visibility(klass);
++        let name = klass.name()?.as_name();
++        let ast_id = self.source_ast_id_map.ast_id(klass);
++        let res = Class { name, visibility };
++        self.tree.small_data.insert(ast_id.upcast(), SmallModItem::Class(res));
++
++        Some(ast_id)
++    }
++
+     fn lower_union(&mut self, union: &ast::Union) -> Option<ItemTreeAstId<Union>> {
+         let visibility = self.lower_visibility(union);
+         let name = union.name()?.as_name();
+diff --git a/crates/hir-def/src/item_tree/pretty.rs b/crates/hir-def/src/item_tree/pretty.rs
+index 4113a778e..4b525fc3c 100644
+--- a/crates/hir-def/src/item_tree/pretty.rs
++++ b/crates/hir-def/src/item_tree/pretty.rs
+@@ -6,9 +6,9 @@ use span::{Edition, ErasedFileAstId};
+ 
+ use crate::{
+     item_tree::{
+-        Const, DefDatabase, Enum, ExternBlock, ExternCrate, FieldsShape, Function, Impl, ItemTree,
+-        Macro2, MacroCall, MacroRules, Mod, ModItemId, ModKind, RawVisibilityId, Static, Struct,
+-        Trait, TypeAlias, Union, Use, UseTree, UseTreeKind, attrs::AttrsOrCfg,
++        Class, Const, DefDatabase, Enum, ExternBlock, ExternCrate, FieldsShape, Function, Impl,
++        ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId, ModKind, RawVisibilityId, Static,
++        Struct, Trait, TypeAlias, Union, Use, UseTree, UseTreeKind, attrs::AttrsOrCfg,
+     },
+     visibility::RawVisibility,
+ };
+@@ -217,6 +217,17 @@ impl Printer<'_> {
+                     wln!(self, ";");
+                 }
+             }
++            // rustcc Phase 2 (B.2).  A class always uses record-style
++            // fields, so we can short-circuit straight to the Record
++            // shape printer.
++            ModItemId::Class(ast_id) => {
++                let Class { visibility, name } = &self.tree[ast_id];
++                self.print_ast_id(ast_id.erase());
++                self.print_visibility(*visibility);
++                w!(self, "class {}", name.display(self.db, self.edition));
++                self.print_fields(FieldsShape::Record);
++                wln!(self);
++            }
+             ModItemId::Union(ast_id) => {
+                 let Union { name, visibility } = &self.tree[ast_id];
+                 self.print_ast_id(ast_id.erase());
+diff --git a/crates/hir-def/src/nameres/collector.rs b/crates/hir-def/src/nameres/collector.rs
+index 5ef51dbb2..109be269a 100644
+--- a/crates/hir-def/src/nameres/collector.rs
++++ b/crates/hir-def/src/nameres/collector.rs
+@@ -28,10 +28,10 @@ use syntax::ast;
+ use triomphe::Arc;
+ 
+ use crate::{
+-    AdtId, AssocItemId, AstId, AstIdWithPath, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc,
+-    EnumLoc, ExternBlockLoc, ExternCrateId, ExternCrateLoc, FunctionId, FunctionLoc, FxIndexMap,
+-    ImplLoc, Intern, ItemContainerId, Lookup, Macro2Id, Macro2Loc, MacroExpander, MacroId,
+-    MacroRulesId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId, ProcMacroId,
++    AdtId, AssocItemId, AstId, AstIdWithPath, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ClassLoc,
++    ConstLoc, EnumLoc, ExternBlockLoc, ExternCrateId, ExternCrateLoc, FunctionId, FunctionLoc,
++    FxIndexMap, ImplLoc, Intern, ItemContainerId, Lookup, Macro2Id, Macro2Loc, MacroExpander,
++    MacroId, MacroRulesId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId, ProcMacroId,
+     ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UnresolvedMacro, UseId,
+     UseLoc,
+     db::DefDatabase,
+@@ -2148,6 +2148,27 @@ impl ModCollector<'_, '_> {
+                         !matches!(it.shape, FieldsShape::Record),
+                     );
+                 }
++                // rustcc Phase 2 (B.2): introduce `class Foo { ... }`
++                // into the module scope. Treated like a record-style
++                // struct for v0 — values namespace stays empty (no
++                // tuple/unit ctor) just like a record struct.
++                ModItemId::Class(id) => {
++                    let it = &self.item_tree[id];
++
++                    let vis = resolve_vis(def_map, local_def_map, &self.item_tree[it.visibility]);
++                    let interned = ClassLoc {
++                        container: module_id,
++                        id: InFile::new(self.tree_id.file_id(), id),
++                    }
++                    .intern(db);
++                    update_def(
++                        self.def_collector,
++                        interned.into(),
++                        &it.name,
++                        vis,
++                        false,
++                    );
++                }
+                 ModItemId::Union(id) => {
+                     let it = &self.item_tree[id];
+ 
+diff --git a/crates/hir-def/src/signatures.rs b/crates/hir-def/src/signatures.rs
+index 74dc4432f..b10b5adc3 100644
+--- a/crates/hir-def/src/signatures.rs
++++ b/crates/hir-def/src/signatures.rs
+@@ -19,8 +19,9 @@ use thin_vec::ThinVec;
+ use triomphe::Arc;
+ 
+ use crate::{
+-    ConstId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId, FunctionId, HasModule, ImplId,
+-    ItemContainerId, ModuleId, StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId,
++    ClassId, ConstId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId, FunctionId, HasModule,
++    ImplId, ItemContainerId, ModuleId, StaticId, StructId, TraitId, TypeAliasId, UnionId,
++    VariantId,
+     attrs::AttrFlags,
+     db::DefDatabase,
+     expr_store::{
+@@ -150,6 +151,84 @@ fn adt_shape(adt_kind: ast::StructKind) -> FieldsShape {
+     }
+ }
+ 
++// rustcc Phase 2 (B.2): signature for `class Foo { ... }`. Mirrors
++// StructSignature but specializes a few details for v0:
++//   - `shape` is always FieldsShape::Record (a class member-list is
++//     curly-brace, never tuple/unit).
++//   - lang-item-driven StructFlags (PhantomData, Box, ManuallyDrop,
++//     UnsafeCell, UnsafePinned) are not detected — those are
++//     standard-library-internal markers that classes shouldn't
++//     impersonate. We still pick up RUSTC_HAS_INCOHERENT_INHERENT_IMPLS,
++//     FUNDAMENTAL, and HAS_REPR so the rest of the trait-solver
++//     plumbing keeps working uniformly across AdtId variants.
++#[derive(Debug, PartialEq, Eq)]
++pub struct ClassSignature {
++    pub name: Name,
++    pub generic_params: GenericParams,
++    pub store: ExpressionStore,
++    pub flags: StructFlags,
++    pub shape: FieldsShape,
++}
++
++#[salsa::tracked]
++impl ClassSignature {
++    #[salsa::tracked(returns(deref))]
++    pub fn of(db: &dyn DefDatabase, id: ClassId) -> Arc<Self> {
++        Self::with_source_map(db, id).0.clone()
++    }
++
++    #[salsa::tracked(returns(ref))]
++    pub fn with_source_map(
++        db: &dyn DefDatabase,
++        id: ClassId,
++    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
++        let loc = id.lookup(db);
++        let InFile { file_id, value: source } = loc.source(db);
++        let attrs = AttrFlags::query(db, id.into());
++
++        let mut flags = StructFlags::empty();
++        if attrs.contains(AttrFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS) {
++            flags |= StructFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS;
++        }
++        if attrs.contains(AttrFlags::FUNDAMENTAL) {
++            flags |= StructFlags::FUNDAMENTAL;
++        }
++        if attrs.contains(AttrFlags::HAS_REPR) {
++            flags |= StructFlags::HAS_REPR;
++        }
++
++        let (store, generic_params, source_map) = lower_generic_params(
++            db,
++            loc.container,
++            id.into(),
++            file_id,
++            source.generic_param_list(),
++            source.where_clause(),
++        );
++        (
++            Arc::new(ClassSignature {
++                generic_params,
++                store,
++                flags,
++                shape: FieldsShape::Record,
++                name: as_name_opt(source.name()),
++            }),
++            source_map,
++        )
++    }
++}
++
++impl ClassSignature {
++    #[inline]
++    pub fn repr(&self, db: &dyn DefDatabase, id: ClassId) -> Option<ReprOptions> {
++        if self.flags.contains(StructFlags::HAS_REPR) {
++            AttrFlags::repr(db, id.into())
++        } else {
++            None
++        }
++    }
++}
++
+ #[derive(Debug, PartialEq, Eq)]
+ pub struct UnionSignature {
+     pub name: Name,
+-- 
+2.50.1 (Apple Git-155)
+

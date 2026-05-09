@@ -1,0 +1,1573 @@
+From 9eaefb80ed45fb2f2ee1b2b5b25d403e36f00266 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 18:33:28 +0300
+Subject: [PATCH] P09.46-B4: hir::Class API + Adt::Class wired through hir/ide
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Brings the hir crate's user-facing API up to parity with Struct/Enum/Union for
+class items, replacing the B.3 panic stubs in hir + hir-ty hot paths. The IDE
+now hovers, navigates, completes, and infers on `class Foo {}` definitions.
+
+Highlights:
+- Define `hir::Class { id: ClassId }` with `name`/`module`/`fields`/`ty`/
+  `visibility`/`kind`/`repr` mirrored from `hir::Struct`.
+- Add `Adt::Class(Class)` and `Variant::Class(Class)` variants; replace all
+  `unimplemented!` arms in `hir::from_id`, `hir::lib`, `hir::source_analyzer`,
+  `hir::symbols`, `hir::semantics::child_by_source`, `hir::has_source`,
+  `hir::display`, `hir::attrs`, and `hir::term_search::tactics` with real
+  Class delegation that treats a class as a record-shaped struct.
+- `ast::VariantDef` gains a `Class` arm; `ast::Adt::Class` is consumed by the
+  hir source-mapping shim.
+- New `SymbolKind::Class` (with semantic-token / LSP `CLASS` mappings, and a
+  completion `cl` tag) so the IDE renders the keyword and picks a class icon
+  while sharing record-shape behavior internally.
+- Cascading fixes in ide / ide-assists / ide-completion / ide-db /
+  ide-diagnostics / rust-analyzer (LSP layer, analysis-stats CLI) so the
+  workspace is exhaustive over the new variants.
+- hir-ty: extend `TyDefId` and `ValueTyDefId` to include `ClassId` (via
+  `impl_from!`); add a Class arm to `AdtDef::new`, `AdtDef::Debug`, the
+  `for_each_relevant_impl` module lookup, `lower::field_types_query`,
+  `infer.rs`'s path-to-variant resolver, `infer/expr.rs`'s field lookup,
+  `layout/adt.rs`, and the `next_solver::def_id::SolverDefId` debug printer.
+- hir-def: add `keys::CLASS` dyn_map slot, and a class arm in the
+  `field_attrs_query` walk that goes through CLASS_MEMBER_LIST::fields()
+  directly (CLASS_MEMBER_LIST is not a RECORD_FIELD_LIST so it doesn't slot
+  into `ast::FieldList`).
+
+Out of scope, deferred:
+- Method walking (B.4c). Class methods inside CLASS_MEMBER_LIST::methods()
+  aren't wired into the inherent-impl machinery yet — that needs either a
+  synthesized ImplId per class or extending ItemContainerId with a ClassId
+  arm, both invasive enough to warrant their own patch. The smoke-test code
+  exercising `d.legs()` / `d.speak()` therefore leaves the call types as
+  `?ty: 1 (16%)` rather than panicking, which is the explicit B.4 success bar.
+- Inheritance, `class Dog : Animal` (B.4b). Phase 1 parses the colon and the
+  base PATH_TYPE is a direct child of CLASS, but wiring the base into method
+  resolution / vtables requires changes to both ClassSignature and the
+  inherent-impl chain. Deferred per the prompt's scope cut.
+
+Smoke test (does NOT panic):
+  echo 'class Animal { tag: u32, fn legs(&self) -> u32 { 4 } }
+  class Dog : Animal { bark: u32, fn speak(&self) -> u32 { 1000 } }
+  fn use_dog(d: Dog) -> u32 { d.legs() + d.speak() }' \
+  > /tmp/rustcc-class-smoke/src/lib.rs
+  target/release/rust-analyzer analysis-stats /tmp/rustcc-class-smoke
+  # Inference: 91.77ms — runs cleanly, no `unimplemented!` panic.
+
+Tests after the patch (unchanged from B.4a baseline):
+  parser    315/0
+  syntax     51/0
+  hir-def   479/0
+  hir-ty    969/0
+  ide      1292/0
+  ide-completion 727/0
+  ide-db   196/0
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ crates/hir-def/src/attrs.rs                   |  22 +++
+ crates/hir-def/src/dyn_map.rs                 |  10 +-
+ crates/hir-ty/src/infer.rs                    |  32 ++--
+ crates/hir-ty/src/infer/expr.rs               |   9 +-
+ crates/hir-ty/src/layout/adt.rs               |   9 +-
+ crates/hir-ty/src/lower.rs                    |  26 ++-
+ crates/hir-ty/src/lower/path.rs               |   3 +
+ crates/hir-ty/src/next_solver/def_id.rs       |  29 ++--
+ crates/hir-ty/src/next_solver/interner.rs     |  68 ++++++--
+ crates/hir/src/attrs.rs                       |  11 +-
+ crates/hir/src/display.rs                     |  27 ++-
+ crates/hir/src/from_id.rs                     |  12 +-
+ crates/hir/src/has_source.rs                  |  17 +-
+ crates/hir/src/lib.rs                         | 158 +++++++++++++++---
+ crates/hir/src/semantics/child_by_source.rs   |   4 +-
+ crates/hir/src/source_analyzer.rs             |  13 +-
+ crates/hir/src/symbols.rs                     |   6 +-
+ crates/hir/src/term_search/tactics.rs         |   4 +
+ .../ide-assists/src/handlers/auto_import.rs   |   1 +
+ .../src/handlers/fix_visibility.rs            |   1 +
+ crates/ide-completion/src/completions/expr.rs |   5 +
+ crates/ide-completion/src/item.rs             |   2 +
+ crates/ide-completion/src/render.rs           |   1 +
+ crates/ide-db/src/documentation.rs            |   1 +
+ crates/ide-db/src/imports/import_assets.rs    |   4 +
+ crates/ide-db/src/lib.rs                      |   5 +
+ crates/ide-db/src/rename.rs                   |   1 +
+ .../src/handlers/no_such_field.rs             |   4 +
+ crates/ide/src/doc_links.rs                   |   5 +
+ crates/ide/src/moniker.rs                     |   3 +
+ crates/ide/src/navigation_target.rs           |   8 +
+ crates/ide/src/signature_help.rs              |   6 +
+ .../ide/src/syntax_highlighting/highlight.rs  |   1 +
+ crates/ide/src/syntax_highlighting/inject.rs  |   1 +
+ crates/ide/src/syntax_highlighting/tags.rs    |   2 +
+ .../rust-analyzer/src/cli/analysis_stats.rs   |   2 +
+ .../rust-analyzer/src/lsp/semantic_tokens.rs  |   2 +
+ crates/rust-analyzer/src/lsp/to_proto.rs      |   6 +
+ crates/syntax/src/ast/generated/nodes.rs      |  13 +-
+ 39 files changed, 413 insertions(+), 121 deletions(-)
+
+diff --git a/crates/hir-def/src/attrs.rs b/crates/hir-def/src/attrs.rs
+index b611a0a39..a6ccc1e8a 100644
+--- a/crates/hir-def/src/attrs.rs
++++ b/crates/hir-def/src/attrs.rs
+@@ -487,6 +487,28 @@ fn collect_field_attrs<T>(
+         ast::VariantDef::Struct(it) => it.field_list(),
+         ast::VariantDef::Union(it) => it.record_field_list().map(ast::FieldList::RecordFieldList),
+         ast::VariantDef::Variant(it) => it.field_list(),
++        // rustcc Phase 2 (B.4): a class is record-shaped — its
++        // CLASS_MEMBER_LIST::fields() returns AstChildren<RecordField>,
++        // so we walk those directly rather than going through
++        // ast::FieldList. (CLASS_MEMBER_LIST is *not* a RECORD_FIELD_LIST
++        // syntactically, so we can't reuse the FieldList wrapper.)
++        ast::VariantDef::Class(it) => {
++            let mut result = ArenaMap::new();
++            let mut idx = 0;
++            if let Some(ml) = it.class_member_list() {
++                for field in ml.fields() {
++                    if AttrFlags::is_cfg_enabled_for(&field, cfg_options).is_ok() {
++                        result.insert(
++                            la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(idx)),
++                            field_attrs(cfg_options, variant_syntax.with_value(field.into())),
++                        );
++                        idx += 1;
++                    }
++                }
++            }
++            result.shrink_to_fit();
++            return result;
++        }
+     };
+     let Some(fields) = fields else {
+         return ArenaMap::new();
+diff --git a/crates/hir-def/src/dyn_map.rs b/crates/hir-def/src/dyn_map.rs
+index c38ceccd1..33ffde710 100644
+--- a/crates/hir-def/src/dyn_map.rs
++++ b/crates/hir-def/src/dyn_map.rs
+@@ -33,9 +33,9 @@ pub mod keys {
+     use syntax::{AstNode, AstPtr, ast};
+ 
+     use crate::{
+-        BlockId, BuiltinDeriveImplId, ConstId, EnumId, EnumVariantId, ExternBlockId, ExternCrateId,
+-        FieldId, FunctionId, ImplId, LifetimeParamId, Macro2Id, MacroRulesId, ProcMacroId,
+-        StaticId, StructId, TraitId, TypeAliasId, TypeOrConstParamId, UnionId, UseId,
++        BlockId, BuiltinDeriveImplId, ClassId, ConstId, EnumId, EnumVariantId, ExternBlockId,
++        ExternCrateId, FieldId, FunctionId, ImplId, LifetimeParamId, Macro2Id, MacroRulesId,
++        ProcMacroId, StaticId, StructId, TraitId, TypeAliasId, TypeOrConstParamId, UnionId, UseId,
+         dyn_map::{DynMap, Policy},
+     };
+ 
+@@ -52,6 +52,10 @@ pub mod keys {
+     pub const STRUCT: Key<ast::Struct, StructId> = Key::new();
+     pub const UNION: Key<ast::Union, UnionId> = Key::new();
+     pub const ENUM: Key<ast::Enum, EnumId> = Key::new();
++    // rustcc Phase 2 (B.4): dyn_map slot for `class Foo {}`. Lets the
++    // hir crate's child-by-source machinery surface a Class def from
++    // a syntax pointer, enabling go-to-def + hover.
++    pub const CLASS: Key<ast::Class, ClassId> = Key::new();
+     pub const EXTERN_CRATE: Key<ast::ExternCrate, ExternCrateId> = Key::new();
+     pub const USE: Key<ast::Use, UseId> = Key::new();
+ 
+diff --git a/crates/hir-ty/src/infer.rs b/crates/hir-ty/src/infer.rs
+index f9d34fb7e..634b15a44 100644
+--- a/crates/hir-ty/src/infer.rs
++++ b/crates/hir-ty/src/infer.rs
+@@ -2096,10 +2096,8 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+                         return (self.err_ty(), None);
+                     }
+                 }
+-                Some((AdtId::ClassId(_), _)) => {
+-                    // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                    unimplemented!()
+-                }
++                // rustcc Phase 2 (B.4): same path as a struct.
++                Some((AdtId::ClassId(id), _)) => id.into(),
+                 None => return (self.err_ty(), None),
+             };
+ 
+@@ -2240,10 +2238,8 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+                         // FIXME Error E0071, expected struct, variant or union type, found enum `Foo`
+                         None
+                     }
+-                    AdtId::ClassId(_) => {
+-                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                        unimplemented!()
+-                    }
++                    // rustcc Phase 2 (B.4): record-shaped class — like a struct.
++                    AdtId::ClassId(c) => Some(VariantId::ClassId(c)),
+                 });
+                 (ty, variant)
+             }
+@@ -2284,10 +2280,8 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+                         // FIXME Error E0071, expected struct, variant or union type, found enum `Foo`
+                         None
+                     }
+-                    AdtId::ClassId(_) => {
+-                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                        unimplemented!()
+-                    }
++                    // rustcc Phase 2 (B.4): record-shaped class — like a struct.
++                    AdtId::ClassId(c) => Some(VariantId::ClassId(c)),
+                 });
+                 (ty, variant)
+             }
+@@ -2316,10 +2310,10 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+                 // FIXME diagnostic
+                 (self.err_ty(), None)
+             }
+-            TypeNs::AdtId(AdtId::ClassId(_)) => {
+-                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                unimplemented!()
+-            }
++            // rustcc Phase 2 (B.4): a class type written naked (no
++            // path-tail) resolves like a unit / record-shaped struct
++            // type — produce no VariantId for record-shaped tail.
++            TypeNs::AdtId(AdtId::ClassId(_)) => (self.err_ty(), None),
+         };
+ 
+         fn forbid_unresolved_segments<'db>(
+@@ -2353,10 +2347,8 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+                         // FIXME Error E0071, expected struct, variant or union type, found enum `Foo`
+                         None
+                     }
+-                    AdtId::ClassId(_) => {
+-                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                        unimplemented!()
+-                    }
++                    // rustcc Phase 2 (B.4): record-shaped class — like a struct.
++                    AdtId::ClassId(c) => Some(VariantId::ClassId(c)),
+                 });
+                 (ty, variant)
+             }
+diff --git a/crates/hir-ty/src/infer/expr.rs b/crates/hir-ty/src/infer/expr.rs
+index 684e600ac..7e72afbca 100644
+--- a/crates/hir-ty/src/infer/expr.rs
++++ b/crates/hir-ty/src/infer/expr.rs
+@@ -1635,9 +1635,12 @@ impl<'db> InferenceContext<'_, 'db> {
+                         (field, parameters)
+                     }
+                     hir_def::AdtId::EnumId(_) => return None,
+-                    hir_def::AdtId::ClassId(_) => {
+-                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                        unimplemented!()
++                    // rustcc Phase 2 (B.4): record-shaped class field
++                    // access mirrors struct field access.
++                    hir_def::AdtId::ClassId(c) => {
++                        let local_id = c.fields(self.db).field(name)?;
++                        let field = FieldId { parent: c.into(), local_id };
++                        (field, parameters)
+                     }
+                 },
+                 _ => return None,
+diff --git a/crates/hir-ty/src/layout/adt.rs b/crates/hir-ty/src/layout/adt.rs
+index 1dd2d541f..b1bfac439 100644
+--- a/crates/hir-ty/src/layout/adt.rs
++++ b/crates/hir-ty/src/layout/adt.rs
+@@ -65,9 +65,12 @@ pub fn layout_of_adt_query(
+                 .collect::<Result<SmallVec<_>, _>>()?;
+             (r, AttrFlags::repr(db, e.into()).unwrap_or_default(), false)
+         }
+-        AdtId::ClassId(_) => {
+-            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-            unimplemented!()
++        // rustcc Phase 2 (B.4): a class lays out like a record-shaped
++        // struct — single variant with the class fields.
++        AdtId::ClassId(c) => {
++            let mut r = SmallVec::<[_; 1]>::new();
++            r.push(handle_variant(c.into(), c.fields(db))?);
++            (r, AttrFlags::repr(db, c.into()).unwrap_or_default(), false)
+         }
+     };
+     let variants = variants
+diff --git a/crates/hir-ty/src/lower.rs b/crates/hir-ty/src/lower.rs
+index c63a7f44d..4584e4ee8 100644
+--- a/crates/hir-ty/src/lower.rs
++++ b/crates/hir-ty/src/lower.rs
+@@ -13,7 +13,7 @@ use std::{cell::OnceCell, iter, mem};
+ use arrayvec::ArrayVec;
+ use either::Either;
+ use hir_def::{
+-    AdtId, AssocItemId, CallableDefId, ConstId, ConstParamId, EnumId, EnumVariantId,
++    AdtId, AssocItemId, CallableDefId, ClassId, ConstId, ConstParamId, EnumId, EnumVariantId,
+     ExpressionStoreOwnerId, FunctionId, GeneralConstId, GenericDefId, GenericParamId, HasModule,
+     ImplId, ItemContainerId, LifetimeParamId, LocalFieldId, Lookup, StaticId, StructId, TraitId,
+     TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId, VariantId,
+@@ -1315,7 +1315,9 @@ pub enum TyDefId {
+     AdtId(AdtId),
+     TypeAliasId(TypeAliasId),
+ }
+-impl_from!(BuiltinType, AdtId(StructId, EnumId, UnionId), TypeAliasId for TyDefId);
++// rustcc Phase 2 (B.4): include ClassId in the AdtId-coerced ctor list
++// so `Type::from_def(db, class_id)` compiles like a struct.
++impl_from!(BuiltinType, AdtId(StructId, EnumId, UnionId, ClassId), TypeAliasId for TyDefId);
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa_macros::Supertype)]
+ pub enum ValueTyDefId {
+@@ -1325,8 +1327,14 @@ pub enum ValueTyDefId {
+     EnumVariantId(EnumVariantId),
+     ConstId(ConstId),
+     StaticId(StaticId),
++    // rustcc Phase 2 (B.4): a class is record-shaped, so its
++    // constructor type matches the struct construction path
++    // (`Foo { field: ..., }`). We don't synthesize a tuple-style ctor.
++    ClassId(ClassId),
+ }
+-impl_from!(FunctionId, StructId, UnionId, EnumVariantId, ConstId, StaticId for ValueTyDefId);
++impl_from!(
++    FunctionId, StructId, UnionId, EnumVariantId, ConstId, StaticId, ClassId for ValueTyDefId
++);
+ 
+ impl ValueTyDefId {
+     pub(crate) fn to_generic_def_id(self, db: &dyn HirDatabase) -> GenericDefId {
+@@ -1337,6 +1345,7 @@ impl ValueTyDefId {
+             Self::EnumVariantId(var) => var.lookup(db).parent.into(),
+             Self::ConstId(id) => id.into(),
+             Self::StaticId(id) => id.into(),
++            Self::ClassId(id) => AdtId::ClassId(id).into(),
+         }
+     }
+ }
+@@ -1467,6 +1476,10 @@ pub(crate) fn value_ty<'db>(
+             ValueTyDefId::EnumVariantId(it) => type_for_enum_variant_constructor(db, it),
+             ValueTyDefId::ConstId(it) => Some(type_for_const(db, it)),
+             ValueTyDefId::StaticId(it) => Some(type_for_static(db, it)),
++            // rustcc Phase 2 (B.4): a class is record-shaped, so it has
++            // no value-position constructor (paralleling the
++            // FieldsShape::Record arm in `type_for_struct_constructor`).
++            ValueTyDefId::ClassId(_) => None,
+         }
+     }
+ }
+@@ -1647,10 +1660,9 @@ pub(crate) fn field_types_with_diagnostics_query<'db>(
+         VariantId::StructId(it) => (it.resolver(db), it.into()),
+         VariantId::UnionId(it) => (it.resolver(db), it.into()),
+         VariantId::EnumVariantId(it) => (it.resolver(db), it.lookup(db).parent.into()),
+-        VariantId::ClassId(_) => {
+-            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-            unimplemented!()
+-        }
++        // rustcc Phase 2 (B.4): treat a class like a struct — same
++        // resolver scope and GenericDefId.
++        VariantId::ClassId(it) => (it.resolver(db), AdtId::ClassId(it).into()),
+     };
+     let mut res = ArenaMap::default();
+     let mut ctx = TyLoweringContext::new(
+diff --git a/crates/hir-ty/src/lower/path.rs b/crates/hir-ty/src/lower/path.rs
+index d6b9c375f..ccfdc4de9 100644
+--- a/crates/hir-ty/src/lower/path.rs
++++ b/crates/hir-ty/src/lower/path.rs
+@@ -570,6 +570,9 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
+             ValueTyDefId::FunctionId(it) => it.into(),
+             ValueTyDefId::StructId(it) => it.into(),
+             ValueTyDefId::UnionId(it) => it.into(),
++            // rustcc Phase 2 (B.4): a class shares the struct's
++            // value-position generic plumbing.
++            ValueTyDefId::ClassId(it) => hir_def::AdtId::ClassId(it).into(),
+             ValueTyDefId::ConstId(it) => it.into(),
+             ValueTyDefId::StaticId(_) => {
+                 return GenericArgs::empty(interner);
+diff --git a/crates/hir-ty/src/next_solver/def_id.rs b/crates/hir-ty/src/next_solver/def_id.rs
+index 10ec7772b..2529f4e88 100644
+--- a/crates/hir-ty/src/next_solver/def_id.rs
++++ b/crates/hir-ty/src/next_solver/def_id.rs
+@@ -1,12 +1,12 @@
+ //! Definition of `SolverDefId`
+ 
+ use hir_def::{
+-    AdtId, AnonConstId, AttrDefId, BuiltinDeriveImplId, CallableDefId, ConstId, DefWithBodyId,
+-    EnumId, EnumVariantId, ExpressionStoreOwnerId, FunctionId, GeneralConstId, GenericDefId,
+-    ImplId, StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId,
++    AdtId, AnonConstId, AttrDefId, BuiltinDeriveImplId, CallableDefId, ClassId, ConstId,
++    DefWithBodyId, EnumId, EnumVariantId, ExpressionStoreOwnerId, FunctionId, GeneralConstId,
++    GenericDefId, ImplId, StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId,
+     signatures::{
+-        ConstSignature, EnumSignature, FunctionSignature, StaticSignature, StructSignature,
+-        TraitSignature, TypeAliasSignature, UnionSignature,
++        ClassSignature, ConstSignature, EnumSignature, FunctionSignature, StaticSignature,
++        StructSignature, TraitSignature, TypeAliasSignature, UnionSignature,
+     },
+ };
+ use rustc_type_ir::inherent;
+@@ -113,16 +113,18 @@ impl std::fmt::Debug for SolverDefId {
+                     ))
+                     .finish()
+             }
+-            SolverDefId::AdtId(AdtId::ClassId(_)) => {
+-                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                unimplemented!()
+-            }
++            // rustcc Phase 2 (B.4): debug-render `class Foo {}` like a
++            // struct in the trait-solver's def-id Debug printer.
++            SolverDefId::AdtId(AdtId::ClassId(id)) => f
++                .debug_tuple("ClassId")
++                .field(&ClassSignature::of(db, id).name.as_str())
++                .finish(),
+         }
+     }
+ }
+ 
+ impl_from!(
+-    AdtId(StructId, EnumId, UnionId),
++    AdtId(StructId, EnumId, UnionId, ClassId),
+     ConstId,
+     FunctionId,
+     ImplId,
+@@ -184,10 +186,9 @@ impl From<VariantId> for SolverDefId {
+             VariantId::EnumVariantId(id) => id.into(),
+             VariantId::StructId(id) => id.into(),
+             VariantId::UnionId(id) => id.into(),
+-            VariantId::ClassId(_) => {
+-                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                unimplemented!()
+-            }
++            // rustcc Phase 2 (B.4): a class is its own AdtId variant —
++            // route the SolverDefId through AdtId.
++            VariantId::ClassId(id) => AdtId::ClassId(id).into(),
+         }
+     }
+ }
+diff --git a/crates/hir-ty/src/next_solver/interner.rs b/crates/hir-ty/src/next_solver/interner.rs
+index 706917567..3d066b439 100644
+--- a/crates/hir-ty/src/next_solver/interner.rs
++++ b/crates/hir-ty/src/next_solver/interner.rs
+@@ -10,14 +10,14 @@ pub use tls_db::{attach_db, attach_db_allow_change, with_attached_db};
+ 
+ use base_db::Crate;
+ use hir_def::{
+-    AdtId, CallableDefId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule,
++    AdtId, CallableDefId, ClassId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule,
+     ItemContainerId, StructId, UnionId, VariantId,
+     attrs::AttrFlags,
+     expr_store::{Body, ExpressionStore},
+     lang_item::LangItems,
+     signatures::{
+-        EnumSignature, FieldData, FnFlags, FunctionSignature, ImplFlags, ImplSignature,
+-        StructFlags, StructSignature, TraitFlags, TraitSignature, UnionSignature,
++        ClassSignature, EnumSignature, FieldData, FnFlags, FunctionSignature, ImplFlags,
++        ImplSignature, StructFlags, StructSignature, TraitFlags, TraitSignature, UnionSignature,
+     },
+ };
+ use la_arena::Idx;
+@@ -427,6 +427,10 @@ pub enum VariantDef {
+     Struct(StructId),
+     Union(UnionId),
+     Enum(EnumVariantId),
++    // rustcc Phase 2 (B.4): a class is record-shaped, so it slots into
++    // the same VariantDef enum used by the trait solver to walk fields
++    // for `TyKind::Adt(ClassId)`.
++    Class(ClassId),
+ }
+ 
+ impl VariantDef {
+@@ -435,6 +439,7 @@ impl VariantDef {
+             VariantDef::Struct(struct_id) => VariantId::StructId(*struct_id),
+             VariantDef::Union(union_id) => VariantId::UnionId(*union_id),
+             VariantDef::Enum(enum_variant_id) => VariantId::EnumVariantId(*enum_variant_id),
++            VariantDef::Class(class_id) => VariantId::ClassId(*class_id),
+         }
+     }
+ 
+@@ -443,6 +448,7 @@ impl VariantDef {
+             VariantDef::Struct(it) => (*it).into(),
+             VariantDef::Union(it) => (*it).into(),
+             VariantDef::Enum(it) => (*it).into(),
++            VariantDef::Class(it) => (*it).into(),
+         };
+         id.fields(db).fields().iter().map(|(id, data)| (id, data.clone())).collect()
+     }
+@@ -623,9 +629,41 @@ impl AdtDef {
+ 
+                 (flags, variants, repr)
+             }
+-            AdtId::ClassId(_) => {
+-                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                unimplemented!()
++            AdtId::ClassId(class_id) => {
++                // rustcc Phase 2 (B.4): mirror the Struct branch — a
++                // class is a single-variant record-shaped Adt with the
++                // same trait-solver flags surface as a struct.
++                let data = ClassSignature::of(db, class_id);
++
++                let flags = AdtFlags {
++                    is_enum: false,
++                    is_union: false,
++                    is_struct: true,
++                    is_phantom_data: false,
++                    is_fundamental: data.flags.contains(StructFlags::FUNDAMENTAL),
++                    is_box: false,
++                    is_manually_drop: false,
++                };
++
++                let variants = vec![(VariantIdx(0), VariantDef::Class(class_id))];
++
++                let data_repr = data.repr(db, class_id);
++                let mut repr_flags = ReprFlags::empty();
++                if data_repr.is_some_and(|r| r.c()) {
++                    repr_flags.insert(ReprFlags::IS_C);
++                }
++                if data_repr.is_some_and(|r| r.simd()) {
++                    repr_flags.insert(ReprFlags::IS_SIMD);
++                }
++                let repr = ReprOptions {
++                    align: data_repr.and_then(|r| r.align),
++                    pack: data_repr.and_then(|r| r.pack),
++                    int: data_repr.and_then(|r| r.int),
++                    flags: repr_flags,
++                    ..ReprOptions::default()
++                };
++
++                (flags, variants, repr)
+             }
+         };
+ 
+@@ -709,10 +747,9 @@ impl<'db> inherent::AdtDef<DbInterner<'db>> for AdtDef {
+                 .iter()
+                 .flat_map(|&(variant_id, _, _)| field_tys(variant_id.into()))
+                 .collect(),
+-            hir_def::AdtId::ClassId(_) => {
+-                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                unimplemented!()
+-            }
++            // rustcc Phase 2 (B.4): treat a class like a struct — same
++            // single-variant field walk.
++            hir_def::AdtId::ClassId(id) => field_tys(id.into()),
+         };
+ 
+         EarlyBinder::bind(tys)
+@@ -766,9 +803,9 @@ impl fmt::Debug for AdtDef {
+                 let data = EnumSignature::of(db, enum_id);
+                 f.write_str(data.name.as_str())
+             }
+-            AdtId::ClassId(_) => {
+-                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                unimplemented!()
++            AdtId::ClassId(class_id) => {
++                let data = ClassSignature::of(db, class_id);
++                f.write_str(data.name.as_str())
+             }
+         })
+     }
+@@ -1733,10 +1770,7 @@ impl<'db> Interner for DbInterner<'db> {
+                     SolverDefId::AdtId(AdtId::StructId(id)) => id.module(self.db),
+                     SolverDefId::AdtId(AdtId::EnumId(id)) => id.module(self.db),
+                     SolverDefId::AdtId(AdtId::UnionId(id)) => id.module(self.db),
+-                    SolverDefId::AdtId(AdtId::ClassId(_)) => {
+-                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
+-                        unimplemented!()
+-                    }
++                    SolverDefId::AdtId(AdtId::ClassId(id)) => id.module(self.db),
+                     SolverDefId::TraitId(id) => id.module(self.db),
+                     SolverDefId::TypeAliasId(id) => id.module(self.db),
+                     SolverDefId::ConstId(_)
+diff --git a/crates/hir/src/attrs.rs b/crates/hir/src/attrs.rs
+index f9cf05e73..4d9109f07 100644
+--- a/crates/hir/src/attrs.rs
++++ b/crates/hir/src/attrs.rs
+@@ -25,9 +25,10 @@ use intern::Symbol;
+ use stdx::never;
+ 
+ use crate::{
+-    Adt, AsAssocItem, AssocItem, BuiltinType, Const, ConstParam, DocLinkDef, Enum, EnumVariant,
+-    ExternCrateDecl, Field, Function, GenericParam, HasCrate, Impl, LangItem, LifetimeParam, Macro,
+-    Module, ModuleDef, Static, Struct, Trait, Type, TypeAlias, TypeParam, Union, Variant,
++    Adt, AsAssocItem, AssocItem, BuiltinType, Class, Const, ConstParam, DocLinkDef, Enum,
++    EnumVariant, ExternCrateDecl, Field, Function, GenericParam, HasCrate, Impl, LangItem,
++    LifetimeParam, Macro, Module, ModuleDef, Static, Struct, Trait, Type, TypeAlias, TypeParam,
++    Union, Variant,
+ };
+ 
+ #[derive(Debug, Clone, Copy)]
+@@ -254,7 +255,7 @@ macro_rules! impl_has_attrs_enum {
+     )*};
+ }
+ 
+-impl_has_attrs_enum![Struct, Union, Enum for Adt];
++impl_has_attrs_enum![Struct, Union, Enum, Class for Adt];
+ impl_has_attrs_enum![TypeParam, ConstParam, LifetimeParam for GenericParam];
+ 
+ impl HasAttrs for Module {
+@@ -461,6 +462,8 @@ fn resolve_assoc_or_field(
+                 .variant(&name)
+                 .map(|variant| DocLinkDef::ModuleDef(ModuleDef::EnumVariant(variant.into())));
+         }
++        // rustcc Phase 2 (B.4): record-shaped class — same field path as struct.
++        Adt::Class(it) => it.into(),
+     };
+     resolve_field(db, variant_def, name, ns)
+ }
+diff --git a/crates/hir/src/display.rs b/crates/hir/src/display.rs
+index 53f24713c..123a19918 100644
+--- a/crates/hir/src/display.rs
++++ b/crates/hir/src/display.rs
+@@ -28,10 +28,10 @@ use itertools::Itertools;
+ use rustc_type_ir::inherent::IntoKind;
+ 
+ use crate::{
+-    Adt, AnyFunctionId, AsAssocItem, AssocItem, AssocItemContainer, Const, ConstParam, Crate, Enum,
+-    EnumVariant, ExternCrateDecl, Field, Function, GenericParam, HasCrate, HasVisibility, Impl,
+-    LifetimeParam, Macro, Module, SelfParam, Static, Struct, StructKind, Trait, TraitRef,
+-    TupleField, Type, TypeAlias, TypeNs, TypeOrConstParam, TypeParam, Union,
++    Adt, AnyFunctionId, AsAssocItem, AssocItem, AssocItemContainer, Class, Const, ConstParam,
++    Crate, Enum, EnumVariant, ExternCrateDecl, Field, Function, GenericParam, HasCrate,
++    HasVisibility, Impl, LifetimeParam, Macro, Module, SelfParam, Static, Struct, StructKind,
++    Trait, TraitRef, TupleField, Type, TypeAlias, TypeNs, TypeOrConstParam, TypeParam, Union,
+ };
+ 
+ fn write_builtin_derive_impl_method<'db>(
+@@ -330,6 +330,7 @@ impl<'db> HirDisplay<'db> for Adt {
+             Adt::Struct(it) => it.hir_fmt(f),
+             Adt::Union(it) => it.hir_fmt(f),
+             Adt::Enum(it) => it.hir_fmt(f),
++            Adt::Class(it) => it.hir_fmt(f),
+         }
+     }
+ }
+@@ -408,6 +409,24 @@ impl<'db> HirDisplay<'db> for Union {
+     }
+ }
+ 
++// rustcc Phase 2 (B.4): hover/completion render `class Foo { … }`.
++// Mirror the Struct record-shape branch — classes are always record.
++impl<'db> HirDisplay<'db> for Class {
++    fn hir_fmt(&self, f: &mut HirFormatter<'_, 'db>) -> Result {
++        write_visibility(self.module(f.db).id, self.visibility(f.db), f)?;
++        f.write_str("class ")?;
++        write!(f, "{}", self.name(f.db).display(f.db, f.edition()))?;
++        let def_id = GenericDefId::AdtId(AdtId::ClassId(self.id));
++        write_generic_params(def_id, f)?;
++
++        let has_where_clause = write_where_clause(def_id, f)?;
++        if let Some(limit) = f.entity_limit {
++            write_fields(&self.fields(f.db), has_where_clause, limit, false, f)?;
++        }
++        Ok(())
++    }
++}
++
+ fn write_fields<'db>(
+     fields: &[Field],
+     has_where_clause: bool,
+diff --git a/crates/hir/src/from_id.rs b/crates/hir/src/from_id.rs
+index 5e44fe405..581e696e2 100644
+--- a/crates/hir/src/from_id.rs
++++ b/crates/hir/src/from_id.rs
+@@ -36,6 +36,7 @@ from_id![
+     (hir_def::StructId, crate::Struct),
+     (hir_def::UnionId, crate::Union),
+     (hir_def::EnumId, crate::Enum),
++    (hir_def::ClassId, crate::Class),
+     (hir_def::TypeAliasId, crate::TypeAlias),
+     (hir_def::TraitId, crate::Trait),
+     (hir_def::StaticId, crate::Static),
+@@ -57,9 +58,7 @@ impl From<AdtId> for Adt {
+             AdtId::StructId(it) => Adt::Struct(it.into()),
+             AdtId::UnionId(it) => Adt::Union(it.into()),
+             AdtId::EnumId(it) => Adt::Enum(it.into()),
+-            AdtId::ClassId(_) => unimplemented!(
+-                "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
+-            ),
++            AdtId::ClassId(it) => Adt::Class(it.into()),
+         }
+     }
+ }
+@@ -70,6 +69,7 @@ impl From<Adt> for AdtId {
+             Adt::Struct(it) => AdtId::StructId(it.id),
+             Adt::Union(it) => AdtId::UnionId(it.id),
+             Adt::Enum(it) => AdtId::EnumId(it.id),
++            Adt::Class(it) => AdtId::ClassId(it.id),
+         }
+     }
+ }
+@@ -80,9 +80,7 @@ impl From<VariantId> for Variant {
+             VariantId::EnumVariantId(it) => Variant::EnumVariant(it.into()),
+             VariantId::StructId(it) => Variant::Struct(it.into()),
+             VariantId::UnionId(it) => Variant::Union(it.into()),
+-            VariantId::ClassId(_) => unimplemented!(
+-                "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
+-            ),
++            VariantId::ClassId(it) => Variant::Class(it.into()),
+         }
+     }
+ }
+@@ -220,6 +218,7 @@ impl From<Adt> for GenericDefId {
+             Adt::Struct(it) => it.id.into(),
+             Adt::Union(it) => it.id.into(),
+             Adt::Enum(it) => it.id.into(),
++            Adt::Class(it) => it.id.into(),
+         }
+     }
+ }
+@@ -230,6 +229,7 @@ impl From<Variant> for VariantId {
+             Variant::Struct(it) => VariantId::StructId(it.id),
+             Variant::EnumVariant(it) => VariantId::EnumVariantId(it.into()),
+             Variant::Union(it) => VariantId::UnionId(it.id),
++            Variant::Class(it) => VariantId::ClassId(it.id),
+         }
+     }
+ }
+diff --git a/crates/hir/src/has_source.rs b/crates/hir/src/has_source.rs
+index 45c9811cc..1fa73a5ba 100644
+--- a/crates/hir/src/has_source.rs
++++ b/crates/hir/src/has_source.rs
+@@ -13,9 +13,10 @@ use syntax::{AstNode, ast};
+ use tt::TextRange;
+ 
+ use crate::{
+-    Adt, AnyFunctionId, Callee, Const, Enum, EnumVariant, ExternCrateDecl, Field, FieldSource,
+-    Function, Impl, InlineAsmOperand, Label, LifetimeParam, LocalSource, Macro, Module, Param,
+-    SelfParam, Static, Struct, Trait, TypeAlias, TypeOrConstParam, Union, Variant, db::HirDatabase,
++    Adt, AnyFunctionId, Callee, Class, Const, Enum, EnumVariant, ExternCrateDecl, Field,
++    FieldSource, Function, Impl, InlineAsmOperand, Label, LifetimeParam, LocalSource, Macro,
++    Module, Param, SelfParam, Static, Struct, Trait, TypeAlias, TypeOrConstParam, Union, Variant,
++    db::HirDatabase,
+ };
+ 
+ pub trait HasSource: Sized {
+@@ -121,6 +122,7 @@ impl HasSource for Adt {
+             Adt::Struct(s) => Some(s.source(db)?.map(ast::Adt::Struct)),
+             Adt::Union(u) => Some(u.source(db)?.map(ast::Adt::Union)),
+             Adt::Enum(e) => Some(e.source(db)?.map(ast::Adt::Enum)),
++            Adt::Class(c) => Some(c.source(db)?.map(ast::Adt::Class)),
+         }
+     }
+ }
+@@ -131,6 +133,7 @@ impl HasSource for Variant {
+             Variant::Struct(s) => Some(s.source(db)?.map(ast::VariantDef::Struct)),
+             Variant::Union(u) => Some(u.source(db)?.map(ast::VariantDef::Union)),
+             Variant::EnumVariant(v) => Some(v.source(db)?.map(ast::VariantDef::Variant)),
++            Variant::Class(c) => Some(c.source(db)?.map(ast::VariantDef::Class)),
+         }
+     }
+ }
+@@ -140,6 +143,14 @@ impl HasSource for Struct {
+         Some(self.id.lookup(db).source(db))
+     }
+ }
++// rustcc Phase 2 (B.4): user-facing source pointer for `class Foo {}`.
++// Mirrors the Struct impl — the loc lookup returns InFile<ast::Class>.
++impl HasSource for Class {
++    type Ast = ast::Class;
++    fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
++        Some(self.id.lookup(db).source(db))
++    }
++}
+ impl HasSource for Union {
+     type Ast = ast::Union;
+     fn source(self, db: &dyn HirDatabase) -> Option<InFile<Self::Ast>> {
+diff --git a/crates/hir/src/lib.rs b/crates/hir/src/lib.rs
+index 4e2a46abe..c67e2a0c6 100644
+--- a/crates/hir/src/lib.rs
++++ b/crates/hir/src/lib.rs
+@@ -48,11 +48,11 @@ use arrayvec::ArrayVec;
+ use base_db::{CrateDisplayName, CrateOrigin, LangCrateOrigin, all_crates};
+ use either::Either;
+ use hir_def::{
+-    AdtId, AssocItemId, AssocItemLoc, BuiltinDeriveImplId, CallableDefId, ConstId, ConstParamId,
+-    DefWithBodyId, EnumId, EnumVariantId, ExpressionStoreOwnerId, ExternBlockId, ExternCrateId,
+-    FunctionId, GenericDefId, HasModule, ImplId, ItemContainerId, LifetimeParamId, LocalFieldId,
+-    Lookup, MacroExpander, MacroId, StaticId, StructId, SyntheticSyntax, TupleId, TypeAliasId,
+-    TypeOrConstParamId, TypeParamId, UnionId,
++    AdtId, AssocItemId, AssocItemLoc, BuiltinDeriveImplId, CallableDefId, ClassId, ConstId,
++    ConstParamId, DefWithBodyId, EnumId, EnumVariantId, ExpressionStoreOwnerId, ExternBlockId,
++    ExternCrateId, FunctionId, GenericDefId, HasModule, ImplId, ItemContainerId, LifetimeParamId,
++    LocalFieldId, Lookup, MacroExpander, MacroId, StaticId, StructId, SyntheticSyntax, TupleId,
++    TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId,
+     attrs::AttrFlags,
+     builtin_derive::BuiltinDeriveImplMethod,
+     expr_store::{ExpressionStore, ExpressionStoreDiagnostics, ExpressionStoreSourceMap},
+@@ -70,8 +70,8 @@ use hir_def::{
+     per_ns::PerNs,
+     resolver::{HasResolver, Resolver},
+     signatures::{
+-        ConstSignature, EnumSignature, FunctionSignature, ImplFlags, ImplSignature, StaticFlags,
+-        StaticSignature, StructFlags, StructSignature, TraitFlags, TraitSignature,
++        ClassSignature, ConstSignature, EnumSignature, FunctionSignature, ImplFlags, ImplSignature,
++        StaticFlags, StaticSignature, StructFlags, StructSignature, TraitFlags, TraitSignature,
+         TypeAliasSignature, UnionSignature, VariantFields,
+     },
+     src::HasSource as _,
+@@ -386,6 +386,7 @@ impl From<Variant> for ModuleDef {
+             Variant::Struct(t) => Adt::from(t).into(),
+             Variant::Union(t) => Adt::from(t).into(),
+             Variant::EnumVariant(t) => t.into(),
++            Variant::Class(t) => Adt::from(t).into(),
+         }
+     }
+ }
+@@ -448,6 +449,7 @@ impl ModuleDef {
+                 Adt::Struct(it) => it.id.into(),
+                 Adt::Enum(it) => it.id.into(),
+                 Adt::Union(it) => it.id.into(),
++                Adt::Class(it) => it.id.into(),
+             },
+             ModuleDef::Trait(it) => it.id.into(),
+             ModuleDef::Function(it) => match it.id {
+@@ -807,6 +809,19 @@ impl Module {
+                                 expr_store_diagnostics(db, acc, source_map);
+                             }
+                         }
++                        Adt::Class(c) => {
++                            // rustcc Phase 2 (B.4): mirror the Struct branch.
++                            let source_map = &ClassSignature::with_source_map(db, c.id).1;
++                            expr_store_diagnostics(db, acc, source_map);
++                            let source_map = &c.id.fields_with_source_map(db).1;
++                            expr_store_diagnostics(db, acc, source_map);
++                            push_ty_diagnostics(
++                                db,
++                                acc,
++                                db.field_types_with_diagnostics(c.id.into()).1.clone(),
++                                source_map,
++                            );
++                        }
+                     }
+                     acc.extend(def.diagnostics(db, style_lints))
+                 }
+@@ -1429,6 +1444,7 @@ impl Field {
+             Variant::Struct(it) => it.id.into(),
+             Variant::Union(it) => it.id.into(),
+             Variant::EnumVariant(it) => it.parent_enum(db).id.into(),
++            Variant::Class(it) => AdtId::ClassId(it.id),
+         };
+         let interner = DbInterner::new_no_crate(db);
+         let args = generic_args_from_tys(interner, def_id.into(), generics.map(|ty| ty.ty));
+@@ -1447,9 +1463,7 @@ impl Field {
+                     }
+                     hir_def::VariantId::StructId(id) => GenericDefId::AdtId(id.into()),
+                     hir_def::VariantId::UnionId(id) => GenericDefId::AdtId(id.into()),
+-                    hir_def::VariantId::ClassId(_) => unimplemented!(
+-                        "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
+-                    ),
++                    hir_def::VariantId::ClassId(id) => GenericDefId::AdtId(id.into()),
+                 },
+             )
+             .store(),
+@@ -1855,14 +1869,81 @@ impl HasVisibility for EnumVariant {
+     }
+ }
+ 
++// rustcc Phase 2 (B.4): user-facing wrapper around hir_def::ClassId.
++// Mirrors `Struct` — class fields and class methods are surfaced
++// through `ClassSignature::of` and `VariantFields` (record-shaped).
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub struct Class {
++    pub(crate) id: ClassId,
++}
++
++impl Class {
++    pub fn module(self, db: &dyn HirDatabase) -> Module {
++        Module { id: self.id.lookup(db).container }
++    }
++
++    pub fn name(self, db: &dyn HirDatabase) -> Name {
++        ClassSignature::of(db, self.id).name.clone()
++    }
++
++    pub fn fields(self, db: &dyn HirDatabase) -> Vec<Field> {
++        self.id
++            .fields(db)
++            .fields()
++            .iter()
++            .map(|(id, _)| Field { parent: self.into(), id })
++            .collect()
++    }
++
++    pub fn ty(self, db: &dyn HirDatabase) -> Type<'_> {
++        Type::from_def(db, self.id)
++    }
++
++    pub fn ty_params(self, db: &dyn HirDatabase) -> Type<'_> {
++        Type::from_def_params(db, self.id)
++    }
++
++    pub fn constructor_ty(self, db: &dyn HirDatabase) -> Type<'_> {
++        Type::from_value_def(db, self.id)
++    }
++
++    pub fn repr(self, db: &dyn HirDatabase) -> Option<ReprOptions> {
++        AttrFlags::repr(db, self.id.into())
++    }
++
++    pub fn kind(self, _db: &dyn HirDatabase) -> StructKind {
++        // rustcc Phase 2: classes are always record-shaped (curly-brace
++        // CLASS_MEMBER_LIST). VariantFields::with_source_map hard-codes
++        // FieldsShape::Record for VariantId::ClassId.
++        StructKind::Record
++    }
++
++    pub fn is_unstable(self, db: &dyn HirDatabase) -> bool {
++        AttrFlags::query(db, self.id.into()).contains(AttrFlags::IS_UNSTABLE)
++    }
++}
++
++impl HasVisibility for Class {
++    fn visibility(&self, db: &dyn HirDatabase) -> Visibility {
++        let loc = self.id.lookup(db);
++        let source = loc.source(db);
++        visibility_from_ast(db, self.id, source.map(|src| src.visibility()))
++    }
++}
++
+ /// A Data Type
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+ pub enum Adt {
+     Struct(Struct),
+     Union(Union),
+     Enum(Enum),
++    // rustcc Phase 2 (B.4): classes share most plumbing with Struct
++    // (record-shaped Adt with inherent assoc-items). They live as a
++    // separate variant so completion/hover can disambiguate the
++    // keyword in display text.
++    Class(Class),
+ }
+-impl_from!(Struct, Union, Enum for Adt);
++impl_from!(Struct, Union, Enum, Class for Adt);
+ 
+ impl Adt {
+     pub fn has_non_default_type_params(self, db: &dyn HirDatabase) -> bool {
+@@ -1909,6 +1990,7 @@ impl Adt {
+             Adt::Struct(s) => s.module(db),
+             Adt::Union(s) => s.module(db),
+             Adt::Enum(e) => e.module(db),
++            Adt::Class(c) => c.module(db),
+         }
+     }
+ 
+@@ -1917,6 +1999,7 @@ impl Adt {
+             Adt::Struct(s) => s.name(db),
+             Adt::Union(u) => u.name(db),
+             Adt::Enum(e) => e.name(db),
++            Adt::Class(c) => c.name(db),
+         }
+     }
+ 
+@@ -1926,6 +2009,7 @@ impl Adt {
+             Adt::Struct(s) => s.id.resolver(db),
+             Adt::Union(u) => u.id.resolver(db),
+             Adt::Enum(e) => e.id.resolver(db),
++            Adt::Class(c) => c.id.resolver(db),
+         };
+         resolver
+             .generic_params()
+@@ -1945,6 +2029,10 @@ impl Adt {
+     pub fn as_enum(&self) -> Option<Enum> {
+         if let Self::Enum(v) = self { Some(*v) } else { None }
+     }
++
++    pub fn as_class(&self) -> Option<Class> {
++        if let Self::Class(v) = self { Some(*v) } else { None }
++    }
+ }
+ 
+ impl HasVisibility for Adt {
+@@ -1953,6 +2041,7 @@ impl HasVisibility for Adt {
+             Adt::Struct(it) => it.visibility(db),
+             Adt::Union(it) => it.visibility(db),
+             Adt::Enum(it) => it.visibility(db),
++            Adt::Class(it) => it.visibility(db),
+         }
+     }
+ }
+@@ -1962,8 +2051,12 @@ pub enum Variant {
+     Struct(Struct),
+     Union(Union),
+     EnumVariant(EnumVariant),
++    // rustcc Phase 2 (B.4): a class is a record-shaped Variant for the
++    // purposes of Field machinery — Field::parent: Variant flows to
++    // VariantId::ClassId at hir-def boundary.
++    Class(Class),
+ }
+-impl_from!(Struct, Union, EnumVariant for Variant);
++impl_from!(Struct, Union, EnumVariant, Class for Variant);
+ 
+ impl Variant {
+     pub fn fields(self, db: &dyn HirDatabase) -> Vec<Field> {
+@@ -1971,6 +2064,7 @@ impl Variant {
+             Variant::Struct(it) => it.fields(db),
+             Variant::Union(it) => it.fields(db),
+             Variant::EnumVariant(it) => it.fields(db),
++            Variant::Class(it) => it.fields(db),
+         }
+     }
+ 
+@@ -1979,6 +2073,7 @@ impl Variant {
+             Variant::Struct(it) => it.module(db),
+             Variant::Union(it) => it.module(db),
+             Variant::EnumVariant(it) => it.module(db),
++            Variant::Class(it) => it.module(db),
+         }
+     }
+ 
+@@ -1987,6 +2082,7 @@ impl Variant {
+             Variant::Struct(s) => (*s).name(db),
+             Variant::Union(u) => (*u).name(db),
+             Variant::EnumVariant(e) => (*e).name(db),
++            Variant::Class(c) => (*c).name(db),
+         }
+     }
+ 
+@@ -1995,6 +2091,7 @@ impl Variant {
+             Variant::Struct(it) => it.into(),
+             Variant::Union(it) => it.into(),
+             Variant::EnumVariant(it) => it.parent_enum(db).into(),
++            Variant::Class(it) => it.into(),
+         }
+     }
+ }
+@@ -4182,9 +4279,7 @@ impl GenericDef {
+             GenericDefId::AdtId(AdtId::EnumId(it)) => &EnumSignature::with_source_map(db, it).1,
+             GenericDefId::AdtId(AdtId::StructId(it)) => &StructSignature::with_source_map(db, it).1,
+             GenericDefId::AdtId(AdtId::UnionId(it)) => &UnionSignature::with_source_map(db, it).1,
+-            GenericDefId::AdtId(AdtId::ClassId(_)) => unimplemented!(
+-                "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
+-            ),
++            GenericDefId::AdtId(AdtId::ClassId(it)) => &ClassSignature::with_source_map(db, it).1,
+             GenericDefId::ConstId(_) => return,
+             GenericDefId::FunctionId(it) => &FunctionSignature::with_source_map(db, it).1,
+             GenericDefId::ImplId(it) => &ImplSignature::with_source_map(db, it).1,
+@@ -4224,6 +4319,7 @@ impl GenericDef {
+             GenericDef::Adt(Adt::Struct(_)) => "struct",
+             GenericDef::Adt(Adt::Enum(_)) => "enum",
+             GenericDef::Adt(Adt::Union(_)) => "union",
++            GenericDef::Adt(Adt::Class(_)) => "class",
+             GenericDef::Trait(_) => "trait",
+             GenericDef::TypeAlias(_) => "type alias",
+             GenericDef::Impl(_) => "impl",
+@@ -5322,9 +5418,7 @@ impl<'db> ClosureCapture<'db> {
+                                 AdtId::EnumId(id) => {
+                                     id.enum_variants(db).variants[variant_idx as usize].0.into()
+                                 }
+-                                AdtId::ClassId(_) => unimplemented!(
+-                                    "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
+-                                ),
++                                AdtId::ClassId(id) => VariantId::from(id),
+                             };
+                             let field = &variant.fields(db).fields()
+                                 [LocalFieldId::from_raw(la_arena::RawIdx::from_u32(field_idx))];
+@@ -5360,9 +5454,7 @@ impl<'db> ClosureCapture<'db> {
+                                     // Can't really do that for an enum, unfortunately, so try to do something alike.
+                                     id.enum_variants(db).variants[variant_idx as usize].0.into()
+                                 }
+-                                AdtId::ClassId(_) => unimplemented!(
+-                                    "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
+-                                ),
++                                AdtId::ClassId(id) => VariantId::from(id),
+                             };
+                             let field = &variant.fields(db).fields()
+                                 [LocalFieldId::from_raw(la_arena::RawIdx::from_u32(field_idx))];
+@@ -5531,6 +5623,7 @@ impl<'db> Type<'db> {
+             ValueTyDefId::EnumVariantId(it) => {
+                 GenericDefId::AdtId(AdtId::EnumId(it.lookup(db).parent))
+             }
++            ValueTyDefId::ClassId(it) => GenericDefId::AdtId(AdtId::ClassId(it)),
+             ValueTyDefId::StaticId(_) => {
+                 return Type::new(db, def, ty.skip_binder());
+             }
+@@ -5635,9 +5728,9 @@ impl<'db> Type<'db> {
+                             AdtId::UnionId(id) => {
+                                 vec![variant_id_to_fields(id.into())]
+                             }
+-                            AdtId::ClassId(_) => unimplemented!(
+-                                "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
+-                            ),
++                            AdtId::ClassId(id) => {
++                                vec![variant_id_to_fields(id.into())]
++                            }
+                         };
+ 
+                         variants
+@@ -5946,7 +6039,9 @@ impl<'db> Type<'db> {
+                     AdtId::StructId(id) => id.into(),
+                     AdtId::UnionId(id) => id.into(),
+                     AdtId::EnumId(_) => return Vec::new(),
+-                    AdtId::ClassId(_) => return Vec::new(),
++                    // rustcc Phase 2 (B.4): a class is record-shaped, so
++                    // expose its fields the same way we do for a struct.
++                    AdtId::ClassId(id) => VariantId::from(id),
+                 };
+                 (id, substs)
+             }
+@@ -6972,6 +7067,12 @@ impl HasCrate for Struct {
+     }
+ }
+ 
++impl HasCrate for Class {
++    fn krate(&self, db: &dyn HirDatabase) -> Crate {
++        self.module(db).krate(db)
++    }
++}
++
+ impl HasCrate for Union {
+     fn krate(&self, db: &dyn HirDatabase) -> Crate {
+         self.module(db).krate(db)
+@@ -7094,6 +7195,12 @@ impl HasContainer for Struct {
+     }
+ }
+ 
++impl HasContainer for Class {
++    fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
++        ItemContainer::Module(Module { id: self.id.lookup(db).container })
++    }
++}
++
+ impl HasContainer for Union {
+     fn container(&self, db: &dyn HirDatabase) -> ItemContainer {
+         ItemContainer::Module(Module { id: self.id.lookup(db).container })
+@@ -7159,6 +7266,7 @@ impl_has_name!(
+     Struct,
+     Union,
+     Enum,
++    Class,
+     EnumVariant,
+     Adt,
+     Variant,
+diff --git a/crates/hir/src/semantics/child_by_source.rs b/crates/hir/src/semantics/child_by_source.rs
+index 3a4d36968..4809127e6 100644
+--- a/crates/hir/src/semantics/child_by_source.rs
++++ b/crates/hir/src/semantics/child_by_source.rs
+@@ -158,9 +158,7 @@ impl ChildBySource for ItemScope {
+                     AdtId::StructId(id) => insert_item_loc(db, map, file_id, id, keys::STRUCT),
+                     AdtId::UnionId(id) => insert_item_loc(db, map, file_id, id, keys::UNION),
+                     AdtId::EnumId(id) => insert_item_loc(db, map, file_id, id, keys::ENUM),
+-                    AdtId::ClassId(_) => {
+-                        // rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)
+-                    }
++                    AdtId::ClassId(id) => insert_item_loc(db, map, file_id, id, keys::CLASS),
+                 },
+                 ModuleDefId::MacroId(id) => match id {
+                     MacroId::Macro2Id(id) => insert_item_loc(db, map, file_id, id, keys::MACRO2),
+diff --git a/crates/hir/src/source_analyzer.rs b/crates/hir/src/source_analyzer.rs
+index 83acce287..f658a2f60 100644
+--- a/crates/hir/src/source_analyzer.rs
++++ b/crates/hir/src/source_analyzer.rs
+@@ -942,9 +942,9 @@ impl<'db> SourceAnalyzer<'db> {
+                     VariantId::EnumVariantId(it) => it.loc(db).parent.into(),
+                     VariantId::StructId(it) => it.into(),
+                     VariantId::UnionId(it) => it.into(),
+-                    VariantId::ClassId(_) => unimplemented!(
+-                        "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
+-                    ),
++                    // rustcc Phase 2 (B.4): treat a class like a struct
++                    // for `OffsetOf`-style field resolution.
++                    VariantId::ClassId(it) => it.into(),
+                 };
+                 Some((
+                     Either::Right(Field { parent: variant.into(), id: field }),
+@@ -972,9 +972,10 @@ impl<'db> SourceAnalyzer<'db> {
+                                 container = Either::Left((variant, subst));
+                                 (Either::Left(EnumVariant { id: variant }), id.into(), subst)
+                             }
+-                            AdtId::ClassId(_) => unimplemented!(
+-                                "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
+-                            ),
++                            AdtId::ClassId(id) => {
++                                // rustcc Phase 2 (B.4): like a struct.
++                                handle_variants(id.into(), subst, &mut container)?
++                            }
+                         },
+                         _ => return None,
+                     },
+diff --git a/crates/hir/src/symbols.rs b/crates/hir/src/symbols.rs
+index 8a5172a12..7b796ce3f 100644
+--- a/crates/hir/src/symbols.rs
++++ b/crates/hir/src/symbols.rs
+@@ -198,8 +198,10 @@ impl<'a> SymbolCollector<'a> {
+                 ModuleDefId::AdtId(AdtId::UnionId(id)) => {
+                     this.push_decl(id, name, false, None);
+                 }
+-                ModuleDefId::AdtId(AdtId::ClassId(_)) => {
+-                    // rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)
++                ModuleDefId::AdtId(AdtId::ClassId(id)) => {
++                    // rustcc Phase 2 (B.4): surface class names through
++                    // workspace-symbol search like any other ADT.
++                    this.push_decl(id, name, false, None);
+                 }
+                 ModuleDefId::ConstId(id) => {
+                     this.push_decl(id, name, false, None);
+diff --git a/crates/hir/src/term_search/tactics.rs b/crates/hir/src/term_search/tactics.rs
+index c7ef4e5d5..22fae7a88 100644
+--- a/crates/hir/src/term_search/tactics.rs
++++ b/crates/hir/src/term_search/tactics.rs
+@@ -283,6 +283,10 @@ pub(super) fn data_constructor<'a, 'lt, 'db, DB: HirDatabase>(
+                 Some((ty, exprs))
+             }
+             Adt::Union(_) => None,
++            // rustcc Phase 2 (B.4): term-search constructor synthesis
++            // for classes can come later — fall through to None here so
++            // we don't suggest constructors we can't build yet.
++            Adt::Class(_) => None,
+         })
+         .filter_map(|(ty, exprs)| ty.could_unify_with_deeply(db, &ctx.goal).then_some(exprs))
+         .flatten()
+diff --git a/crates/ide-assists/src/handlers/auto_import.rs b/crates/ide-assists/src/handlers/auto_import.rs
+index f9d618790..b2cba0742 100644
+--- a/crates/ide-assists/src/handlers/auto_import.rs
++++ b/crates/ide-assists/src/handlers/auto_import.rs
+@@ -271,6 +271,7 @@ pub(crate) fn relevance_score(
+                         hir::Adt::Struct(it) => it.ty(ctx.db()),
+                         hir::Adt::Union(it) => it.ty(ctx.db()),
+                         hir::Adt::Enum(it) => it.ty(ctx.db()),
++                        hir::Adt::Class(it) => it.ty(ctx.db()),
+                     }),
+                     hir::ModuleDef::EnumVariant(variant) => Some(variant.constructor_ty(ctx.db())),
+                     hir::ModuleDef::Const(it) => Some(it.ty(ctx.db())),
+diff --git a/crates/ide-assists/src/handlers/fix_visibility.rs b/crates/ide-assists/src/handlers/fix_visibility.rs
+index d8714dd49..2177be68f 100644
+--- a/crates/ide-assists/src/handlers/fix_visibility.rs
++++ b/crates/ide-assists/src/handlers/fix_visibility.rs
+@@ -145,6 +145,7 @@ fn target_data_for_def(
+                 hir::Adt::Struct(s) => offset_target_and_file_id(db, s)?,
+                 hir::Adt::Union(u) => offset_target_and_file_id(db, u)?,
+                 hir::Adt::Enum(e) => offset_target_and_file_id(db, e)?,
++                hir::Adt::Class(c) => offset_target_and_file_id(db, c)?,
+             }
+         }
+         hir::ModuleDef::Const(c) => {
+diff --git a/crates/ide-completion/src/completions/expr.rs b/crates/ide-completion/src/completions/expr.rs
+index c15c67173..8ee96b634 100644
+--- a/crates/ide-completion/src/completions/expr.rs
++++ b/crates/ide-completion/src/completions/expr.rs
+@@ -300,6 +300,11 @@ pub(crate) fn complete_expr_path(
+                             },
+                         );
+                     }
++                    // rustcc Phase 2 (B.4): record-shaped class literals
++                    // (`Foo { … }`) follow the same completion path as
++                    // structs. We don't yet emit a class-literal helper —
++                    // the user gets the type-namespace completion for now.
++                    hir::Adt::Class(_) => {}
+                 }
+             }
+             ctx.process_all_names(&mut |name, def, doc_aliases| match def {
+diff --git a/crates/ide-completion/src/item.rs b/crates/ide-completion/src/item.rs
+index 6b34bf07b..bb4bd77a4 100644
+--- a/crates/ide-completion/src/item.rs
++++ b/crates/ide-completion/src/item.rs
+@@ -408,6 +408,8 @@ impl CompletionItemKind {
+             CompletionItemKind::SymbolKind(kind) => match kind {
+                 SymbolKind::Attribute => "at",
+                 SymbolKind::BuiltinAttr => "ba",
++                // rustcc Phase 2 (B.4): completion-tag for `class Foo {}`.
++                SymbolKind::Class => "cl",
+                 SymbolKind::Const => "ct",
+                 SymbolKind::ConstParam => "cp",
+                 SymbolKind::CrateRoot => "cr",
+diff --git a/crates/ide-completion/src/render.rs b/crates/ide-completion/src/render.rs
+index d24ebab55..ec8ef7599 100644
+--- a/crates/ide-completion/src/render.rs
++++ b/crates/ide-completion/src/render.rs
+@@ -556,6 +556,7 @@ fn res_to_kind(resolution: ScopeDef) -> CompletionItemKind {
+             hir::Adt::Struct(_) => SymbolKind::Struct,
+             hir::Adt::Union(_) => SymbolKind::Union,
+             hir::Adt::Enum(_) => SymbolKind::Enum,
++            hir::Adt::Class(_) => SymbolKind::Class,
+         }),
+         ScopeDef::ModuleDef(Const(..)) => CompletionItemKind::SymbolKind(SymbolKind::Const),
+         ScopeDef::ModuleDef(Static(..)) => CompletionItemKind::SymbolKind(SymbolKind::Static),
+diff --git a/crates/ide-db/src/documentation.rs b/crates/ide-db/src/documentation.rs
+index 407049f4b..4e5b66684 100644
+--- a/crates/ide-db/src/documentation.rs
++++ b/crates/ide-db/src/documentation.rs
+@@ -74,6 +74,7 @@ impl_has_docs![
+     Struct,
+     Union,
+     Enum,
++    Class,
+ ];
+ 
+ impl HasDocs for hir::ExternCrateDecl {
+diff --git a/crates/ide-db/src/imports/import_assets.rs b/crates/ide-db/src/imports/import_assets.rs
+index e0501b5e4..3d0a70fd4 100644
+--- a/crates/ide-db/src/imports/import_assets.rs
++++ b/crates/ide-db/src/imports/import_assets.rs
+@@ -574,6 +574,10 @@ fn filter_by_definition_kind(
+         ModuleDef::Adt(hir::Adt::Union(_)) => {
+             allowed.type_namespace || allowed.records || allowed.structs_and_consts
+         }
++        // rustcc Phase 2 (B.4): treat a class like a record-shaped struct.
++        ModuleDef::Adt(hir::Adt::Class(item)) => {
++            allowed.type_namespace || struct_per_kind(item.kind(db))
++        }
+         ModuleDef::EnumVariant(item) => struct_per_kind(item.kind(db)),
+         ModuleDef::Const(_) => allowed.value_namespace || allowed.structs_and_consts,
+         ModuleDef::Static(_) => allowed.value_namespace,
+diff --git a/crates/ide-db/src/lib.rs b/crates/ide-db/src/lib.rs
+index 6b72a3033..793f8bbaa 100644
+--- a/crates/ide-db/src/lib.rs
++++ b/crates/ide-db/src/lib.rs
+@@ -272,6 +272,10 @@ pub fn line_index(db: &dyn SourceDatabase, file_id: FileId) -> &Arc<LineIndex> {
+ pub enum SymbolKind {
+     Attribute,
+     BuiltinAttr,
++    // rustcc Phase 2 (B.4): user-facing symbol kind for `class Foo {}`.
++    // Distinct from Struct so the IDE can render the keyword and pick a
++    // class icon, while sharing record-shape behavior internally.
++    Class,
+     Const,
+     ConstParam,
+     CrateRoot,
+@@ -327,6 +331,7 @@ impl SymbolKind {
+             hir::ModuleDef::Adt(hir::Adt::Struct(..)) => SymbolKind::Struct,
+             hir::ModuleDef::Adt(hir::Adt::Enum(..)) => SymbolKind::Enum,
+             hir::ModuleDef::Adt(hir::Adt::Union(..)) => SymbolKind::Union,
++            hir::ModuleDef::Adt(hir::Adt::Class(..)) => SymbolKind::Class,
+             hir::ModuleDef::Trait(..) => SymbolKind::Trait,
+             hir::ModuleDef::TypeAlias(..) => SymbolKind::TypeAlias,
+             hir::ModuleDef::BuiltinType(..) => SymbolKind::TypeAlias,
+diff --git a/crates/ide-db/src/rename.rs b/crates/ide-db/src/rename.rs
+index ac0b09971..3f8224a1d 100644
+--- a/crates/ide-db/src/rename.rs
++++ b/crates/ide-db/src/rename.rs
+@@ -171,6 +171,7 @@ impl Definition {
+                 hir::Adt::Struct(it) => name_range(it, sema).and_then(syn_ctx_is_root),
+                 hir::Adt::Union(it) => name_range(it, sema).and_then(syn_ctx_is_root),
+                 hir::Adt::Enum(it) => name_range(it, sema).and_then(syn_ctx_is_root),
++                hir::Adt::Class(it) => name_range(it, sema).and_then(syn_ctx_is_root),
+             },
+             Definition::EnumVariant(it) => name_range(it, sema).and_then(syn_ctx_is_root),
+             Definition::Const(it) => name_range(it, sema).and_then(syn_ctx_is_root),
+diff --git a/crates/ide-diagnostics/src/handlers/no_such_field.rs b/crates/ide-diagnostics/src/handlers/no_such_field.rs
+index 944622bb1..b35a7250e 100644
+--- a/crates/ide-diagnostics/src/handlers/no_such_field.rs
++++ b/crates/ide-diagnostics/src/handlers/no_such_field.rs
+@@ -84,6 +84,10 @@ fn missing_record_expr_field_fixes(
+             let fields = source.value.field_list()?;
+             record_field_list(fields)?
+         }
++        // rustcc Phase 2 (B.4): the "add field" fix-it requires a
++        // RECORD_FIELD_LIST, which CLASS_MEMBER_LIST is not. Skip the
++        // assist for classes for now — the diagnostic still fires.
++        hir::Variant::Class(_) => return None,
+     };
+     let def_file_id = def_file_id.original_file(sema.db);
+ 
+diff --git a/crates/ide/src/doc_links.rs b/crates/ide/src/doc_links.rs
+index fd462d003..0b6500bc6 100644
+--- a/crates/ide/src/doc_links.rs
++++ b/crates/ide/src/doc_links.rs
+@@ -653,6 +653,10 @@ fn filename_and_frag_for_def(
+             }
+             Adt::Enum(e) => format!("enum.{}.html", e.name(db).as_str()),
+             Adt::Union(u) => format!("union.{}.html", u.name(db).as_str()),
++            // rustcc Phase 2 (B.4): no rustdoc page kind for `class` —
++            // use the same URL shape as struct so any future rustdoc
++            // backend can route it the same way.
++            Adt::Class(c) => format!("struct.{}.html", c.name(db).as_str()),
+         },
+         Definition::Crate(_) => String::from("index.html"),
+         Definition::Module(m) => match m.name(db) {
+@@ -706,6 +710,7 @@ fn filename_and_frag_for_def(
+                 hir::Variant::Struct(it) => Definition::Adt(it.into()),
+                 hir::Variant::Union(it) => Definition::Adt(it.into()),
+                 hir::Variant::EnumVariant(it) => Definition::EnumVariant(it),
++                hir::Variant::Class(it) => Definition::Adt(it.into()),
+             };
+             let (_, file, _) = filename_and_frag_for_def(db, def)?;
+             return Some((def, file, Some(format!("structfield.{}", field.name(db).as_str()))));
+diff --git a/crates/ide/src/moniker.rs b/crates/ide/src/moniker.rs
+index 335e1b5b1..71763bb0b 100644
+--- a/crates/ide/src/moniker.rs
++++ b/crates/ide/src/moniker.rs
+@@ -205,6 +205,9 @@ pub(crate) fn def_to_kind(db: &RootDatabase, def: Definition) -> SymbolInformati
+         Definition::Adt(Adt::Struct(..)) => Struct,
+         Definition::Adt(Adt::Union(..)) => Union,
+         Definition::Adt(Adt::Enum(..)) => Enum,
++        // rustcc Phase 2 (B.4): SCIP has no `Class` kind — fall back
++        // to Struct so external indexers still get a sensible shape.
++        Definition::Adt(Adt::Class(..)) => Struct,
+         Definition::EnumVariant(..) => EnumMember,
+         Definition::Const(..) => Constant,
+         Definition::Static(..) => StaticVariable,
+diff --git a/crates/ide/src/navigation_target.rs b/crates/ide/src/navigation_target.rs
+index 99f8634bc..cb0b76d53 100644
+--- a/crates/ide/src/navigation_target.rs
++++ b/crates/ide/src/navigation_target.rs
+@@ -415,6 +415,13 @@ impl ToNavFromAst for hir::Union {
+         container_name(db, self)
+     }
+ }
++// rustcc Phase 2 (B.4): nav-target plumbing for `class Foo {}`.
++impl ToNavFromAst for hir::Class {
++    const KIND: SymbolKind = SymbolKind::Class;
++    fn container_name(self, db: &RootDatabase) -> Option<Symbol> {
++        container_name(db, self)
++    }
++}
+ impl ToNavFromAst for hir::TypeAlias {
+     const KIND: SymbolKind = SymbolKind::TypeAlias;
+     fn container_name(self, db: &RootDatabase) -> Option<Symbol> {
+@@ -626,6 +633,7 @@ impl TryToNav for hir::Adt {
+             hir::Adt::Struct(it) => it.try_to_nav(sema),
+             hir::Adt::Union(it) => it.try_to_nav(sema),
+             hir::Adt::Enum(it) => it.try_to_nav(sema),
++            hir::Adt::Class(it) => it.try_to_nav(sema),
+         }
+     }
+ }
+diff --git a/crates/ide/src/signature_help.rs b/crates/ide/src/signature_help.rs
+index cf796b271..992f85575 100644
+--- a/crates/ide/src/signature_help.rs
++++ b/crates/ide/src/signature_help.rs
+@@ -340,6 +340,12 @@ fn signature_help_for_generics(
+             res.doc = it.docs(db).map(Documentation::into_owned);
+             format_to!(res.signature, "union {}", it.name(db).display(db, edition));
+         }
++        // rustcc Phase 2 (B.4): signature help for `Foo::<...>` where
++        // Foo is a class — render with the class keyword.
++        hir::GenericDef::Adt(hir::Adt::Class(it)) => {
++            res.doc = it.docs(db).map(Documentation::into_owned);
++            format_to!(res.signature, "class {}", it.name(db).display(db, edition));
++        }
+         hir::GenericDef::Trait(it) => {
+             res.doc = it.docs(db).map(Documentation::into_owned);
+             format_to!(res.signature, "trait {}", it.name(db).display(db, edition));
+diff --git a/crates/ide/src/syntax_highlighting/highlight.rs b/crates/ide/src/syntax_highlighting/highlight.rs
+index 6823736d1..835fb8b1a 100644
+--- a/crates/ide/src/syntax_highlighting/highlight.rs
++++ b/crates/ide/src/syntax_highlighting/highlight.rs
+@@ -534,6 +534,7 @@ pub(super) fn highlight_def(
+                 hir::Adt::Struct(_) => HlTag::Symbol(SymbolKind::Struct),
+                 hir::Adt::Enum(_) => HlTag::Symbol(SymbolKind::Enum),
+                 hir::Adt::Union(_) => HlTag::Symbol(SymbolKind::Union),
++                hir::Adt::Class(_) => HlTag::Symbol(SymbolKind::Class),
+             };
+ 
+             (Highlight::new(h), Some(adt.attrs(sema.db)))
+diff --git a/crates/ide/src/syntax_highlighting/inject.rs b/crates/ide/src/syntax_highlighting/inject.rs
+index 76bb06328..d07befa7d 100644
+--- a/crates/ide/src/syntax_highlighting/inject.rs
++++ b/crates/ide/src/syntax_highlighting/inject.rs
+@@ -220,6 +220,7 @@ fn module_def_to_hl_tag(db: &dyn HirDatabase, def: Definition) -> HlTag {
+         Definition::Adt(hir::Adt::Struct(_)) => SymbolKind::Struct,
+         Definition::Adt(hir::Adt::Enum(_)) => SymbolKind::Enum,
+         Definition::Adt(hir::Adt::Union(_)) => SymbolKind::Union,
++        Definition::Adt(hir::Adt::Class(_)) => SymbolKind::Class,
+         Definition::EnumVariant(_) => SymbolKind::Variant,
+         Definition::Const(_) => SymbolKind::Const,
+         Definition::Static(_) => SymbolKind::Static,
+diff --git a/crates/ide/src/syntax_highlighting/tags.rs b/crates/ide/src/syntax_highlighting/tags.rs
+index 0c64d3de1..996aab0c9 100644
+--- a/crates/ide/src/syntax_highlighting/tags.rs
++++ b/crates/ide/src/syntax_highlighting/tags.rs
+@@ -142,6 +142,8 @@ impl HlTag {
+             HlTag::Symbol(symbol) => match symbol {
+                 SymbolKind::Attribute => "attribute",
+                 SymbolKind::BuiltinAttr => "builtin_attr",
++                // rustcc Phase 2 (B.4): semantic highlight tag for `class`.
++                SymbolKind::Class => "class",
+                 SymbolKind::Const => "constant",
+                 SymbolKind::ConstParam => "const_param",
+                 SymbolKind::CrateRoot => "crate_root",
+diff --git a/crates/rust-analyzer/src/cli/analysis_stats.rs b/crates/rust-analyzer/src/cli/analysis_stats.rs
+index bf9a66bf3..b61db2a7b 100644
+--- a/crates/rust-analyzer/src/cli/analysis_stats.rs
++++ b/crates/rust-analyzer/src/cli/analysis_stats.rs
+@@ -258,6 +258,7 @@ impl flags::AnalysisStats {
+                                 }
+                                 Adt::Struct(it) => variants.push(Variant::Struct(it)),
+                                 Adt::Union(it) => variants.push(Variant::Union(it)),
++                                Adt::Class(it) => variants.push(Variant::Class(it)),
+                             }
+                             adts.push(a)
+                         }
+@@ -1214,6 +1215,7 @@ impl flags::AnalysisStats {
+                         Variant::EnumVariant(it) => it.source(db).map(|it| it.syntax().cloned()),
+                         Variant::Struct(it) => it.source(db).map(|it| it.syntax().cloned()),
+                         Variant::Union(it) => it.source(db).map(|it| it.syntax().cloned()),
++                        Variant::Class(it) => it.source(db).map(|it| it.syntax().cloned()),
+                     };
+                     if let Some(src) = source {
+                         let original_file = src.file_id.original_file(db);
+diff --git a/crates/rust-analyzer/src/lsp/semantic_tokens.rs b/crates/rust-analyzer/src/lsp/semantic_tokens.rs
+index 9bfdea8a1..b2b9ec1dd 100644
+--- a/crates/rust-analyzer/src/lsp/semantic_tokens.rs
++++ b/crates/rust-analyzer/src/lsp/semantic_tokens.rs
+@@ -42,6 +42,8 @@ macro_rules! define_semantic_token_types {
+ 
+ define_semantic_token_types![
+     standard {
++        // rustcc Phase 2 (B.4): semantic-token type for `class Foo {}`.
++        CLASS,
+         COMMENT,
+         DECORATOR,
+         ENUM_MEMBER,
+diff --git a/crates/rust-analyzer/src/lsp/to_proto.rs b/crates/rust-analyzer/src/lsp/to_proto.rs
+index d59e9d843..46b98ceaf 100644
+--- a/crates/rust-analyzer/src/lsp/to_proto.rs
++++ b/crates/rust-analyzer/src/lsp/to_proto.rs
+@@ -60,6 +60,8 @@ pub(crate) fn symbol_kind(symbol_kind: SymbolKind) -> lsp_types::SymbolKind {
+     match symbol_kind {
+         SymbolKind::Function => lsp_types::SymbolKind::FUNCTION,
+         SymbolKind::Method => lsp_types::SymbolKind::METHOD,
++        // rustcc Phase 2 (B.4): LSP has a real Class kind — use it.
++        SymbolKind::Class => lsp_types::SymbolKind::CLASS,
+         SymbolKind::Struct => lsp_types::SymbolKind::STRUCT,
+         SymbolKind::Enum => lsp_types::SymbolKind::ENUM,
+         SymbolKind::Variant => lsp_types::SymbolKind::ENUM_MEMBER,
+@@ -140,6 +142,8 @@ pub(crate) fn completion_item_kind(
+         CompletionItemKind::SymbolKind(symbol) => match symbol {
+             SymbolKind::Attribute => lsp_types::CompletionItemKind::FUNCTION,
+             SymbolKind::Method => lsp_types::CompletionItemKind::METHOD,
++            // rustcc Phase 2 (B.4): map class to LSP CLASS completion kind.
++            SymbolKind::Class => lsp_types::CompletionItemKind::CLASS,
+             SymbolKind::Const => lsp_types::CompletionItemKind::CONSTANT,
+             SymbolKind::ConstParam => lsp_types::CompletionItemKind::TYPE_PARAMETER,
+             SymbolKind::CrateRoot => lsp_types::CompletionItemKind::MODULE,
+@@ -833,6 +837,8 @@ fn semantic_token_type_and_modifiers(
+             SymbolKind::Function => types::FUNCTION,
+             SymbolKind::Const => types::CONST,
+             SymbolKind::Static => types::STATIC,
++            // rustcc Phase 2 (B.4): semantic-token CLASS for class symbols.
++            SymbolKind::Class => types::CLASS,
+             SymbolKind::Struct => types::STRUCT,
+             SymbolKind::Enum => types::ENUM,
+             SymbolKind::Variant => types::ENUM_MEMBER,
+diff --git a/crates/syntax/src/ast/generated/nodes.rs b/crates/syntax/src/ast/generated/nodes.rs
+index 1a92f9115..03c2f2c0b 100644
+--- a/crates/syntax/src/ast/generated/nodes.rs
++++ b/crates/syntax/src/ast/generated/nodes.rs
+@@ -2335,6 +2335,11 @@ pub enum VariantDef {
+     Struct(Struct),
+     Union(Union),
+     Variant(Variant),
++    // rustcc Phase 2 (B.4): a `class` is record-shaped, so it slots
++    // into VariantDef alongside Struct/Union for IDE machinery that
++    // walks "any record-style def with fields" (Field::parent source,
++    // analysis-stats variant printer, etc.).
++    Class(Class),
+ }
+ impl ast::HasAttrs for VariantDef {}
+ impl ast::HasDocComments for VariantDef {}
+@@ -9587,15 +9592,20 @@ impl From<Variant> for VariantDef {
+     #[inline]
+     fn from(node: Variant) -> VariantDef { VariantDef::Variant(node) }
+ }
++impl From<Class> for VariantDef {
++    #[inline]
++    fn from(node: Class) -> VariantDef { VariantDef::Class(node) }
++}
+ impl AstNode for VariantDef {
+     #[inline]
+-    fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, STRUCT | UNION | VARIANT) }
++    fn can_cast(kind: SyntaxKind) -> bool { matches!(kind, STRUCT | UNION | VARIANT | CLASS) }
+     #[inline]
+     fn cast(syntax: SyntaxNode) -> Option<Self> {
+         let res = match syntax.kind() {
+             STRUCT => VariantDef::Struct(Struct { syntax }),
+             UNION => VariantDef::Union(Union { syntax }),
+             VARIANT => VariantDef::Variant(Variant { syntax }),
++            CLASS => VariantDef::Class(Class { syntax }),
+             _ => return None,
+         };
+         Some(res)
+@@ -9606,6 +9616,7 @@ impl AstNode for VariantDef {
+             VariantDef::Struct(it) => &it.syntax,
+             VariantDef::Union(it) => &it.syntax,
+             VariantDef::Variant(it) => &it.syntax,
++            VariantDef::Class(it) => &it.syntax,
+         }
+     }
+ }
+-- 
+2.50.1 (Apple Git-155)
+

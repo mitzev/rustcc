@@ -1,0 +1,546 @@
+From 0ebcd1e48f95e4043e96002defa70ed40170b4be Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 18:46:41 +0300
+Subject: [PATCH] P09.46-B5: class-aware assist test coverage +
+ generate_class_new
+
+---
+ .../src/handlers/add_lifetime_to_type.rs      |  13 +
+ .../src/handlers/change_visibility.rs         |  39 ++-
+ .../src/handlers/extract_module.rs            |  43 +++
+ .../src/handlers/generate_class_new.rs        | 280 ++++++++++++++++++
+ .../src/handlers/generate_derive.rs           |  14 +
+ .../ide-assists/src/handlers/generate_impl.rs |  33 +++
+ crates/ide-assists/src/lib.rs                 |   4 +
+ 7 files changed, 423 insertions(+), 3 deletions(-)
+ create mode 100644 crates/ide-assists/src/handlers/generate_class_new.rs
+
+diff --git a/crates/ide-assists/src/handlers/add_lifetime_to_type.rs b/crates/ide-assists/src/handlers/add_lifetime_to_type.rs
+index 2d21b6a9b..f08a3838c 100644
+--- a/crates/ide-assists/src/handlers/add_lifetime_to_type.rs
++++ b/crates/ide-assists/src/handlers/add_lifetime_to_type.rs
+@@ -238,4 +238,17 @@ mod tests {
+ 
+         check_assist_not_applicable(add_lifetime_to_type, r#"struct Foo<'a> { a: &'a $0i32 }"#);
+     }
++
++    // rustcc P09.46-B5: classes are intentionally not supported by this assist
++    // yet — the lifetime inference walks `FieldList`, but classes expose a
++    // different shape (`ClassMemberList` mixing fields and methods). Keep the
++    // bail and document it via a not-applicable test so future B.4c method-walk
++    // work doesn't accidentally regress this.
++    #[test]
++    fn add_lifetime_to_class_is_not_applicable_yet() {
++        check_assist_not_applicable(
++            add_lifetime_to_type,
++            r#"class Foo { a: &$0i32 }"#,
++        );
++    }
+ }
+diff --git a/crates/ide-assists/src/handlers/change_visibility.rs b/crates/ide-assists/src/handlers/change_visibility.rs
+index 7119d5b9c..f19ea5bf0 100644
+--- a/crates/ide-assists/src/handlers/change_visibility.rs
++++ b/crates/ide-assists/src/handlers/change_visibility.rs
+@@ -1,8 +1,8 @@
+ use syntax::{
+     AstNode,
+     SyntaxKind::{
+-        self, ASSOC_ITEM_LIST, CONST, ENUM, FN, MACRO_DEF, MODULE, SOURCE_FILE, STATIC, STRUCT,
+-        TRAIT, TYPE_ALIAS, USE, VISIBILITY,
++        self, ASSOC_ITEM_LIST, CLASS, CONST, ENUM, FN, MACRO_DEF, MODULE, SOURCE_FILE, STATIC,
++        STRUCT, TRAIT, TYPE_ALIAS, USE, VISIBILITY,
+     },
+     SyntaxNode, T,
+     ast::{self, HasName, HasVisibility},
+@@ -42,6 +42,9 @@ fn add_vis(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+                 | T![type]
+                 | T![use]
+                 | T![macro]
++                // rustcc fork (P09.46-B5): accept `class` as a top-level
++                // visibility-bearing item keyword, mirroring `struct`.
++                | T![class]
+         )
+     });
+ 
+@@ -88,8 +91,10 @@ fn add_vis(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
+ }
+ 
+ fn can_add(node: &SyntaxNode) -> bool {
++    // rustcc fork (P09.46-B5): `CLASS` is a legal top-level item that should
++    // accept `pub(crate)`, just like `STRUCT`.
+     const LEGAL: &[SyntaxKind] =
+-        &[CONST, STATIC, TYPE_ALIAS, FN, MODULE, STRUCT, ENUM, TRAIT, USE, MACRO_DEF];
++        &[CLASS, CONST, STATIC, TYPE_ALIAS, FN, MODULE, STRUCT, ENUM, TRAIT, USE, MACRO_DEF];
+ 
+     LEGAL.contains(&node.kind()) && {
+         let Some(p) = node.parent() else {
+@@ -180,6 +185,34 @@ mod tests {
+         check_assist(change_visibility, r"struct S ( $0u32 )", r"struct S ( pub(crate) u32 )");
+     }
+ 
++    // rustcc P09.46-B5: classes accept the same visibility modifiers as
++    // structs. Adding `class` to both the keyword filter in `add_vis` and the
++    // `LEGAL` syntax-kind list in `can_add` makes `pub(crate)` insertion work
++    // on class headers; the existing record-field path covers class members,
++    // since `RecordField` is shared between struct and class member lists.
++    #[test]
++    fn change_visibility_works_for_class_keyword() {
++        check_assist(
++            change_visibility,
++            "$0class Widget { x: i32, y: i32 }",
++            "pub(crate) class Widget { x: i32, y: i32 }",
++        );
++        check_assist(
++            change_visibility,
++            "c$0lass Widget { x: i32, y: i32 }",
++            "pub(crate) class Widget { x: i32, y: i32 }",
++        );
++    }
++
++    #[test]
++    fn change_visibility_works_with_class_fields() {
++        check_assist(
++            change_visibility,
++            r"class W { $0field: u32 }",
++            r"class W { pub(crate) field: u32 }",
++        );
++    }
++
+     #[test]
+     fn change_visibility_field_false_positive() {
+         cov_mark::check!(change_visibility_field_false_positive);
+diff --git a/crates/ide-assists/src/handlers/extract_module.rs b/crates/ide-assists/src/handlers/extract_module.rs
+index 3501f0623..5075c073c 100644
+--- a/crates/ide-assists/src/handlers/extract_module.rs
++++ b/crates/ide-assists/src/handlers/extract_module.rs
+@@ -791,6 +791,16 @@ fn get_replacements_for_visibility_change(
+                 push_to_replacement!(it);
+                 record_field_parents.push((it.visibility(), it.syntax().clone()));
+             }
++            // rustcc fork (P09.46-B5): treat `class` like `struct`/`union` for
++            // visibility-promotion purposes — the class itself becomes
++            // `pub(crate)`, and its named fields participate in
++            // record-field-parent walking. Methods inside the class body are
++            // associated items and are intentionally skipped here (matching
++            // the `Impl` handling above).
++            ast::Item::Class(it) => {
++                push_to_replacement!(it);
++                record_field_parents.push((it.visibility(), it.syntax().clone()));
++            }
+             _ => (),
+         }
+     }
+@@ -1822,4 +1832,37 @@ mod foo {
+ "#,
+         )
+     }
++
++    // rustcc P09.46-B5: classes participate in `extract_module` at the item
++    // level — the class itself gets promoted to `pub(crate)` via the new
++    // `Item::Class` arm in `get_replacements_for_visibility_change`. Field-level
++    // visibility promotion is gated on `Sema::to_def(class)`, which currently
++    // returns None for class (see `source_to_def::adt_to_def`'s class arm) until
++    // B.4b lands a synthesized `StructId` mapping. Once that lands the inner
++    // fields will pick up `pub(crate)` automatically; for now we pin the
++    // structural extraction down with a class-level visibility check.
++    #[test]
++    fn test_extract_module_with_class() {
++        check_assist(
++            extract_module,
++            r"
++            mod bar {
++                $0class Widget {
++                    x: i32,
++                    y: i32,
++                }$0
++            }
++            ",
++            r"
++            mod bar {
++                mod modname {
++                    pub(crate) class Widget {
++                        x: i32,
++                        y: i32,
++                    }
++                }
++            }
++            ",
++        );
++    }
+ }
+diff --git a/crates/ide-assists/src/handlers/generate_class_new.rs b/crates/ide-assists/src/handlers/generate_class_new.rs
+new file mode 100644
+index 000000000..56e7fec14
+--- /dev/null
++++ b/crates/ide-assists/src/handlers/generate_class_new.rs
+@@ -0,0 +1,280 @@
++//! rustcc fork (P09.46-B5): class-flavored `generate_new`.
++//!
++//! The upstream `generate_new` works on `ast::Struct` and depends on
++//! `Sema::to_def(struct)` for resolving existing `impl` blocks. Until B.4b/c
++//! gives `class` items a real `hir-def` AdtId, the resolved-hir paths
++//! consistently return `None` for class — so a class-specific assist that
++//! sticks to syntax-level manipulation is the pragmatic shape for now.
++//!
++//! This assist offers `Generate constructor for class` on a class header. It
++//! always inserts a brand-new inherent `impl` block after the class with a
++//! `#[constructor]` method named `new`. The `#[constructor]` attribute is a
++//! fork-only marker that downstream tools (e.g. the rustcc cxx_importer
++//! lowering pass) recognize; rust-analyzer treats it as an opaque attribute,
++//! which is fine for the IDE's purposes — the assist scaffolds source the
++//! user can refine.
++//!
++//! Limitations (deliberate):
++//! - We do NOT detect a pre-existing inherent `impl` for the class to splice
++//!   into (would need `to_def`, see above).
++//! - We do NOT detect a pre-existing `new` function (same reason).
++//! - We do NOT walk inheritance to forward base-class fields (B.4b territory).
++//!
++//! When B.4b lands and `to_def(class)` starts returning a real id, this assist
++//! should be revisited and probably folded back into `generate_new`.
++
++use stdx::format_to;
++use syntax::{
++    ast::{self, AstNode, HasGenericParams, HasName, HasVisibility, edit::IndentLevel},
++};
++
++use crate::{AssistContext, AssistId, Assists};
++
++// Assist: generate_class_new
++//
++// Adds a `#[constructor] fn new` for a class.
++//
++// ```
++// class Widget$0 {
++//     x: i32,
++//     y: i32,
++// }
++// ```
++// ->
++// ```
++// class Widget {
++//     x: i32,
++//     y: i32,
++// }
++//
++// impl Widget {
++//     #[constructor]
++//     pub fn new(x: i32, y: i32) -> Self {
++//         Widget { x, y }
++//     }
++// }
++// ```
++pub(crate) fn generate_class_new(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
++    let class = ctx.find_node_at_offset::<ast::Class>()?;
++    let name = class.name()?;
++    let member_list = class.class_member_list()?;
++
++    // Collect named fields. Class members can also be methods, but for the
++    // constructor only the field list matters.
++    let fields: Vec<(String, String)> = member_list
++        .fields()
++        .filter_map(|f| Some((f.name()?.to_string(), f.ty()?.syntax().text().to_string())))
++        .collect();
++
++    // Bail if any field has no name or no type — we'd produce broken output.
++    if fields.is_empty() && member_list.fields().next().is_some() {
++        return None;
++    }
++
++    let target = class.syntax().text_range();
++
++    acc.add(
++        AssistId::generate("generate_class_new"),
++        "Generate `new` constructor for class",
++        target,
++        |builder| {
++            let class_indent = IndentLevel::from_node(class.syntax());
++            let body_indent = class_indent + 1;
++            let inner_indent = class_indent + 2;
++
++            // Build `<generics>` for the impl header. We reuse the class's
++            // generic param list verbatim (defaults are illegal in impls but
++            // Phase 2 classes don't carry defaults yet); this matches what
++            // `generate_impl` produces for simple struct cases.
++            let generics = class.generic_param_list().map(|g| g.syntax().text().to_string());
++            let generic_args = class.generic_param_list().map(|g| {
++                let mut s = String::from("<");
++                let parts: Vec<String> = g
++                    .generic_params()
++                    .filter_map(|p| match p {
++                        ast::GenericParam::TypeParam(t) => Some(t.name()?.to_string()),
++                        ast::GenericParam::LifetimeParam(l) => {
++                            Some(l.lifetime()?.syntax().text().to_string())
++                        }
++                        ast::GenericParam::ConstParam(c) => Some(c.name()?.to_string()),
++                    })
++                    .collect();
++                s.push_str(&parts.join(", "));
++                s.push('>');
++                s
++            });
++
++            // Visibility on `new`: mirror class visibility, with a `pub`
++            // default (constructors are typically public).
++            let vis = class.visibility().map_or_else(
++                || "pub ".to_owned(),
++                |v| format!("{} ", v.syntax().text()),
++            );
++
++            let params = fields
++                .iter()
++                .map(|(n, t)| format!("{n}: {t}"))
++                .collect::<Vec<_>>()
++                .join(", ");
++            let init_fields = fields
++                .iter()
++                .map(|(n, _)| n.clone())
++                .collect::<Vec<_>>()
++                .join(", ");
++
++            let impl_header = match (&generics, &generic_args) {
++                (Some(g), Some(ga)) => format!("impl{g} {name}{ga}"),
++                _ => format!("impl {name}"),
++            };
++
++            let mut out = String::new();
++            format_to!(out, "\n\n{class_indent}{impl_header} {{\n");
++            format_to!(out, "{body_indent}#[constructor]\n");
++            format_to!(out, "{body_indent}{vis}fn new({params}) -> Self {{\n");
++            if init_fields.is_empty() {
++                format_to!(out, "{inner_indent}{name} {{}}\n");
++            } else {
++                format_to!(out, "{inner_indent}{name} {{ {init_fields} }}\n");
++            }
++            format_to!(out, "{body_indent}}}\n");
++            format_to!(out, "{class_indent}}}");
++
++            builder.insert(class.syntax().text_range().end(), out);
++        },
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use crate::tests::{check_assist, check_assist_not_applicable};
++
++    use super::*;
++
++    #[test]
++    fn generate_class_new_basic() {
++        check_assist(
++            generate_class_new,
++            r#"
++class Widget$0 {
++    x: i32,
++    y: i32,
++}
++"#,
++            r#"
++class Widget {
++    x: i32,
++    y: i32,
++}
++
++impl Widget {
++    #[constructor]
++    pub fn new(x: i32, y: i32) -> Self {
++        Widget { x, y }
++    }
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn generate_class_new_empty() {
++        check_assist(
++            generate_class_new,
++            r#"
++class Marker$0 {}
++"#,
++            r#"
++class Marker {}
++
++impl Marker {
++    #[constructor]
++    pub fn new() -> Self {
++        Marker {}
++    }
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn generate_class_new_preserves_visibility() {
++        check_assist(
++            generate_class_new,
++            r#"
++pub(crate) class Widget$0 { x: i32 }
++"#,
++            r#"
++pub(crate) class Widget { x: i32 }
++
++impl Widget {
++    #[constructor]
++    pub(crate) fn new(x: i32) -> Self {
++        Widget { x }
++    }
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn generate_class_new_with_generics() {
++        check_assist(
++            generate_class_new,
++            r#"
++class Pair$0<T> { a: T, b: T }
++"#,
++            r#"
++class Pair<T> { a: T, b: T }
++
++impl<T> Pair<T> {
++    #[constructor]
++    pub fn new(a: T, b: T) -> Self {
++        Pair { a, b }
++    }
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn generate_class_new_indented() {
++        check_assist(
++            generate_class_new,
++            r#"
++mod m {
++    class Widget$0 {
++        x: i32,
++    }
++}
++"#,
++            r#"
++mod m {
++    class Widget {
++        x: i32,
++    }
++
++    impl Widget {
++        #[constructor]
++        pub fn new(x: i32) -> Self {
++            Widget { x }
++        }
++    }
++}
++"#,
++        );
++    }
++
++    #[test]
++    fn generate_class_new_not_applicable_on_struct() {
++        // The struct path is owned by upstream `generate_new`; the
++        // class-flavored assist should never fire on a struct cursor.
++        check_assist_not_applicable(
++            generate_class_new,
++            r#"
++struct Widget$0 {
++    x: i32,
++}
++"#,
++        );
++    }
++}
+diff --git a/crates/ide-assists/src/handlers/generate_derive.rs b/crates/ide-assists/src/handlers/generate_derive.rs
+index 0129b1db3..a9abef792 100644
+--- a/crates/ide-assists/src/handlers/generate_derive.rs
++++ b/crates/ide-assists/src/handlers/generate_derive.rs
+@@ -219,4 +219,18 @@ struct EvenMoreIrrelevant;
+ struct Foo { a: i32, }",
+         );
+     }
++
++    // rustcc P09.46-B5: classes flow through `ast::Adt::Class` and `HasAttrs`,
++    // so `generate_derive` should hang `#[derive]` on the class header. Whether
++    // any given derive macro actually expands successfully is a separate question
++    // (most stdlib derives are written for `struct`/`enum`); this assist only
++    // scaffolds the attribute.
++    #[test]
++    fn add_derive_to_class() {
++        check_assist(
++            generate_derive,
++            "class Widget { x: i32, $0}",
++            "#[derive($0)]\nclass Widget { x: i32, }",
++        );
++    }
+ }
+diff --git a/crates/ide-assists/src/handlers/generate_impl.rs b/crates/ide-assists/src/handlers/generate_impl.rs
+index 27a1eb643..54564dfe0 100644
+--- a/crates/ide-assists/src/handlers/generate_impl.rs
++++ b/crates/ide-assists/src/handlers/generate_impl.rs
+@@ -827,4 +827,37 @@ mod tests {
+             "#,
+         );
+     }
++
++    // rustcc P09.46-B5: class-aware coverage. `class` is a fork-only ADT flavor
++    // that flows through `ast::Adt::Class`; `generate_impl` operates on `ast::Adt`
++    // generically, so it should produce an `impl` block with the class's name.
++    #[test]
++    fn test_add_impl_for_class() {
++        check_assist(
++            generate_impl,
++            r#"
++                class Widget$0 { x: i32, y: i32 }
++            "#,
++            r#"
++                class Widget { x: i32, y: i32 }
++
++                impl Widget {$0}
++            "#,
++        );
++    }
++
++    #[test]
++    fn test_add_trait_impl_for_class() {
++        check_assist(
++            generate_trait_impl,
++            r#"
++                class Widget$0 { x: i32, y: i32 }
++            "#,
++            r#"
++                class Widget { x: i32, y: i32 }
++
++                impl ${1:_} for Widget {$0}
++            "#,
++        );
++    }
+ }
+diff --git a/crates/ide-assists/src/lib.rs b/crates/ide-assists/src/lib.rs
+index 1fe385e95..285967635 100644
+--- a/crates/ide-assists/src/lib.rs
++++ b/crates/ide-assists/src/lib.rs
+@@ -176,6 +176,8 @@ mod handlers {
+     mod generate_is_empty_from_len;
+     mod generate_mut_trait_impl;
+     mod generate_new;
++    // rustcc fork (P09.46-B5): class-flavored constructor assist.
++    mod generate_class_new;
+     mod generate_single_field_struct_from;
+     mod generate_trait_from_impl;
+     mod inline_call;
+@@ -314,6 +316,8 @@ mod handlers {
+             generate_is_empty_from_len::generate_is_empty_from_len,
+             generate_mut_trait_impl::generate_mut_trait_impl,
+             generate_new::generate_new,
++            // rustcc fork (P09.46-B5).
++            generate_class_new::generate_class_new,
+             generate_trait_from_impl::generate_trait_from_impl,
+             generate_single_field_struct_from::generate_single_field_struct_from,
+             generate_blanket_trait_impl::generate_blanket_trait_impl,
+-- 
+2.50.1 (Apple Git-155)
+

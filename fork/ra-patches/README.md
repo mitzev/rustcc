@@ -7,46 +7,64 @@ the 1.02 #1 user-visible IDE deliverable: editor support for the
 
 ## Applying
 
+One command (recommended):
+
 ```bash
-git clone --filter=blob:none --depth=1 \
-  https://github.com/rust-lang/rust-analyzer.git ~/rust-analyzer
-cd ~/rust-analyzer
-git am < /path/to/rustcc/fork/ra-patches/01-ra-class-keyword.patch
+./fork/ra-patches/build.sh
+```
+
+Clones rust-analyzer at the [pinned commit](PINNED_COMMIT), applies every `??-*.patch` in lexical order, and runs `cargo build --release -p rust-analyzer`. Pass `--apply-only` to skip the build and just verify patches apply cleanly.
+
+Manual recipe if you prefer:
+
+```bash
+git clone --filter=blob:none \
+  https://github.com/rust-lang/rust-analyzer.git ~/rust-analyzer-rustcc
+cd ~/rust-analyzer-rustcc
+git checkout $(cat /path/to/rustcc/fork/ra-patches/PINNED_COMMIT)
+git am /path/to/rustcc/fork/ra-patches/*.patch
 cargo build --release -p rust-analyzer
 ```
 
-The resulting `target/release/rust-analyzer` binary is a drop-in
-replacement for the upstream RA — point VS Code / other editor
-at it by setting
-`rust-analyzer.server.path` to that binary's path.
+The resulting `target/release/rust-analyzer` binary is a drop-in replacement for upstream RA. Point VS Code / other editor at it via `rust-analyzer.server.path`.
+
+## Pinned commit
+
+`PINNED_COMMIT` records the rust-analyzer master commit the patch series was authored against. Bumped on demand when patches need to track upstream changes — the rebase is part of any per-quarterly maintenance pass. See [`PHASE-2-PLAN.md`](PHASE-2-PLAN.md) for the upstream-churn risk discussion.
 
 ## Series
 
-| File                        | Scope                                                |
-|-----------------------------|------------------------------------------------------|
-| `01-ra-class-keyword.patch` | P09.45 — Phase 1 parser support (CLASS node + CLASS_MEMBER_LIST). Files with `class` items stop producing cascading parse errors. Hover / go-to-def on the class name itself is deferred to Phase 2. |
+| File | Scope |
+|---|---|
+| `01-ra-class-keyword.patch` | P09.45 — Phase 1 parser support (CLASS node + CLASS_MEMBER_LIST). Files with `class` items stop producing cascading parse errors. |
+| `02-ra-class-id.patch` | Phase 2 B.1 — `ClassId`/`ClassLoc` + `intern_class` query + `AdtId::ClassId` and `VariantId::ClassId` variants + 17 hir-def match-arm stubs. |
+| `03-ra-class-arms-hir-ty.patch` | Phase 2 B.3b — 41 Class-arm stubs in hir-ty (type inference, MIR lowering, drop checking, pattern matching, layout, next_solver). |
+| `04-ra-class-arms-hir.patch` | Phase 2 B.3c — 13 Class-arm stubs in the user-facing `hir` crate (from_id, source_analyzer, child_by_source, symbols). |
+| `05-ra-class-arms-tests.patch` | Phase 2 B.3 — 4 test-only Class arms (signatures, layout/tests, closure_captures, variance). |
+| `06-ra-class-signature.patch` | Phase 2 B.2 — `ClassSignature` salsa-tracked type + item-tree `Class` slot + `lower_class` + name-resolution wiring. ClassIds now flow through the pipeline; Generics + ExpressionStore stubs replaced with real `ClassSignature::of(db, id)` calls. |
+| `07-ra-class-fields.patch` | Phase 2 B.4a — `CLASS_MEMBER_LIST.fields()` walker bypasses `lower_field_list` and feeds `lower_fields` directly. Field access on class instances type-checks; `widget.x` works. Also wires `child_source` for `VariantId::ClassId(_)`. |
+| `08-ra-class-resolve.patch` | Phase 2 B.4 — `hir::Class` user-facing API + `Adt::Class` arms wired across hir / ide-db / ide-completion / ide-assists / ide-diagnostics / ide / lsp. New `SymbolKind::Class` + `CLASS` semantic-token type. Hover, go-to-def, find-references, completion (within class body) work end-to-end. *Method walking via synthesized impl deferred to B.4c; inheritance graph deferred to B.4b.* |
+| `09-ra-class-assists.patch` | Phase 2 B.5 — class-aware refactoring: new `generate_class_new` assist (synthesizes `#[constructor] pub fn new(...) -> Self`); class arms wired into `generate_impl`/`generate_trait_impl`/`generate_derive`/`change_visibility`/`extract_module`; +13 regression tests. |
+| `10-ra-class-inheritance.patch` | Phase 2 B.4b — `ast::Class::extends_clause()` accessor; `ClassSignature::base: Option<TypeRefId>`; `Sema::to_def(class) -> Some(hir::Class)`; resolver wiring so assists like `auto_import`, `fix_visibility`, `extract_module` field promotion light up on classes. Includes a parser bug fix in `looks_like_field_at` discovered by the new field-promotion path. |
+| `11-ra-class-methods.patch` | Phase 2 B.4c — `ItemContainerId::ClassId(ClassId)` variant + cascade across hir-def/hir-ty/hir/ide-* (~25 sites); item-tree lowering creates real `FunctionId`s for class methods; `assemble_inherent_class_probe` walks `ClassSignature::base` for inheritance with C++-style derived-shadows-base name resolution. `widget.foo()` and `dog.legs()` (inherited from Animal) resolve and type-check. +6 new tests. |
+| `12-ra-class-assists-extra.patch` | Phase 2 B.5 expansion — three new class-aware assists: **Find all overriders** (new `Analysis::find_class_overriders` + 5 ide tests, mirrors `goto_implementation`); **Implement override** (lists base methods not yet overridden, inserts `#[cpp_virtual]` stub); **base-aware `generate_class_new`** (when class has a base, flattens base fields into params and emits `__base: Base::new(...)`). +7 ide-assists tests. Also wires `ChildContainer::ClassId` so `Sema::to_def(class_method)` works. |
 
-## Phase 1 vs Phase 2
+See [`PHASE-2-PLAN.md`](PHASE-2-PLAN.md) for the full Phase 2 design + sub-deliverable breakdown.
 
-Phase 1 (shipped in this patch):
+## Phase 1 status
+
+Phase 1 (shipped in `01-ra-class-keyword.patch`):
 - Parser accepts `class Name<Generics>? (: Base)? { fields; methods }`.
-- CLASS syntax node with CLASS_MEMBER_LIST child containing
-  RECORD_FIELD and FN (and other assoc item) children.
-- Non-exhaustive `match adt` sites in hir-expand, hir-def,
-  hir/semantics, ide-assists, syntax updated with Phase-1-safe
-  arms (mostly bail like union; extract fields where the
-  existing logic can keep going).
-- Inline parser test `class_item`. RA's own `cargo test -p
-  parser` and `-p syntax` stay green (315/0 and 51/0).
+- `CLASS` syntax node with `CLASS_MEMBER_LIST` child containing `RECORD_FIELD` and `FN` (and other assoc-item) children.
+- Non-exhaustive `match adt` sites in hir-expand, hir-def, hir/semantics, ide-assists, syntax updated with Phase-1-safe arms (mostly bail like union; extract fields where the existing logic can keep going).
+- Inline parser test `class_item`. RA's own `cargo test -p parser` and `-p syntax` stay green (315/0 and 51/0).
 
-Phase 2 (not in this patch):
-- Synthesize a `Struct` + inherent `Impl` pair at the item-tree
-  level so the class name becomes hoverable / findable /
-  go-to-def-able.
-- Wire method-inside-class call sites to the synthesized impl's
-  methods so completion + signature help work.
-- Potentially fork / extend rustc's `ItemKind::Class` name-
-  resolution story into hir-def's own trait-method-resolution.
+What Phase 1 does NOT deliver:
+- Class names aren't hoverable / findable / go-to-def-able.
+- Methods declared inside `class` blocks don't surface for completion.
+- `class Dog : Animal` doesn't connect Dog to Animal.
+
+Phase 2 (in progress) closes those gaps via a first-class `Adt::Class` HIR variant. See `PHASE-2-PLAN.md`.
 
 ## Running the probe
 

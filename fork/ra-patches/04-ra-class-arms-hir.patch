@@ -1,0 +1,164 @@
+From de0b7de0af03bde71a8dbaf9eb5c49d078ca3845 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 17:13:48 +0300
+Subject: [PATCH 4/5] P09.46-B3-hir: Class arm stubs across hir + cascading ide
+ crates
+
+---
+ crates/hir/src/from_id.rs                   |  6 ++++++
+ crates/hir/src/lib.rs                       | 18 +++++++++++++++++-
+ crates/hir/src/semantics/child_by_source.rs |  3 +++
+ crates/hir/src/source_analyzer.rs           |  6 ++++++
+ crates/hir/src/symbols.rs                   |  3 +++
+ 5 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/crates/hir/src/from_id.rs b/crates/hir/src/from_id.rs
+index 0a48be547..5e44fe405 100644
+--- a/crates/hir/src/from_id.rs
++++ b/crates/hir/src/from_id.rs
+@@ -57,6 +57,9 @@ impl From<AdtId> for Adt {
+             AdtId::StructId(it) => Adt::Struct(it.into()),
+             AdtId::UnionId(it) => Adt::Union(it.into()),
+             AdtId::EnumId(it) => Adt::Enum(it.into()),
++            AdtId::ClassId(_) => unimplemented!(
++                "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
++            ),
+         }
+     }
+ }
+@@ -77,6 +80,9 @@ impl From<VariantId> for Variant {
+             VariantId::EnumVariantId(it) => Variant::EnumVariant(it.into()),
+             VariantId::StructId(it) => Variant::Struct(it.into()),
+             VariantId::UnionId(it) => Variant::Union(it.into()),
++            VariantId::ClassId(_) => unimplemented!(
++                "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
++            ),
+         }
+     }
+ }
+diff --git a/crates/hir/src/lib.rs b/crates/hir/src/lib.rs
+index 8cc82113b..4e2a46abe 100644
+--- a/crates/hir/src/lib.rs
++++ b/crates/hir/src/lib.rs
+@@ -1447,6 +1447,9 @@ impl Field {
+                     }
+                     hir_def::VariantId::StructId(id) => GenericDefId::AdtId(id.into()),
+                     hir_def::VariantId::UnionId(id) => GenericDefId::AdtId(id.into()),
++                    hir_def::VariantId::ClassId(_) => unimplemented!(
++                        "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
++                    ),
+                 },
+             )
+             .store(),
+@@ -4179,6 +4182,9 @@ impl GenericDef {
+             GenericDefId::AdtId(AdtId::EnumId(it)) => &EnumSignature::with_source_map(db, it).1,
+             GenericDefId::AdtId(AdtId::StructId(it)) => &StructSignature::with_source_map(db, it).1,
+             GenericDefId::AdtId(AdtId::UnionId(it)) => &UnionSignature::with_source_map(db, it).1,
++            GenericDefId::AdtId(AdtId::ClassId(_)) => unimplemented!(
++                "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
++            ),
+             GenericDefId::ConstId(_) => return,
+             GenericDefId::FunctionId(it) => &FunctionSignature::with_source_map(db, it).1,
+             GenericDefId::ImplId(it) => &ImplSignature::with_source_map(db, it).1,
+@@ -5316,6 +5322,9 @@ impl<'db> ClosureCapture<'db> {
+                                 AdtId::EnumId(id) => {
+                                     id.enum_variants(db).variants[variant_idx as usize].0.into()
+                                 }
++                                AdtId::ClassId(_) => unimplemented!(
++                                    "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
++                                ),
+                             };
+                             let field = &variant.fields(db).fields()
+                                 [LocalFieldId::from_raw(la_arena::RawIdx::from_u32(field_idx))];
+@@ -5351,6 +5360,9 @@ impl<'db> ClosureCapture<'db> {
+                                     // Can't really do that for an enum, unfortunately, so try to do something alike.
+                                     id.enum_variants(db).variants[variant_idx as usize].0.into()
+                                 }
++                                AdtId::ClassId(_) => unimplemented!(
++                                    "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
++                                ),
+                             };
+                             let field = &variant.fields(db).fields()
+                                 [LocalFieldId::from_raw(la_arena::RawIdx::from_u32(field_idx))];
+@@ -5572,7 +5584,7 @@ impl<'db> Type<'db> {
+                     let flags = StructSignature::of(db, s).flags;
+                     flags.contains(StructFlags::IS_PHANTOM_DATA)
+                 }
+-                AdtId::UnionId(_) | AdtId::EnumId(_) => false,
++                AdtId::UnionId(_) | AdtId::EnumId(_) | AdtId::ClassId(_) => false,
+             }
+         }
+ 
+@@ -5623,6 +5635,9 @@ impl<'db> Type<'db> {
+                             AdtId::UnionId(id) => {
+                                 vec![variant_id_to_fields(id.into())]
+                             }
++                            AdtId::ClassId(_) => unimplemented!(
++                                "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
++                            ),
+                         };
+ 
+                         variants
+@@ -5931,6 +5946,7 @@ impl<'db> Type<'db> {
+                     AdtId::StructId(id) => id.into(),
+                     AdtId::UnionId(id) => id.into(),
+                     AdtId::EnumId(_) => return Vec::new(),
++                    AdtId::ClassId(_) => return Vec::new(),
+                 };
+                 (id, substs)
+             }
+diff --git a/crates/hir/src/semantics/child_by_source.rs b/crates/hir/src/semantics/child_by_source.rs
+index babeb3591..3a4d36968 100644
+--- a/crates/hir/src/semantics/child_by_source.rs
++++ b/crates/hir/src/semantics/child_by_source.rs
+@@ -158,6 +158,9 @@ impl ChildBySource for ItemScope {
+                     AdtId::StructId(id) => insert_item_loc(db, map, file_id, id, keys::STRUCT),
+                     AdtId::UnionId(id) => insert_item_loc(db, map, file_id, id, keys::UNION),
+                     AdtId::EnumId(id) => insert_item_loc(db, map, file_id, id, keys::ENUM),
++                    AdtId::ClassId(_) => {
++                        // rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)
++                    }
+                 },
+                 ModuleDefId::MacroId(id) => match id {
+                     MacroId::Macro2Id(id) => insert_item_loc(db, map, file_id, id, keys::MACRO2),
+diff --git a/crates/hir/src/source_analyzer.rs b/crates/hir/src/source_analyzer.rs
+index d2658e06d..83acce287 100644
+--- a/crates/hir/src/source_analyzer.rs
++++ b/crates/hir/src/source_analyzer.rs
+@@ -942,6 +942,9 @@ impl<'db> SourceAnalyzer<'db> {
+                     VariantId::EnumVariantId(it) => it.loc(db).parent.into(),
+                     VariantId::StructId(it) => it.into(),
+                     VariantId::UnionId(it) => it.into(),
++                    VariantId::ClassId(_) => unimplemented!(
++                        "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
++                    ),
+                 };
+                 Some((
+                     Either::Right(Field { parent: variant.into(), id: field }),
+@@ -969,6 +972,9 @@ impl<'db> SourceAnalyzer<'db> {
+                                 container = Either::Left((variant, subst));
+                                 (Either::Left(EnumVariant { id: variant }), id.into(), subst)
+                             }
++                            AdtId::ClassId(_) => unimplemented!(
++                                "rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)"
++                            ),
+                         },
+                         _ => return None,
+                     },
+diff --git a/crates/hir/src/symbols.rs b/crates/hir/src/symbols.rs
+index ff56544d8..8a5172a12 100644
+--- a/crates/hir/src/symbols.rs
++++ b/crates/hir/src/symbols.rs
+@@ -198,6 +198,9 @@ impl<'a> SymbolCollector<'a> {
+                 ModuleDefId::AdtId(AdtId::UnionId(id)) => {
+                     this.push_decl(id, name, false, None);
+                 }
++                ModuleDefId::AdtId(AdtId::ClassId(_)) => {
++                    // rustcc Phase 2 (B.3 stub): hir crate class semantics not yet wired (B.4 will)
++                }
+                 ModuleDefId::ConstId(id) => {
+                     this.push_decl(id, name, false, None);
+                     this.collect_from_body(id, Some(name.clone()));
+-- 
+2.50.1 (Apple Git-155)
+
