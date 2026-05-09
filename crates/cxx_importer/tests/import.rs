@@ -2946,6 +2946,168 @@ fn m20b_handles_mixed_params_with_one_cstr_slot() {
     cleanup(&header);
 }
 
+// ============================================================
+// M20.c: `&str` + `Option<&CStr>` smart parameter wrappers,
+// also opt-in via `cstr_ergonomics: true`. Builds on M20.b's
+// detection.
+// ============================================================
+
+#[test]
+fn m20c_emits_str_wrapper_with_cstring_allocation_and_panic_on_nul() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* text);\n};\n",
+        "m20c_str_wrapper",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("pub fn label_str(&mut self, arg0: &str)"),
+        "_str wrapper signature missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("::std::ffi::CString::new(arg0)"),
+        "_str wrapper should allocate a CString; got:\n{src}",
+    );
+    assert!(
+        src.contains("interior nul in &str passed to label_str"),
+        "_str wrapper should panic on interior nul with a clear message; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.label(__cs_0.as_ptr())"),
+        "_str wrapper should forward `.as_ptr()` of the temp CString; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20c_emits_opt_cstr_wrapper_mapping_none_to_null() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void title(const char* t);\n};\n",
+        "m20c_opt_cstr_wrapper",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains(
+            "pub fn title_opt_cstr(&mut self, arg0: Option<&::core::ffi::CStr>)"
+        ),
+        "_opt_cstr wrapper signature missing; got:\n{src}",
+    );
+    assert!(
+        src.contains(
+            "self.title(arg0.map_or(::core::ptr::null(), |c| c.as_ptr()))"
+        ),
+        "_opt_cstr should map None to null and Some to as_ptr; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20c_handles_multiple_cstr_slots_with_independent_temps() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void set(const char* a, int x, const char* b);\n};\n",
+        "m20c_multi_cstr",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // _str wrapper: two CString temporaries.
+    assert!(
+        src.contains("__cs_0") && src.contains("__cs_2"),
+        "_str wrapper should allocate one CString temp per cstr slot; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.set(__cs_0.as_ptr(), arg1, __cs_2.as_ptr())"),
+        "_str wrapper should forward as_ptr() per cstr slot, keep ints raw; got:\n{src}",
+    );
+    // _opt_cstr wrapper: two map_or's.
+    assert!(
+        src.matches("map_or(::core::ptr::null(), |c| c.as_ptr())").count() >= 2,
+        "_opt_cstr should call map_or for each cstr slot; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20c_disabled_when_cstr_ergonomics_off() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* t);\n};\n",
+        "m20c_off_when_disabled",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: false,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    assert!(
+        !src.contains("label_str") && !src.contains("label_opt_cstr"),
+        "no `_str` / `_opt_cstr` wrappers when cstr_ergonomics is off; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
 #[test]
 fn m20b_emits_for_static_methods_and_ctors() {
     use cxx_importer::rust_bindings::{
