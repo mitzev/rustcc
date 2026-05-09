@@ -879,6 +879,17 @@ fn render_namespace_tree(
         match render_rust_type(ctx, *target, &where_) {
             Ok(rendered) => {
                 let _ = writeln!(out, "{indent}pub type {alias_name} = {rendered};");
+                // M15.b: when the alias target is a function-
+                // pointer signature with a trailing `void*`
+                // user-data slot, emit a per-callback-type
+                // wrapper struct alongside the alias. The
+                // wrapper boxes a Rust closure into the
+                // `(extern "C" fn, *mut c_void)` shape the C++
+                // side expects. Detection + emission is
+                // intentionally narrow — only aliases that
+                // match the FLTK-style callback shape qualify;
+                // anything else gets a plain `pub type`.
+                render_m15b_callback_wrapper(ctx, alias_name, *target, indent, out);
             }
             Err(_) => {
                 // Skip silently — surfacing the alias name as a
@@ -2369,6 +2380,205 @@ fn render_direct_extern_wrapper(
     }
 
     out
+}
+
+/// M15.b: emit a per-callback-type wrapper struct alongside a
+/// `pub type Foo_Callback = Option<unsafe extern "C" fn(...)>;`
+/// declaration when the alias target matches the
+/// `(args..., void* user_data)` callback shape (FLTK's
+/// `Fl_Callback`, GTK's `GCallback` family, X11's
+/// `XtCallbackProc`, etc.).
+///
+/// The generated wrapper boxes a Rust closure and exposes a
+/// `(fn-pointer, user-data)` pair that callers hand to the C++
+/// API — same idea as the existing single-arity
+/// `::cxx::CxxCallback<F>` runtime helper but specialized to
+/// the alias's actual signature.
+///
+/// Skip cases:
+/// - Alias target isn't `CxxType::Fn(...)`.
+/// - Alias target is `Fn` but the trailing param isn't
+///   `*[const|mut] void` (no opaque user-data slot to bind
+///   the closure to).
+/// - Any of the args' types can't be rendered.
+fn render_m15b_callback_wrapper(
+    ctx: &CxxTypeCtx,
+    alias_name: &str,
+    target: TypeId,
+    indent: &str,
+    out: &mut String,
+) {
+    let sig = match ctx.type_of(target) {
+        CxxType::Fn(s) => s,
+        _ => return,
+    };
+    // Trailing param must be `void*` for the user-data slot.
+    let last = match sig.params.last() {
+        Some(p) => *p,
+        None => return,
+    };
+    let trailing_is_void_ptr = matches!(
+        ctx.type_of(last),
+        CxxType::Ptr { pointee, .. } if matches!(ctx.type_of(*pointee), CxxType::Void),
+    );
+    if !trailing_is_void_ptr {
+        return;
+    }
+    // Closure args = all args except the trailing void*.
+    let n = sig.params.len();
+    if n == 0 {
+        return;
+    }
+    let closure_arg_tys = &sig.params[..n - 1];
+    let mut closure_arg_strs: Vec<String> = Vec::with_capacity(closure_arg_tys.len());
+    let where_ = format!("callback `{alias_name}` arg");
+    for &p in closure_arg_tys {
+        match render_rust_type(ctx, p, &where_) {
+            Ok(s) => closure_arg_strs.push(s),
+            Err(_) => return, // bail; alias still emits as plain `pub type`
+        }
+    }
+    // Render the trailing void* parameter for the thunk
+    // signature. Use `*mut ::core::ffi::c_void` for clarity
+    // (the renderer would produce `*mut ()` which is correct
+    // but unconventional).
+    let void_ptr_ty = "*mut ::core::ffi::c_void".to_string();
+    let mut thunk_param_strs: Vec<String> = Vec::with_capacity(n);
+    for (i, ty) in closure_arg_strs.iter().enumerate() {
+        thunk_param_strs.push(format!("arg{i}: {ty}"));
+    }
+    thunk_param_strs.push(format!("user: {void_ptr_ty}"));
+
+    let closure_arg_list = closure_arg_strs.join(", ");
+    let closure_call_args: Vec<String> = (0..closure_arg_tys.len())
+        .map(|i| format!("arg{i}"))
+        .collect();
+    let thunk_param_list = thunk_param_strs.join(", ");
+    let thunk_name = format!("__cxx_{alias_name}_thunk");
+    let wrapper_name = format!("{alias_name}_Wrapper");
+
+    // Doc comment to anchor the generated section.
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{indent}/// M15.b: wraps a Rust closure into the `({alias_name}, *mut c_void)`",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}/// pair the C++ API expects. Hand `wrapper.fn_ptr()` and",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}/// `wrapper.user_data()` to the registration call; keep `wrapper`",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}/// alive for as long as the C++ side may invoke the callback.",
+    );
+    // Wrapper struct.
+    let _ = writeln!(
+        out,
+        "{indent}pub struct {wrapper_name}<F: Fn({closure_arg_list}) + 'static> {{",
+    );
+    let _ = writeln!(out, "{indent}    boxed: {void_ptr_ty},");
+    let _ = writeln!(
+        out,
+        "{indent}    _phantom: ::core::marker::PhantomData<F>,",
+    );
+    let _ = writeln!(out, "{indent}}}");
+
+    // impl block.
+    let _ = writeln!(
+        out,
+        "{indent}impl<F: Fn({closure_arg_list}) + 'static> {wrapper_name}<F> {{",
+    );
+    // new()
+    let _ = writeln!(out, "{indent}    pub fn new(f: F) -> Self {{");
+    let _ = writeln!(out, "{indent}        let boxed: ::std::boxed::Box<F> = ::std::boxed::Box::new(f);");
+    let _ = writeln!(
+        out,
+        "{indent}        let raw = ::std::boxed::Box::into_raw(boxed) as {void_ptr_ty};",
+    );
+    let _ = writeln!(out, "{indent}        Self {{");
+    let _ = writeln!(out, "{indent}            boxed: raw,");
+    let _ = writeln!(
+        out,
+        "{indent}            _phantom: ::core::marker::PhantomData,",
+    );
+    let _ = writeln!(out, "{indent}        }}");
+    let _ = writeln!(out, "{indent}    }}");
+
+    // fn_ptr()
+    let _ = writeln!(
+        out,
+        "{indent}    /// The `extern \"C\"` thunk to pass as the function-pointer half",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    /// of the callback pair. Forwards through the boxed closure on",
+    );
+    let _ = writeln!(out, "{indent}    /// every invocation.");
+    let _ = writeln!(out, "{indent}    pub fn fn_ptr(&self) -> {alias_name} {{");
+    let _ = writeln!(
+        out,
+        "{indent}        Some({thunk_name}::<F> as unsafe extern \"C\" fn({thunk_param_list}))",
+    );
+    let _ = writeln!(out, "{indent}    }}");
+
+    // user_data()
+    let _ = writeln!(
+        out,
+        "{indent}    /// Opaque user-data pointer to pair with [`Self::fn_ptr`].",
+    );
+    let _ = writeln!(out, "{indent}    pub fn user_data(&self) -> {void_ptr_ty} {{");
+    let _ = writeln!(out, "{indent}        self.boxed");
+    let _ = writeln!(out, "{indent}    }}");
+    let _ = writeln!(out, "{indent}}}");
+
+    // The thunk fn — generic over F so each closure type lands in its own
+    // monomorphized symbol.
+    let _ = writeln!(
+        out,
+        "{indent}#[allow(non_snake_case)]",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}unsafe extern \"C\" fn {thunk_name}<F: Fn({closure_arg_list}) + 'static>({thunk_param_list}) {{",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    // SAFETY: `user` was minted by `Box::into_raw(Box::new(f))` in",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    // `Wrapper::new` and is alive as long as the wrapper hasn't dropped.",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    let f: &F = unsafe {{ &*(user as *const F) }};",
+    );
+    let _ = writeln!(out, "{indent}    f({});", closure_call_args.join(", "));
+    let _ = writeln!(out, "{indent}}}");
+
+    // Drop impl that reclaims the box.
+    let _ = writeln!(
+        out,
+        "{indent}impl<F: Fn({closure_arg_list}) + 'static> ::core::ops::Drop for {wrapper_name}<F> {{",
+    );
+    let _ = writeln!(out, "{indent}    fn drop(&mut self) {{");
+    let _ = writeln!(out, "{indent}        if !self.boxed.is_null() {{");
+    let _ = writeln!(
+        out,
+        "{indent}            // SAFETY: same pointer minted by `new()`; reclaim it.",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}            unsafe {{ let _ = ::std::boxed::Box::from_raw(self.boxed as *mut F); }}",
+    );
+    let _ = writeln!(out, "{indent}            self.boxed = ::core::ptr::null_mut();");
+    let _ = writeln!(out, "{indent}        }}");
+    let _ = writeln!(out, "{indent}    }}");
+    let _ = writeln!(out, "{indent}}}");
 }
 
 /// M20.b: emit a `_cstr` wrapper for methods with one or more
