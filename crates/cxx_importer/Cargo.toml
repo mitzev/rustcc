@@ -48,4 +48,4 @@ cache = ["rustc_abi_cxx/serde", "dep:serde_json", "dep:sha2"]
 # end-to-end so downstream crates close the click-run-see-a-window
 # gap with a few lines of `build.rs`. Pulls in `libclang` (parser)
 # and `cc` (C++ compile driver).
-build = ["libclang", "dep:cc"]
+build = ["libclang", "dep:cc", "dep:serde_json"]

@@ -447,6 +447,30 @@ impl Build {
             ))
         })?;
 
+        // ----- 3.b Skip-log sidecar. -----
+        // Parse the `// N method[s] skipped by the v0 bindings emitter:`
+        // comment blocks the bindings renderer emits inside each
+        // `impl Class { ... }` block. Editor tooling (vscode-rustcc
+        // Problems pane, rustcc-cli `doctor`) consumes the JSON to
+        // surface gaps without re-grepping the generated source on
+        // every keystroke. The bindings.rs file remains the source
+        // of truth; this is a structured projection.
+        let skip_records = parse_skip_records(&bindings_src);
+        let skip_log_path = out_dir.join("bindings.skips.json");
+        let skip_log_json = serde_json::to_string_pretty(&SkipLog {
+            schema_version: 1,
+            generator: env!("CARGO_PKG_NAME").into(),
+            generator_version: env!("CARGO_PKG_VERSION").into(),
+            skips: skip_records.clone(),
+        })
+        .unwrap_or_else(|_| "{\"skips\":[]}".into());
+        std::fs::write(&skip_log_path, &skip_log_json).map_err(|e| {
+            BuildError::Io(format!(
+                "write skip log to {}: {e}",
+                skip_log_path.display(),
+            ))
+        })?;
+
         // ----- 4. Emit C++ shims. ------
         let shims_src =
             driver.emit_shims(&ctx, &all_class_ids).map_err(BuildError::Shim)?;
@@ -530,6 +554,8 @@ impl Build {
             shims_path,
             static_lib_path,
             cargo_directives: directives,
+            skip_log_path,
+            skips: skip_records,
         })
     }
 
@@ -559,6 +585,104 @@ pub struct BuildOutputs {
     pub shims_path: PathBuf,
     pub static_lib_path: PathBuf,
     pub cargo_directives: Vec<String>,
+    /// Path to the JSON skip-log sidecar (`bindings.skips.json`).
+    /// Each record names a class + method + drop reason. Editor
+    /// tooling consumes this to surface gaps in the Problems pane.
+    pub skip_log_path: PathBuf,
+    /// Same content as the JSON file, also returned in-memory so
+    /// callers can introspect without a re-read.
+    pub skips: Vec<SkipRecord>,
+}
+
+/// One method-emission skip recorded by the v0 bindings renderer.
+/// Parsed from the `// N method[s] skipped by the v0 bindings
+/// emitter:` comment blocks the renderer emits inside each
+/// `impl Class { ... }` block. Stable across emitter internals
+/// because we go through the source-text representation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SkipRecord {
+    /// Rust identifier of the enclosing class — matches the
+    /// `impl <Class> { ... }` block this skip was found in.
+    pub class: String,
+    /// Resolved Rust method name as the renderer would have used
+    /// (for ctor overloads: `new_<param-suffix>`; for failed
+    /// virtual dispatch: `drop`, `handle`, etc.).
+    pub method: String,
+    /// Free-form reason as the renderer emits it. Editor tooling
+    /// may want to bucket on substring matches like
+    /// `extra ctor`, `virtual method without populated vtable_index`.
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SkipLog {
+    schema_version: u32,
+    generator: String,
+    generator_version: String,
+    skips: Vec<SkipRecord>,
+}
+
+/// Walk the rendered bindings source, locate `impl ClassName {`
+/// blocks, and inside each look for the
+/// `// N method[s] skipped by the v0 bindings emitter:` header
+/// followed by `//   <method>: <reason>` lines.
+///
+/// The renderer emits these comments deterministically (sorted by
+/// method name); we parse line-by-line without a full Rust parser.
+/// Heuristic on the impl-line shape (`impl Foo {`) keeps the parser
+/// tiny — the bindings file is generated, so the input shape is
+/// stable enough for this to work.
+fn parse_skip_records(src: &str) -> Vec<SkipRecord> {
+    let mut out = Vec::new();
+    let mut current_class: Option<String> = None;
+    let mut in_skip_block = false;
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("impl ") {
+            // `impl Foo {` — capture class name. Skip trait impls
+            // (`impl ::cxx::CxxBase<Bar> for Foo`) by checking for
+            // a `for` token before the `{`.
+            let head = rest.split('{').next().unwrap_or("").trim();
+            if head.contains(" for ") {
+                continue;
+            }
+            current_class = Some(head.split_whitespace().next().unwrap_or("").to_string());
+            in_skip_block = false;
+            continue;
+        }
+        if trimmed.starts_with("//") {
+            // Header line introduces a skip block.
+            if trimmed.contains("skipped by the v0 bindings emitter:") {
+                in_skip_block = true;
+                continue;
+            }
+            // Skip-block body: `//   method: reason`. The renderer
+            // uses three spaces after the `//` to indent each entry.
+            if in_skip_block {
+                if let Some(body) = trimmed
+                    .strip_prefix("//   ")
+                    .or_else(|| trimmed.strip_prefix("// "))
+                {
+                    if let Some((method, reason)) = body.split_once(": ") {
+                        if let Some(class) = current_class.clone() {
+                            out.push(SkipRecord {
+                                class,
+                                method: method.trim().to_string(),
+                                reason: reason.trim().to_string(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                // Any non-skip-shape comment line ends the block.
+                in_skip_block = false;
+            }
+            continue;
+        }
+        // Non-comment, non-impl line: outside any skip block.
+        in_skip_block = false;
+    }
+    out
 }
 
 /// Failures `Build::compile` can return. Each variant pins the
@@ -658,6 +782,60 @@ fn build_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_skip_records_handles_zero_skips() {
+        let src = "impl Foo {\n    pub fn bar(&self) {}\n}\n";
+        assert!(parse_skip_records(src).is_empty());
+    }
+
+    #[test]
+    fn parse_skip_records_picks_up_class_method_pairs() {
+        let src = "\
+impl Fl_Window {
+    // 2 methods skipped by the v0 bindings emitter:
+    //   new_const_fl_pixmap_u32: extra ctor — v0 emitter renders only one ctor per class
+    //   drop: virtual method without populated vtable_index (multi-inh)
+    pub fn new(_a: i32) -> Self { todo!() }
+}
+
+impl Fl_Box {
+    // 1 method skipped by the v0 bindings emitter:
+    //   new_fl_boxtype_i32_i32_i32_i32_const_i8: extra ctor
+    pub fn new(_a: i32) -> Self { todo!() }
+}
+";
+        let recs = parse_skip_records(src);
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].class, "Fl_Window");
+        assert_eq!(recs[0].method, "new_const_fl_pixmap_u32");
+        assert!(recs[0].reason.contains("extra ctor"));
+        assert_eq!(recs[1].class, "Fl_Window");
+        assert_eq!(recs[1].method, "drop");
+        assert_eq!(recs[2].class, "Fl_Box");
+    }
+
+    #[test]
+    fn parse_skip_records_ignores_trait_impls() {
+        // `impl ::cxx::CxxBase<Bar> for Foo` blocks must not leak
+        // into `current_class` because their bodies aren't shaped
+        // like inherent skip blocks.
+        let src = "\
+impl ::cxx::CxxBase<Bar> for Foo {
+    fn upcast(&self) -> &Bar { todo!() }
+}
+
+impl Foo {
+    // 1 method skipped by the v0 bindings emitter:
+    //   helper: extra ctor
+    pub fn other(&self) {}
+}
+";
+        let recs = parse_skip_records(src);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].class, "Foo");
+        assert_eq!(recs[0].method, "helper");
+    }
 
     #[test]
     fn link_spec_cargo_directives_have_the_expected_shape() {
