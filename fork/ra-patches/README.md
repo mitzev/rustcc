@@ -41,9 +41,10 @@ The resulting `target/release/rust-analyzer` binary is a drop-in replacement for
 | `03-ra-class-arms-hir-ty.patch` | Phase 2 B.3b — 41 Class-arm stubs in hir-ty (type inference, MIR lowering, drop checking, pattern matching, layout, next_solver). |
 | `04-ra-class-arms-hir.patch` | Phase 2 B.3c — 13 Class-arm stubs in the user-facing `hir` crate (from_id, source_analyzer, child_by_source, symbols). |
 | `05-ra-class-arms-tests.patch` | Phase 2 B.3 — 4 test-only Class arms (signatures, layout/tests, closure_captures, variance). |
-| (planned) `06-ra-class-signature.patch` | Phase 2 B.2 — wire `ClassSignature` lowering so the `unimplemented!()` stubs become real lookups. |
-| (planned) `07-ra-class-resolve.patch` | Phase 2 B.4 — class-specific method dispatch + inheritance walk. |
-| (planned) `08-ra-class-assists.patch` | Phase 2 B.5 — class-aware refactoring assists. |
+| `06-ra-class-signature.patch` | Phase 2 B.2 — `ClassSignature` salsa-tracked type + item-tree `Class` slot + `lower_class` + name-resolution wiring. ClassIds now flow through the pipeline; Generics + ExpressionStore stubs replaced with real `ClassSignature::of(db, id)` calls. |
+| (planned) `07-ra-class-fields.patch` | Phase 2 B.4a — walk `CLASS_MEMBER_LIST` for `VariantFields` lowering (replaces the remaining `signatures.rs` + `src.rs` stubs). |
+| (planned) `08-ra-class-resolve.patch` | Phase 2 B.4 — class-specific method dispatch + inheritance walk. |
+| (planned) `09-ra-class-assists.patch` | Phase 2 B.5 — class-aware refactoring assists. |
 
 See [`PHASE-2-PLAN.md`](PHASE-2-PLAN.md) for the full Phase 2 design + sub-deliverable breakdown.
 
