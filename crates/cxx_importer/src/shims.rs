@@ -86,8 +86,14 @@ pub fn generate_shims(
         // hold a `CxxHeap<Foo>` instead of a raw pointer.
         //
         // Skip poisoned / opaque classes — we have no
-        // constructable / destructable Rust analog for them.
-        if !ctx.is_poisoned(class_id) {
+        // constructable / destructable Rust analog for them. Skip
+        // also abstract classes: even when their `methods` list
+        // includes a public ctor, calling `new AbstractClass(...)`
+        // is ill-formed C++ (`error: allocating an object of
+        // abstract class type`). A class is abstract iff its
+        // vtable still references `__cxa_pure_virtual` after
+        // override resolution.
+        if !ctx.is_poisoned(class_id) && !is_abstract_class(ctx, class_id) {
             let mut ctor_idx: usize = 0;
             for method in &class.methods {
                 let is_ctor = matches!(
@@ -166,6 +172,41 @@ pub fn generate_shims(
 /// `__cxx_<class>_new_heap_<i>` / `__cxx_<class>_delete` shim
 /// symbol. Mirrors what the bindings emitter passes to
 /// `format!("__cxx_{class_name}_new_heap_{i}")`.
+/// True iff the class has an unoverridden pure-virtual slot in
+/// its primary vtable — i.e. C++ would reject `new ClassName(...)`
+/// with `error: allocating an object of abstract class type`.
+///
+/// We use the vtable rather than just walking `class.methods` for
+/// `Virtuality::PureVirtual` because a derived class can be
+/// abstract through inheritance (e.g. `Mid : Iface {}` where
+/// `Iface::do_thing` is pure and Mid doesn't override it). The
+/// vtable's slot for that inherited pure virtual still points at
+/// `__cxa_pure_virtual` after override resolution, which is the
+/// authoritative signal.
+fn is_abstract_class(
+    ctx: &CxxTypeCtx,
+    class_id: ClassId,
+) -> bool {
+    let vt = match ctx.vtable(class_id) {
+        Some(v) => v,
+        None => return false,
+    };
+    for st in &vt.sub_tables {
+        for entry in &st.entries {
+            if let rustc_abi_cxx::VTableEntry::FunctionPointer {
+                mangled_target,
+                ..
+            } = entry
+            {
+                if mangled_target == "__cxa_pure_virtual" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn cxx_class_basename(name: &rustc_abi_cxx::NestedName) -> String {
     use rustc_abi_cxx::NameSegment;
     match name.0.last() {

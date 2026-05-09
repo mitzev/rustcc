@@ -24,3 +24,7 @@ Cargo.lock.bak
 # OS / IDE
 .idea/
 .vscode/
+
+# fltk_text_editor example outputs
+examples/fltk_text_editor/Cargo.lock
+examples/fltk_text_editor/target/

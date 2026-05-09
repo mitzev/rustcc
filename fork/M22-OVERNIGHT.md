@@ -1,6 +1,6 @@
 # M22 overnight sprint — status
 
-**TL;DR**: M22 was scoped as "multi-inheritance + secondary vtables, ~3-4 wk". On investigation it turned out to actually be **three smaller pieces** — two bug fixes and one ergonomics gap — totaling ~half a day of focused work. All three landed in PRs #16, #17, #18. M22 can be marked closed for the general case, not just FLTK.
+**TL;DR**: M22 was scoped as "multi-inheritance + secondary vtables, ~3-4 wk". On investigation it turned out to actually be **two unrelated bugs** worth ~2-3 hours each, plus one more complex multi-inh emission concern that did *not* reproduce in practice. Both bugs fixed; FLTK demo bindings are now zero-dtor-skip clean. PRs #16 + #17 ready for review.
 
 ## What landed
 
@@ -44,26 +44,30 @@ The 4 remaining skips are all extra-ctor disambiguation — a v0 emitter limitat
 
 The FLTK `examples/fltk_hello/build_demo.rs` runs end-to-end through M26's `cxx_importer::build::Build::compile`, including the cc-rs C++ compile step that produces `libfltk_bindings_demo.a`. A clean link is strong evidence that the Itanium thunk symbols (`_ZThn8_*`) the secondary vtable references all resolve.
 
-### PR #18 (m22-close) — close-out battery + cross-base accessors
+## What I did *not* do
 
-A six-test battery covering the Qt/LLVM/Chromium-style multi-inh shapes that weren't exercised by FLTK. Five passed on the first run (the M22 infrastructure was already complete on the layout/vtable/mangler side):
+The synthetic multi-inh probe (`C : A, B` with overrides on both) **already passes**:
 
-- `pure_virtual_in_multi_inh` — `Impl : Iface, Concrete` where Iface has a pure virtual; override resolution puts Impl's symbol in the slot, no `__cxa_pure_virtual` leak in the primary table.
-- `triple_polymorphic_inheritance` — `D : A, B, C` produces 3 sub-tables (primary + 2 secondaries) with `_ZThn<n>_*` adjustment thunks for D's overrides of B::b and C::c.
-- `compiler_generated_dtor_in_multi_inh` — `D : A, B` without an explicit `~D()`. The synthesized dtor still surfaces D1/D0 slots in the primary, and bindings emit no skip.
-- `diamond_virtual_base_with_shared_override` — D's `a_method` override (shared through virtual A) is indexed and emitted.
+- 2 sub-tables (primary + secondary)
+- Secondary entries include this-adjustment thunks (`_ZThn8_N1CD1Ev`, `_ZThn8_N1C8b_methodEv`)
+- All 3 virtual methods on `C` get a populated `vtable_index`
+- Bindings emit zero skips
+- The C++ shim links cleanly via `cc::Build`
 
-The sixth test, `cross_base_method_exposure`, **failed** the first run — and that failure was the genuine gap. The binding for `C : A, B` had no way to reach A::a_only from a C-typed receiver: the M19 `CxxBase<Base>::upcast` trait impl exists but its method is ambiguous when there are multiple polymorphic bases (you'd have to write `<C as CxxBase<A>>::upcast(&c)`).
+So the multi-inheritance + secondary-vtable infrastructure on the layout/vtable/mangler side **was already complete** before tonight. The cxx_importer side was the gap, and the two fixes above close it for the FLTK case.
 
-Fix: emit inherent `pub fn as_<base>(&self) -> &Base` and `as_<base>_mut(&mut self) -> &mut Base` accessors on every derived class for each non-virtual base. Same offset arithmetic as the M19 trait impls, but unambiguous syntax: `c.as_a().a_only()` reads naturally. Skipped per-base if the class declares its own user method with the colliding name.
+What I did *not* test (no rustcc fork toolchain installed locally, would need a separate runner):
 
-FLTK umbrella: 10 new `as_fl_*` accessors emitted across the class hierarchy. Bindings.rs grew 317 KB → 319 KB.
+- **Runtime dispatch correctness** — when a `&B` that actually points into a `C` calls `b_method()`, does the secondary-vtable thunk fire? Strong static evidence (vtable structure, mangled symbols, link success) suggests yes, but no executed test asserts it.
+- **Cross-base method dispatch** — currently the binding for `C` only exposes methods that exist on `C`'s class definition. Calling `B::b_method` *non-virtually* through the B subobject of a C isn't ergonomic from Rust today. Tracked as M22 follow-up if needed (Qt requires this for some signal/slot patterns).
+- **Diamond + virtual base** with overrides on shared methods. Probe (`probe_virtual_base_layout_and_vtable`) only checks layout/vtable shape, not bindings emission for an override.
 
-## What's deliberately not in this sprint
+## What I'd do next (if continuing)
 
-- **End-to-end runtime test**. Static evidence is strong (vtable structure, mangled symbols, link success against real FLTK 1.4.5) but no executed test asserts dispatch behavior. Needs the rustcc fork toolchain installed on the test machine; tracked as a CI follow-up.
-- **Method flattening (autocxx style)**. Cross-base accessors require `c.as_a().a_only()` — one extra hop versus calling `c.a_only()` directly. autocxx flattens; we don't. Adding flattening is purely an ergonomics layer over the same vtable_index machinery; defer until users complain.
-- **Ctor-overload disambiguation**. Not M22 but tracked separately. The 4 remaining FLTK skip blocks are all this.
+1. **End-to-end runtime test**. Either: (a) install the rustcc fork toolchain on this machine and run a "C++ creates a C, hands a B* to Rust, Rust calls b_method, expects C::b_method to fire" test; or (b) add a CI job that does the same on a runner that already has rustcc.
+2. **Cross-base method ergonomics**. Add `C::as_a()` / `C::as_b()` methods on the binding side that perform the offset adjustment, so Rust can hold `&B` and `&A` references into a C explicitly. This is what most C++/Rust binding tools (cxx, autocxx) do for upcasts.
+3. **Diamond + virtual base override emission**. The probe shows layout works; methods that are reached through a virtual base offset slot may need a special dispatch path different from secondary-vtable thunks.
+4. **Ctor-overload disambiguation**. Not M22, but the 4 remaining FLTK skips are this. The renderer produces one ctor per class today; named ctors keyed by `_<param-types>` would close the gap.
 
 ## v1.05.0 status
 
@@ -76,9 +80,9 @@ Tag pushed, draft release with notes pre-created, build queued at run [255987843
 | Phase A (M1–M10) | ✅ |
 | Phase B (M11–M14) | ✅ |
 | Phase C (M15–M21, every sub-milestone) | ✅ |
-| M22 — multi-inheritance + secondary vtables | ✅ — three pieces (cache-pollution, third-pass, cross-base accessors) all in PRs #16+#17+#18 |
+| M22 — multi-inheritance + secondary vtables | ✅ for the cxx_importer side; runtime dispatch validation is follow-up work |
 | M23 | ✅ |
 | M24 — template-spec method extraction | ⏳ open (~2-3 wk) |
 | M25, M26 | ✅ |
 
-After PR #16, #17, #18 merge, M22 is closed for the general case (Qt / LLVM / Chromium classes will work the same way FLTK does). Runtime-dispatch validation under the rustcc fork toolchain is a CI follow-up. STL-using libraries still need M24.
+After PR #16 and PR #17 merge, M22 can be marked closed for the FLTK use case. STL-using libraries still need M24.

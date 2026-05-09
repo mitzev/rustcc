@@ -476,6 +476,68 @@ struct C : public A, public B {
     cleanup(&header);
 }
 
+/// Abstract classes (any pure-virtual slot in their primary
+/// vtable) must have ctor-shim emission skipped. Otherwise the
+/// generated `cxx_shims.cpp` would contain
+/// `new AbstractClass(...)` which C++ rejects with
+/// `error: allocating an object of abstract class type`.
+///
+/// This surfaces when an umbrella header transitively pulls in
+/// abstract intermediates (FLTK's Fl_Menu_, Fl_Input_, etc.).
+#[test]
+fn abstract_class_ctor_shim_skipped() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp(
+        r#"
+struct Iface {
+    virtual int do_thing() = 0;
+    virtual ~Iface() = default;
+};
+// Abstract through inheritance: Mid doesn't override do_thing.
+struct Mid : public Iface {
+    int helper() const { return 1; }
+};
+struct Concrete : public Mid {
+    Concrete() {}
+    int do_thing() override { return 42; }
+};
+"#,
+        "abstract",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // The shim emitter should produce *no* `new Iface(` or
+    // `new Mid(` lines. Concrete should still get `new Concrete(`.
+    let opts = cxx_importer::shims::ShimOptions {
+        headers: &["dummy.hpp"],
+        classes: &class_ids,
+    };
+    let shims_src = cxx_importer::shims::generate_shims(&ctx, &opts).expect("shims");
+
+    assert!(
+        !shims_src.contains("new Iface("),
+        "Iface (pure-virt root) ctor shim must not be emitted",
+    );
+    assert!(
+        !shims_src.contains("new Mid("),
+        "Mid (pure-virt inherited) ctor shim must not be emitted",
+    );
+    // Concrete IS instantiable, so its shim should still emit.
+    assert!(
+        shims_src.contains("new Concrete("),
+        "Concrete (overrides do_thing) ctor shim must be emitted",
+    );
+
+    cleanup(&header);
+}
+
 /// Verify the M22 cross-base accessors work for FLTK's umbrella
 /// classes. Fl_Window inherits from Fl_Group; Fl_Group inherits
 /// from Fl_Widget. After this fix Rust users should be able to:
