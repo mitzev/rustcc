@@ -119,7 +119,7 @@ The DX layer's JSON skip log surfaces these structurally for tooling consumption
 This release ships:
 
 - **Stage-1 toolchains** for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (same triples as v1.06.0; bit-for-bit identical binaries).
-- **rust-analyzer-rustcc binaries** for the same 4 triples (new in v1.07.0).
+- **rust-analyzer-rustcc binaries** — *deferred to v1.07.1.* The first runs of `ra-release.yml` surfaced that RA's pinned tree expects a very specific rustc (it uses `rustup-toolchain-install-master` to install rustc by commit SHA, then `RUSTC_BOOTSTRAP=1` to emulate nightly). Three iterations at simpler approaches (workspace-inherited nightly, latest nightly, RUSTC_BOOTSTRAP alone) all hit different incompatibilities. The CI workflow needs the full RA recipe, which is mechanical but not landing in this release window. **Until then**, build locally: `./fork/ra-patches/build.sh` clones, applies all 12 patches at PINNED_COMMIT `45b868b19`, and produces `target/release/rust-analyzer` in ~5 minutes. Point your editor at it via `rust-analyzer.server.path`.
 
 Same caveats as previous releases — the macOS-13 Intel runner pool is occasionally saturated; `x86_64-apple-darwin` may be missing if the build job times out. Source-build path documented in `fork/INSTALL.md`.
 
@@ -140,10 +140,10 @@ rustup toolchain link rustcc "$HOME/.rustcc/$VERSION/stage1"
 cargo install --path crates/rustcc-cli   # from the source checkout
 rustcc install --version v1.07.0
 
-# Optional: install the RA fork too (or use the VS Code command).
-curl -fsSL -o ra.tar.xz "$BASE/rust-analyzer-rustcc-$TARGET.tar.xz"
-tar -xJf ra.tar.xz -C "$HOME/.rustcc/$VERSION"
-# Then point your editor at $HOME/.rustcc/$VERSION/rust-analyzer-rustcc/rust-analyzer
+# RA fork — build locally (prebuilt deferred to v1.07.1):
+git clone https://github.com/rustcc/rustcc /tmp/rustcc
+/tmp/rustcc/fork/ra-patches/build.sh
+# Then point your editor at ~/rust-analyzer-rustcc/target/release/rust-analyzer
 ```
 
 ## Acknowledgements
