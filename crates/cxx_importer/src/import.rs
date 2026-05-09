@@ -407,6 +407,19 @@ fn attach_methods_recursively(
             None => continue,
         };
         let parent_name = parent.get_name().unwrap_or_default();
+        // Same access filter as the in-class child walk: skip
+        // protected / private methods. A free C trampoline can't
+        // legally call them, and emitting shims for them would
+        // produce un-compilable C++ source. Out-of-class
+        // declarations (`void Foo::bar() {}` at TU scope) carry
+        // the access info on the cursor too.
+        if matches!(
+            method_entity.get_accessibility(),
+            Some(clang::Accessibility::Protected)
+                | Some(clang::Accessibility::Private),
+        ) {
+            continue;
+        }
         // `lower_method` may fail if the method uses an unsupported type
         // kind; ignore those cases rather than aborting the whole import
         // (they're typically template primary-definition methods with
@@ -1155,6 +1168,22 @@ impl<'a> Importer<'a> {
                 | EntityKind::Constructor
                 | EntityKind::Destructor
                 | EntityKind::ConversionFunction => {
+                    // Skip non-public methods. C++ access control
+                    // means a protected/private method can't be
+                    // called from a free C trampoline anyway —
+                    // including them in the binding would emit
+                    // shims that fail to compile (`'foo' is a
+                    // protected member of 'Bar'`). libclang
+                    // reports access via `get_accessibility()`;
+                    // ctors / dtors / conversions are always
+                    // public-or-default.
+                    if matches!(
+                        child.get_accessibility(),
+                        Some(clang::Accessibility::Protected)
+                            | Some(clang::Accessibility::Private),
+                    ) {
+                        continue;
+                    }
                     let m = self.lower_method(&child, &name, id)?;
                     // M11: capture static-method markers. libclang
                     // exposes `is_static_method()` only on `Method`

@@ -22,6 +22,10 @@ serde_yaml = "0.9"
 # inert.
 serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
+# `build` feature pulls this in; the cargo `build.rs` orchestrator
+# uses `cc` to compile the emitted C++ shims into a static lib that
+# the user's crate then links against.
+cc = { version = "1.2", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -38,3 +42,10 @@ libclang = ["dep:clang"]
 # stamps. Pulls in serde derives across the IR via
 # `rustc_abi_cxx/serde`.
 cache = ["rustc_abi_cxx/serde", "dep:serde_json", "dep:sha2"]
+# M26 (build-system integration). Exposes `cxx_importer::build::Build`
+# — a `cc::Build`-style orchestrator for `build.rs` files. Drives the
+# importer + bindings emitter + shim emitter + a C++ compile step
+# end-to-end so downstream crates close the click-run-see-a-window
+# gap with a few lines of `build.rs`. Pulls in `libclang` (parser)
+# and `cc` (C++ compile driver).
+build = ["libclang", "dep:cc"]
