@@ -3196,6 +3196,156 @@ fn m20c_handles_multiple_cstr_slots_with_independent_temps() {
     cleanup(&header);
 }
 
+// ============================================================
+// M20.d: cross-product of M18.b + M20.c — `_str_with_defaults`
+// and `_opt_cstr_with_defaults` for methods with both default
+// args AND `*const c_char` params (when `cstr_ergonomics` is on).
+// ============================================================
+
+#[test]
+fn m20d_emits_combined_wrappers_when_method_has_cstr_param_and_defaults() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // Models `Fl_Window(int w, int h, const char* title = nullptr)`.
+    // The cstr is the trailing default arg, but there are also
+    // leading non-default cstr params possible in other shapes;
+    // start with the simpler case.
+    //
+    // For default-only-cstr case, M18.b's `_with_defaults`
+    // already covers it (synthesizes null()). So M20.d is
+    // useful only when there's a NON-default cstr param
+    // alongside trailing defaults. Let's test that pattern:
+    // `set(const char* msg, int delay = 0)`.
+    let header = temp_header(
+        "struct W {\n  void set(const char* msg, int delay = 0);\n};\n",
+        "m20d_combined_wrappers",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // _str_with_defaults: takes only the non-default cstr as &str.
+    assert!(
+        src.contains("pub fn set_str_with_defaults(&mut self, arg0: &str)"),
+        "M20.d _str_with_defaults missing or wrong shape; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.set(__cs_0.as_ptr(), 0_i32)"),
+        "M20.d _str body should forward as_ptr() + synthesized 0; got:\n{src}",
+    );
+    // _opt_cstr_with_defaults: same shape but Option<&CStr>.
+    assert!(
+        src.contains("pub fn set_opt_cstr_with_defaults(&mut self, arg0: Option<&::core::ffi::CStr>)"),
+        "M20.d _opt_cstr_with_defaults missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.set(arg0.map_or(::core::ptr::null(), |c| c.as_ptr()), 0_i32)"),
+        "M20.d _opt_cstr body should map_or + synthesized 0; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20d_skips_when_all_cstr_params_are_default_args() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `void title(const char* m = 0)` — the only cstr param IS
+    // the default arg. M18.b's `_with_defaults` already
+    // covers this (synthesizes `null()` for the trailing
+    // cstr). M20.d adds nothing useful here, so the
+    // `_str_with_defaults` / `_opt_cstr_with_defaults`
+    // wrappers should NOT emit.
+    let header = temp_header(
+        "struct W {\n  void title(const char* m = 0);\n};\n",
+        "m20d_all_cstr_default",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // M18.b `_with_defaults` still emits.
+    assert!(
+        src.contains("pub fn title_with_defaults(&mut self)"),
+        "_with_defaults should emit (M18.b); got:\n{src}",
+    );
+    // M20.d combined wrappers should NOT emit because every
+    // cstr param is in the default-args tail.
+    assert!(
+        !src.contains("title_str_with_defaults"),
+        "M20.d _str_with_defaults should not emit when all cstr params are defaults; got:\n{src}",
+    );
+    assert!(
+        !src.contains("title_opt_cstr_with_defaults"),
+        "M20.d _opt_cstr_with_defaults should not emit; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m20d_handles_mixed_kept_cstr_and_kept_int_with_default_int_tail() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `f(int x, const char* msg, int delay = 0)`:
+    //   - kept (non-default): `int x`, `const char* msg`
+    //   - default: `int delay = 0`
+    // M20.d's _str_with_defaults: takes (i32, &str), passes
+    // (x, msg.as_ptr(), 0_i32) to `f`.
+    let header = temp_header(
+        "struct W {\n  void f(int x, const char* msg, int delay = 0);\n};\n",
+        "m20d_mixed_kept",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("pub fn f_str_with_defaults(&mut self, arg0: i32, arg1: &str)"),
+        "_str_with_defaults signature should keep `i32` + take `&str`; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.f(arg0, __cs_1.as_ptr(), 0_i32)"),
+        "_str body should forward int + as_ptr + synthesized default; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
 #[test]
 fn m20c_disabled_when_cstr_ergonomics_off() {
     use cxx_importer::rust_bindings::{

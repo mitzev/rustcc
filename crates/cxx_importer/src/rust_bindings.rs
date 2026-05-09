@@ -2407,9 +2407,217 @@ fn render_direct_extern_wrapper(
         //     is a valid input.
         render_m20c_str_wrapper(emission, &display_name, indent, &mut out);
         render_m20c_opt_cstr_wrapper(emission, &display_name, indent, &mut out);
+        // M20.d: cross-product of M18.b + M20.c. When a method
+        // has both `*const c_char` parameters AND default args
+        // whose trailing slots all synthesize cleanly, also
+        // emit the combined `_str_with_defaults` /
+        // `_opt_cstr_with_defaults` variants. Drops trailing
+        // defaults (filled with M18.b-synthesized literals)
+        // and converts the remaining cstr slots to `&str` /
+        // `Option<&CStr>`. The all-defaults variants only —
+        // partial-drop combinations explode the surface
+        // without much added value (callers wanting
+        // partial defaults use `_default_<n>` with raw
+        // pointers and convert manually).
+        if let Some(defaults) = &emission.synthesized_default_literals {
+            render_m20d_combined_wrappers(emission, &display_name, defaults, indent, &mut out);
+        }
     }
 
     out
+}
+
+/// M20.d: emit `_str_with_defaults` + `_opt_cstr_with_defaults`
+/// for methods that have both `*const c_char` parameters AND
+/// default-args whose trailing slots all synthesize cleanly.
+/// Drops trailing defaults, converts the remaining cstr slots
+/// to `&str` / `Option<&CStr>`, forwards via the full-arity
+/// safe wrapper with synthesized literals appended.
+fn render_m20d_combined_wrappers(
+    emission: &MethodEmission,
+    display_name: &str,
+    defaults: &[String],
+    indent: &str,
+    out: &mut String,
+) {
+    let total = emission.wrapper_user_params.len();
+    let default_count = defaults.len();
+    if default_count == 0 || default_count > total {
+        return;
+    }
+    let kept = total - default_count;
+    let cstr_indices: std::collections::HashSet<usize> =
+        emission.cstr_param_indices.iter().copied().collect();
+    // Determine which of the kept (non-default) params are
+    // cstr slots — that's where the conversion happens.
+    let kept_has_cstr = (0..kept).any(|i| cstr_indices.contains(&i));
+    if !kept_has_cstr {
+        // Every cstr param is in the default-args tail —
+        // M18.b's `_with_defaults` already covers this case
+        // (synthesizes `null()` for those slots). No new
+        // M20.d emission needed.
+        return;
+    }
+
+    let receiver_decl = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst => Some("&self"),
+        WrapperReceiver::SelfMut => Some("&mut self"),
+        WrapperReceiver::None => None,
+        WrapperReceiver::Ctor => None,
+    };
+    let receiver_call = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst | WrapperReceiver::SelfMut => "self.",
+        WrapperReceiver::None => "Self::",
+        WrapperReceiver::Ctor => "Self::",
+    };
+    let ret_clause = if matches!(emission.kind, EmissionKind::Ctor) {
+        " -> Self".to_string()
+    } else if emission.wrapper_return == "()" {
+        String::new()
+    } else {
+        format!(" -> {}", emission.wrapper_return)
+    };
+
+    // Emit the `_str_with_defaults` variant.
+    render_m20d_one_variant(
+        emission,
+        display_name,
+        defaults,
+        indent,
+        out,
+        kept,
+        &cstr_indices,
+        receiver_decl,
+        receiver_call,
+        &ret_clause,
+        M20dVariant::Str,
+    );
+    // Emit the `_opt_cstr_with_defaults` variant.
+    render_m20d_one_variant(
+        emission,
+        display_name,
+        defaults,
+        indent,
+        out,
+        kept,
+        &cstr_indices,
+        receiver_decl,
+        receiver_call,
+        &ret_clause,
+        M20dVariant::OptCstr,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum M20dVariant {
+    /// `&str` parameter, allocate a temp CString.
+    Str,
+    /// `Option<&CStr>` parameter, map None → null().
+    OptCstr,
+}
+
+fn render_m20d_one_variant(
+    emission: &MethodEmission,
+    display_name: &str,
+    defaults: &[String],
+    indent: &str,
+    out: &mut String,
+    kept: usize,
+    cstr_indices: &std::collections::HashSet<usize>,
+    receiver_decl: Option<&str>,
+    receiver_call: &str,
+    ret_clause: &str,
+    variant: M20dVariant,
+) {
+    let suffix = match variant {
+        M20dVariant::Str => "_str_with_defaults",
+        M20dVariant::OptCstr => "_opt_cstr_with_defaults",
+    };
+    let wrapper_name = format!("{display_name}{suffix}");
+    // Build the kept params (signature) — cstr slots get
+    // converted to `&str` / `Option<&CStr>`, others pass
+    // through.
+    let kept_params: Vec<String> = (0..kept)
+        .map(|i| {
+            let (name, ty) = &emission.wrapper_user_params[i];
+            if cstr_indices.contains(&i) {
+                match variant {
+                    M20dVariant::Str => format!("{name}: &str"),
+                    M20dVariant::OptCstr => {
+                        format!("{name}: Option<&::core::ffi::CStr>")
+                    }
+                }
+            } else {
+                format!("{name}: {ty}")
+            }
+        })
+        .collect();
+
+    // Head.
+    let head = match receiver_decl {
+        Some(recv) if !kept_params.is_empty() => format!(
+            "{indent}pub fn {wrapper_name}({recv}, {params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+        Some(recv) => {
+            format!("{indent}pub fn {wrapper_name}({recv}){ret_clause} {{")
+        }
+        None => format!(
+            "{indent}pub fn {wrapper_name}({params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+    };
+    let _ = writeln!(out, "{head}");
+    let _ = writeln!(
+        out,
+        "{indent}    // M20.d: combined `_str|_opt_cstr` + `_with_defaults` shape.",
+    );
+
+    // For `_str_with_defaults`, allocate one temporary CString
+    // per kept cstr slot (same scheme as M20.c).
+    if matches!(variant, M20dVariant::Str) {
+        for i in 0..kept {
+            if !cstr_indices.contains(&i) {
+                continue;
+            }
+            let arg_name = &emission.wrapper_forward_arg_names[i];
+            let _ = writeln!(
+                out,
+                "{indent}    let __cs_{i} = ::std::ffi::CString::new({arg_name})",
+            );
+            let _ = writeln!(
+                out,
+                "{indent}        .expect(\"interior nul in &str passed to {wrapper_name}\");",
+            );
+        }
+    }
+
+    // Build forward args. Kept slots: cstr-converted or
+    // passed through. Default slots: synthesized literal.
+    let mut forwards: Vec<String> = Vec::with_capacity(emission.wrapper_user_params.len());
+    for i in 0..kept {
+        let arg_name = &emission.wrapper_forward_arg_names[i];
+        if cstr_indices.contains(&i) {
+            forwards.push(match variant {
+                M20dVariant::Str => format!("__cs_{i}.as_ptr()"),
+                M20dVariant::OptCstr => format!(
+                    "{arg_name}.map_or(::core::ptr::null(), |c| c.as_ptr())"
+                ),
+            });
+        } else {
+            forwards.push(arg_name.clone());
+        }
+    }
+    // Append synthesized defaults for the trailing default-args.
+    forwards.extend(defaults.iter().cloned());
+
+    let _ = writeln!(
+        out,
+        "{indent}    {recv}{display_name}({args})",
+        recv = receiver_call,
+        args = forwards.join(", "),
+    );
+    let _ = writeln!(out, "{indent}}}");
 }
 
 /// M21.c: emit getter/setter pairs for every bitfield field on
