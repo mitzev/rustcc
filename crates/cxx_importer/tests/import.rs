@@ -3851,6 +3851,176 @@ fn m21b_layout_handles_non_bitfield_after_bitfield() {
     cleanup(&header);
 }
 
+// ============================================================
+// M21.c: per-field bitfield getter/setter accessors. Builds
+// on M21.b's layout to expose actual readable/writable fields
+// on the Rust binding side.
+// ============================================================
+
+#[test]
+fn m21c_emits_getter_and_setter_per_unsigned_bitfield_field() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Flags {\n  unsigned a : 4;\n  unsigned b : 4;\n};\n",
+        "m21c_unsigned_accessors",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Getter for `a`.
+    assert!(
+        src.contains("pub fn a(&self) -> u32"),
+        "getter for `a` missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("read_unaligned"),
+        "getter should use read_unaligned; got:\n{src}",
+    );
+    // Setter for `a`.
+    assert!(
+        src.contains("pub fn set_a(&mut self, v: u32)"),
+        "setter for `a` missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("write_unaligned"),
+        "setter should use write_unaligned; got:\n{src}",
+    );
+    // Getter + setter for `b`.
+    assert!(
+        src.contains("pub fn b(&self) -> u32"),
+        "getter for `b` missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub fn set_b(&mut self, v: u32)"),
+        "setter for `b` missing; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m21c_signed_bitfield_uses_sign_extension_in_getter() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  int s : 4;\n};\n",
+        "m21c_signed_sign_extend",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Signed accessor should mention sign-extension via the
+    // shift-up-shift-down idiom.
+    assert!(
+        src.contains("pub fn s(&self) -> i32"),
+        "signed getter missing or wrong return type; got:\n{src}",
+    );
+    let getter = src
+        .lines()
+        .skip_while(|l| !l.contains("pub fn s(&self) -> i32"))
+        .take(15)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        getter.contains("hi_shift") && getter.contains("lo_shift"),
+        "signed getter should use shift-up-shift-down sign extension; got:\n{getter}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m21c_skips_zero_width_bitfield_marker() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `unsigned :0;` is the Itanium AU-boundary marker — no
+    // storage, no Rust accessor needed.
+    let header = temp_header(
+        "struct W {\n  unsigned a : 4;\n  unsigned : 0;\n  unsigned b : 4;\n};\n",
+        "m21c_zero_width",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Real bitfields get accessors.
+    assert!(src.contains("pub fn a(&self)"));
+    assert!(src.contains("pub fn b(&self)"));
+    // No `set_` for an empty-name slot.
+    let zero_width_count = src
+        .lines()
+        .filter(|l| l.contains("set_") && l.contains("(&mut self,"))
+        .count();
+    assert_eq!(
+        zero_width_count, 2,
+        "should emit exactly 2 setters (a, b); found {zero_width_count} in:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m21c_no_accessors_when_no_bitfields() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  int x;\n  int y;\n};\n",
+        "m21c_no_bitfields",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    assert!(
+        !src.contains("M21.c") && !src.contains("read_unaligned"),
+        "no bitfields → no M21.c accessors; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
 #[test]
 fn m21b_bitfield_class_emits_through_normal_path_no_poison() {
     use cxx_importer::rust_bindings::{
