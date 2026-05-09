@@ -3196,6 +3196,156 @@ fn m20c_handles_multiple_cstr_slots_with_independent_temps() {
     cleanup(&header);
 }
 
+// ============================================================
+// M20.d: cross-product of M18.b + M20.c — `_str_with_defaults`
+// and `_opt_cstr_with_defaults` for methods with both default
+// args AND `*const c_char` params (when `cstr_ergonomics` is on).
+// ============================================================
+
+#[test]
+fn m20d_emits_combined_wrappers_when_method_has_cstr_param_and_defaults() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // Models `Fl_Window(int w, int h, const char* title = nullptr)`.
+    // The cstr is the trailing default arg, but there are also
+    // leading non-default cstr params possible in other shapes;
+    // start with the simpler case.
+    //
+    // For default-only-cstr case, M18.b's `_with_defaults`
+    // already covers it (synthesizes null()). So M20.d is
+    // useful only when there's a NON-default cstr param
+    // alongside trailing defaults. Let's test that pattern:
+    // `set(const char* msg, int delay = 0)`.
+    let header = temp_header(
+        "struct W {\n  void set(const char* msg, int delay = 0);\n};\n",
+        "m20d_combined_wrappers",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // _str_with_defaults: takes only the non-default cstr as &str.
+    assert!(
+        src.contains("pub fn set_str_with_defaults(&mut self, arg0: &str)"),
+        "M20.d _str_with_defaults missing or wrong shape; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.set(__cs_0.as_ptr(), 0_i32)"),
+        "M20.d _str body should forward as_ptr() + synthesized 0; got:\n{src}",
+    );
+    // _opt_cstr_with_defaults: same shape but Option<&CStr>.
+    assert!(
+        src.contains("pub fn set_opt_cstr_with_defaults(&mut self, arg0: Option<&::core::ffi::CStr>)"),
+        "M20.d _opt_cstr_with_defaults missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.set(arg0.map_or(::core::ptr::null(), |c| c.as_ptr()), 0_i32)"),
+        "M20.d _opt_cstr body should map_or + synthesized 0; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20d_skips_when_all_cstr_params_are_default_args() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `void title(const char* m = 0)` — the only cstr param IS
+    // the default arg. M18.b's `_with_defaults` already
+    // covers this (synthesizes `null()` for the trailing
+    // cstr). M20.d adds nothing useful here, so the
+    // `_str_with_defaults` / `_opt_cstr_with_defaults`
+    // wrappers should NOT emit.
+    let header = temp_header(
+        "struct W {\n  void title(const char* m = 0);\n};\n",
+        "m20d_all_cstr_default",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // M18.b `_with_defaults` still emits.
+    assert!(
+        src.contains("pub fn title_with_defaults(&mut self)"),
+        "_with_defaults should emit (M18.b); got:\n{src}",
+    );
+    // M20.d combined wrappers should NOT emit because every
+    // cstr param is in the default-args tail.
+    assert!(
+        !src.contains("title_str_with_defaults"),
+        "M20.d _str_with_defaults should not emit when all cstr params are defaults; got:\n{src}",
+    );
+    assert!(
+        !src.contains("title_opt_cstr_with_defaults"),
+        "M20.d _opt_cstr_with_defaults should not emit; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m20d_handles_mixed_kept_cstr_and_kept_int_with_default_int_tail() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `f(int x, const char* msg, int delay = 0)`:
+    //   - kept (non-default): `int x`, `const char* msg`
+    //   - default: `int delay = 0`
+    // M20.d's _str_with_defaults: takes (i32, &str), passes
+    // (x, msg.as_ptr(), 0_i32) to `f`.
+    let header = temp_header(
+        "struct W {\n  void f(int x, const char* msg, int delay = 0);\n};\n",
+        "m20d_mixed_kept",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("pub fn f_str_with_defaults(&mut self, arg0: i32, arg1: &str)"),
+        "_str_with_defaults signature should keep `i32` + take `&str`; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.f(arg0, __cs_1.as_ptr(), 0_i32)"),
+        "_str body should forward int + as_ptr + synthesized default; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
 #[test]
 fn m20c_disabled_when_cstr_ergonomics_off() {
     use cxx_importer::rust_bindings::{
@@ -3848,6 +3998,176 @@ fn m21b_layout_handles_non_bitfield_after_bitfield() {
     assert_eq!(layout.field_bit_widths[2], 0);
     // Total: 4 (AU) + 4 (int) = 8 bytes.
     assert_eq!(layout.size_bytes, 8);
+    cleanup(&header);
+}
+
+// ============================================================
+// M21.c: per-field bitfield getter/setter accessors. Builds
+// on M21.b's layout to expose actual readable/writable fields
+// on the Rust binding side.
+// ============================================================
+
+#[test]
+fn m21c_emits_getter_and_setter_per_unsigned_bitfield_field() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Flags {\n  unsigned a : 4;\n  unsigned b : 4;\n};\n",
+        "m21c_unsigned_accessors",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Getter for `a`.
+    assert!(
+        src.contains("pub fn a(&self) -> u32"),
+        "getter for `a` missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("read_unaligned"),
+        "getter should use read_unaligned; got:\n{src}",
+    );
+    // Setter for `a`.
+    assert!(
+        src.contains("pub fn set_a(&mut self, v: u32)"),
+        "setter for `a` missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("write_unaligned"),
+        "setter should use write_unaligned; got:\n{src}",
+    );
+    // Getter + setter for `b`.
+    assert!(
+        src.contains("pub fn b(&self) -> u32"),
+        "getter for `b` missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub fn set_b(&mut self, v: u32)"),
+        "setter for `b` missing; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m21c_signed_bitfield_uses_sign_extension_in_getter() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  int s : 4;\n};\n",
+        "m21c_signed_sign_extend",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Signed accessor should mention sign-extension via the
+    // shift-up-shift-down idiom.
+    assert!(
+        src.contains("pub fn s(&self) -> i32"),
+        "signed getter missing or wrong return type; got:\n{src}",
+    );
+    let getter = src
+        .lines()
+        .skip_while(|l| !l.contains("pub fn s(&self) -> i32"))
+        .take(15)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        getter.contains("hi_shift") && getter.contains("lo_shift"),
+        "signed getter should use shift-up-shift-down sign extension; got:\n{getter}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m21c_skips_zero_width_bitfield_marker() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `unsigned :0;` is the Itanium AU-boundary marker — no
+    // storage, no Rust accessor needed.
+    let header = temp_header(
+        "struct W {\n  unsigned a : 4;\n  unsigned : 0;\n  unsigned b : 4;\n};\n",
+        "m21c_zero_width",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Real bitfields get accessors.
+    assert!(src.contains("pub fn a(&self)"));
+    assert!(src.contains("pub fn b(&self)"));
+    // No `set_` for an empty-name slot.
+    let zero_width_count = src
+        .lines()
+        .filter(|l| l.contains("set_") && l.contains("(&mut self,"))
+        .count();
+    assert_eq!(
+        zero_width_count, 2,
+        "should emit exactly 2 setters (a, b); found {zero_width_count} in:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m21c_no_accessors_when_no_bitfields() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  int x;\n  int y;\n};\n",
+        "m21c_no_bitfields",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    assert!(
+        !src.contains("M21.c") && !src.contains("read_unaligned"),
+        "no bitfields → no M21.c accessors; got:\n{src}",
+    );
     cleanup(&header);
 }
 

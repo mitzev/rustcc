@@ -1265,6 +1265,19 @@ fn render_direct_extern_class(
         );
         let _ = writeln!(block, "{inner_indent}}}");
     }
+
+    // M21.c: per-bitfield-field getter + setter accessors. The
+    // class's storage is opaque (`[MaybeUninit<u8>; size]`), so
+    // user code can't reach bitfield contents through field
+    // access; the accessors do the byte-offset + bit-shift +
+    // mask dance that compilers otherwise generate inline.
+    //
+    // For unsigned bitfields: read → mask → shift right.
+    // For signed bitfields: same, then sign-extend by shifting
+    // up to the host int's width and back down with arithmetic
+    // shift. Width-zero bitfields (Itanium boundary marker)
+    // get no accessor.
+    render_m21c_bitfield_accessors(ctx, class_id, &class_name, indent, &mut block);
     let _ = writeln!(block, "{indent}}}");
 
     // 4. `Drop` impl. Always emitted when the class has a user dtor;
@@ -2394,9 +2407,408 @@ fn render_direct_extern_wrapper(
         //     is a valid input.
         render_m20c_str_wrapper(emission, &display_name, indent, &mut out);
         render_m20c_opt_cstr_wrapper(emission, &display_name, indent, &mut out);
+        // M20.d: cross-product of M18.b + M20.c. When a method
+        // has both `*const c_char` parameters AND default args
+        // whose trailing slots all synthesize cleanly, also
+        // emit the combined `_str_with_defaults` /
+        // `_opt_cstr_with_defaults` variants. Drops trailing
+        // defaults (filled with M18.b-synthesized literals)
+        // and converts the remaining cstr slots to `&str` /
+        // `Option<&CStr>`. The all-defaults variants only —
+        // partial-drop combinations explode the surface
+        // without much added value (callers wanting
+        // partial defaults use `_default_<n>` with raw
+        // pointers and convert manually).
+        if let Some(defaults) = &emission.synthesized_default_literals {
+            render_m20d_combined_wrappers(emission, &display_name, defaults, indent, &mut out);
+        }
     }
 
     out
+}
+
+/// M20.d: emit `_str_with_defaults` + `_opt_cstr_with_defaults`
+/// for methods that have both `*const c_char` parameters AND
+/// default-args whose trailing slots all synthesize cleanly.
+/// Drops trailing defaults, converts the remaining cstr slots
+/// to `&str` / `Option<&CStr>`, forwards via the full-arity
+/// safe wrapper with synthesized literals appended.
+fn render_m20d_combined_wrappers(
+    emission: &MethodEmission,
+    display_name: &str,
+    defaults: &[String],
+    indent: &str,
+    out: &mut String,
+) {
+    let total = emission.wrapper_user_params.len();
+    let default_count = defaults.len();
+    if default_count == 0 || default_count > total {
+        return;
+    }
+    let kept = total - default_count;
+    let cstr_indices: std::collections::HashSet<usize> =
+        emission.cstr_param_indices.iter().copied().collect();
+    // Determine which of the kept (non-default) params are
+    // cstr slots — that's where the conversion happens.
+    let kept_has_cstr = (0..kept).any(|i| cstr_indices.contains(&i));
+    if !kept_has_cstr {
+        // Every cstr param is in the default-args tail —
+        // M18.b's `_with_defaults` already covers this case
+        // (synthesizes `null()` for those slots). No new
+        // M20.d emission needed.
+        return;
+    }
+
+    let receiver_decl = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst => Some("&self"),
+        WrapperReceiver::SelfMut => Some("&mut self"),
+        WrapperReceiver::None => None,
+        WrapperReceiver::Ctor => None,
+    };
+    let receiver_call = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst | WrapperReceiver::SelfMut => "self.",
+        WrapperReceiver::None => "Self::",
+        WrapperReceiver::Ctor => "Self::",
+    };
+    let ret_clause = if matches!(emission.kind, EmissionKind::Ctor) {
+        " -> Self".to_string()
+    } else if emission.wrapper_return == "()" {
+        String::new()
+    } else {
+        format!(" -> {}", emission.wrapper_return)
+    };
+
+    // Emit the `_str_with_defaults` variant.
+    render_m20d_one_variant(
+        emission,
+        display_name,
+        defaults,
+        indent,
+        out,
+        kept,
+        &cstr_indices,
+        receiver_decl,
+        receiver_call,
+        &ret_clause,
+        M20dVariant::Str,
+    );
+    // Emit the `_opt_cstr_with_defaults` variant.
+    render_m20d_one_variant(
+        emission,
+        display_name,
+        defaults,
+        indent,
+        out,
+        kept,
+        &cstr_indices,
+        receiver_decl,
+        receiver_call,
+        &ret_clause,
+        M20dVariant::OptCstr,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum M20dVariant {
+    /// `&str` parameter, allocate a temp CString.
+    Str,
+    /// `Option<&CStr>` parameter, map None → null().
+    OptCstr,
+}
+
+fn render_m20d_one_variant(
+    emission: &MethodEmission,
+    display_name: &str,
+    defaults: &[String],
+    indent: &str,
+    out: &mut String,
+    kept: usize,
+    cstr_indices: &std::collections::HashSet<usize>,
+    receiver_decl: Option<&str>,
+    receiver_call: &str,
+    ret_clause: &str,
+    variant: M20dVariant,
+) {
+    let suffix = match variant {
+        M20dVariant::Str => "_str_with_defaults",
+        M20dVariant::OptCstr => "_opt_cstr_with_defaults",
+    };
+    let wrapper_name = format!("{display_name}{suffix}");
+    // Build the kept params (signature) — cstr slots get
+    // converted to `&str` / `Option<&CStr>`, others pass
+    // through.
+    let kept_params: Vec<String> = (0..kept)
+        .map(|i| {
+            let (name, ty) = &emission.wrapper_user_params[i];
+            if cstr_indices.contains(&i) {
+                match variant {
+                    M20dVariant::Str => format!("{name}: &str"),
+                    M20dVariant::OptCstr => {
+                        format!("{name}: Option<&::core::ffi::CStr>")
+                    }
+                }
+            } else {
+                format!("{name}: {ty}")
+            }
+        })
+        .collect();
+
+    // Head.
+    let head = match receiver_decl {
+        Some(recv) if !kept_params.is_empty() => format!(
+            "{indent}pub fn {wrapper_name}({recv}, {params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+        Some(recv) => {
+            format!("{indent}pub fn {wrapper_name}({recv}){ret_clause} {{")
+        }
+        None => format!(
+            "{indent}pub fn {wrapper_name}({params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+    };
+    let _ = writeln!(out, "{head}");
+    let _ = writeln!(
+        out,
+        "{indent}    // M20.d: combined `_str|_opt_cstr` + `_with_defaults` shape.",
+    );
+
+    // For `_str_with_defaults`, allocate one temporary CString
+    // per kept cstr slot (same scheme as M20.c).
+    if matches!(variant, M20dVariant::Str) {
+        for i in 0..kept {
+            if !cstr_indices.contains(&i) {
+                continue;
+            }
+            let arg_name = &emission.wrapper_forward_arg_names[i];
+            let _ = writeln!(
+                out,
+                "{indent}    let __cs_{i} = ::std::ffi::CString::new({arg_name})",
+            );
+            let _ = writeln!(
+                out,
+                "{indent}        .expect(\"interior nul in &str passed to {wrapper_name}\");",
+            );
+        }
+    }
+
+    // Build forward args. Kept slots: cstr-converted or
+    // passed through. Default slots: synthesized literal.
+    let mut forwards: Vec<String> = Vec::with_capacity(emission.wrapper_user_params.len());
+    for i in 0..kept {
+        let arg_name = &emission.wrapper_forward_arg_names[i];
+        if cstr_indices.contains(&i) {
+            forwards.push(match variant {
+                M20dVariant::Str => format!("__cs_{i}.as_ptr()"),
+                M20dVariant::OptCstr => format!(
+                    "{arg_name}.map_or(::core::ptr::null(), |c| c.as_ptr())"
+                ),
+            });
+        } else {
+            forwards.push(arg_name.clone());
+        }
+    }
+    // Append synthesized defaults for the trailing default-args.
+    forwards.extend(defaults.iter().cloned());
+
+    let _ = writeln!(
+        out,
+        "{indent}    {recv}{display_name}({args})",
+        recv = receiver_call,
+        args = forwards.join(", "),
+    );
+    let _ = writeln!(out, "{indent}}}");
+}
+
+/// M21.c: emit getter/setter pairs for every bitfield field on
+/// `class_id`. Each accessor sits inside the class's existing
+/// `impl <Class> { ... }` block and goes through unaligned
+/// reads/writes on the opaque storage so the resulting code is
+/// safe regardless of where the bitfield's allocation unit
+/// starts within the parent struct.
+///
+/// Skipped:
+/// - Width-zero bitfields (`int :0;`) — Itanium boundary marker,
+///   no storage allocated.
+/// - Bitfield fields whose container type doesn't render to a
+///   primitive Rust integer (defensive — should never happen
+///   since the importer + layout engine already require an
+///   integer container).
+fn render_m21c_bitfield_accessors(
+    ctx: &CxxTypeCtx,
+    class_id: ClassId,
+    class_name: &str,
+    indent: &str,
+    block: &mut String,
+) {
+    let layout = match ctx.layout(class_id) {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    let class = ctx.class(class_id);
+    if class.fields.is_empty() {
+        return;
+    }
+    let inner_indent = format!("{indent}    ");
+    for (i, field) in class.fields.iter().enumerate() {
+        let width = match ctx.bitfield_width(class_id, i) {
+            Some(w) if w > 0 => w,
+            _ => continue,
+        };
+        // Container type — must be an integer for bitfield
+        // arithmetic to make sense. We pull it from the field's
+        // CxxType directly so the accessor's container type
+        // matches what Itanium uses for the AU.
+        let (signed, container_rust) = match ctx.type_of(field.ty) {
+            CxxType::Int { signed, width: w } => {
+                (*signed, int_rust(*signed, *w).to_string())
+            }
+            CxxType::Bool => (false, "u8".to_string()),
+            // Bitfields can technically be declared on enum
+            // types — fall back to the underlying integer.
+            CxxType::Enum {
+                underlying, scoped, ..
+            } => match ctx.type_of(*underlying) {
+                CxxType::Int { signed, width: w } => {
+                    let _ = scoped;
+                    (*signed, int_rust(*signed, *w).to_string())
+                }
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let field_name = rust_safe_ident(&field.name.0);
+        let setter_name = format!("set_{}", field.name.0);
+        let setter_name = rust_safe_ident(&setter_name);
+        let byte_offset = layout.field_offsets[i];
+        let bit_offset = layout.field_bit_offsets[i] as u64;
+        let _ = layout.field_bit_widths[i]; // sanity: matches `width`
+        // Mask expression. Wrap only when we need to combine
+        // with another op (e.g. `<< bit_offset`); for the bare
+        // `let mask_v = …;` line we elide the outer parens to
+        // avoid the `unused_parens` warning.
+        let mask = format!("((1 as {container_rust}) << {width}) - 1");
+
+        // Getter: read container at byte_offset, shift to
+        // align low bit at zero, mask to `width` bits, sign-
+        // extend if signed.
+        let _ = writeln!(block);
+        let _ = writeln!(
+            block,
+            "{inner_indent}/// M21.c: bitfield getter — {class_name}::{} ({width}-bit, signed: {signed}).",
+            field.name.0,
+        );
+        let _ = writeln!(
+            block,
+            "{inner_indent}pub fn {field_name}(&self) -> {container_rust} {{",
+        );
+        let _ = writeln!(
+            block,
+            "{inner_indent}    let raw = unsafe {{",
+        );
+        let _ = writeln!(
+            block,
+            "{inner_indent}        ::core::ptr::read_unaligned(",
+        );
+        let _ = writeln!(
+            block,
+            "{inner_indent}            (self as *const Self as *const u8).add({byte_offset}) as *const {container_rust},",
+        );
+        let _ = writeln!(block, "{inner_indent}        )");
+        let _ = writeln!(block, "{inner_indent}    }};");
+        if signed {
+            // Sign-extend by shifting up to the container's
+            // top bit and back down with arithmetic shift.
+            // For width 4 in i32: `(raw << (32 - 4 - bit_offset)) >> (32 - 4)`.
+            let _ = writeln!(
+                block,
+                "{inner_indent}    let bits = ::core::mem::size_of::<{container_rust}>() as u32 * 8;",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}    let lo_shift = bits - {width} as u32;",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}    let hi_shift = lo_shift - {bit_offset} as u32;",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}    ((raw << hi_shift) >> lo_shift) as {container_rust}",
+            );
+        } else {
+            let _ = writeln!(
+                block,
+                "{inner_indent}    (raw >> {bit_offset}) & {mask}",
+            );
+        }
+        let _ = writeln!(block, "{inner_indent}}}");
+
+        // Setter: read-modify-write. Mask the new value, clear
+        // the old field bits, OR in the new bits.
+        let _ = writeln!(
+            block,
+            "{inner_indent}/// M21.c: bitfield setter — {class_name}::{} ({width}-bit, signed: {signed}).",
+            field.name.0,
+        );
+        let _ = writeln!(
+            block,
+            "{inner_indent}pub fn {setter_name}(&mut self, v: {container_rust}) {{",
+        );
+        let _ = writeln!(
+            block,
+            "{inner_indent}    let ptr = (self as *mut Self as *mut u8).wrapping_add({byte_offset}) as *mut {container_rust};",
+        );
+        let _ = writeln!(
+            block,
+            "{inner_indent}    let raw = unsafe {{ ::core::ptr::read_unaligned(ptr) }};",
+        );
+        // Cast the value to unsigned for masking, then back
+        // for the OR. Rust's bitwise ops are sign-agnostic on
+        // primitive integers, so we can stay in the container
+        // type when signed=false. For signed, mask in the
+        // unsigned domain to avoid sign extension during the
+        // shift, then bit-cast back.
+        if signed {
+            // Convert via `as <unsigned>`; the bit pattern is
+            // preserved for primitive integer types.
+            let unsigned = container_rust.replace('i', "u");
+            let _ = writeln!(
+                block,
+                "{inner_indent}    let mask_u = (((1 as {unsigned}) << {width}) - 1) << {bit_offset};",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}    let v_bits = ((v as {unsigned}) & (((1 as {unsigned}) << {width}) - 1)) << {bit_offset};",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}    let new = (raw as {unsigned} & !mask_u) | v_bits;",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}    unsafe {{ ::core::ptr::write_unaligned(ptr, new as {container_rust}) }}",
+            );
+        } else {
+            let _ = writeln!(
+                block,
+                "{inner_indent}    let mask_v = {mask};",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}    let v_bits = (v & mask_v) << {bit_offset};",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}    let cleared = raw & !(mask_v << {bit_offset});",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}    unsafe {{ ::core::ptr::write_unaligned(ptr, cleared | v_bits) }}",
+            );
+        }
+        let _ = writeln!(block, "{inner_indent}}}");
+    }
 }
 
 /// M15.b: emit a per-callback-type wrapper struct alongside a
