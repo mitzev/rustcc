@@ -7,46 +7,58 @@ the 1.02 #1 user-visible IDE deliverable: editor support for the
 
 ## Applying
 
+One command (recommended):
+
 ```bash
-git clone --filter=blob:none --depth=1 \
-  https://github.com/rust-lang/rust-analyzer.git ~/rust-analyzer
-cd ~/rust-analyzer
-git am < /path/to/rustcc/fork/ra-patches/01-ra-class-keyword.patch
+./fork/ra-patches/build.sh
+```
+
+Clones rust-analyzer at the [pinned commit](PINNED_COMMIT), applies every `??-*.patch` in lexical order, and runs `cargo build --release -p rust-analyzer`. Pass `--apply-only` to skip the build and just verify patches apply cleanly.
+
+Manual recipe if you prefer:
+
+```bash
+git clone --filter=blob:none \
+  https://github.com/rust-lang/rust-analyzer.git ~/rust-analyzer-rustcc
+cd ~/rust-analyzer-rustcc
+git checkout $(cat /path/to/rustcc/fork/ra-patches/PINNED_COMMIT)
+git am /path/to/rustcc/fork/ra-patches/*.patch
 cargo build --release -p rust-analyzer
 ```
 
-The resulting `target/release/rust-analyzer` binary is a drop-in
-replacement for the upstream RA — point VS Code / other editor
-at it by setting
-`rust-analyzer.server.path` to that binary's path.
+The resulting `target/release/rust-analyzer` binary is a drop-in replacement for upstream RA. Point VS Code / other editor at it via `rust-analyzer.server.path`.
+
+## Pinned commit
+
+`PINNED_COMMIT` records the rust-analyzer master commit the patch series was authored against. Bumped on demand when patches need to track upstream changes — the rebase is part of any per-quarterly maintenance pass. See [`PHASE-2-PLAN.md`](PHASE-2-PLAN.md) for the upstream-churn risk discussion.
 
 ## Series
 
-| File                        | Scope                                                |
-|-----------------------------|------------------------------------------------------|
-| `01-ra-class-keyword.patch` | P09.45 — Phase 1 parser support (CLASS node + CLASS_MEMBER_LIST). Files with `class` items stop producing cascading parse errors. Hover / go-to-def on the class name itself is deferred to Phase 2. |
+| File | Scope |
+|---|---|
+| `01-ra-class-keyword.patch` | P09.45 — Phase 1 parser support (CLASS node + CLASS_MEMBER_LIST). Files with `class` items stop producing cascading parse errors. |
+| (planned) `02-ra-class-id.patch` | Phase 2 B.1 — `ClassId`, `ClassData`, `Adt::Class` variant + db queries |
+| (planned) `03-ra-class-lowering.patch` | Phase 2 B.2 — item-tree lowering produces `Class` instead of bailing |
+| (planned) `04..07-ra-match-arms-*.patch` | Phase 2 B.3 — match-arm sweep across hir-def / hir-ty / ide / ide-assists |
+| (planned) `08-ra-class-resolve.patch` | Phase 2 B.4 — class-specific method dispatch + inheritance walk |
+| (planned) `09-ra-class-assists.patch` | Phase 2 B.5 — class-aware refactoring assists |
 
-## Phase 1 vs Phase 2
+See [`PHASE-2-PLAN.md`](PHASE-2-PLAN.md) for the full Phase 2 design + sub-deliverable breakdown.
 
-Phase 1 (shipped in this patch):
+## Phase 1 status
+
+Phase 1 (shipped in `01-ra-class-keyword.patch`):
 - Parser accepts `class Name<Generics>? (: Base)? { fields; methods }`.
-- CLASS syntax node with CLASS_MEMBER_LIST child containing
-  RECORD_FIELD and FN (and other assoc item) children.
-- Non-exhaustive `match adt` sites in hir-expand, hir-def,
-  hir/semantics, ide-assists, syntax updated with Phase-1-safe
-  arms (mostly bail like union; extract fields where the
-  existing logic can keep going).
-- Inline parser test `class_item`. RA's own `cargo test -p
-  parser` and `-p syntax` stay green (315/0 and 51/0).
+- `CLASS` syntax node with `CLASS_MEMBER_LIST` child containing `RECORD_FIELD` and `FN` (and other assoc-item) children.
+- Non-exhaustive `match adt` sites in hir-expand, hir-def, hir/semantics, ide-assists, syntax updated with Phase-1-safe arms (mostly bail like union; extract fields where the existing logic can keep going).
+- Inline parser test `class_item`. RA's own `cargo test -p parser` and `-p syntax` stay green (315/0 and 51/0).
 
-Phase 2 (not in this patch):
-- Synthesize a `Struct` + inherent `Impl` pair at the item-tree
-  level so the class name becomes hoverable / findable /
-  go-to-def-able.
-- Wire method-inside-class call sites to the synthesized impl's
-  methods so completion + signature help work.
-- Potentially fork / extend rustc's `ItemKind::Class` name-
-  resolution story into hir-def's own trait-method-resolution.
+What Phase 1 does NOT deliver:
+- Class names aren't hoverable / findable / go-to-def-able.
+- Methods declared inside `class` blocks don't surface for completion.
+- `class Dog : Animal` doesn't connect Dog to Animal.
+
+Phase 2 (in progress) closes those gaps via a first-class `Adt::Class` HIR variant. See `PHASE-2-PLAN.md`.
 
 ## Running the probe
 
