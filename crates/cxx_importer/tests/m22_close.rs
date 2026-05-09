@@ -538,6 +538,91 @@ struct Concrete : public Mid {
     cleanup(&header);
 }
 
+/// M22 follow-up: opt-in method flattening.
+///
+/// When `RustBindingsConfig::flatten_inherited_methods = true`,
+/// each derived class's inherent impl block grows forwarding
+/// wrappers for every non-virtual non-special public method on
+/// any of its non-virtual bases. With the flag off (default),
+/// emission is byte-identical to pre-flattening — users who
+/// pin to the previous shape are unaffected.
+#[test]
+fn flattening_emits_inherited_methods() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp(
+        r#"
+struct Base {
+    int a_only() const { return 1; }
+    void mutate() { }
+};
+struct Derived : public Base {
+    int derived_only() const { return 2; }
+};
+"#,
+        "flatten",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // Off (default): no forwarding wrappers.
+    let cfg_off = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src_off = generate_rust_bindings(&ctx, &class_ids, &cfg_off).expect("emit");
+    let derived_off = m22_section(&src_off, "impl Derived {");
+    assert!(
+        !derived_off.contains("Flattened from"),
+        "default config must not flatten",
+    );
+    assert!(
+        !derived_off.contains("pub fn a_only"),
+        "default config must not surface inherited a_only on Derived",
+    );
+
+    // On: forwarding wrappers for non-virtual base methods.
+    let cfg_on = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        flatten_inherited_methods: true,
+        ..RustBindingsConfig::default()
+    };
+    let src_on = generate_rust_bindings(&ctx, &class_ids, &cfg_on).expect("emit");
+    let derived_on = m22_section(&src_on, "impl Derived {");
+    assert!(
+        derived_on.contains("pub fn a_only"),
+        "flattened config must surface a_only on Derived",
+    );
+    assert!(
+        derived_on.contains("pub fn mutate"),
+        "flattened config must surface mutate on Derived",
+    );
+    assert!(
+        derived_on.contains("self.as_base().a_only()"),
+        "a_only forwarding body must chain through as_base()",
+    );
+    assert!(
+        derived_on.contains("self.as_base_mut().mutate()"),
+        "mutate forwarding body must use as_base_mut() (non-const)",
+    );
+
+    cleanup(&header);
+}
+
+fn m22_section<'a>(src: &'a str, marker: &str) -> &'a str {
+    let start = match src.find(marker) {
+        Some(i) => i,
+        None => return "",
+    };
+    let rest = &src[start..];
+    let end = rest.find("\n}\n").map(|e| e + 2).unwrap_or(rest.len());
+    &rest[..end]
+}
+
 /// Verify the M22 cross-base accessors work for FLTK's umbrella
 /// classes. Fl_Window inherits from Fl_Group; Fl_Group inherits
 /// from Fl_Widget. After this fix Rust users should be able to:

@@ -185,6 +185,17 @@ pub struct RustBindingsConfig {
     /// Off by default — preserving the prior emission shape — and
     /// opt-in via this knob. See `docs/cxx_importer.md §16 / M20`.
     pub cstr_ergonomics: bool,
+    /// M22 follow-up: emit forwarding wrappers for inherited
+    /// non-virtual methods, so users can call `c.a_only()`
+    /// directly instead of `c.as_a().a_only()`. The wrappers
+    /// chain through the inherent `as_<base>` accessors emitted
+    /// per non-virtual base, so dispatch and offset arithmetic
+    /// match what an explicit upcast would do. Skipped on
+    /// signature collision with the derived class's own
+    /// methods. Off by default to preserve binding stability —
+    /// every flattened method is reachable via the explicit
+    /// upcast path even without this flag.
+    pub flatten_inherited_methods: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1407,6 +1418,32 @@ fn render_direct_extern_class(
             }
             let _ = writeln!(block, "{inner_indent}}}");
         }
+    }
+
+    // M22 follow-up: opt-in method flattening. For each
+    // non-virtual base, walk inherited non-virtual non-special
+    // public methods and emit a forwarding wrapper on the derived
+    // class that chains through the inherent `as_<base>` accessor.
+    // Reads naturally:
+    //
+    //   c.a_only()  // forwards to (&*c.as_a()).a_only()
+    //
+    // Skipped on signature collision with derived methods or
+    // earlier-flattened methods (declaration-order priority,
+    // matching C++ name-lookup). Disabled by default — every
+    // inherited method is still reachable via the explicit
+    // `c.as_a().a_only()` form, so binding stability for users
+    // who pin to the previous emission shape is preserved.
+    if config.flatten_inherited_methods {
+        render_flattened_inherited_methods(
+            ctx,
+            class_id,
+            class,
+            &class_name,
+            &inner_indent,
+            &method_blocks,
+            &mut block,
+        );
     }
 
     let _ = writeln!(block, "{indent}}}");
@@ -2765,6 +2802,176 @@ fn render_m20d_one_variant(
 ///   primitive Rust integer (defensive — should never happen
 ///   since the importer + layout engine already require an
 ///   integer container).
+/// M22 follow-up: emit forwarding wrappers for inherited
+/// non-virtual non-special public methods on every direct
+/// non-virtual base. Skips on signature collision with the
+/// derived class's own emission or with already-flattened names
+/// from earlier bases (left-to-right base order).
+///
+/// The body of each wrapper chains through the inherent
+/// `as_<base>(&self) -> &Base` (or `_mut`) accessor, which is
+/// emitted unconditionally by the M22 cross-base path right
+/// before this. So flattening adds zero new offset arithmetic;
+/// it's pure ergonomics.
+///
+/// v0 limitations:
+/// - Only directly-declared methods on a direct base get
+///   flattened. Multi-level chains (Fl_Window inherits from
+///   Fl_Group inherits from Fl_Widget) need a recursive walk
+///   to surface Fl_Widget's methods on Fl_Window directly.
+///   For v0 we walk one level; users get the second hop via
+///   `window.as_fl_group().handle()` which still works.
+/// - Static methods are skipped — they don't carry through
+///   inheritance the same way at the binding level.
+/// - Operators / conversions / virtuals / ctors / dtors are
+///   skipped (they have separate dispatch shapes).
+fn render_flattened_inherited_methods(
+    ctx: &CxxTypeCtx,
+    class_id: ClassId,
+    class: &rustc_abi_cxx::ClassDef,
+    class_name: &str,
+    inner_indent: &str,
+    derived_emissions: &[MethodEmission],
+    block: &mut String,
+) {
+    use rustc_abi_cxx::{MethodName, Virtuality};
+
+    // Names already taken by the derived class's own emissions or
+    // by the M22 cross-base accessors emitted above. Cross-base
+    // accessor names follow the `as_<base_lowercase>` /
+    // `as_<base_lowercase>_mut` pattern.
+    let mut taken: std::collections::HashSet<String> =
+        derived_emissions.iter().map(|e| e.rust_name.clone()).collect();
+    for base_spec in &class.bases {
+        if base_spec.virtual_ {
+            continue;
+        }
+        if ctx.is_poisoned(base_spec.class) {
+            continue;
+        }
+        let base = ctx.class(base_spec.class);
+        let base_ident = match ident_of_class_with_ctx(base, Some(ctx)) {
+            Some(n) => n,
+            None => continue,
+        };
+        taken.insert(format!("as_{}", base_ident.to_lowercase()));
+        taken.insert(format!("as_{}_mut", base_ident.to_lowercase()));
+    }
+
+    let mut emitted_any = false;
+    let mut header_written = false;
+    for base_spec in &class.bases {
+        if base_spec.virtual_ {
+            continue;
+        }
+        if ctx.is_poisoned(base_spec.class) {
+            continue;
+        }
+        let base = ctx.class(base_spec.class);
+        let base_ident = match ident_of_class_with_ctx(base, Some(ctx)) {
+            Some(n) => n,
+            None => continue,
+        };
+        let accessor_const = format!("as_{}", base_ident.to_lowercase());
+        let accessor_mut = format!("{accessor_const}_mut");
+
+        for (m_idx, method) in base.methods.iter().enumerate() {
+            if method.virtuality != Virtuality::NonVirtual {
+                continue;
+            }
+            if method.special.is_some() {
+                continue;
+            }
+            // Only methods named with a plain identifier — skip
+            // operators / conversion functions for v0.
+            let name = match &method.name {
+                MethodName::Ident(i) => i.0.clone(),
+                _ => continue,
+            };
+            // Skip static methods — at the binding level they
+            // don't carry through inheritance the way instance
+            // methods do.
+            if ctx.is_method_static(class_id, m_idx)
+                || ctx.is_method_static(base_spec.class, m_idx)
+            {
+                continue;
+            }
+            if !taken.insert(rust_safe_ident(&name)) {
+                continue;
+            }
+            // Render parameter and return types. Failures (e.g.
+            // unsupported parameter type) silently skip — same
+            // policy as the regular method walk.
+            let where_ =
+                format!("{class_name}::{name} (flattened from {base_ident})");
+            let mut param_decls: Vec<String> = Vec::new();
+            let mut forward_args: Vec<String> = Vec::new();
+            let mut params_ok = true;
+            for (i, p) in method.sig.params.iter().enumerate() {
+                match render_rust_type(ctx, *p, &format!("{where_} arg {i}")) {
+                    Ok(ty) => {
+                        param_decls.push(format!("arg{i}: {ty}"));
+                        forward_args.push(format!("arg{i}"));
+                    }
+                    Err(_) => {
+                        params_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !params_ok {
+                continue;
+            }
+            let ret_ty =
+                match render_rust_type(ctx, method.sig.ret, &where_) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+            let ret_clause = if ret_ty == "()" {
+                String::new()
+            } else {
+                format!(" -> {ret_ty}")
+            };
+            let receiver = if method.sig.cv.is_const {
+                ("&self", &accessor_const)
+            } else {
+                ("&mut self", &accessor_mut)
+            };
+            let display_name = rust_safe_ident(&name);
+            if !header_written {
+                let _ = writeln!(block);
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}// M22 follow-up: flattened methods inherited from non-virtual bases.",
+                );
+                header_written = true;
+            }
+            let _ = writeln!(
+                block,
+                "{inner_indent}/// Flattened from `{base_ident}`. Equivalent to \
+                 `self.{accessor}().{name}(...)`.",
+                accessor = receiver.1,
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}pub fn {display_name}({receiver_str}{maybe_comma}{params}){ret_clause} {{",
+                receiver_str = receiver.0,
+                maybe_comma = if param_decls.is_empty() { "" } else { ", " },
+                params = param_decls.join(", "),
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}    self.{accessor}().{name}({fwd})",
+                accessor = receiver.1,
+                fwd = forward_args.join(", "),
+            );
+            let _ = writeln!(block, "{inner_indent}}}");
+            emitted_any = true;
+        }
+    }
+    let _ = emitted_any;
+}
+
 fn render_m21c_bitfield_accessors(
     ctx: &CxxTypeCtx,
     class_id: ClassId,
