@@ -62,7 +62,13 @@ if (( apply_only )); then
 fi
 
 echo "==> building rust-analyzer (release)"
-cargo build --release -p rust-analyzer
+# RA's tree uses unstable rustc features (`if let` guards, internal
+# crate access via `extern crate rustc_abi`). It pins to a specific
+# rust-lang/rust commit via the `rust-version` file, but locally we
+# don't materialize that exact toolchain — instead, `RUSTC_BOOTSTRAP=1`
+# lets whatever rustc rustup picks accept the unstable features. Same
+# trick rust-analyzer's own CI uses.
+RUSTC_BOOTSTRAP=1 cargo build --release -p rust-analyzer
 
 BUILT="$CLONE_DIR/target/release/rust-analyzer"
 echo
