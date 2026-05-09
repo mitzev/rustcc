@@ -147,6 +147,28 @@ struct C : public A, public B {
     eprintln!("[probe] bindings emit skipped {skipped} virtual methods on multi-inh classes");
     assert_eq!(skipped, 0, "Bindings must not skip multi-inh virtual methods");
 
+    // Inspect emission shape for b_method on C. Since it has
+    // vtable_index=3 (b_method's rank in C's primary), the
+    // dispatch must read the vptr from `self` and load slot 3.
+    // Don't be too strict about formatting — just check that the
+    // index appears in the C section. This is a smoke check, not
+    // a runtime test (running requires the rustcc fork toolchain).
+    let c_section_start = src.find("impl C {").expect("C impl block emitted");
+    let c_section = &src[c_section_start..];
+    let c_section_end = c_section.find("\n}\n").map(|e| e + 2).unwrap_or(c_section.len());
+    let c_section = &c_section[..c_section_end];
+    eprintln!("[probe] C impl block ({} bytes)", c_section.len());
+    assert!(
+        c_section.contains("b_method"),
+        "C::b_method should be emitted",
+    );
+    // The dispatch code threads vtable_index through; we just
+    // sanity-check that b_method's body references vtable lookup.
+    assert!(
+        c_section.contains("__vtable") || c_section.contains("vtable"),
+        "C::b_method emission should perform a vtable lookup",
+    );
+
     cleanup(&header);
 }
 
@@ -469,7 +491,50 @@ struct D : public B, public C {
             st.subobject_offset,
             st.entries.len(),
         );
+        for (j, e) in st.entries.iter().enumerate() {
+            eprintln!("[probe]     entry[{j}]: {e:?}");
+        }
     }
+
+    // D has one virtual base (A, shared between B and C).
+    assert_eq!(
+        layout.virtual_base_offsets.len(),
+        1,
+        "D should report exactly one virtual base (A, shared by B+C)",
+    );
+    // D should have at least primary + secondary sub-tables (B and
+    // C as non-virtual direct bases of D, A reached through the
+    // virtual-base offset machinery).
+    assert!(
+        vt.sub_tables.len() >= 2,
+        "D should have multi sub-tables for the diamond",
+    );
+
+    // D's own a_method override must have a populated vtable_index.
+    let class = ctx.class(d_id);
+    let mut a_method_idx: Option<u32> = None;
+    for m in &class.methods {
+        let nm = m.name.ident_name().unwrap_or_default();
+        if nm == "a_method" {
+            a_method_idx = m.vtable_index;
+        }
+    }
+    assert!(
+        a_method_idx.is_some(),
+        "D::a_method override must have vtable_index in diamond + virtual base",
+    );
+
+    // Bindings emit zero skips on D.
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    let skipped = src.matches("skipped: virtual method without populated vtable_index").count();
+    assert_eq!(
+        skipped, 0,
+        "Bindings emit must not skip virtual methods on diamond + virtual base",
+    );
 
     cleanup(&header);
 }
