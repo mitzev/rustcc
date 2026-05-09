@@ -61,11 +61,19 @@ jobs:
       # Cache the RA clone + cargo target dir between runs. The
       # patches change rarely; the bulk of the time is recompiling
       # rust-analyzer's dependency tree.
+      # rust-analyzer needs a recent nightly (uses unstable features
+      # like `if let` guards). Install one explicitly so the build
+      # picks it up rather than falling back to whatever the runner
+      # has by default.
+      - name: Install nightly toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal --no-self-update
+          rustup default nightly
+
       - name: Cache RA build
         uses: actions/cache@v4
         with:
           path: |
-            ~/rust-analyzer-rustcc
             ~/.cargo/registry
             ~/.cargo/git
           key: ra-fork-${{ matrix.target }}-${{ hashFiles('fork/ra-patches/*.patch', 'fork/ra-patches/PINNED_COMMIT') }}
@@ -74,14 +82,20 @@ jobs:
 
       - name: Build patched rust-analyzer
         env:
-          RA_CLONE_DIR: ${{ github.workspace }}/.ra-clone
+          # Outside the workspace so cargo doesn't pick up rustcc's
+          # rust-toolchain.toml — RA needs a much newer nightly than
+          # the rustcc workspace pins to.
+          RA_CLONE_DIR: ${{ runner.temp }}/rust-analyzer-rustcc
         run: |
           ./fork/ra-patches/build.sh
           test -x "$RA_CLONE_DIR/target/release/rust-analyzer"
 
       - name: Package
         env:
-          RA_CLONE_DIR: ${{ github.workspace }}/.ra-clone
+          # Outside the workspace so cargo doesn't pick up rustcc's
+          # rust-toolchain.toml — RA needs a much newer nightly than
+          # the rustcc workspace pins to.
+          RA_CLONE_DIR: ${{ runner.temp }}/rust-analyzer-rustcc
         run: |
           # Tarball the binary with a small wrapper README so users
           # know what they got.
