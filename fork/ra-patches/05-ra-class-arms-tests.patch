@@ -1,0 +1,88 @@
+From 2b051be04685a9760fde14e0aab85eeb5bf5dc41 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 17:17:39 +0300
+Subject: [PATCH 5/5] P09.46-B3-tests: Class arms in test-only match sites
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Four test-only sites needed Class arms after AdtId/VariantId
+gained the ClassId variant:
+
+- crates/hir-def/src/expr_store/tests/signatures.rs — pretty printer
+- crates/hir-ty/src/layout/tests.rs — Goal-finder skips Class
+- crates/hir-ty/src/tests/closure_captures.rs — VariantId mapping
+- crates/hir-ty/src/variance.rs — variance test scaffolding
+
+Same stub-style as B.3b: skip / return None / return empty.
+
+Verification:
+- cargo test --workspace --no-run: 0 errors
+- cargo test -p parser: 315 passed
+- cargo test -p syntax: 51 passed
+- cargo test -p hir-def: 479 passed
+- cargo test -p hir-ty: 969 passed
+---
+ crates/hir-def/src/expr_store/tests/signatures.rs | 2 ++
+ crates/hir-ty/src/layout/tests.rs                 | 3 +++
+ crates/hir-ty/src/tests/closure_captures.rs       | 2 ++
+ crates/hir-ty/src/variance.rs                     | 3 +++
+ 4 files changed, 10 insertions(+)
+
+diff --git a/crates/hir-def/src/expr_store/tests/signatures.rs b/crates/hir-def/src/expr_store/tests/signatures.rs
+index 5e0184dfa..c809412cd 100644
+--- a/crates/hir-def/src/expr_store/tests/signatures.rs
++++ b/crates/hir-def/src/expr_store/tests/signatures.rs
+@@ -48,6 +48,8 @@ fn lower_and_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expe
+                 }
+                 crate::AdtId::UnionId(_id) => (),
+                 crate::AdtId::EnumId(_id) => (),
++                // rustcc Phase 2 (B.3 stub): no ClassSignature pretty-printer yet.
++                crate::AdtId::ClassId(_id) => (),
+             },
+             GenericDefId::ConstId(_id) => (),
+             GenericDefId::FunctionId(function_id) => {
+diff --git a/crates/hir-ty/src/layout/tests.rs b/crates/hir-ty/src/layout/tests.rs
+index 484ecebba..1fff64579 100644
+--- a/crates/hir-ty/src/layout/tests.rs
++++ b/crates/hir-ty/src/layout/tests.rs
+@@ -67,6 +67,9 @@ fn eval_goal(
+                             .name
+                             .display_no_db(file_id.edition(&db))
+                             .to_smolstr(),
++                        // rustcc Phase 2 (B.3 stub): no ClassSignature yet — layout
++                        // tests can't target a class as `Goal` until B.2 lands.
++                        hir_def::AdtId::ClassId(_) => return None,
+                     };
+                     (name == "Goal").then_some(Either::Left(x))
+                 }
+diff --git a/crates/hir-ty/src/tests/closure_captures.rs b/crates/hir-ty/src/tests/closure_captures.rs
+index 5324d8c60..2bda40082 100644
+--- a/crates/hir-ty/src/tests/closure_captures.rs
++++ b/crates/hir-ty/src/tests/closure_captures.rs
+@@ -49,6 +49,8 @@ fn display_place(db: &TestDB, store: &ExpressionStore, place: &Place, local: Bin
+                                 // Can't really do that for an enum, unfortunately, so try to do something alike.
+                                 id.enum_variants(db).variants[variant_idx as usize].0.into()
+                             }
++                            // rustcc Phase 2 (B.3 stub): closure capture tests over a class.
++                            AdtId::ClassId(id) => VariantId::from(id),
+                         };
+                         let field = &variant.fields(db).fields()
+                             [LocalFieldId::from_raw(la_arena::RawIdx::from_u32(field_idx))];
+diff --git a/crates/hir-ty/src/variance.rs b/crates/hir-ty/src/variance.rs
+index 78a4cff25..002174a5c 100644
+--- a/crates/hir-ty/src/variance.rs
++++ b/crates/hir-ty/src/variance.rs
+@@ -911,6 +911,9 @@ struct FixedPoint<T, U, V>(&'static FixedPoint<(), T, U>, V);
+                                 let loc = it.lookup(&db);
+                                 loc.source(&db).value.name().unwrap()
+                             }
++                            // rustcc Phase 2 (B.3 stub): variance tests don't
++                            // exercise classes yet.
++                            GenericDefId::AdtId(AdtId::ClassId(_)) => return None,
+                             GenericDefId::TraitId(_)
+                             | GenericDefId::TypeAliasId(_)
+                             | GenericDefId::ImplId(_)
+-- 
+2.50.1 (Apple Git-155)
+

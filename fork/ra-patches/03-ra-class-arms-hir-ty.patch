@@ -1,0 +1,572 @@
+From c57168757558d5ab884c9a6f18b761a5c2014ae1 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 17:09:17 +0300
+Subject: [PATCH 3/5] P09.46-B3-hir-ty: Class arm stubs for exhaustive matches
+
+---
+ crates/hir-ty/src/builtin_derive.rs           |  4 ++++
+ crates/hir-ty/src/diagnostics/decl_check.rs   |  4 ++++
+ crates/hir-ty/src/diagnostics/match_check.rs  |  8 ++++++++
+ .../diagnostics/match_check/pat_analysis.rs   |  8 ++++++++
+ crates/hir-ty/src/display.rs                  |  8 ++++++++
+ crates/hir-ty/src/drop.rs                     |  8 ++++++++
+ crates/hir-ty/src/infer.rs                    | 20 +++++++++++++++++++
+ .../closure/analysis/expr_use_visitor.rs      |  8 ++++++++
+ crates/hir-ty/src/infer/expr.rs               |  4 ++++
+ crates/hir-ty/src/inhabitedness.rs            |  4 ++++
+ crates/hir-ty/src/layout/adt.rs               |  4 ++++
+ crates/hir-ty/src/lower.rs                    |  4 ++++
+ crates/hir-ty/src/mir/eval.rs                 | 16 +++++++++++++++
+ crates/hir-ty/src/mir/lower.rs                | 12 +++++++++++
+ .../hir-ty/src/mir/lower/pattern_matching.rs  |  4 ++++
+ crates/hir-ty/src/mir/pretty.rs               |  4 ++++
+ crates/hir-ty/src/next_solver/def_id.rs       |  8 ++++++++
+ .../src/next_solver/format_proof_tree.rs      |  4 ++++
+ crates/hir-ty/src/next_solver/interner.rs     | 16 +++++++++++++++
+ crates/hir-ty/src/representability.rs         |  8 ++++++++
+ crates/hir-ty/src/traits.rs                   |  4 ++++
+ crates/hir-ty/src/variance.rs                 |  4 ++++
+ 22 files changed, 164 insertions(+)
+
+diff --git a/crates/hir-ty/src/builtin_derive.rs b/crates/hir-ty/src/builtin_derive.rs
+index 6a9b1671e..3ef51c36b 100644
+--- a/crates/hir-ty/src/builtin_derive.rs
++++ b/crates/hir-ty/src/builtin_derive.rs
+@@ -310,6 +310,10 @@ fn simple_trait_predicates<'db>(
+                 )
+             }
+         }
++        AdtId::ClassId(_) => {
++            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++            unimplemented!()
++        }
+     }
+     GenericPredicates::from_explicit_own_predicates(StoredEarlyBinder::bind(
+         Clauses::new_from_iter(
+diff --git a/crates/hir-ty/src/diagnostics/decl_check.rs b/crates/hir-ty/src/diagnostics/decl_check.rs
+index 89d8c0e91..46f5185e6 100644
+--- a/crates/hir-ty/src/diagnostics/decl_check.rs
++++ b/crates/hir-ty/src/diagnostics/decl_check.rs
+@@ -158,6 +158,10 @@ impl<'a> DeclValidator<'a> {
+             AdtId::StructId(struct_id) => self.validate_struct(struct_id),
+             AdtId::EnumId(enum_id) => self.validate_enum(enum_id),
+             AdtId::UnionId(union_id) => self.validate_union(union_id),
++            AdtId::ClassId(_) => {
++                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                unimplemented!()
++            }
+         }
+     }
+ 
+diff --git a/crates/hir-ty/src/diagnostics/match_check.rs b/crates/hir-ty/src/diagnostics/match_check.rs
+index 8356329d9..67996ec61 100644
+--- a/crates/hir-ty/src/diagnostics/match_check.rs
++++ b/crates/hir-ty/src/diagnostics/match_check.rs
+@@ -323,6 +323,10 @@ impl<'db> HirDisplay<'db> for Pat<'db> {
+                         AdtId::StructId(s) => Some(s.into()),
+                         AdtId::UnionId(u) => Some(u.into()),
+                         AdtId::EnumId(_) => None,
++                        AdtId::ClassId(_) => {
++                            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                            unimplemented!()
++                        }
+                     }),
+                 };
+ 
+@@ -348,6 +352,10 @@ impl<'db> HirDisplay<'db> for Pat<'db> {
+                             "{}",
+                             UnionSignature::of(f.db, u).name.display(f.db, f.edition())
+                         )?,
++                        VariantId::ClassId(_) => {
++                            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                            unimplemented!()
++                        }
+                     };
+ 
+                     let variant_data = variant.fields(f.db);
+diff --git a/crates/hir-ty/src/diagnostics/match_check/pat_analysis.rs b/crates/hir-ty/src/diagnostics/match_check/pat_analysis.rs
+index 5ed7eb7a6..74235c110 100644
+--- a/crates/hir-ty/src/diagnostics/match_check/pat_analysis.rs
++++ b/crates/hir-ty/src/diagnostics/match_check/pat_analysis.rs
+@@ -132,6 +132,10 @@ impl<'a, 'db> MatchCheckCtx<'a, 'db> {
+                 hir_def::AdtId::EnumId(_) => None,
+                 hir_def::AdtId::StructId(id) => Some(id.into()),
+                 hir_def::AdtId::UnionId(id) => Some(id.into()),
++                hir_def::AdtId::ClassId(_) => {
++                    // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                    unimplemented!()
++                }
+             },
+             _ => panic!("bad constructor {ctor:?} for adt {adt:?}"),
+         }
+@@ -460,6 +464,10 @@ impl<'a, 'db> PatCx for MatchCheckCtx<'a, 'db> {
+                     hir_def::AdtId::StructId(_) => {
+                         ConstructorSet::Struct { empty: cx.is_uninhabited(*ty) }
+                     }
++                    hir_def::AdtId::ClassId(_) => {
++                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                        unimplemented!()
++                    }
+                 }
+             }
+             TyKind::Tuple(..) => ConstructorSet::Struct { empty: cx.is_uninhabited(*ty) },
+diff --git a/crates/hir-ty/src/display.rs b/crates/hir-ty/src/display.rs
+index e4a8def44..dc23baa7a 100644
+--- a/crates/hir-ty/src/display.rs
++++ b/crates/hir-ty/src/display.rs
+@@ -967,6 +967,10 @@ fn render_const_scalar_inner<'db>(
+                         memory_map,
+                     )
+                 }
++                hir_def::AdtId::ClassId(_) => {
++                    // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                    unimplemented!()
++                }
+             }
+         }
+         TyKind::FnDef(..) => ty.hir_fmt(f),
+@@ -1397,6 +1401,10 @@ impl<'db> HirDisplay<'db> for Ty<'db> {
+                             }
+                             hir_def::AdtId::UnionId(it) => UnionSignature::of(db, it).name.clone(),
+                             hir_def::AdtId::EnumId(it) => EnumSignature::of(db, it).name.clone(),
++                            hir_def::AdtId::ClassId(_) => {
++                                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                                unimplemented!()
++                            }
+                         };
+                         write!(f, "{}", name.display(f.db, f.edition()))?;
+                     }
+diff --git a/crates/hir-ty/src/drop.rs b/crates/hir-ty/src/drop.rs
+index 0d25d7dbd..a64460a62 100644
+--- a/crates/hir-ty/src/drop.rs
++++ b/crates/hir-ty/src/drop.rs
+@@ -25,6 +25,10 @@ pub fn destructor(db: &dyn HirDatabase, adt: AdtId) -> Option<ImplId> {
+         AdtId::EnumId(id) => db.lookup_intern_enum(id).container,
+         AdtId::StructId(id) => db.lookup_intern_struct(id).container,
+         AdtId::UnionId(id) => db.lookup_intern_union(id).container,
++        AdtId::ClassId(_) => {
++            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++            unimplemented!()
++        }
+     };
+     let interner = DbInterner::new_with(db, module.krate(db));
+     let drop_trait = interner.lang_items().Drop?;
+@@ -117,6 +121,10 @@ fn has_drop_glue_impl<'db>(
+                     })
+                     .max()
+                     .unwrap_or(DropGlue::None),
++                AdtId::ClassId(_) => {
++                    // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                    unimplemented!()
++                }
+             }
+         }
+         TyKind::Tuple(tys) => tys
+diff --git a/crates/hir-ty/src/infer.rs b/crates/hir-ty/src/infer.rs
+index 4aeb5ec71..f9d34fb7e 100644
+--- a/crates/hir-ty/src/infer.rs
++++ b/crates/hir-ty/src/infer.rs
+@@ -2096,6 +2096,10 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+                         return (self.err_ty(), None);
+                     }
+                 }
++                Some((AdtId::ClassId(_), _)) => {
++                    // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                    unimplemented!()
++                }
+                 None => return (self.err_ty(), None),
+             };
+ 
+@@ -2236,6 +2240,10 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+                         // FIXME Error E0071, expected struct, variant or union type, found enum `Foo`
+                         None
+                     }
++                    AdtId::ClassId(_) => {
++                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                        unimplemented!()
++                    }
+                 });
+                 (ty, variant)
+             }
+@@ -2276,6 +2284,10 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+                         // FIXME Error E0071, expected struct, variant or union type, found enum `Foo`
+                         None
+                     }
++                    AdtId::ClassId(_) => {
++                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                        unimplemented!()
++                    }
+                 });
+                 (ty, variant)
+             }
+@@ -2304,6 +2316,10 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+                 // FIXME diagnostic
+                 (self.err_ty(), None)
+             }
++            TypeNs::AdtId(AdtId::ClassId(_)) => {
++                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                unimplemented!()
++            }
+         };
+ 
+         fn forbid_unresolved_segments<'db>(
+@@ -2337,6 +2353,10 @@ impl<'body, 'db> InferenceContext<'body, 'db> {
+                         // FIXME Error E0071, expected struct, variant or union type, found enum `Foo`
+                         None
+                     }
++                    AdtId::ClassId(_) => {
++                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                        unimplemented!()
++                    }
+                 });
+                 (ty, variant)
+             }
+diff --git a/crates/hir-ty/src/infer/closure/analysis/expr_use_visitor.rs b/crates/hir-ty/src/infer/closure/analysis/expr_use_visitor.rs
+index 0fd3cda31..ef3aab7fc 100644
+--- a/crates/hir-ty/src/infer/closure/analysis/expr_use_visitor.rs
++++ b/crates/hir-ty/src/infer/closure/analysis/expr_use_visitor.rs
+@@ -1472,6 +1472,10 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, '_, 'db, D> {
+         let variant_idx = match variant {
+             VariantId::EnumVariantId(variant) => variant.loc(self.cx.db).index,
+             VariantId::StructId(_) | VariantId::UnionId(_) => 0,
++            VariantId::ClassId(_) => {
++                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                unimplemented!()
++            }
+         };
+         Ok((variant_idx, variant))
+     }
+@@ -1710,6 +1714,10 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, '_, 'db, D> {
+                     };
+                     did.enum_variants(self.cx.db).variants.len() > 1 || has_foreign_non_exhaustive()
+                 }
++                AdtId::ClassId(_) => {
++                    // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                    unimplemented!()
++                }
+             }
+         } else {
+             false
+diff --git a/crates/hir-ty/src/infer/expr.rs b/crates/hir-ty/src/infer/expr.rs
+index a6c8cda40..684e600ac 100644
+--- a/crates/hir-ty/src/infer/expr.rs
++++ b/crates/hir-ty/src/infer/expr.rs
+@@ -1635,6 +1635,10 @@ impl<'db> InferenceContext<'_, 'db> {
+                         (field, parameters)
+                     }
+                     hir_def::AdtId::EnumId(_) => return None,
++                    hir_def::AdtId::ClassId(_) => {
++                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                        unimplemented!()
++                    }
+                 },
+                 _ => return None,
+             };
+diff --git a/crates/hir-ty/src/inhabitedness.rs b/crates/hir-ty/src/inhabitedness.rs
+index 74d66123e..5861f6195 100644
+--- a/crates/hir-ty/src/inhabitedness.rs
++++ b/crates/hir-ty/src/inhabitedness.rs
+@@ -137,6 +137,10 @@ impl<'a, 'db> UninhabitedFrom<'a, 'db> {
+                 }
+                 BREAK_VISIBLY_UNINHABITED
+             }
++            AdtId::ClassId(_) => {
++                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                unimplemented!()
++            }
+         }
+     }
+ 
+diff --git a/crates/hir-ty/src/layout/adt.rs b/crates/hir-ty/src/layout/adt.rs
+index 6090ddfd4..1dd2d541f 100644
+--- a/crates/hir-ty/src/layout/adt.rs
++++ b/crates/hir-ty/src/layout/adt.rs
+@@ -65,6 +65,10 @@ pub fn layout_of_adt_query(
+                 .collect::<Result<SmallVec<_>, _>>()?;
+             (r, AttrFlags::repr(db, e.into()).unwrap_or_default(), false)
+         }
++        AdtId::ClassId(_) => {
++            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++            unimplemented!()
++        }
+     };
+     let variants = variants
+         .iter()
+diff --git a/crates/hir-ty/src/lower.rs b/crates/hir-ty/src/lower.rs
+index 7325cd0ef..c63a7f44d 100644
+--- a/crates/hir-ty/src/lower.rs
++++ b/crates/hir-ty/src/lower.rs
+@@ -1647,6 +1647,10 @@ pub(crate) fn field_types_with_diagnostics_query<'db>(
+         VariantId::StructId(it) => (it.resolver(db), it.into()),
+         VariantId::UnionId(it) => (it.resolver(db), it.into()),
+         VariantId::EnumVariantId(it) => (it.resolver(db), it.lookup(db).parent.into()),
++        VariantId::ClassId(_) => {
++            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++            unimplemented!()
++        }
+     };
+     let mut res = ArenaMap::default();
+     let mut ctx = TyLoweringContext::new(
+diff --git a/crates/hir-ty/src/mir/eval.rs b/crates/hir-ty/src/mir/eval.rs
+index 80e429c4c..7b3c64bff 100644
+--- a/crates/hir-ty/src/mir/eval.rs
++++ b/crates/hir-ty/src/mir/eval.rs
+@@ -1777,6 +1777,10 @@ impl<'db> Evaluator<'db> {
+                         AdtId::StructId(s) => s,
+                         AdtId::UnionId(_) => not_supported!("unsizing unions"),
+                         AdtId::EnumId(_) => not_supported!("unsizing enums"),
++                        AdtId::ClassId(_) => {
++                            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                            unimplemented!()
++                        }
+                     };
+                     let Some((last_field, _)) = id.fields(self.db).fields().iter().next_back()
+                     else {
+@@ -2459,6 +2463,10 @@ impl<'db> Evaluator<'db> {
+                         }
+                     }
+                     AdtId::UnionId(_) => (),
++                    AdtId::ClassId(_) => {
++                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                        unimplemented!()
++                    }
+                 },
+                 TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => {
+                     let mut ocx = ObligationCtxt::new(&this.infcx);
+@@ -2563,6 +2571,10 @@ impl<'db> Evaluator<'db> {
+                         }
+                     }
+                 }
++                AdtId::ClassId(_) => {
++                    // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                    unimplemented!()
++                }
+             },
+             TyKind::Tuple(tys) => {
+                 for (id, ty) in tys.iter().enumerate() {
+@@ -3075,6 +3087,10 @@ impl<'db> Evaluator<'db> {
+                     }
+                     AdtId::UnionId(_) => (), // union fields don't need drop
+                     AdtId::EnumId(_) => (),
++                    AdtId::ClassId(_) => {
++                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                        unimplemented!()
++                    }
+                 }
+             }
+             TyKind::Bool
+diff --git a/crates/hir-ty/src/mir/lower.rs b/crates/hir-ty/src/mir/lower.rs
+index 49fb6f530..0e51ca9e3 100644
+--- a/crates/hir-ty/src/mir/lower.rs
++++ b/crates/hir-ty/src/mir/lower.rs
+@@ -502,6 +502,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+                             VariantId::EnumVariantId(e) => ValueNs::EnumVariantId(e),
+                             VariantId::StructId(s) => ValueNs::StructId(s),
+                             VariantId::UnionId(_) => implementation_error!("Union variant as path"),
++                            VariantId::ClassId(_) => {
++                                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                                unimplemented!()
++                            }
+                         }
+                     } else {
+                         let resolver_guard =
+@@ -956,6 +960,10 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
+                         );
+                         self.lower_expr_to_place(*expr, place, current)
+                     }
++                    VariantId::ClassId(_) => {
++                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                        unimplemented!()
++                    }
+                 }
+             }
+             Expr::Await { .. } => not_supported!("await"),
+@@ -2108,6 +2116,10 @@ fn convert_closure_capture_projections(
+                             let variant = id.enum_variants(db).variants[variant_idx as usize].0;
+                             FieldId { parent: variant.into(), local_id: local_field_id }
+                         }
++                        AdtId::ClassId(_) => {
++                            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                            unimplemented!()
++                        }
+                     };
+                     ProjectionElem::Field(Either::Left(field))
+                 }
+diff --git a/crates/hir-ty/src/mir/lower/pattern_matching.rs b/crates/hir-ty/src/mir/lower/pattern_matching.rs
+index 03c608f4b..2159ec7cf 100644
+--- a/crates/hir-ty/src/mir/lower/pattern_matching.rs
++++ b/crates/hir-ty/src/mir/lower/pattern_matching.rs
+@@ -633,6 +633,10 @@ impl<'db> MirLowerCtx<'_, 'db> {
+             VariantId::UnionId(_) => {
+                 return Err(MirLowerError::TypeError("pattern matching on union"));
+             }
++            VariantId::ClassId(_) => {
++                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                unimplemented!()
++            }
+         })
+     }
+ 
+diff --git a/crates/hir-ty/src/mir/pretty.rs b/crates/hir-ty/src/mir/pretty.rs
+index de5ee223a..cb17c538c 100644
+--- a/crates/hir-ty/src/mir/pretty.rs
++++ b/crates/hir-ty/src/mir/pretty.rs
+@@ -349,6 +349,10 @@ impl<'a, 'db> MirPrettyCtx<'a, 'db> {
+                             f(this, local, head);
+                             w!(this, ".{}", name.display(this.db, this.display_target.edition));
+                         }
++                        hir_def::VariantId::ClassId(_) => {
++                            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                            unimplemented!()
++                        }
+                     }
+                 }
+                 ProjectionElem::Field(Either::Right(field)) => {
+diff --git a/crates/hir-ty/src/next_solver/def_id.rs b/crates/hir-ty/src/next_solver/def_id.rs
+index 542eca3de..10ec7772b 100644
+--- a/crates/hir-ty/src/next_solver/def_id.rs
++++ b/crates/hir-ty/src/next_solver/def_id.rs
+@@ -113,6 +113,10 @@ impl std::fmt::Debug for SolverDefId {
+                     ))
+                     .finish()
+             }
++            SolverDefId::AdtId(AdtId::ClassId(_)) => {
++                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                unimplemented!()
++            }
+         }
+     }
+ }
+@@ -180,6 +184,10 @@ impl From<VariantId> for SolverDefId {
+             VariantId::EnumVariantId(id) => id.into(),
+             VariantId::StructId(id) => id.into(),
+             VariantId::UnionId(id) => id.into(),
++            VariantId::ClassId(_) => {
++                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                unimplemented!()
++            }
+         }
+     }
+ }
+diff --git a/crates/hir-ty/src/next_solver/format_proof_tree.rs b/crates/hir-ty/src/next_solver/format_proof_tree.rs
+index 4b2f66a17..8bff00e5c 100644
+--- a/crates/hir-ty/src/next_solver/format_proof_tree.rs
++++ b/crates/hir-ty/src/next_solver/format_proof_tree.rs
+@@ -97,6 +97,10 @@ impl<'a, 'db> ProofTreeSerializer<'a, 'db> {
+                                 hir_def::AdtId::EnumId(adt) => {
+                                     adt.loc(db).source(db).value.to_string()
+                                 }
++                                hir_def::AdtId::ClassId(_) => {
++                                    // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                                    unimplemented!()
++                                }
+                             };
+                             Some(format!("#[derive(${})]\n{}", impl_loc.trait_.name(), adt_src))
+                         }
+diff --git a/crates/hir-ty/src/next_solver/interner.rs b/crates/hir-ty/src/next_solver/interner.rs
+index af3798f1d..706917567 100644
+--- a/crates/hir-ty/src/next_solver/interner.rs
++++ b/crates/hir-ty/src/next_solver/interner.rs
+@@ -623,6 +623,10 @@ impl AdtDef {
+ 
+                 (flags, variants, repr)
+             }
++            AdtId::ClassId(_) => {
++                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                unimplemented!()
++            }
+         };
+ 
+         AdtDef::new_(db, AdtDefInner { id: def_id, variants, flags, repr })
+@@ -705,6 +709,10 @@ impl<'db> inherent::AdtDef<DbInterner<'db>> for AdtDef {
+                 .iter()
+                 .flat_map(|&(variant_id, _, _)| field_tys(variant_id.into()))
+                 .collect(),
++            hir_def::AdtId::ClassId(_) => {
++                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                unimplemented!()
++            }
+         };
+ 
+         EarlyBinder::bind(tys)
+@@ -758,6 +766,10 @@ impl fmt::Debug for AdtDef {
+                 let data = EnumSignature::of(db, enum_id);
+                 f.write_str(data.name.as_str())
+             }
++            AdtId::ClassId(_) => {
++                // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                unimplemented!()
++            }
+         })
+     }
+ }
+@@ -1721,6 +1733,10 @@ impl<'db> Interner for DbInterner<'db> {
+                     SolverDefId::AdtId(AdtId::StructId(id)) => id.module(self.db),
+                     SolverDefId::AdtId(AdtId::EnumId(id)) => id.module(self.db),
+                     SolverDefId::AdtId(AdtId::UnionId(id)) => id.module(self.db),
++                    SolverDefId::AdtId(AdtId::ClassId(_)) => {
++                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                        unimplemented!()
++                    }
+                     SolverDefId::TraitId(id) => id.module(self.db),
+                     SolverDefId::TypeAliasId(id) => id.module(self.db),
+                     SolverDefId::ConstId(_)
+diff --git a/crates/hir-ty/src/representability.rs b/crates/hir-ty/src/representability.rs
+index bae204c4e..28711464b 100644
+--- a/crates/hir-ty/src/representability.rs
++++ b/crates/hir-ty/src/representability.rs
+@@ -34,6 +34,10 @@ pub(crate) fn representability(db: &dyn HirDatabase, id: AdtId) -> Representabil
+             }
+             Representability::Representable
+         }
++        AdtId::ClassId(_) => {
++            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++            unimplemented!()
++        }
+     }
+ }
+ 
+@@ -105,6 +109,10 @@ fn params_in_repr(db: &dyn HirDatabase, def_id: AdtId) -> Box<[bool]> {
+                 handle_variant(variant.into());
+             }
+         }
++        AdtId::ClassId(_) => {
++            // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++            unimplemented!()
++        }
+     }
+     params_in_repr
+ }
+diff --git a/crates/hir-ty/src/traits.rs b/crates/hir-ty/src/traits.rs
+index ad668f2ee..1bd71bce0 100644
+--- a/crates/hir-ty/src/traits.rs
++++ b/crates/hir-ty/src/traits.rs
+@@ -204,6 +204,10 @@ pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id
+                 hir_def::AdtId::EnumId(it) => EnumSignature::of(db, it)
+                     .flags
+                     .contains(EnumFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS),
++                hir_def::AdtId::ClassId(_) => {
++                    // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                    unimplemented!()
++                }
+             },
+             TyKind::Dynamic(it, _) => it.principal_def_id().is_some_and(|trait_id| {
+                 TraitSignature::of(db, trait_id.0)
+diff --git a/crates/hir-ty/src/variance.rs b/crates/hir-ty/src/variance.rs
+index a88457e3c..78a4cff25 100644
+--- a/crates/hir-ty/src/variance.rs
++++ b/crates/hir-ty/src/variance.rs
+@@ -142,6 +142,10 @@ impl<'db> Context<'db> {
+                             add_constraints_from_variant(VariantId::EnumVariantId(variant))
+                         });
+                     }
++                    AdtId::ClassId(_) => {
++                        // rustcc Phase 2 (B.3 stub): hir-ty class semantics not yet wired (B.4 will).
++                        unimplemented!()
++                    }
+                 }
+             }
+             GenericDefId::FunctionId(f) => {
+-- 
+2.50.1 (Apple Git-155)
+

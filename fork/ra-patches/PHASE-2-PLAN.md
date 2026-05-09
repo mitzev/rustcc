@@ -389,3 +389,4 @@ strictly additive.
 ## Status log
 
 - 2026-05-09 — plan committed; B.1 in progress.
+- 2026-05-09 — overnight sprint: B.1 (hir-def, 17 sites), B.3b (hir-ty, 41 sites), B.3c (hir, 13 sites), B.3-tests (4 sites) all landed as patches `02..05-*.patch`. Workspace builds with 0 errors; cargo test green for parser (315/0), syntax (51/0), hir-def (479/0), hir-ty (969/0). All 75 Class arms are stubs (`unimplemented!` or no-op fall-through) since lowering doesn't yet produce ClassId values — runtime invariant means the arms are unreachable. **Next**: B.2 wires ClassSignature lowering so the stubs become real behavior; that's the milestone where IDE features start to *work* on `class` items, not just compile.

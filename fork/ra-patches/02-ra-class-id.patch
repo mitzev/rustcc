@@ -1,0 +1,470 @@
+From 5735e16b7b1c23360e3c7749528a2f63997e795b Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Sat, 9 May 2026 17:00:32 +0300
+Subject: [PATCH 2/5] P09.46-B1-hir-def: ClassId / AdtId::ClassId /
+ VariantId::ClassId stubs
+
+Pure data-structure scaffolding for rustcc Phase 2 Option B.
+
+Adds:
+- ClassLoc, ClassId, intern_class / lookup_intern_class (parallel
+  to StructId in hir-def/src/lib.rs)
+- AdtId::ClassId(ClassId) variant with impl_from! routing to
+  AdtId, GenericDefId, ModuleDefId, AttrDefId
+- VariantId::ClassId(ClassId) variant
+- ErasedFileAstIdKind::Class + register_has_name_ast_id! entry
+  in span/src/ast_id.rs
+- intern_class on InternDatabase trait
+
+Each non-exhaustive match-Adt site in hir-def gets either:
+- A 'treat-like-struct' Class arm where the struct path makes
+  semantic sense (resolver attrs, attr collection, builtin
+  derive sourcing, item-scope kind classification, hir-display)
+- An 'unimplemented' stub where ClassSignature would need to
+  be wired (generics::Generics::with_store / with_source_map,
+  expr_store::ExpressionStore::of for Signature owner,
+  signatures::VariantFields::with_source_map, src::child_source
+  for VariantId, expr_store/pretty for VariantId+AdtId headers).
+  These stubs are unreachable at runtime: lowering doesn't
+  produce ClassIds yet, so no caller can construct a value
+  that hits these match arms. B.2 wires real ClassSignature
+  lowering and replaces the stubs.
+
+Verification:
+- cargo check -p hir-def: 0 errors (was 25 after AdtId variant
+  was added)
+- cargo test -p parser: 315 passed, 0 failed (Phase 1 baseline)
+- cargo test -p syntax: 51 passed, 0 failed (Phase 1 baseline)
+
+Remaining workspace errors after this commit (~42 in hir-ty +
+hir + ide-*) are addressed in subsequent commits in this series.
+---
+ crates/hir-def/src/attrs.rs             |  7 ++++
+ crates/hir-def/src/builtin_derive.rs    |  6 ++++
+ crates/hir-def/src/db.rs                | 16 +++++----
+ crates/hir-def/src/expr_store.rs        |  8 +++++
+ crates/hir-def/src/expr_store/pretty.rs |  6 ++++
+ crates/hir-def/src/hir/generics.rs      | 10 ++++++
+ crates/hir-def/src/item_scope.rs        |  5 ++-
+ crates/hir-def/src/lib.rs               | 47 ++++++++++++++++++++++---
+ crates/hir-def/src/resolver.rs          |  6 +++-
+ crates/hir-def/src/signatures.rs        |  6 ++++
+ crates/hir-def/src/src.rs               |  7 ++++
+ crates/span/src/ast_id.rs               |  7 +++-
+ 12 files changed, 117 insertions(+), 14 deletions(-)
+
+diff --git a/crates/hir-def/src/attrs.rs b/crates/hir-def/src/attrs.rs
+index 5cf5a9b6b..b611a0a39 100644
+--- a/crates/hir-def/src/attrs.rs
++++ b/crates/hir-def/src/attrs.rs
+@@ -405,6 +405,9 @@ fn attrs_source(
+         AttrDefId::AdtId(AdtId::StructId(it)) => attrs_from_ast_id_loc(db, it),
+         AttrDefId::AdtId(AdtId::UnionId(it)) => attrs_from_ast_id_loc(db, it),
+         AttrDefId::AdtId(AdtId::EnumId(it)) => attrs_from_ast_id_loc(db, it),
++        // rustcc Phase 2 (B.1): class items have attrs sourced from
++        // the same AST-id-loc machinery as Struct.
++        AttrDefId::AdtId(AdtId::ClassId(it)) => attrs_from_ast_id_loc(db, it),
+         AttrDefId::FunctionId(it) => attrs_from_ast_id_loc(db, it),
+         AttrDefId::EnumVariantId(it) => attrs_from_ast_id_loc(db, it),
+         AttrDefId::StaticId(it) => attrs_from_ast_id_loc(db, it),
+@@ -428,6 +431,8 @@ fn resolver_for_attr_def_id(db: &dyn DefDatabase, owner: AttrDefId) -> Resolver<
+         AttrDefId::AdtId(AdtId::StructId(id)) => id.resolver(db),
+         AttrDefId::AdtId(AdtId::UnionId(id)) => id.resolver(db),
+         AttrDefId::AdtId(AdtId::EnumId(id)) => id.resolver(db),
++        // rustcc Phase 2 (B.1): treat class like struct for resolver lookup.
++        AttrDefId::AdtId(AdtId::ClassId(id)) => id.resolver(db),
+         AttrDefId::FunctionId(id) => id.resolver(db),
+         AttrDefId::EnumVariantId(id) => id.resolver(db),
+         AttrDefId::StaticId(id) => id.resolver(db),
+@@ -472,6 +477,8 @@ fn collect_field_attrs<T>(
+         VariantId::EnumVariantId(it) => attrs_from_ast_id_loc(db, it),
+         VariantId::StructId(it) => attrs_from_ast_id_loc(db, it),
+         VariantId::UnionId(it) => attrs_from_ast_id_loc(db, it),
++        // rustcc Phase 2 (B.1).
++        VariantId::ClassId(it) => attrs_from_ast_id_loc(db, it),
+     };
+     let cfg_options = krate.cfg_options(db);
+     let variant_syntax = variant_syntax
+diff --git a/crates/hir-def/src/builtin_derive.rs b/crates/hir-def/src/builtin_derive.rs
+index 946f08ec3..576166e83 100644
+--- a/crates/hir-def/src/builtin_derive.rs
++++ b/crates/hir-def/src/builtin_derive.rs
+@@ -157,6 +157,12 @@ impl BuiltinDeriveImplLoc {
+                 let adt_loc = adt.loc(db);
+                 (adt_loc.id.upcast(), adt_loc.container)
+             }
++            // rustcc Phase 2 (B.1): builtin derive on a class
++            // sources from the same Loc machinery as Struct.
++            AdtId::ClassId(adt) => {
++                let adt_loc = adt.loc(db);
++                (adt_loc.id.upcast(), adt_loc.container)
++            }
+         };
+         let derive_range = self.derive_attr_id.find_derive_range(
+             db,
+diff --git a/crates/hir-def/src/db.rs b/crates/hir-def/src/db.rs
+index 9dd7768ea..ac0e4d872 100644
+--- a/crates/hir-def/src/db.rs
++++ b/crates/hir-def/src/db.rs
+@@ -7,12 +7,12 @@ use hir_expand::{
+ use triomphe::Arc;
+ 
+ use crate::{
+-    AnonConstId, AnonConstLoc, AssocItemId, AttrDefId, BlockId, BlockLoc, ConstId, ConstLoc,
+-    EnumId, EnumLoc, EnumVariantId, EnumVariantLoc, ExternBlockId, ExternBlockLoc, ExternCrateId,
+-    ExternCrateLoc, FunctionId, FunctionLoc, ImplId, ImplLoc, Macro2Id, Macro2Loc, MacroExpander,
+-    MacroId, MacroRulesId, MacroRulesLoc, MacroRulesLocFlags, ProcMacroId, ProcMacroLoc, StaticId,
+-    StaticLoc, StructId, StructLoc, TraitId, TraitLoc, TypeAliasId, TypeAliasLoc, UnionId,
+-    UnionLoc, UseId, UseLoc,
++    AnonConstId, AnonConstLoc, AssocItemId, AttrDefId, BlockId, BlockLoc, ClassId, ClassLoc,
++    ConstId, ConstLoc, EnumId, EnumLoc, EnumVariantId, EnumVariantLoc, ExternBlockId,
++    ExternBlockLoc, ExternCrateId, ExternCrateLoc, FunctionId, FunctionLoc, ImplId, ImplLoc,
++    Macro2Id, Macro2Loc, MacroExpander, MacroId, MacroRulesId, MacroRulesLoc, MacroRulesLocFlags,
++    ProcMacroId, ProcMacroLoc, StaticId, StaticLoc, StructId, StructLoc, TraitId, TraitLoc,
++    TypeAliasId, TypeAliasLoc, UnionId, UnionLoc, UseId, UseLoc,
+     attrs::AttrFlags,
+     item_tree::{ItemTree, file_item_tree_query},
+     nameres::crate_def_map,
+@@ -42,6 +42,10 @@ pub trait InternDatabase: SourceDatabase {
+     #[salsa::interned]
+     fn intern_enum(&self, loc: EnumLoc) -> EnumId;
+ 
++    /// rustcc Phase 2 (B.1): salsa-interned `class` items.
++    #[salsa::interned]
++    fn intern_class(&self, loc: ClassLoc) -> ClassId;
++
+     #[salsa::interned]
+     fn intern_enum_variant(&self, loc: EnumVariantLoc) -> EnumVariantId;
+ 
+diff --git a/crates/hir-def/src/expr_store.rs b/crates/hir-def/src/expr_store.rs
+index 51951896f..72b643f63 100644
+--- a/crates/hir-def/src/expr_store.rs
++++ b/crates/hir-def/src/expr_store.rs
+@@ -439,6 +439,10 @@ impl ExpressionStore {
+                     GenericDefId::AdtId(AdtId::EnumId(id)) => &EnumSignature::of(db, id).store,
+                     GenericDefId::AdtId(AdtId::StructId(id)) => &StructSignature::of(db, id).store,
+                     GenericDefId::AdtId(AdtId::UnionId(id)) => &UnionSignature::of(db, id).store,
++                    // rustcc Phase 2 (B.1 stub) — see generics.rs for the matching arm.
++                    GenericDefId::AdtId(AdtId::ClassId(_)) => {
++                        unimplemented!("rustcc B.2: ClassSignature lowering not yet wired")
++                    }
+                     GenericDefId::ConstId(id) => &ConstSignature::of(db, id).store,
+                     GenericDefId::FunctionId(id) => &FunctionSignature::of(db, id).store,
+                     GenericDefId::ImplId(id) => &ImplSignature::of(db, id).store,
+@@ -478,6 +482,10 @@ impl ExpressionStore {
+                         let sig = UnionSignature::with_source_map(db, id);
+                         (&sig.0.store, &sig.1)
+                     }
++                    // rustcc Phase 2 (B.1 stub).
++                    GenericDefId::AdtId(AdtId::ClassId(_)) => {
++                        unimplemented!("rustcc B.2: ClassSignature lowering not yet wired")
++                    }
+                     GenericDefId::ConstId(id) => {
+                         let sig = ConstSignature::with_source_map(db, id);
+                         (&sig.0.store, &sig.1)
+diff --git a/crates/hir-def/src/expr_store/pretty.rs b/crates/hir-def/src/expr_store/pretty.rs
+index bb35009f3..6a1fdcdb9 100644
+--- a/crates/hir-def/src/expr_store/pretty.rs
++++ b/crates/hir-def/src/expr_store/pretty.rs
+@@ -122,6 +122,8 @@ pub fn print_variant_body_hir(db: &dyn DefDatabase, owner: VariantId, edition: E
+             item_name(db, it, "<missing>")
+         ),
+         VariantId::UnionId(it) => format!("union {}", item_name(db, it, "<missing>")),
++        // rustcc Phase 2 (B.1).
++        VariantId::ClassId(it) => format!("class {}", item_name(db, it, "<missing>")),
+     };
+ 
+     let fields = owner.fields(db);
+@@ -178,6 +180,10 @@ pub fn print_signature(db: &dyn DefDatabase, owner: GenericDefId, edition: Editi
+             AdtId::EnumId(id) => {
+                 format!("unimplemented {id:?}")
+             }
++            // rustcc Phase 2 (B.1).
++            AdtId::ClassId(id) => {
++                format!("class {}", item_name(db, id, "<missing>"))
++            }
+         },
+         GenericDefId::ConstId(id) => format!("unimplemented {id:?}"),
+         GenericDefId::FunctionId(id) => {
+diff --git a/crates/hir-def/src/hir/generics.rs b/crates/hir-def/src/hir/generics.rs
+index 43dd7d1c5..691215c8a 100644
+--- a/crates/hir-def/src/hir/generics.rs
++++ b/crates/hir-def/src/hir/generics.rs
+@@ -209,6 +209,12 @@ impl GenericParams {
+                 let sig = UnionSignature::of(db, id);
+                 (&sig.generic_params, &sig.store)
+             }
++            // rustcc Phase 2 (B.1 stub): no ClassSignature::of yet —
++            // lowering doesn't produce ClassIds, so this arm is
++            // unreachable at runtime. B.2 wires real ClassSignature.
++            GenericDefId::AdtId(AdtId::ClassId(_)) => {
++                unimplemented!("rustcc B.2: ClassSignature lowering not yet wired")
++            }
+             GenericDefId::ConstId(id) => {
+                 let sig = ConstSignature::of(db, id);
+                 (&EMPTY, &sig.store)
+@@ -253,6 +259,10 @@ impl GenericParams {
+                 let (sig, sm) = UnionSignature::with_source_map(db, id);
+                 (&sig.generic_params, &sig.store, sm)
+             }
++            // rustcc Phase 2 (B.1 stub) — see with_store above.
++            GenericDefId::AdtId(AdtId::ClassId(_)) => {
++                unimplemented!("rustcc B.2: ClassSignature lowering not yet wired")
++            }
+             GenericDefId::ConstId(id) => {
+                 let (sig, sm) = ConstSignature::with_source_map(db, id);
+                 (&EMPTY, &sig.store, sm)
+diff --git a/crates/hir-def/src/item_scope.rs b/crates/hir-def/src/item_scope.rs
+index fe7d18068..5e56fff17 100644
+--- a/crates/hir-def/src/item_scope.rs
++++ b/crates/hir-def/src/item_scope.rs
+@@ -931,7 +931,10 @@ impl PerNs {
+             ModuleDefId::AdtId(adt) => match adt {
+                 AdtId::UnionId(_) => PerNs::types(def, v, import),
+                 AdtId::EnumId(_) => PerNs::types(def, v, import),
+-                AdtId::StructId(_) => {
++                AdtId::StructId(_) | AdtId::ClassId(_) => {
++                    // rustcc Phase 2 (B.1): class behaves like struct for
++                    // import lookup (record-fielded type with optional
++                    // tuple constructor).
+                     if has_constructor {
+                         PerNs::both(def, def, v, import)
+                     } else {
+diff --git a/crates/hir-def/src/lib.rs b/crates/hir-def/src/lib.rs
+index 2c7685b18..c8cb9cdab 100644
+--- a/crates/hir-def/src/lib.rs
++++ b/crates/hir-def/src/lib.rs
+@@ -289,6 +289,28 @@ impl UnionId {
+     }
+ }
+ 
++// rustcc Phase 2 (B.1): ClassId, parallel to StructId. The class
++// keyword Phase 1 patch parsed `class Foo { … }` into a CLASS
++// AST node; this gives the body a def-id space so downstream IDE
++// machinery can identify a class by ClassId. ClassData / class-
++// specific signatures land alongside in `signatures.rs`.
++pub type ClassLoc = ItemLoc<ast::Class>;
++impl_intern!(ClassId, ClassLoc, intern_class, lookup_intern_class);
++
++impl ClassId {
++    pub fn fields(self, db: &dyn DefDatabase) -> &VariantFields {
++        VariantFields::of(db, self.into())
++    }
++
++    pub fn fields_with_source_map(
++        self,
++        db: &dyn DefDatabase,
++    ) -> (&VariantFields, &ExpressionStoreSourceMap) {
++        let r = VariantFields::with_source_map(db, self.into());
++        (&r.0, &r.1)
++    }
++}
++
+ pub type EnumLoc = ItemLoc<ast::Enum>;
+ impl_intern!(EnumId, EnumLoc, intern_enum, lookup_intern_enum);
+ 
+@@ -653,8 +675,13 @@ pub enum AdtId {
+     StructId(StructId),
+     UnionId(UnionId),
+     EnumId(EnumId),
++    // rustcc Phase 2 (B.1): first-class Class variant. Most match
++    // sites can treat ClassId(_) like StructId(_) for v0 — a class
++    // has record-style fields + inherent methods. Class-specific
++    // semantics (inheritance, virtuality) layer in via B.4.
++    ClassId(ClassId),
+ }
+-impl_from!(StructId, UnionId, EnumId for AdtId);
++impl_from!(StructId, UnionId, EnumId, ClassId for AdtId);
+ 
+ /// A macro
+ #[derive(Debug, PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, salsa_macros::Supertype)]
+@@ -699,7 +726,7 @@ impl_from!(
+     MacroId(Macro2Id, MacroRulesId, ProcMacroId),
+     ModuleId,
+     FunctionId,
+-    AdtId(StructId, EnumId, UnionId),
++    AdtId(StructId, EnumId, UnionId, ClassId),
+     EnumVariantId,
+     ConstId,
+     StaticId,
+@@ -826,7 +853,7 @@ pub enum GenericDefId {
+     TypeAliasId(TypeAliasId),
+ }
+ impl_from!(
+-    AdtId(StructId, EnumId, UnionId),
++    AdtId(StructId, EnumId, UnionId, ClassId),
+     ConstId,
+     FunctionId,
+     ImplId,
+@@ -869,6 +896,7 @@ impl ExpressionStoreOwnerId {
+                 VariantId::EnumVariantId(it) => it.lookup(db).parent.into(),
+                 VariantId::StructId(it) => it.into(),
+                 VariantId::UnionId(it) => it.into(),
++                VariantId::ClassId(it) => it.into(),
+             },
+         }
+     }
+@@ -915,6 +943,7 @@ impl GenericDefId {
+             GenericDefId::AdtId(AdtId::StructId(it)) => file_id_and_params_of_item_loc(db, it),
+             GenericDefId::AdtId(AdtId::UnionId(it)) => file_id_and_params_of_item_loc(db, it),
+             GenericDefId::AdtId(AdtId::EnumId(it)) => file_id_and_params_of_item_loc(db, it),
++            GenericDefId::AdtId(AdtId::ClassId(it)) => file_id_and_params_of_item_loc(db, it),
+             GenericDefId::TraitId(it) => file_id_and_params_of_item_loc(db, it),
+             GenericDefId::ImplId(it) => file_id_and_params_of_item_loc(db, it),
+             GenericDefId::ConstId(it) => (it.lookup(db).id.file_id, None),
+@@ -999,7 +1028,7 @@ pub enum AttrDefId {
+ }
+ 
+ impl_from!(
+-    AdtId(StructId, EnumId, UnionId),
++    AdtId(StructId, EnumId, UnionId, ClassId),
+     EnumVariantId,
+     StaticId,
+     ConstId,
+@@ -1028,6 +1057,7 @@ impl From<VariantId> for AttrDefId {
+             VariantId::EnumVariantId(id) => id.into(),
+             VariantId::StructId(id) => id.into(),
+             VariantId::UnionId(id) => id.into(),
++            VariantId::ClassId(id) => id.into(),
+         }
+     }
+ }
+@@ -1039,8 +1069,11 @@ pub enum VariantId {
+     EnumVariantId(EnumVariantId),
+     StructId(StructId),
+     UnionId(UnionId),
++    // rustcc Phase 2 (B.1): class is structurally a record-fielded
++    // variant, like Struct.
++    ClassId(ClassId),
+ }
+-impl_from!(EnumVariantId, StructId, UnionId for VariantId);
++impl_from!(EnumVariantId, StructId, UnionId, ClassId for VariantId);
+ 
+ impl VariantId {
+     pub fn fields(self, db: &dyn DefDatabase) -> &VariantFields {
+@@ -1060,6 +1093,7 @@ impl VariantId {
+             VariantId::EnumVariantId(it) => it.lookup(db).id.file_id,
+             VariantId::StructId(it) => it.lookup(db).id.file_id,
+             VariantId::UnionId(it) => it.lookup(db).id.file_id,
++            VariantId::ClassId(it) => it.lookup(db).id.file_id,
+         }
+     }
+ 
+@@ -1068,6 +1102,7 @@ impl VariantId {
+             VariantId::EnumVariantId(it) => it.lookup(db).parent.into(),
+             VariantId::StructId(it) => it.into(),
+             VariantId::UnionId(it) => it.into(),
++            VariantId::ClassId(it) => it.into(),
+         }
+     }
+ }
+@@ -1218,6 +1253,7 @@ impl HasModule for AdtId {
+             AdtId::StructId(it) => it.module(db),
+             AdtId::UnionId(it) => it.module(db),
+             AdtId::EnumId(it) => it.module(db),
++            AdtId::ClassId(it) => it.module(db),
+         }
+     }
+ }
+@@ -1228,6 +1264,7 @@ impl HasModule for VariantId {
+             VariantId::EnumVariantId(it) => it.module(db),
+             VariantId::StructId(it) => it.module(db),
+             VariantId::UnionId(it) => it.module(db),
++            VariantId::ClassId(it) => it.module(db),
+         }
+     }
+ }
+diff --git a/crates/hir-def/src/resolver.rs b/crates/hir-def/src/resolver.rs
+index bb292ac1a..4fb5f9cec 100644
+--- a/crates/hir-def/src/resolver.rs
++++ b/crates/hir-def/src/resolver.rs
+@@ -1207,7 +1207,9 @@ fn to_value_ns(per_ns: PerNs, def_map: &DefMap) -> Option<ValueNs> {
+         ModuleDefId::ConstId(it) => ValueNs::ConstId(it),
+         ModuleDefId::StaticId(it) => ValueNs::StaticId(it),
+ 
+-        ModuleDefId::AdtId(AdtId::EnumId(_) | AdtId::UnionId(_))
++        // rustcc Phase 2 (B.1): class is not (yet) a value-namespace member.
++        // Eventually will follow Struct semantics for tuple-style ctors.
++        ModuleDefId::AdtId(AdtId::EnumId(_) | AdtId::UnionId(_) | AdtId::ClassId(_))
+         | ModuleDefId::TraitId(_)
+         | ModuleDefId::TypeAliasId(_)
+         | ModuleDefId::BuiltinType(_)
+@@ -1436,6 +1438,8 @@ impl HasResolver for VariantId {
+             VariantId::EnumVariantId(it) => it.resolver(db),
+             VariantId::StructId(it) => it.resolver(db),
+             VariantId::UnionId(it) => it.resolver(db),
++            // rustcc Phase 2 (B.1).
++            VariantId::ClassId(it) => it.resolver(db),
+         }
+     }
+ }
+diff --git a/crates/hir-def/src/signatures.rs b/crates/hir-def/src/signatures.rs
+index 6d704274f..74dc4432f 100644
+--- a/crates/hir-def/src/signatures.rs
++++ b/crates/hir-def/src/signatures.rs
+@@ -886,6 +886,12 @@ impl VariantFields {
+                 );
+                 (FieldsShape::Record, fields)
+             }
++            // rustcc Phase 2 (B.1 stub): no Class lowering yet — B.2
++            // wires `class { x: T, ... }` through here using the
++            // `member_list()` getter on ast::Class.
++            VariantId::ClassId(_) => {
++                unimplemented!("rustcc B.2: ClassId field lowering not yet wired")
++            }
+         };
+         match result {
+             Some((fields, store, source_map)) => {
+diff --git a/crates/hir-def/src/src.rs b/crates/hir-def/src/src.rs
+index e33fd9590..dff3285e8 100644
+--- a/crates/hir-def/src/src.rs
++++ b/crates/hir-def/src/src.rs
+@@ -144,6 +144,13 @@ impl HasChildSource<LocalFieldId> for VariantId {
+                 let lookup = it.lookup(db);
+                 (lookup.source(db).map(|it| it.kind()), lookup.container)
+             }
++            // rustcc Phase 2 (B.1 stub): class child-source mapping
++            // walks CLASS_MEMBER_LIST instead of StructKind. B.2 wires
++            // the real walker; here unreachable since lowering doesn't
++            // produce ClassIds yet.
++            VariantId::ClassId(_) => {
++                unimplemented!("rustcc B.2: ClassId child-source walker not yet wired")
++            }
+         };
+         let mut map = ArenaMap::new();
+         match &src.value {
+diff --git a/crates/span/src/ast_id.rs b/crates/span/src/ast_id.rs
+index f6500a9b4..fbf10d5b9 100644
+--- a/crates/span/src/ast_id.rs
++++ b/crates/span/src/ast_id.rs
+@@ -88,6 +88,7 @@ impl fmt::Debug for ErasedFileAstId {
+             Module,
+             Static,
+             Trait,
++            Class,
+             Variant,
+             Const,
+             Fn,
+@@ -128,6 +129,9 @@ enum ErasedFileAstIdKind {
+     Module,
+     Static,
+     Trait,
++    // rustcc Phase 2 (B.1): class is shape-equivalent to Struct
++    // for this enum's purposes — record-style fields with a name.
++    Class,
+     // Until here associated with `ErasedHasNameFileAstId`.
+     // The following are associated with `ErasedAssocItemFileAstId`.
+     Variant,
+@@ -500,7 +504,8 @@ register_has_name_ast_id! {
+         MacroRules = name,
+         Module = name,
+         Static = name,
+-        Trait = name
++        Trait = name,
++        Class = name
+ }
+ 
+ macro_rules! register_assoc_item_ast_id {
+-- 
+2.50.1 (Apple Git-155)
+

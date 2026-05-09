@@ -37,11 +37,13 @@ The resulting `target/release/rust-analyzer` binary is a drop-in replacement for
 | File | Scope |
 |---|---|
 | `01-ra-class-keyword.patch` | P09.45 — Phase 1 parser support (CLASS node + CLASS_MEMBER_LIST). Files with `class` items stop producing cascading parse errors. |
-| (planned) `02-ra-class-id.patch` | Phase 2 B.1 — `ClassId`, `ClassData`, `Adt::Class` variant + db queries |
-| (planned) `03-ra-class-lowering.patch` | Phase 2 B.2 — item-tree lowering produces `Class` instead of bailing |
-| (planned) `04..07-ra-match-arms-*.patch` | Phase 2 B.3 — match-arm sweep across hir-def / hir-ty / ide / ide-assists |
-| (planned) `08-ra-class-resolve.patch` | Phase 2 B.4 — class-specific method dispatch + inheritance walk |
-| (planned) `09-ra-class-assists.patch` | Phase 2 B.5 — class-aware refactoring assists |
+| `02-ra-class-id.patch` | Phase 2 B.1 — `ClassId`/`ClassLoc` + `intern_class` query + `AdtId::ClassId` and `VariantId::ClassId` variants + 17 hir-def match-arm stubs. |
+| `03-ra-class-arms-hir-ty.patch` | Phase 2 B.3b — 41 Class-arm stubs in hir-ty (type inference, MIR lowering, drop checking, pattern matching, layout, next_solver). |
+| `04-ra-class-arms-hir.patch` | Phase 2 B.3c — 13 Class-arm stubs in the user-facing `hir` crate (from_id, source_analyzer, child_by_source, symbols). |
+| `05-ra-class-arms-tests.patch` | Phase 2 B.3 — 4 test-only Class arms (signatures, layout/tests, closure_captures, variance). |
+| (planned) `06-ra-class-signature.patch` | Phase 2 B.2 — wire `ClassSignature` lowering so the `unimplemented!()` stubs become real lookups. |
+| (planned) `07-ra-class-resolve.patch` | Phase 2 B.4 — class-specific method dispatch + inheritance walk. |
+| (planned) `08-ra-class-assists.patch` | Phase 2 B.5 — class-aware refactoring assists. |
 
 See [`PHASE-2-PLAN.md`](PHASE-2-PLAN.md) for the full Phase 2 design + sub-deliverable breakdown.
 
