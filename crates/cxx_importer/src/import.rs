@@ -982,7 +982,9 @@ impl<'a> Importer<'a> {
         //                              return the existing poison id.
         let upgrade_target = match self.classes.get(&usr).copied() {
             Some(id) if self.ctx.is_poisoned(id) => Some(id),
-            Some(id) => return Ok(id),
+            Some(id) => {
+                return Ok(id);
+            }
             None => None,
         };
 
@@ -1126,8 +1128,8 @@ impl<'a> Importer<'a> {
                     }
                 })?;
                 let fty = fty.get_canonical_type();
-                let ty_id = self
-                    .import_type(fty, &format!("{name}::{fname}"))?;
+                let ty_id =
+                    self.import_type(fty, &format!("{name}::{fname}"))?;
                 let field_idx = fields.len();
                 fields.push(FieldDef {
                     name: Ident(fname),
@@ -1177,7 +1179,20 @@ impl<'a> Importer<'a> {
                     ) {
                         continue;
                     }
-                    let m = self.lower_method(&child, &name, id)?;
+                    // M22: skip methods whose `lower_method` fails
+                    // (e.g. unsupported parameter type kinds reachable
+                    // only via this method's signature). Mirrors the
+                    // `attach_methods_recursively` post-pass policy.
+                    // Without this, a single broken method would
+                    // bubble `?` out of `import_class` while the
+                    // placeholder ClassDef registered in the cache
+                    // earlier stayed in place, leaving the class
+                    // permanently half-imported across the rest of
+                    // the TU.
+                    let m = match self.lower_method(&child, &name, id) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
                     // M11: capture static-method markers. libclang
                     // exposes `is_static_method()` only on `Method`
                     // entities (ctors / dtors / conversions can't
@@ -1304,7 +1319,6 @@ impl<'a> Importer<'a> {
         if upgrade_target.is_some() {
             self.ctx.unpoison(id);
         }
-
         Ok(id)
     }
 
@@ -1815,7 +1829,7 @@ impl<'a> Importer<'a> {
                         what: "array without element type",
                         where_: where_.to_string(),
                     span: None,
-                
+
                     }
                 })?;
                 let len = ty.get_size().ok_or_else(|| {
@@ -1823,13 +1837,38 @@ impl<'a> Importer<'a> {
                         what: "array with unknown size",
                         where_: where_.to_string(),
                     span: None,
-                
+
                     }
                 })?;
                 let elem_id = self.import_type(elem, where_)?;
                 CxxType::Array {
                     elem: elem_id,
                     len: len as u64,
+                }
+            }
+            // C array-to-pointer decay. `T arr[]` in a function
+            // parameter list (or any "incomplete array" position
+            // libclang preserves) lowers to `*T` for ABI purposes.
+            // Without this arm, e.g. FLTK's
+            // `static void default_icons(const Fl_Image *icons[], int)`
+            // — where libclang reports the param type as
+            // IncompleteArray-of-pointer rather than pointer-to-pointer
+            // — bubbles an "unsupported clang type kind" error out of
+            // the offending method's `lower_method`, which (before
+            // M22) poisoned the *entire* enclosing class body via
+            // the placeholder cache.
+            TypeKind::IncompleteArray => {
+                let elem = ty.get_element_type().ok_or_else(|| {
+                    ImportError::UnsupportedFeature {
+                        what: "incomplete array without element type",
+                        where_: where_.to_string(),
+                        span: None,
+                    }
+                })?;
+                let elem_id = self.import_type(elem, where_)?;
+                CxxType::Ptr {
+                    pointee: elem_id,
+                    cv: cv_from_type(elem),
                 }
             }
             other => {
