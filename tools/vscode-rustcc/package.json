@@ -1,0 +1,86 @@
+{
+  "name": "rustcc-tools",
+  "displayName": "rustcc",
+  "description": "Syntax + commands + snippets for rustcc — the C++/Swift-interop fork of rustc",
+  "version": "0.1.0",
+  "publisher": "rustcc",
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Programming Languages", "Snippets", "Other"],
+  "keywords": ["rust", "rustcc", "cpp", "swift", "interop", "cxx"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rustcc/rustcc.git",
+    "directory": "tools/vscode-rustcc"
+  },
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:rust",
+    "workspaceContains:**/rust-toolchain.toml"
+  ],
+  "contributes": {
+    "grammars": [
+      {
+        "scopeName": "source.rustcc.injection",
+        "path": "./syntaxes/rustcc-injection.tmLanguage.json",
+        "injectTo": ["source.rust"]
+      }
+    ],
+    "snippets": [
+      {
+        "language": "rust",
+        "path": "./snippets/rustcc.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "rustcc.installToolchain",
+        "title": "rustcc: Install Toolchain (latest)",
+        "category": "rustcc"
+      },
+      {
+        "command": "rustcc.doctor",
+        "title": "rustcc: Run Doctor",
+        "category": "rustcc"
+      },
+      {
+        "command": "rustcc.generateBindings",
+        "title": "rustcc: Generate Bindings for Header",
+        "category": "rustcc"
+      },
+      {
+        "command": "rustcc.showSkips",
+        "title": "rustcc: Show Bindings Skips",
+        "category": "rustcc"
+      }
+    ],
+    "configuration": {
+      "title": "rustcc",
+      "properties": {
+        "rustcc.cliPath": {
+          "type": "string",
+          "default": "rustcc",
+          "description": "Path to the rustcc CLI binary. Defaults to `rustcc` on PATH (install via `cargo install rustcc-cli` or build from this repo)."
+        },
+        "rustcc.cargoPath": {
+          "type": "string",
+          "default": "cargo",
+          "description": "Path to cargo. Used for `Generate Bindings for Header` which invokes the project's gen_bindings binary."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -p . --watch",
+    "package": "vsce package --out rustcc-tools.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.0.0"
+  }
+}

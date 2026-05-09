@@ -1,0 +1,60 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "rustcc Injection",
+  "scopeName": "source.rustcc.injection",
+  "injectionSelector": "L:source.rust",
+  "patterns": [
+    { "include": "#class-keyword" },
+    { "include": "#extern-cpp-string" },
+    { "include": "#extern-swift-string" },
+    { "include": "#rustcc-attributes" },
+    { "include": "#rustcc-attr-args" }
+  ],
+  "repository": {
+    "class-keyword": {
+      "comment": "Highlight `class` / `pub class` as a keyword. Stock Rust treats `class` as an identifier; rustcc's fork promotes it to a contextual keyword.",
+      "match": "\\b(class)\\s+([A-Z][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.other.rustcc.class" },
+        "2": { "name": "entity.name.type.rustcc.class" }
+      }
+    },
+    "extern-cpp-string": {
+      "comment": "Highlight `extern \"C++\"` ABI string as fork-specific.",
+      "match": "(extern)\\s+(\"C\\+\\+\")",
+      "captures": {
+        "1": { "name": "storage.modifier.rust" },
+        "2": { "name": "string.quoted.double.rust meta.rustcc.abi" }
+      }
+    },
+    "extern-swift-string": {
+      "comment": "Highlight `extern \"swiftcall\"` and `extern \"Swift\"` ABI strings.",
+      "match": "(extern)\\s+(\"(swiftcall|Swift)\")",
+      "captures": {
+        "1": { "name": "storage.modifier.rust" },
+        "2": { "name": "string.quoted.double.rust meta.rustcc.abi" }
+      }
+    },
+    "rustcc-attributes": {
+      "comment": "Bare attribute names that the fork understands.",
+      "match": "(#\\[)(cpp_virtual|constructor|swift_throws|swift_value)(\\])",
+      "captures": {
+        "1": { "name": "punctuation.brackets.attribute.rust" },
+        "2": { "name": "support.function.attribute.rustcc" },
+        "3": { "name": "punctuation.brackets.attribute.rust" }
+      }
+    },
+    "rustcc-attr-args": {
+      "comment": "Attributes that take parens (repr(cpp) / repr(swift) / repr(C, cpp) / etc.).",
+      "match": "(#\\[)(repr)(\\()((cpp|swift)([^)]*))(\\))(\\])",
+      "captures": {
+        "1": { "name": "punctuation.brackets.attribute.rust" },
+        "2": { "name": "support.function.attribute.rust" },
+        "3": { "name": "punctuation.brackets.round.rust" },
+        "5": { "name": "support.constant.attribute.rustcc" },
+        "7": { "name": "punctuation.brackets.round.rust" },
+        "8": { "name": "punctuation.brackets.attribute.rust" }
+      }
+    }
+  }
+}
