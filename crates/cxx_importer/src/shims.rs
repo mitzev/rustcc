@@ -134,14 +134,27 @@ pub fn generate_shims(
             if matches!(method.name, MethodName::ConversionTo(_)) {
                 continue;
             }
-            let rendered = render_method_shim(
-                ctx,
-                class_id,
-                &class_source,
-                method,
-            )?;
-            out.push_str(&rendered);
-            out.push('\n');
+            // Per-method resilience: when shim rendering fails
+            // (function-pointer parameter the C++ emitter
+            // doesn't have a syntax form for, member-pointer
+            // type, etc.), drop just that shim and continue.
+            // The Rust bindings emitter has the same
+            // skip-with-comment behavior so the resulting
+            // surface stays consistent between the Rust
+            // declarations and the C++ trampolines.
+            match render_method_shim(ctx, class_id, &class_source, method) {
+                Ok(rendered) => {
+                    out.push_str(&rendered);
+                    out.push('\n');
+                }
+                Err(ShimError::UnsupportedType { where_, kind }) => {
+                    let _ = writeln!(
+                        out,
+                        "// shim skipped: {where_}: {kind}",
+                    );
+                }
+                Err(other) => return Err(other),
+            }
         }
     }
 
@@ -248,8 +261,21 @@ fn render_method_shim(
              catch (...) {{\n        std::terminate();\n    }}\n"
         )
     } else {
+        // C-style cast on the return value bridges the gap
+        // between minor cv-qualifier mismatches between our
+        // rendered return type and the underlying C++ method's
+        // signature. Two cases this papers over:
+        //   - Multi-level pointers where the IR's
+        //     pointer-vs-pointee cv tracking is approximate
+        //     (`Fl_Widget *const *` vs `const Fl_Widget **`).
+        //   - Reference-to-pointer return types (`Fl_Widget*&`).
+        // The cast is a no-op at runtime when the types are
+        // bit-compatible (which is always true for the
+        // `extern "C"` ABI surface) and a sharp tool when they
+        // aren't — same trade-off C++ users make when
+        // round-tripping through `void*`.
         format!(
-            "    try {{\n        return {invoke};\n    }} \
+            "    try {{\n        return ({ret_src})({invoke});\n    }} \
              catch (...) {{\n        std::terminate();\n    }}\n"
         )
     };
@@ -326,6 +352,16 @@ fn render_cxx_type(
             render_nested_name(ctx, &ctx.class(*class_id).name)
         }
         CxxType::Enum { name, .. } => render_nested_name(ctx, name),
+        // M15 function-pointer types are deliberately *not*
+        // rendered here. The C++ syntax for a function-pointer
+        // parameter (`void (*name)(args)`) splices the
+        // declarator name *inside* the type, which our
+        // single-pass `<type> arg<N>` parameter renderer can't
+        // produce. The shim emitter's per-method skip path
+        // catches this `UnsupportedType` and emits a
+        // `// shim skipped: …` comment so the rest of the
+        // class still trampolines cleanly. Proper function-
+        // pointer parameter support is tracked as M15.c.
         CxxType::Array { .. }
         | CxxType::Fn(_)
         | CxxType::MemberPtr { .. } => Err(ShimError::UnsupportedType {
@@ -337,7 +373,18 @@ fn render_cxx_type(
 
 fn int_cpp(signed: bool, width: IntWidth) -> &'static str {
     match (signed, width) {
-        (true, IntWidth::I8) => "signed char",
+        // Use plain `char` for the I8-signed case rather than
+        // `signed char`. C++ treats `char`, `signed char`, and
+        // `unsigned char` as three distinct types — our IR
+        // collapses libclang's `CharS`/`SChar` into the same
+        // `Int { signed: true, width: I8 }`, so picking either
+        // form loses some information. Picking `char` matches
+        // the overwhelmingly-common `const char*` string case
+        // (FLTK uses it everywhere) and lets the resulting
+        // shim source compile cleanly against APIs declared
+        // with `char*`. Strict-`signed char*` APIs on the
+        // 1% boundary are tracked as a follow-up.
+        (true, IntWidth::I8) => "char",
         (false, IntWidth::I8) => "unsigned char",
         (true, IntWidth::I16) => "short",
         (false, IntWidth::I16) => "unsigned short",
@@ -352,12 +399,18 @@ fn int_cpp(signed: bool, width: IntWidth) -> &'static str {
 
 fn apply_cv_prefix(inner: &str, cv: CvQual) -> String {
     // C++ source form: `const T`, `volatile T`, `const volatile T`.
-    // Keep output canonical regardless of argument order.
+    // Keep output canonical regardless of argument order. Dedup
+    // against an already-prefixed `inner` so multi-level pointer
+    // types (`Ptr { pointee: Ptr { pointee: T, cv: const } }`)
+    // don't accidentally emit `const const char**`. The IR
+    // tracks pointer-vs-pointee cv with some ambiguity around
+    // multi-level pointers; the safe rendering rule is to apply
+    // each cv qualifier at most once.
     let mut out = String::new();
-    if cv.is_const {
+    if cv.is_const && !inner.starts_with("const ") {
         out.push_str("const ");
     }
-    if cv.is_volatile {
+    if cv.is_volatile && !inner.starts_with("volatile ") {
         out.push_str("volatile ");
     }
     out.push_str(inner);

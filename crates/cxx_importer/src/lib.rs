@@ -7,6 +7,8 @@
 
 pub mod aliases;
 mod annotations;
+#[cfg(feature = "build")]
+pub mod build;
 #[cfg(feature = "cache")]
 mod cache;
 mod diagnostics;

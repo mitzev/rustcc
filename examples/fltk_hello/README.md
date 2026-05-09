@@ -5,7 +5,44 @@ against a real, mid-sized C++ library: [FLTK 1.4.5](https://github.com/fltk/fltk
 It's a non-workspace crate (lives outside the main workspace's
 member list) so its libclang dependency stays opt-in.
 
-## What this demo proves
+## Two binaries
+
+| Binary | What it does | Toolchain |
+|--------|-------------|-----------|
+| `cargo run --bin probe --release` | Diagnostic: parse FLTK headers + report importer / emitter stats. | Stock nightly. |
+| `cargo run --bin build_demo --release` | **M26 pipeline end-to-end**: parse → emit Rust + C++ shims → invoke `cc` → produce `lib<name>.a` archive ready to link from a downstream crate. | Stock nightly for the build_demo itself; rustcc fork to actually link the resulting bindings (because they use `extern "C++"`). |
+
+## What the build_demo proves
+
+The M26 `cxx_importer::build::Build` orchestrator drives the entire
+pipeline against real FLTK 1.4.5:
+
+```
+=== Pipeline output ===
+  bindings.rs        : 235,721 bytes  (the Rust source the user includes)
+  cxx_shims.cpp      :  97,453 bytes  (453 extern "C" trampolines)
+  static archive     : 182,136 bytes  (libfltk_bindings_demo.a)
+
+=== Cargo directives the build.rs would emit ===
+  cargo:rustc-link-search=native=/opt/homebrew/Cellar/fltk/1.4.5/lib
+  cargo:rustc-link-lib=fltk
+  cargo:rustc-link-lib=static=pthread
+  cargo:rustc-link-lib=framework=Cocoa
+  cargo:rustc-link-arg=-weak_framework
+  cargo:rustc-link-arg=UniformTypeIdentifiers
+  cargo:rustc-link-arg=-weak_framework
+  cargo:rustc-link-arg=ScreenCaptureKit
+  cargo:rerun-if-changed=…/cpp/fltk_umbrella.hpp
+```
+
+**666 exported text symbols** end up in the static archive — the
+trampolines a downstream Rust crate links against. Of FLTK's
+~480 public methods, 39 get skipped with a `// shim skipped: …`
+comment for known v0 limitations (function-pointer params,
+member pointers, multi-inheritance secondary vtables). That's
+~92% of the surface working today.
+
+## What the probe proves
 
 Run `cargo run --release` and watch the importer + emitter chew through
 FLTK's main public headers:

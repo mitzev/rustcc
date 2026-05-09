@@ -1,6 +1,6 @@
-# Standalone manifest for the FLTK probe binary. Lives outside the
-# workspace so we can include `clang`-feature deps without affecting
-# the workspace crate graph.
+# Standalone manifest for the FLTK probe + build-demo binaries.
+# Lives outside the workspace so we can include `clang`-feature deps
+# without affecting the workspace crate graph.
 
 [package]
 name = "fltk_hello_probe"
@@ -8,12 +8,24 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# Diagnostic probe: parses FLTK headers and reports importer / emitter
+# stats. Always runnable on any host with libclang + FLTK installed.
 [[bin]]
 name = "probe"
 path = "probe.rs"
 
+# M26 end-to-end driver: runs the full `cxx_importer::build::Build`
+# pipeline against FLTK headers, including a real `cc::Build`
+# C++ compile of the emitted shims into a static library. The
+# resulting `lib<name>.a` is what a downstream crate would link
+# against (under the rustcc fork rustc, since the generated
+# bindings use the `extern "C++"` ABI).
+[[bin]]
+name = "build_demo"
+path = "build_demo.rs"
+
 [dependencies]
-cxx_importer = { path = "../../crates/cxx_importer", features = ["libclang"] }
+cxx_importer = { path = "../../crates/cxx_importer", features = ["libclang", "build"] }
 rustc_abi_cxx = { path = "../../crates/rustc_abi_cxx" }
 
 [workspace]
