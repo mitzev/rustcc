@@ -574,7 +574,19 @@ fn place_union_field(
 
 fn type_size_align(ctx: &CxxTypeCtx, ty: TypeId) -> Result<(u64, u64), ()> {
     match ctx.type_of(ty) {
-        CxxType::Void | CxxType::Fn(_) | CxxType::MemberPtr { .. } => Err(()),
+        CxxType::Void | CxxType::MemberPtr { .. } => Err(()),
+        // M15 collapses `Ptr<Fn>` → `Fn` in `import_type`'s Pointer
+        // arm, because Itanium treats function pointer + function
+        // type as a single ABI unit at parameter/return position.
+        // When the same `Fn` then surfaces as a *field* type
+        // (e.g. `Fl_Callback* callback_;` in `Fl_Widget`), it
+        // represents a function-pointer slot and is therefore
+        // pointer-sized. Without this branch, every class with a
+        // function-pointer field hits `LayoutError::UnsizedField`.
+        CxxType::Fn(_) => {
+            let ps = pointer_size(ctx);
+            Ok((ps, ps))
+        }
         CxxType::Bool => Ok((1, 1)),
         CxxType::Int { width, .. } => {
             let s = match width {

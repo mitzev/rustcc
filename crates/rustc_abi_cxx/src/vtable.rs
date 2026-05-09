@@ -436,14 +436,27 @@ fn slot_to_entry(ctx: &CxxTypeCtx, slot: &VSlot) -> VTableEntry {
                 class: slot.overrider_class,
                 variant: DtorVariant::D1,
             }),
-            MethodId(0),
+            // M22 partial: track the actual dtor MethodId on the
+            // overrider class instead of hard-coding `MethodId(0)`.
+            // The cxx_importer's `populate_vtable_indices` walker
+            // (which is keyed by MethodId) used to mis-attribute
+            // dtor slot ranks to the class's first method
+            // (index 0); now it correctly assigns the rank to
+            // the actual dtor MethodId. The originator_method_idx
+            // here is the dtor's index in the originating
+            // class's method list — for the override path this is
+            // the BASE class's dtor index. We want the
+            // OVERRIDER's dtor index because the slot is keyed
+            // by the most-derived class's `class.methods`. Look
+            // it up against the overrider class.
+            find_dtor_method_id(ctx, slot.overrider_class),
         ),
         VSlotKind::DtorD0 => function_slot(
             ctx.mangle(&Symbol::Dtor {
                 class: slot.overrider_class,
                 variant: DtorVariant::D0,
             }),
-            MethodId(0),
+            find_dtor_method_id(ctx, slot.overrider_class),
         ),
         VSlotKind::Method => {
             let method_idx = slot
@@ -470,4 +483,28 @@ fn function_slot(mangled_target: String, method: MethodId) -> VTableEntry {
         mangled_target,
         method,
     }
+}
+
+/// M22 partial: find the index of `class_id`'s destructor in
+/// its `methods` list, returning a `MethodId`. Falls back to
+/// `MethodId(0)` if no dtor is declared on the class itself —
+/// this matches the pre-fix behavior for classes whose dtor
+/// is implicit (synthesized by the compiler) so the importer's
+/// downstream walkers see the same shape they used to.
+///
+/// Used by `slot_to_entry` for `VSlotKind::DtorD1` /
+/// `VSlotKind::DtorD0` slots. Without this, every dtor slot
+/// reported `MethodId(0)`, which caused the
+/// `cxx_importer::populate_vtable_indices` walker (keyed by
+/// MethodId) to overwrite `methods[0].vtable_index` with the
+/// dtor slot's rank — leaving the actual dtor method at the
+/// end of the class's method list with `vtable_index = None`.
+fn find_dtor_method_id(ctx: &CxxTypeCtx, class_id: ClassId) -> MethodId {
+    let class = ctx.class(class_id);
+    for (i, m) in class.methods.iter().enumerate() {
+        if matches!(m.special, Some(SpecialMember::Dtor)) {
+            return MethodId(i as u32);
+        }
+    }
+    MethodId(0)
 }
