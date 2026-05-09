@@ -1278,6 +1278,137 @@ fn render_direct_extern_class(
     // shift. Width-zero bitfields (Itanium boundary marker)
     // get no accessor.
     render_m21c_bitfield_accessors(ctx, class_id, &class_name, indent, &mut block);
+
+    // M22 close-out: inherent `as_<base>(&self) -> &Base` and
+    // `as_<base>_mut(&mut self) -> &mut Base` accessors per
+    // non-virtual base. The M19 `CxxBase<Base>::upcast` trait
+    // impls below provide the same machinery, but for classes
+    // with multiple polymorphic bases the `upcast()` call is
+    // ambiguous (`<C as CxxBase<A>>::upcast(&c)` vs `B`),
+    // requiring fully-qualified syntax at every call site. The
+    // inherent accessors are unambiguous and read naturally:
+    //   `c.as_a().a_only()` — calls A::a_only on C's A subobject.
+    //
+    // Skipped on a per-base basis if the class declares its own
+    // user method named `as_<base>` (collision avoidance).
+    // Skipped also for poisoned bases or bases where layout
+    // didn't surface an offset.
+    let inner_indent = format!("{indent}    ");
+    if let Ok(layout) = ctx.layout(class_id) {
+        for base_spec in &class.bases {
+            if base_spec.virtual_ {
+                continue;
+            }
+            if ctx.is_poisoned(base_spec.class) {
+                continue;
+            }
+            let base = ctx.class(base_spec.class);
+            let base_name = match ident_of_class(base) {
+                Some(n) => n,
+                None => continue,
+            };
+            let offset = layout
+                .base_offsets
+                .iter()
+                .find_map(|(bid, off)| (*bid == base_spec.class).then_some(*off));
+            let offset = match offset {
+                Some(o) => o,
+                None => continue,
+            };
+            // Snake-case the base name for the accessor. The
+            // class-name idents we emit use the source-form
+            // (e.g. Fl_Image), so a simple lowercase suffices for
+            // typical C++ class naming.
+            let accessor = format!("as_{}", base_name.to_lowercase());
+            let accessor_mut = format!("{accessor}_mut");
+            // Collision check: if the class has a user method
+            // named `as_<base>` or `as_<base>_mut`, skip.
+            let collision = class.methods.iter().any(|m| {
+                let nm = m.name.ident_name().unwrap_or_default();
+                nm == accessor || nm == accessor_mut
+            });
+            if collision {
+                continue;
+            }
+            let _ = writeln!(block);
+            let _ = writeln!(
+                block,
+                "{inner_indent}/// Reborrow as the `{base_name}` base subobject \
+                 (Itanium offset = {offset}). M22 cross-base method exposure.",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}pub fn {accessor}(&self) -> &{base_name} {{",
+            );
+            if offset == 0 {
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}    // SAFETY: primary base sits at offset 0.",
+                );
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}    unsafe {{ &*(self as *const Self as *const {base_name}) }}",
+                );
+            } else {
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}    // SAFETY: base subobject offset pinned by Itanium layout.",
+                );
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}    unsafe {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}        let p = (self as *const Self as *const u8).add({offset});",
+                );
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}        &*(p as *const {base_name})",
+                );
+                let _ = writeln!(block, "{inner_indent}    }}");
+            }
+            let _ = writeln!(block, "{inner_indent}}}");
+            let _ = writeln!(
+                block,
+                "{inner_indent}/// Mutable reborrow as the `{base_name}` base subobject.",
+            );
+            let _ = writeln!(
+                block,
+                "{inner_indent}pub fn {accessor_mut}(&mut self) -> &mut {base_name} {{",
+            );
+            if offset == 0 {
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}    // SAFETY: primary base sits at offset 0.",
+                );
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}    unsafe {{ &mut *(self as *mut Self as *mut {base_name}) }}",
+                );
+            } else {
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}    // SAFETY: base subobject offset pinned by Itanium layout.",
+                );
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}    unsafe {{",
+                );
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}        let p = (self as *mut Self as *mut u8).add({offset});",
+                );
+                let _ = writeln!(
+                    block,
+                    "{inner_indent}        &mut *(p as *mut {base_name})",
+                );
+                let _ = writeln!(block, "{inner_indent}    }}");
+            }
+            let _ = writeln!(block, "{inner_indent}}}");
+        }
+    }
+
     let _ = writeln!(block, "{indent}}}");
 
     // 4. `Drop` impl. Always emitted when the class has a user dtor;

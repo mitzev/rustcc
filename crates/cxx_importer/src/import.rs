@@ -364,6 +364,51 @@ pub(crate) fn import_header_with_clang(
     //     on the spec cursor.
     attach_methods_recursively(tu.get_entity(), &mut importer)?;
 
+    // Third pass (M22): re-finalize is_polymorphic and re-run
+    // populate_vtable_indices for every class we touched.
+    //
+    // Why a third pass is needed: `import_class` does both jobs at
+    // the end of its body walk, but during that body walk it can
+    // recursively trigger `import_class` for *related* classes via
+    // method-parameter type lookups. E.g. importing Fl_Widget walks
+    // its method `Fl_Group* parent() const`, which triggers
+    // `import_class(Fl_Group)` mid-Fl_Widget-body. Fl_Group's body
+    // walk then sees Fl_Widget as a placeholder (methods=0,
+    // is_polymorphic=false) — Fl_Widget's body walk hasn't finished
+    // and added them yet. Fl_Group's vtable then gets built without
+    // the inherited dtor slots, and `populate_vtable_indices(Fl_Group)`
+    // writes a bogus index map.
+    //
+    // Once *every* class is fully imported, re-running the same two
+    // computations yields the correct steady-state result. Polymorphism
+    // is recomputed in a fixed-point loop because the
+    // base-is-polymorphic bit propagates one inheritance edge per
+    // iteration.
+    {
+        let class_ids: Vec<ClassId> = importer.classes.values().copied().collect();
+        // Polymorphism convergence loop.
+        loop {
+            let mut changed = false;
+            for &id in &class_ids {
+                let new_poly = recompute_is_polymorphic(importer.ctx, id);
+                if importer.ctx.class(id).is_polymorphic != new_poly {
+                    importer.ctx.class_mut(id).is_polymorphic = new_poly;
+                    changed = true;
+                }
+            }
+            if !changed { break; }
+        }
+        // Now re-run populate_vtable_indices for every polymorphic
+        // class. populate_vtable_indices is idempotent: it overwrites
+        // `vtable_index` from the freshly-recomputed vtable, so any
+        // stale index from the in-class call gets corrected.
+        for &id in &class_ids {
+            if importer.ctx.class(id).is_polymorphic {
+                populate_vtable_indices(importer.ctx, id);
+            }
+        }
+    }
+
     // Hand the accumulated USR map back to the caller so the next
     // import call can dedup against it. Drain side-tables (aliases,
     // enums, free fns) so they ride out alongside the class list.
@@ -2132,6 +2177,29 @@ fn parse_rustcc_annotation(text: &str) -> Option<Annotation> {
         "skip" => Some(Annotation::Skip),
         _ => None,
     }
+}
+
+/// Recompute `is_polymorphic` for a class from its current state.
+/// Mirrors the inline computation in `import_class`'s body walk.
+/// Used by the M22 third pass to converge polymorphism flags across
+/// inheritance edges that may have been computed against placeholder
+/// base classes during recursive `import_class` calls.
+fn recompute_is_polymorphic(ctx: &CxxTypeCtx, class_id: ClassId) -> bool {
+    let class = ctx.class(class_id);
+    let self_has_virtual = class
+        .methods
+        .iter()
+        .any(|m| m.virtuality != Virtuality::NonVirtual);
+    let base_polymorphic = class
+        .bases
+        .iter()
+        .any(|b| ctx.class(b.class).is_polymorphic);
+    let has_vbase = class.bases.iter().any(|b| b.virtual_)
+        || class
+            .bases
+            .iter()
+            .any(|b| class_has_virtual_base_chain(ctx, b.class));
+    self_has_virtual || base_polymorphic || has_vbase
 }
 
 /// Walk a polymorphic class's primary vtable and stamp `vtable_index`
