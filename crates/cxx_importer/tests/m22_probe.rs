@@ -128,10 +128,16 @@ struct C : public A, public B {
         }
     }
     eprintln!("[probe] C has {secondary_orphans} virtual methods missing vtable_index");
-    // Pin the current shape so we can see the M22 gap shrink.
-    // After M22 lands, this assertion should be `== 0`.
+    // After the M22 third-pass fix, every virtual method on a
+    // multi-inheritance class must have a vtable_index. Without
+    // this assertion, regressions could re-introduce the
+    // primary-only walker silently.
+    assert_eq!(
+        secondary_orphans, 0,
+        "C should have all virtual methods indexed (M22 multi-inh)",
+    );
 
-    // Bindings emission: see how many methods get skipped.
+    // Bindings emission: must not skip any virtual method.
     let cfg = RustBindingsConfig {
         backend: BindingsBackend::DirectExternCpp,
         ..RustBindingsConfig::default()
@@ -139,6 +145,29 @@ struct C : public A, public B {
     let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
     let skipped = src.matches("skipped: virtual method without populated vtable_index").count();
     eprintln!("[probe] bindings emit skipped {skipped} virtual methods on multi-inh classes");
+    assert_eq!(skipped, 0, "Bindings must not skip multi-inh virtual methods");
+
+    // Inspect emission shape for b_method on C. Since it has
+    // vtable_index=3 (b_method's rank in C's primary), the
+    // dispatch must read the vptr from `self` and load slot 3.
+    // Don't be too strict about formatting — just check that the
+    // index appears in the C section. This is a smoke check, not
+    // a runtime test (running requires the rustcc fork toolchain).
+    let c_section_start = src.find("impl C {").expect("C impl block emitted");
+    let c_section = &src[c_section_start..];
+    let c_section_end = c_section.find("\n}\n").map(|e| e + 2).unwrap_or(c_section.len());
+    let c_section = &c_section[..c_section_end];
+    eprintln!("[probe] C impl block ({} bytes)", c_section.len());
+    assert!(
+        c_section.contains("b_method"),
+        "C::b_method should be emitted",
+    );
+    // The dispatch code threads vtable_index through; we just
+    // sanity-check that b_method's body references vtable lookup.
+    assert!(
+        c_section.contains("__vtable") || c_section.contains("vtable"),
+        "C::b_method emission should perform a vtable lookup",
+    );
 
     cleanup(&header);
 }
@@ -282,6 +311,14 @@ fn probe_fltk_umbrella_fl_image_state() {
     }
     eprintln!("[probe] umbrella Fl_Image virtual methods: {with_idx} with vtable_index, {without_idx} WITHOUT");
     eprintln!("[probe] sample methods missing: {samples:?}");
+    // After the M22 cache-pollution fix + third-pass fix, every
+    // virtual method on Fl_Image must have a vtable_index even
+    // when imported via the umbrella header.
+    assert_eq!(
+        without_idx, 0,
+        "Fl_Image virtual methods missing vtable_index (umbrella context) \u{2014} samples: {samples:?}",
+    );
+    assert!(class.is_polymorphic, "Fl_Image must be polymorphic in umbrella context");
 
     // Detailed dump.
     eprintln!("[probe] Fl_Image method virtualities:");
@@ -305,6 +342,92 @@ fn probe_fltk_umbrella_fl_image_state() {
             vt.sub_tables[0].entries.iter().filter(|e| matches!(e, rustc_abi_cxx::VTableEntry::FunctionPointer { .. })).count(),
         );
     }
+}
+
+/// Regression test for the M22 third-pass fix.
+///
+/// Before the fix: deriving classes (Fl_Group, Fl_Window,
+/// Fl_RGB_Image) imported via the FLTK umbrella header would end up
+/// with `dtor.vtable_index = None`, even though they're
+/// single-inheritance and declare their own virtual destructors.
+/// Root cause: `populate_vtable_indices` ran at the end of each
+/// `import_class` body walk — but a base class's body walk could
+/// recursively trigger `import_class` on a derived class via a
+/// method-parameter type lookup (e.g. Fl_Widget's `Fl_Group*
+/// parent()` triggers `import_class(Fl_Group)`). The derived class
+/// then computed its vtable against the base class in placeholder
+/// state (methods=0, polymorphic=false) → no inherited dtor slots
+/// → no vtable_index for the dtor.
+///
+/// The fix moves polymorphism convergence + populate_vtable_indices
+/// into a third pass that runs after every class body has been
+/// walked. This test pins the FLTK umbrella case so the regression
+/// cannot return.
+#[test]
+fn regression_dtor_vtable_index_in_umbrella_context() {
+    let umbrella = std::path::Path::new(
+        "/Users/ogi/rustcc/examples/fltk_hello/cpp/fltk_umbrella.hpp",
+    );
+    if !umbrella.exists() {
+        eprintln!("[probe] skipping: umbrella not found");
+        return;
+    }
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let _class_ids = import_header(
+        umbrella,
+        &["-x", "c++", "-std=c++17", "-I/opt/homebrew/include"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // Each of these single-inheritance FLTK classes declares its
+    // own virtual destructor. Post-fix, every dtor surfacing in
+    // `class.methods` must have a populated `vtable_index`.
+    let mut failures: Vec<String> = Vec::new();
+    for target in &["Fl_Widget", "Fl_Group", "Fl_Window", "Fl_Image", "Fl_RGB_Image"] {
+        let id = match ctx.class_ids().find(|&id| {
+            ctx.class(id).name.0.last().map(|s| match s {
+                rustc_abi_cxx::NameSegment::Class(i) => i.0 == *target,
+                _ => false,
+            }).unwrap_or(false)
+        }) {
+            Some(i) => i,
+            None => {
+                failures.push(format!("{target}: not imported"));
+                continue;
+            }
+        };
+        let class = ctx.class(id);
+        if !class.is_polymorphic {
+            failures.push(format!("{target}: is_polymorphic = false"));
+        }
+        let dtors: Vec<&rustc_abi_cxx::MethodDef> = class
+            .methods
+            .iter()
+            .filter(|m| matches!(m.special, Some(rustc_abi_cxx::SpecialMember::Dtor)))
+            .collect();
+        if dtors.is_empty() {
+            failures.push(format!("{target}: no dtor in methods"));
+            continue;
+        }
+        for d in dtors {
+            if d.virtuality == rustc_abi_cxx::Virtuality::NonVirtual {
+                failures.push(format!("{target}: dtor reports NonVirtual"));
+            }
+            if d.vtable_index.is_none() {
+                failures.push(format!(
+                    "{target}: dtor.vtable_index = None (the bug this test pins)"
+                ));
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Dtor vtable-index regression — failures:\n  {}",
+        failures.join("\n  "),
+    );
 }
 
 #[test]
@@ -368,7 +491,50 @@ struct D : public B, public C {
             st.subobject_offset,
             st.entries.len(),
         );
+        for (j, e) in st.entries.iter().enumerate() {
+            eprintln!("[probe]     entry[{j}]: {e:?}");
+        }
     }
+
+    // D has one virtual base (A, shared between B and C).
+    assert_eq!(
+        layout.virtual_base_offsets.len(),
+        1,
+        "D should report exactly one virtual base (A, shared by B+C)",
+    );
+    // D should have at least primary + secondary sub-tables (B and
+    // C as non-virtual direct bases of D, A reached through the
+    // virtual-base offset machinery).
+    assert!(
+        vt.sub_tables.len() >= 2,
+        "D should have multi sub-tables for the diamond",
+    );
+
+    // D's own a_method override must have a populated vtable_index.
+    let class = ctx.class(d_id);
+    let mut a_method_idx: Option<u32> = None;
+    for m in &class.methods {
+        let nm = m.name.ident_name().unwrap_or_default();
+        if nm == "a_method" {
+            a_method_idx = m.vtable_index;
+        }
+    }
+    assert!(
+        a_method_idx.is_some(),
+        "D::a_method override must have vtable_index in diamond + virtual base",
+    );
+
+    // Bindings emit zero skips on D.
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    let skipped = src.matches("skipped: virtual method without populated vtable_index").count();
+    assert_eq!(
+        skipped, 0,
+        "Bindings emit must not skip virtual methods on diamond + virtual base",
+    );
 
     cleanup(&header);
 }
