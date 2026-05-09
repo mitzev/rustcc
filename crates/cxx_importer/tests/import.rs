@@ -3186,11 +3186,11 @@ fn m16_emits_struct_with_consts_for_unscoped() {
 }
 
 #[test]
-fn m16_class_scope_enum_is_skipped_in_v0() {
+fn m16b_class_scope_enum_captured_with_class_in_parent_path() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
     let header = temp_header(
         "struct Outer {\n  enum class Mode { A, B };\n  int slot;\n};\n",
-        "m16_class_scope_enum_skipped",
+        "m16b_class_scope_enum",
     );
 
     let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
@@ -3201,11 +3201,21 @@ fn m16_class_scope_enum_is_skipped_in_v0() {
     )
     .expect("import");
 
-    assert!(
-        extras.enums.iter().all(|e| e.name.0 != "Mode"),
-        "class-scope enum should not appear at TU scope; got: {:?}",
-        extras.enums.iter().map(|e| &e.name.0).collect::<Vec<_>>(),
-    );
+    let mode = extras
+        .enums
+        .iter()
+        .find(|e| e.name.0 == "Mode")
+        .expect("class-scope `Mode` enum should be captured (M16.b)");
+    let parent_kinds: Vec<_> = mode
+        .parent
+        .iter()
+        .map(|s| match s {
+            NameSegment::Class(id) => format!("Class({})", id.0),
+            NameSegment::Namespace(id) => format!("Namespace({})", id.0),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(parent_kinds, vec!["Class(Outer)".to_string()]);
 }
 
 #[test]
@@ -3234,15 +3244,11 @@ fn m16_anonymous_enum_is_skipped_in_v0() {
 }
 
 #[test]
-fn m17_class_scope_typedef_is_skipped_in_v0() {
+fn m17b_class_scope_typedef_captured_with_class_in_parent_path() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
-    // In-class aliases require associated-type emission we
-    // don't have yet (deferred per docs/cxx_importer.md §16).
-    // The walker filters them out — verify they're absent
-    // from the AliasSet.
     let header = temp_header(
         "struct Foo {\n  using It = int;\n  int slot;\n};\n",
-        "m17_class_scope_typedef",
+        "m17b_class_scope_typedef",
     );
 
     let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
@@ -3253,13 +3259,109 @@ fn m17_class_scope_typedef_is_skipped_in_v0() {
     )
     .expect("import");
 
-    assert!(
-        extras.aliases.iter().all(|a| a.name.0 != "It"),
-        "class-scope `using It = int;` should not appear at TU scope; got: {:?}",
-        extras.aliases.iter().map(|a| &a.name.0).collect::<Vec<_>>(),
-    );
-    // Sanity: AliasSet may be empty entirely.
+    let alias = extras
+        .aliases
+        .iter()
+        .find(|a| a.name.0 == "It")
+        .expect("class-scope `using It = int;` should be captured (M17.b)");
+    let parent_kinds: Vec<_> = alias
+        .parent
+        .iter()
+        .map(|s| match s {
+            NameSegment::Class(id) => format!("Class({})", id.0),
+            NameSegment::Namespace(id) => format!("Namespace({})", id.0),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(parent_kinds, vec!["Class(Foo)".to_string()]);
     let _ = AliasSet::default();
+}
+
+#[test]
+fn m16b_class_scope_enum_emits_at_module_root_with_outer_prefix() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_full, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Widget {\n  enum class State { Off = 0, On = 1 };\n  int slot;\n};\n",
+        "m16b_emit",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_full(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &extras.free_fns,
+        &extras.static_data,
+        &cfg,
+    )
+    .expect("emit");
+
+    // Class-scope enum flattens to `Widget_State` at module root.
+    assert!(
+        src.contains("pub enum Widget_State"),
+        "expected `pub enum Widget_State` at module root; got:\n{src}",
+    );
+    assert!(
+        src.contains("Off = 0") && src.contains("On = 1"),
+        "expected variants Off = 0 and On = 1; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m17b_class_scope_typedef_emits_pub_type_with_outer_prefix() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_full, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Widget {\n  using Tag = int;\n  int slot;\n};\n",
+        "m17b_emit",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_full(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &extras.free_fns,
+        &extras.static_data,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(
+        src.contains("pub type Widget_Tag = i32;"),
+        "expected `pub type Widget_Tag = i32;` at module root; got:\n{src}",
+    );
+    cleanup(&header);
 }
 
 // ============================================================

@@ -597,6 +597,61 @@ fn class_fqn_string(ctx: &CxxTypeCtx, class_id: ClassId) -> String {
     parent_path_to_fqn(&class.name.0)
 }
 
+/// M16.b / M17.b: split a class-scope item's parent path into
+/// `(namespace-key chain, class-prefix string)`. The first
+/// element is the path of namespace keys to walk in the
+/// `NamespaceTree` so the item lands in the correct
+/// `pub mod`; the second is the `<Outer>_<…>_` prefix to
+/// prepend to the item's name (empty when the item is
+/// namespace-scope).
+///
+/// Class-scope items can't live inside Rust `impl` blocks —
+/// `pub enum` / `pub type` are illegal there — so we flatten
+/// every class segment in the parent path into a `Outer_Inner`
+/// joined name at the nearest enclosing namespace.
+fn split_class_prefix(parent: &[NameSegment]) -> (Vec<String>, String) {
+    let mut keys: Vec<String> = Vec::new();
+    let mut name_prefix_parts: Vec<String> = Vec::new();
+    let mut hit_class = false;
+    for seg in parent {
+        match seg {
+            NameSegment::Namespace(id) if !hit_class => keys.push(id.0.clone()),
+            NameSegment::AnonymousNamespace if !hit_class => {
+                keys.push("__anon".to_string())
+            }
+            // Class / TemplateSpec / Enum: contribute to the
+            // joined name prefix. Anything inside a class scope
+            // must also flatten — once we've seen one class
+            // segment, every subsequent segment (including
+            // namespaces, which would be an unusual but legal
+            // C++ shape) joins into the prefix.
+            NameSegment::Class(id) | NameSegment::Enum(id) => {
+                hit_class = true;
+                name_prefix_parts.push(id.0.clone());
+            }
+            NameSegment::TemplateSpec { name, .. } => {
+                hit_class = true;
+                name_prefix_parts.push(name.0.clone());
+            }
+            // Namespace nested inside a class is rare; treat it
+            // as part of the joined prefix to keep the flattened
+            // name unique.
+            NameSegment::Namespace(id) => {
+                name_prefix_parts.push(id.0.clone());
+            }
+            NameSegment::AnonymousNamespace => {
+                name_prefix_parts.push("__anon".to_string());
+            }
+        }
+    }
+    let prefix = if name_prefix_parts.is_empty() {
+        String::new()
+    } else {
+        format!("{}_", name_prefix_parts.join("_"))
+    };
+    (keys, prefix)
+}
+
 /// `::`-joined string from a `NestedName` slice. M11.c uses this
 /// to build a lookup key for static data members keyed by
 /// owning class. Identical encoding rules to
@@ -719,47 +774,42 @@ fn build_namespace_tree_full(
         }
         node.classes.push(class_id);
     }
-    // M17: drop aliases under their owning namespace node. Anything
-    // referencing a non-namespace prefix segment is silently
-    // skipped — emitter ergonomics, not correctness.
+    // M17 + M17.b: route aliases under their owning namespace
+    // node. Class-scope aliases (parent contains `Class` /
+    // `TemplateSpec` segments) flatten to the nearest enclosing
+    // namespace with their name joined as `Outer_Inner` so they
+    // sit at module root next to other types — Rust doesn't
+    // allow `pub type` inside `impl` blocks, and bindgen-style
+    // flattening is the only viable shape.
     for alias in aliases {
+        let (key_path, name_prefix) = split_class_prefix(&alias.parent);
         let mut node = &mut root;
-        let mut prefix_ok = true;
-        for seg in &alias.parent {
-            let key = match seg {
-                NameSegment::Namespace(id) => id.0.clone(),
-                NameSegment::AnonymousNamespace => "__anon".to_string(),
-                _ => {
-                    prefix_ok = false;
-                    break;
-                }
-            };
-            node = node.children.entry(key).or_default();
+        for key in &key_path {
+            node = node.children.entry(key.clone()).or_default();
         }
-        if !prefix_ok {
-            continue;
-        }
-        node.aliases.push((alias.name.0.clone(), alias.target));
+        let final_name = if name_prefix.is_empty() {
+            alias.name.0.clone()
+        } else {
+            format!("{name_prefix}{}", alias.name.0)
+        };
+        node.aliases.push((final_name, alias.target));
     }
-    // M16: same routing for enum bodies.
+    // M16 + M16.b: same routing for enum bodies.
     for enum_def in enums {
+        let (key_path, name_prefix) = split_class_prefix(&enum_def.parent);
         let mut node = &mut root;
-        let mut prefix_ok = true;
-        for seg in &enum_def.parent {
-            let key = match seg {
-                NameSegment::Namespace(id) => id.0.clone(),
-                NameSegment::AnonymousNamespace => "__anon".to_string(),
-                _ => {
-                    prefix_ok = false;
-                    break;
-                }
-            };
-            node = node.children.entry(key).or_default();
+        for key in &key_path {
+            node = node.children.entry(key.clone()).or_default();
         }
-        if !prefix_ok {
-            continue;
+        let mut def = enum_def.clone();
+        if !name_prefix.is_empty() {
+            // Re-name the enum so the flattened binding emits as
+            // `<Parent>_<Original>`. Variants keep their source
+            // names — they're only reachable through the new
+            // type name anyway.
+            def.name = rustc_abi_cxx::Ident(format!("{name_prefix}{}", def.name.0));
         }
-        node.enums.push(enum_def.clone());
+        node.enums.push(def);
     }
     // M11.b: same routing for free functions.
     for ff in free_fns {

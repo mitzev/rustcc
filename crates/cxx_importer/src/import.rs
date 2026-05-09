@@ -704,28 +704,12 @@ impl<'a> Importer<'a> {
             // needed.
             Err(_) => return Ok(()),
         };
-        // Walk semantic parents to build the namespace prefix.
-        // Stop at the first non-Namespace ancestor so class-scope
-        // aliases (which we already filtered upstream) and the
-        // TU root land with an empty prefix.
-        let mut parent_segments: Vec<NameSegment> = Vec::new();
-        let mut cur = entity.get_semantic_parent();
-        while let Some(e) = cur {
-            match e.get_kind() {
-                EntityKind::Namespace => {
-                    let pname = e.get_name().unwrap_or_default();
-                    if pname.is_empty() {
-                        parent_segments.push(NameSegment::AnonymousNamespace);
-                    } else {
-                        parent_segments
-                            .push(NameSegment::Namespace(Ident(pname)));
-                    }
-                }
-                _ => break,
-            }
-            cur = e.get_semantic_parent();
-        }
-        parent_segments.reverse();
+        // M17 + M17.b: walk every ancestor that contributes to
+        // the alias's qualified name — namespaces *and* class
+        // segments so a class-scope `using It = int;` lands with
+        // its parent encoded as
+        // `[Namespace("ns"), Class("Outer")]`.
+        let parent_segments = build_full_parent_path(entity);
         self.aliases.push(TypeAlias {
             parent: parent_segments,
             name: Ident(name),
@@ -796,26 +780,10 @@ impl<'a> Importer<'a> {
             });
         }
 
-        // Build parent path: same shape as `collect_alias` —
-        // namespace ancestors only, in outer-to-inner order.
-        let mut parent_segments: Vec<NameSegment> = Vec::new();
-        let mut cur = entity.get_semantic_parent();
-        while let Some(e) = cur {
-            match e.get_kind() {
-                EntityKind::Namespace => {
-                    let pname = e.get_name().unwrap_or_default();
-                    if pname.is_empty() {
-                        parent_segments.push(NameSegment::AnonymousNamespace);
-                    } else {
-                        parent_segments
-                            .push(NameSegment::Namespace(Ident(pname)));
-                    }
-                }
-                _ => break,
-            }
-            cur = e.get_semantic_parent();
-        }
-        parent_segments.reverse();
+        // M16 + M16.b: include class-scope ancestors so a
+        // class-scope `enum class E { … };` lands with parent
+        // `[…, Class("Outer")]`.
+        let parent_segments = build_full_parent_path(entity);
 
         self.enums.push(CxxEnumDef {
             parent: parent_segments,
@@ -1237,6 +1205,22 @@ impl<'a> Importer<'a> {
                             &class_name_path,
                         );
                     }
+                }
+                // M16.b: class-scope enums (`struct Outer { enum
+                // class E { … }; };`). `collect_enum`'s
+                // parent-path walk now includes `Class` segments,
+                // so the captured `CxxEnumDef.parent` carries the
+                // full `[…, Class("Outer")]` prefix. The emitter
+                // flattens it to `Outer_E` at module root.
+                EntityKind::EnumDecl => {
+                    let _ = self.collect_enum(&child);
+                }
+                // M17.b: class-scope `using` / `typedef`. Same
+                // shape as M16.b — `collect_alias`'s walk now
+                // includes class segments, and the emitter
+                // flattens to `Outer_It` at module root.
+                EntityKind::TypedefDecl | EntityKind::TypeAliasDecl => {
+                    let _ = self.collect_alias(&child);
                 }
                 _ => {
                     // FieldDecl is already handled above via
@@ -1965,6 +1949,49 @@ fn class_has_virtual_base_chain(
 /// in `get_name()` instead of an empty string for tag-less
 /// declarations; we filter them so they don't leak into the
 /// generated Rust source as invalid identifiers.
+/// Walk `entity`'s semantic-parent chain and return the full
+/// nested-name path — namespaces *and* class scopes — in
+/// outer-to-inner order. Used by M16/M17 (enums + aliases) so
+/// class-scope items land with their owning class encoded in
+/// `parent`. The emitter tells namespace-scope from class-scope
+/// by inspecting `parent` and emits class-scope items at module
+/// root with a `<Outer>_<Inner>` joined name (Rust doesn't
+/// allow `pub enum` / `pub type` inside `impl` blocks, so the
+/// bindgen-style flattening is the only viable shape on stable
+/// rustc).
+///
+/// Stops at the first ancestor that isn't a namespace, class,
+/// struct, or union — so the TU root and any leftover synthetic
+/// kinds don't leak into the path.
+fn build_full_parent_path(entity: &Entity<'_>) -> Vec<NameSegment> {
+    let mut segments: Vec<NameSegment> = Vec::new();
+    let mut cur = entity.get_semantic_parent();
+    while let Some(e) = cur {
+        match e.get_kind() {
+            EntityKind::Namespace => {
+                let pname = e.get_name().unwrap_or_default();
+                if pname.is_empty() {
+                    segments.push(NameSegment::AnonymousNamespace);
+                } else {
+                    segments.push(NameSegment::Namespace(Ident(pname)));
+                }
+            }
+            EntityKind::StructDecl
+            | EntityKind::ClassDecl
+            | EntityKind::UnionDecl => {
+                let cname = e.get_name().unwrap_or_default();
+                if !cname.is_empty() && !is_synthetic_anonymous_name(&cname) {
+                    segments.push(NameSegment::Class(Ident(cname)));
+                }
+            }
+            _ => break,
+        }
+        cur = e.get_semantic_parent();
+    }
+    segments.reverse();
+    segments
+}
+
 fn is_synthetic_anonymous_name(name: &str) -> bool {
     name.starts_with('(')
         || name.contains(" enum at ")
