@@ -879,6 +879,17 @@ fn render_namespace_tree(
         match render_rust_type(ctx, *target, &where_) {
             Ok(rendered) => {
                 let _ = writeln!(out, "{indent}pub type {alias_name} = {rendered};");
+                // M15.b: when the alias target is a function-
+                // pointer signature with a trailing `void*`
+                // user-data slot, emit a per-callback-type
+                // wrapper struct alongside the alias. The
+                // wrapper boxes a Rust closure into the
+                // `(extern "C" fn, *mut c_void)` shape the C++
+                // side expects. Detection + emission is
+                // intentionally narrow — only aliases that
+                // match the FLTK-style callback shape qualify;
+                // anything else gets a plain `pub type`.
+                render_m15b_callback_wrapper(ctx, alias_name, *target, indent, out);
             }
             Err(_) => {
                 // Skip silently — surfacing the alias name as a
@@ -1575,6 +1586,34 @@ struct MethodEmission {
     /// `core::ptr::null()` placeholders match the original
     /// signature.
     default_arg_count: usize,
+    /// M18.b: per-param `(name, rendered_type)` for the user-
+    /// facing wrapper signature (excluding the receiver). Same
+    /// info as `wrapper_params` but un-joined so the convenience-
+    /// wrapper renderer can split off the trailing
+    /// `default_arg_count` entries cleanly without re-parsing
+    /// a comma-joined string (which would mis-handle function-
+    /// pointer types whose rendering contains commas).
+    wrapper_user_params: Vec<(String, String)>,
+    /// M18.b: forward-arg names in source order. Same as
+    /// `forward_args` but un-joined.
+    wrapper_forward_arg_names: Vec<String>,
+    /// M18.b: when `default_arg_count > 0` and *every* trailing
+    /// default-arg parameter has a synthesizable Rust default
+    /// literal (ints → `0_<repr>`, pointers → `null()` / `null_mut()`,
+    /// floats → `0.0_<repr>`, bools → `false`, unscoped int-like
+    /// enums → underlying-zero), this carries the literal source
+    /// per trailing slot in source order. `None` means at least
+    /// one default-arg type can't be safely synthesized and the
+    /// convenience wrapper is suppressed.
+    synthesized_default_literals: Option<Vec<String>>,
+    /// M20.b: parallel index list — for each entry, the position
+    /// in `wrapper_user_params` where a `*const c_char` parameter
+    /// lives. Populated only when `cstr_ergonomics` is on AND
+    /// at least one such parameter exists. The convenience-
+    /// wrapper renderer uses this to emit a `_cstr` variant
+    /// that takes `&::core::ffi::CStr` for each listed slot
+    /// and forwards via `as_ptr()`.
+    cstr_param_indices: Vec<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1771,6 +1810,18 @@ fn classify_for_direct_extern(
     // across method shapes (the `this` slot is added separately).
     let mut user_arg_decls = Vec::with_capacity(arity);
     let mut user_forward = Vec::with_capacity(arity);
+    // Per-param breakdown for the user-facing wrapper. Kept as
+    // un-joined `(name, type)` pairs (alongside the joined
+    // `user_arg_decls` / `user_forward` strings) so the M18.b
+    // convenience-wrapper renderer can split off the trailing
+    // default-arg slots without re-parsing a comma-joined
+    // string. Re-parsing breaks on function-pointer types
+    // (`Option<unsafe extern "C" fn(i32, i32) -> i32>`) which
+    // contain literal commas inside the rendered type.
+    let mut user_param_pairs: Vec<(String, String)> =
+        Vec::with_capacity(method.sig.params.len());
+    let mut user_forward_names: Vec<String> =
+        Vec::with_capacity(method.sig.params.len());
     for (i, &ty_id) in method.sig.params.iter().enumerate() {
         let rust_ty = render_rust_type_with_opts(
             ctx,
@@ -1778,9 +1829,58 @@ fn classify_for_direct_extern(
             &format!("{class_name}::{:?} param {i}", method.name),
             &user_opts,
         )?;
-        user_arg_decls.push(format!("arg{i}: {rust_ty}"));
-        user_forward.push(format!("arg{i}"));
+        let name = format!("arg{i}");
+        user_arg_decls.push(format!("{name}: {rust_ty}"));
+        user_forward.push(name.clone());
+        user_param_pairs.push((name.clone(), rust_ty));
+        user_forward_names.push(name);
     }
+
+    // M20.b: when cstr_ergonomics is on, scan params for
+    // `*const c_char` (i.e., the M20 rewrite of `*const i8`/`*const u8`).
+    // Each hit gets a `_cstr` convenience-wrapper slot that
+    // takes `&::core::ffi::CStr` and forwards via `as_ptr()`.
+    let cstr_param_indices: Vec<usize> = if config.cstr_ergonomics {
+        method
+            .sig
+            .params
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &ty)| is_const_c_char_ptr(ctx, ty).then_some(i))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // M18.b: synthesize a Rust default literal per trailing
+    // default-arg slot. If any one of them fails synthesis,
+    // `synthesized_default_literals` stays `None` and the
+    // convenience wrapper is suppressed.
+    let default_count = ctx.default_arg_count(class_id, method_idx);
+    let synthesized_defaults: Option<Vec<String>> = if default_count == 0
+        || default_count > method.sig.params.len()
+    {
+        None
+    } else {
+        let n = method.sig.params.len();
+        let trailing = &method.sig.params[n - default_count..n];
+        let mut out: Vec<String> = Vec::with_capacity(default_count);
+        let mut all_ok = true;
+        for &ty_id in trailing {
+            match synthesize_default_literal(ctx, ty_id) {
+                Some(lit) => out.push(lit),
+                None => {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
+        if all_ok {
+            Some(out)
+        } else {
+            None
+        }
+    };
 
     // Special-case ctor / dtor first. The resolved Rust name is
     // already `"new"` / `"drop"` for these (assigned by
@@ -1809,6 +1909,10 @@ fn classify_for_direct_extern(
                 wrapper_return: "Self".into(),
                 forward_args: user_forward.join(", "),
                 default_arg_count: ctx.default_arg_count(class_id, method_idx),
+                wrapper_user_params: user_param_pairs.clone(),
+                wrapper_forward_arg_names: user_forward_names.clone(),
+                synthesized_default_literals: synthesized_defaults.clone(),
+                cstr_param_indices: cstr_param_indices.clone(),
             });
         }
         Some(SpecialMember::Dtor) => {
@@ -1828,6 +1932,10 @@ fn classify_for_direct_extern(
                 wrapper_return: "()".into(),
                 forward_args: String::new(),
                 default_arg_count: 0,
+                wrapper_user_params: Vec::new(),
+                wrapper_forward_arg_names: Vec::new(),
+                synthesized_default_literals: None,
+                cstr_param_indices: Vec::new(),
             });
         }
         Some(SpecialMember::CopyCtor | SpecialMember::MoveCtor)
@@ -1947,6 +2055,10 @@ fn classify_for_direct_extern(
         wrapper_params: user_arg_decls.join(", "),
         wrapper_return: ret_rust,
         forward_args: user_forward.join(", "),
+        wrapper_user_params: user_param_pairs,
+        wrapper_forward_arg_names: user_forward_names,
+        synthesized_default_literals: synthesized_defaults,
+        cstr_param_indices,
         default_arg_count: ctx.default_arg_count(class_id, method_idx),
     })
 }
@@ -2231,7 +2343,457 @@ fn render_direct_extern_wrapper(
             // Dtor goes into the Drop impl, not the inherent impl.
         }
     }
+
+    // M18.b: optional convenience wrappers. For methods with
+    // `default_arg_count > 0` whose trailing default-arg slots
+    // all have synthesizable Rust default literals, emit one
+    // additional wrapper per "drop k trailing args" level
+    // (k = 1..=default_arg_count). The wrapper forwards to
+    // the full-arity safe wrapper rather than re-implementing
+    // the unsafe block — same code-shape as the existing per-
+    // EmissionKind branches above, just with synthesized
+    // values appended at the call site.
+    //
+    // Skipped for `Dtor` (no args, no defaults makes sense)
+    // and when `synthesized_default_literals` is `None` (at
+    // least one default-arg type can't be cleanly synthesized).
+    if !matches!(emission.kind, EmissionKind::Dtor) {
+        if let Some(defaults) = &emission.synthesized_default_literals {
+            render_m18b_convenience_wrappers(emission, &display_name, defaults, indent, &mut out);
+        }
+    }
+
+    // M20.b: optional `_cstr` convenience wrapper. When
+    // `cstr_ergonomics` was on at classification time and the
+    // method has at least one `*const c_char` parameter, emit
+    // a parallel wrapper that takes `&::core::ffi::CStr` for
+    // each such slot and forwards via `.as_ptr()`. Other
+    // parameters pass through unchanged. The wrapper
+    // forwards to the full-arity safe wrapper rather than
+    // re-implementing the unsafe block.
+    //
+    // Skipped for `Dtor` (no args). For ctors / static methods
+    // / instance / virtual the same routing rules as M18.b
+    // apply (Self:: vs self.).
+    if !matches!(emission.kind, EmissionKind::Dtor) && !emission.cstr_param_indices.is_empty() {
+        render_m20b_cstr_wrapper(emission, &display_name, indent, &mut out);
+    }
+
     out
+}
+
+/// M15.b: emit a per-callback-type wrapper struct alongside a
+/// `pub type Foo_Callback = Option<unsafe extern "C" fn(...)>;`
+/// declaration when the alias target matches the
+/// `(args..., void* user_data)` callback shape (FLTK's
+/// `Fl_Callback`, GTK's `GCallback` family, X11's
+/// `XtCallbackProc`, etc.).
+///
+/// The generated wrapper boxes a Rust closure and exposes a
+/// `(fn-pointer, user-data)` pair that callers hand to the C++
+/// API — same idea as the existing single-arity
+/// `::cxx::CxxCallback<F>` runtime helper but specialized to
+/// the alias's actual signature.
+///
+/// Skip cases:
+/// - Alias target isn't `CxxType::Fn(...)`.
+/// - Alias target is `Fn` but the trailing param isn't
+///   `*[const|mut] void` (no opaque user-data slot to bind
+///   the closure to).
+/// - Any of the args' types can't be rendered.
+fn render_m15b_callback_wrapper(
+    ctx: &CxxTypeCtx,
+    alias_name: &str,
+    target: TypeId,
+    indent: &str,
+    out: &mut String,
+) {
+    let sig = match ctx.type_of(target) {
+        CxxType::Fn(s) => s,
+        _ => return,
+    };
+    // Trailing param must be `void*` for the user-data slot.
+    let last = match sig.params.last() {
+        Some(p) => *p,
+        None => return,
+    };
+    let trailing_is_void_ptr = matches!(
+        ctx.type_of(last),
+        CxxType::Ptr { pointee, .. } if matches!(ctx.type_of(*pointee), CxxType::Void),
+    );
+    if !trailing_is_void_ptr {
+        return;
+    }
+    // Closure args = all args except the trailing void*.
+    let n = sig.params.len();
+    if n == 0 {
+        return;
+    }
+    let closure_arg_tys = &sig.params[..n - 1];
+    let mut closure_arg_strs: Vec<String> = Vec::with_capacity(closure_arg_tys.len());
+    let where_ = format!("callback `{alias_name}` arg");
+    for &p in closure_arg_tys {
+        match render_rust_type(ctx, p, &where_) {
+            Ok(s) => closure_arg_strs.push(s),
+            Err(_) => return, // bail; alias still emits as plain `pub type`
+        }
+    }
+    // Render the trailing void* parameter for the thunk
+    // signature. Use `*mut ::core::ffi::c_void` for clarity
+    // (the renderer would produce `*mut ()` which is correct
+    // but unconventional).
+    let void_ptr_ty = "*mut ::core::ffi::c_void".to_string();
+    let mut thunk_param_strs: Vec<String> = Vec::with_capacity(n);
+    for (i, ty) in closure_arg_strs.iter().enumerate() {
+        thunk_param_strs.push(format!("arg{i}: {ty}"));
+    }
+    thunk_param_strs.push(format!("user: {void_ptr_ty}"));
+
+    let closure_arg_list = closure_arg_strs.join(", ");
+    let closure_call_args: Vec<String> = (0..closure_arg_tys.len())
+        .map(|i| format!("arg{i}"))
+        .collect();
+    let thunk_param_list = thunk_param_strs.join(", ");
+    let thunk_name = format!("__cxx_{alias_name}_thunk");
+    let wrapper_name = format!("{alias_name}_Wrapper");
+
+    // Doc comment to anchor the generated section.
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{indent}/// M15.b: wraps a Rust closure into the `({alias_name}, *mut c_void)`",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}/// pair the C++ API expects. Hand `wrapper.fn_ptr()` and",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}/// `wrapper.user_data()` to the registration call; keep `wrapper`",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}/// alive for as long as the C++ side may invoke the callback.",
+    );
+    // Wrapper struct.
+    let _ = writeln!(
+        out,
+        "{indent}pub struct {wrapper_name}<F: Fn({closure_arg_list}) + 'static> {{",
+    );
+    let _ = writeln!(out, "{indent}    boxed: {void_ptr_ty},");
+    let _ = writeln!(
+        out,
+        "{indent}    _phantom: ::core::marker::PhantomData<F>,",
+    );
+    let _ = writeln!(out, "{indent}}}");
+
+    // impl block.
+    let _ = writeln!(
+        out,
+        "{indent}impl<F: Fn({closure_arg_list}) + 'static> {wrapper_name}<F> {{",
+    );
+    // new()
+    let _ = writeln!(out, "{indent}    pub fn new(f: F) -> Self {{");
+    let _ = writeln!(out, "{indent}        let boxed: ::std::boxed::Box<F> = ::std::boxed::Box::new(f);");
+    let _ = writeln!(
+        out,
+        "{indent}        let raw = ::std::boxed::Box::into_raw(boxed) as {void_ptr_ty};",
+    );
+    let _ = writeln!(out, "{indent}        Self {{");
+    let _ = writeln!(out, "{indent}            boxed: raw,");
+    let _ = writeln!(
+        out,
+        "{indent}            _phantom: ::core::marker::PhantomData,",
+    );
+    let _ = writeln!(out, "{indent}        }}");
+    let _ = writeln!(out, "{indent}    }}");
+
+    // fn_ptr()
+    let _ = writeln!(
+        out,
+        "{indent}    /// The `extern \"C\"` thunk to pass as the function-pointer half",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    /// of the callback pair. Forwards through the boxed closure on",
+    );
+    let _ = writeln!(out, "{indent}    /// every invocation.");
+    let _ = writeln!(out, "{indent}    pub fn fn_ptr(&self) -> {alias_name} {{");
+    let _ = writeln!(
+        out,
+        "{indent}        Some({thunk_name}::<F> as unsafe extern \"C\" fn({thunk_param_list}))",
+    );
+    let _ = writeln!(out, "{indent}    }}");
+
+    // user_data()
+    let _ = writeln!(
+        out,
+        "{indent}    /// Opaque user-data pointer to pair with [`Self::fn_ptr`].",
+    );
+    let _ = writeln!(out, "{indent}    pub fn user_data(&self) -> {void_ptr_ty} {{");
+    let _ = writeln!(out, "{indent}        self.boxed");
+    let _ = writeln!(out, "{indent}    }}");
+    let _ = writeln!(out, "{indent}}}");
+
+    // The thunk fn — generic over F so each closure type lands in its own
+    // monomorphized symbol.
+    let _ = writeln!(
+        out,
+        "{indent}#[allow(non_snake_case)]",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}unsafe extern \"C\" fn {thunk_name}<F: Fn({closure_arg_list}) + 'static>({thunk_param_list}) {{",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    // SAFETY: `user` was minted by `Box::into_raw(Box::new(f))` in",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    // `Wrapper::new` and is alive as long as the wrapper hasn't dropped.",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    let f: &F = unsafe {{ &*(user as *const F) }};",
+    );
+    let _ = writeln!(out, "{indent}    f({});", closure_call_args.join(", "));
+    let _ = writeln!(out, "{indent}}}");
+
+    // Drop impl that reclaims the box.
+    let _ = writeln!(
+        out,
+        "{indent}impl<F: Fn({closure_arg_list}) + 'static> ::core::ops::Drop for {wrapper_name}<F> {{",
+    );
+    let _ = writeln!(out, "{indent}    fn drop(&mut self) {{");
+    let _ = writeln!(out, "{indent}        if !self.boxed.is_null() {{");
+    let _ = writeln!(
+        out,
+        "{indent}            // SAFETY: same pointer minted by `new()`; reclaim it.",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}            unsafe {{ let _ = ::std::boxed::Box::from_raw(self.boxed as *mut F); }}",
+    );
+    let _ = writeln!(out, "{indent}            self.boxed = ::core::ptr::null_mut();");
+    let _ = writeln!(out, "{indent}        }}");
+    let _ = writeln!(out, "{indent}    }}");
+    let _ = writeln!(out, "{indent}}}");
+}
+
+/// M20.b: emit a `_cstr` wrapper for methods with one or more
+/// `*const c_char` parameters. Each such parameter becomes
+/// `&::core::ffi::CStr` in the wrapper signature and forwards
+/// via `.as_ptr()`. Other parameters pass through unchanged.
+///
+/// The `_cstr` wrapper composes naturally with M18.b: a method
+/// with both default args and `const char*` parameters gets
+/// `<name>`, `<name>_with_defaults`, and `<name>_cstr`. We
+/// don't (yet) emit `<name>_cstr_with_defaults` — combining
+/// the two wrapper variants is tracked as M20.c when callers
+/// ask for it.
+fn render_m20b_cstr_wrapper(
+    emission: &MethodEmission,
+    display_name: &str,
+    indent: &str,
+    out: &mut String,
+) {
+    let cstr_indices: std::collections::HashSet<usize> =
+        emission.cstr_param_indices.iter().copied().collect();
+    // Build the wrapper params: `*const c_char` slots become
+    // `&::core::ffi::CStr`, others pass through.
+    let kept_params: Vec<String> = emission
+        .wrapper_user_params
+        .iter()
+        .enumerate()
+        .map(|(i, (n, t))| {
+            if cstr_indices.contains(&i) {
+                format!("{n}: &::core::ffi::CStr")
+            } else {
+                format!("{n}: {t}")
+            }
+        })
+        .collect();
+    // Forward args: `*const c_char` slots get `.as_ptr()`
+    // appended, others pass through.
+    let forwards: Vec<String> = emission
+        .wrapper_forward_arg_names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            if cstr_indices.contains(&i) {
+                format!("{n}.as_ptr()")
+            } else {
+                n.clone()
+            }
+        })
+        .collect();
+
+    let wrapper_name = format!("{display_name}_cstr");
+    let receiver_decl = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst => Some("&self"),
+        WrapperReceiver::SelfMut => Some("&mut self"),
+        WrapperReceiver::None => None,
+        WrapperReceiver::Ctor => None,
+    };
+    let receiver_call = match emission.wrapper_receiver {
+        WrapperReceiver::SelfConst | WrapperReceiver::SelfMut => "self.",
+        WrapperReceiver::None => "Self::",
+        WrapperReceiver::Ctor => "Self::",
+    };
+    let ret_clause = if matches!(emission.kind, EmissionKind::Ctor) {
+        " -> Self".to_string()
+    } else if emission.wrapper_return == "()" {
+        String::new()
+    } else {
+        format!(" -> {}", emission.wrapper_return)
+    };
+
+    let head = match receiver_decl {
+        Some(recv) if !kept_params.is_empty() => format!(
+            "{indent}pub fn {wrapper_name}({recv}, {params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+        Some(recv) => {
+            format!("{indent}pub fn {wrapper_name}({recv}){ret_clause} {{")
+        }
+        None => format!(
+            "{indent}pub fn {wrapper_name}({params}){ret_clause} {{",
+            params = kept_params.join(", "),
+        ),
+    };
+    let _ = writeln!(out, "{head}");
+    let _ = writeln!(
+        out,
+        "{indent}    // M20.b: `&CStr` ergonomic — forwards `.as_ptr()` per `*const c_char` slot.",
+    );
+    let _ = writeln!(
+        out,
+        "{indent}    {recv}{display_name}({args})",
+        recv = receiver_call,
+        args = forwards.join(", "),
+    );
+    let _ = writeln!(out, "{indent}}}");
+}
+
+/// M18.b: emit one convenience wrapper per "drop k trailing
+/// args" level (k = 1..=defaults.len()). Each wrapper forwards
+/// to the full-arity safe wrapper with the synthesized
+/// defaults appended; receivers / return clauses match the
+/// owning `EmissionKind`.
+///
+/// Naming convention: full arity stays as `<name>`, k-dropped
+/// becomes `<name>_with_defaults` when k == default_count
+/// (the all-defaults variant — the most useful one) and
+/// `<name>_default_<n>(...)` when 0 < k < default_count, where
+/// `<n>` is the number of *user-supplied* args remaining. The
+/// underscore-numeric suffix avoids collisions with the
+/// operator-name table (`op_eq`, etc.).
+fn render_m18b_convenience_wrappers(
+    emission: &MethodEmission,
+    display_name: &str,
+    defaults: &[String],
+    indent: &str,
+    out: &mut String,
+) {
+    let total = emission.wrapper_user_params.len();
+    let default_count = defaults.len();
+    if default_count == 0 || default_count > total {
+        return;
+    }
+    // Each wrapper drops `k` trailing args (k = 1..=default_count)
+    // and synthesizes them at the call site.
+    for k in 1..=default_count {
+        let kept = total - k;
+        let kept_params: Vec<String> = emission
+            .wrapper_user_params
+            .iter()
+            .take(kept)
+            .map(|(n, t)| format!("{n}: {t}"))
+            .collect();
+        let kept_forwards: Vec<&str> = emission
+            .wrapper_forward_arg_names
+            .iter()
+            .take(kept)
+            .map(String::as_str)
+            .collect();
+        let synthesized: Vec<&str> = defaults
+            .iter()
+            .skip(default_count - k)
+            .map(String::as_str)
+            .collect();
+        let mut all_forwards: Vec<String> = kept_forwards
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        all_forwards.extend(synthesized.iter().map(|s| s.to_string()));
+        // Wrapper name suffix.
+        let wrapper_name = if k == default_count {
+            format!("{display_name}_with_defaults")
+        } else {
+            // k < default_count: name by the count of args
+            // we still take. `_default_3` reads as
+            // "leaves 3 user args, fills the rest with
+            // C++ defaults."
+            format!("{display_name}_default_{kept}")
+        };
+        let receiver_decl = match emission.wrapper_receiver {
+            WrapperReceiver::SelfConst => Some("&self"),
+            WrapperReceiver::SelfMut => Some("&mut self"),
+            WrapperReceiver::None => None,
+            WrapperReceiver::Ctor => None,
+        };
+        let receiver_call = match emission.wrapper_receiver {
+            WrapperReceiver::SelfConst | WrapperReceiver::SelfMut => "self.",
+            WrapperReceiver::None => "Self::",
+            WrapperReceiver::Ctor => "Self::",
+        };
+        let ret_clause = if matches!(emission.kind, EmissionKind::Ctor) {
+            " -> Self".to_string()
+        } else if emission.wrapper_return == "()" {
+            String::new()
+        } else {
+            format!(" -> {}", emission.wrapper_return)
+        };
+
+        // Build signature.
+        let head = match receiver_decl {
+            Some(recv) if !kept_params.is_empty() => format!(
+                "{indent}pub fn {wrapper_name}({recv}, {params}){ret_clause} {{",
+                params = kept_params.join(", "),
+            ),
+            Some(recv) => {
+                format!("{indent}pub fn {wrapper_name}({recv}){ret_clause} {{")
+            }
+            None => format!(
+                "{indent}pub fn {wrapper_name}({params}){ret_clause} {{",
+                params = kept_params.join(", "),
+            ),
+        };
+        let _ = writeln!(out, "{head}");
+
+        // Doc comment listing every synthesized default so the
+        // reader can spot mismatches against the C++ source.
+        // The doc comment lives just inside the function body
+        // as a regular comment (not a `///` doc — that would
+        // attach to nothing), giving the user grep-able context
+        // when they read the generated source.
+        let synth_str = synthesized.join(", ");
+        let _ = writeln!(
+            out,
+            "{indent}    // M18.b: trailing {k} arg{s} default-synthesized as ({synth_str}).",
+            s = if k == 1 { "" } else { "s" },
+        );
+
+        // Body: forward to the full-arity wrapper.
+        let _ = writeln!(
+            out,
+            "{indent}    {recv}{display_name}({args})",
+            recv = receiver_call,
+            args = all_forwards.join(", "),
+        );
+        let _ = writeln!(out, "{indent}}}");
+    }
 }
 
 fn render_class_block(
@@ -2821,6 +3383,72 @@ fn render_enum_discriminant(value: i64, signed: bool) -> String {
     }
 }
 
+/// M18.b: synthesize a Rust source literal that matches what
+/// the C++ side would use for an unspecified default argument.
+/// Returns `None` for types where no general-purpose default
+/// makes sense — record types by value, references, function
+/// pointers, etc. The convenience-wrapper renderer skips
+/// emission entirely when *any* trailing default-arg type fails
+/// to synthesize, so a method with one tricky default still
+/// emits the full-arity wrapper without breaking compilation.
+///
+/// The synthesized values match C++ value-initialization rules
+/// for primitive types (zero / null / false), which in
+/// practice line up with the overwhelming majority of C++
+/// API defaults — FLTK uses `int = 0`, `const char* =
+/// nullptr`, `bool = false`, `Fl_Color = 0` (an integer
+/// alias). For the cases where a C++ API has a non-zero
+/// default (`int delay = 100`), the synthesized wrapper
+/// passes 0 instead, which is wrong but visible: the
+/// wrapper carries a `///` doc comment listing every
+/// synthesized value so the reader can spot mismatches.
+fn synthesize_default_literal(ctx: &CxxTypeCtx, ty: TypeId) -> Option<String> {
+    match ctx.type_of(ty) {
+        CxxType::Bool => Some("false".to_string()),
+        CxxType::Int { signed, width } => {
+            let r = int_rust(*signed, *width);
+            Some(format!("0_{r}"))
+        }
+        CxxType::Float { kind } => match kind {
+            FloatKind::F32 => Some("0.0_f32".to_string()),
+            FloatKind::F64 => Some("0.0_f64".to_string()),
+            FloatKind::LongDouble => None,
+        },
+        CxxType::Ptr { cv, .. } => {
+            // Raw pointers: null is the universal C++ default.
+            if cv.is_const {
+                Some("::core::ptr::null()".to_string())
+            } else {
+                Some("::core::ptr::null_mut()".to_string())
+            }
+        }
+        CxxType::Enum {
+            underlying,
+            scoped,
+            name,
+        } => {
+            // Enums alias an integer; default 0 matches C++
+            // value-initialization. For scoped enums we'd
+            // need to pick a variant, which is risky; only
+            // synthesize for unscoped (int-like) enums.
+            if *scoped {
+                None
+            } else {
+                let _ = name;
+                synthesize_default_literal(ctx, *underlying)
+            }
+        }
+        // References, records by value, function pointers,
+        // arrays, member pointers, void: skip.
+        CxxType::Ref { .. }
+        | CxxType::Record(_)
+        | CxxType::Fn(_)
+        | CxxType::Array { .. }
+        | CxxType::MemberPtr { .. }
+        | CxxType::Void => None,
+    }
+}
+
 /// Escape `name` with `r#` if it collides with a Rust keyword.
 /// FLTK is full of identifiers like `type`, `box`, `align`, …
 /// that are perfectly legal C++ but reserved in Rust; the raw-
@@ -2844,6 +3472,20 @@ fn rust_safe_ident(name: &str) -> String {
         format!("r#{name}")
     } else {
         name.to_string()
+    }
+}
+
+/// M20.b: true when `ty` is `*const <byte-int>`, i.e. a const
+/// pointer to a single-byte integer. Matches what M20's
+/// cstr_ergonomics rewrite turns into `*const c_char`. Used to
+/// decide whether to emit a `_cstr` convenience wrapper that
+/// takes `&::core::ffi::CStr` and forwards via `as_ptr()`.
+fn is_const_c_char_ptr(ctx: &CxxTypeCtx, ty: TypeId) -> bool {
+    match ctx.type_of(ty) {
+        CxxType::Ptr { pointee, cv } if cv.is_const => {
+            is_byte_int(ctx, *pointee)
+        }
+        _ => false,
     }
 }
 

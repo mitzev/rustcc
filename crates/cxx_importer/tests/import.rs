@@ -2643,6 +2643,549 @@ fn m18_emits_doc_comment_when_method_has_default_args() {
 }
 
 // ============================================================
+// M18.b: per-arity convenience wrappers with synthesized
+// defaults. Closes the deferred half of M18.
+// ============================================================
+
+#[test]
+fn m18b_emits_with_defaults_wrapper_when_all_trailing_defaults_synthesize() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `paint(int x = 0, int y = 0)` — both trailing defaults
+    // are synthesizable (i32 → 0_i32). Expect a `_with_defaults`
+    // wrapper that takes no user args plus a `_default_1`
+    // wrapper that takes one.
+    let header = temp_header(
+        "struct W {\n  void paint(int x = 0, int y = 0);\n};\n",
+        "m18b_all_defaults_synth",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Full-arity wrapper still emits.
+    assert!(
+        src.contains("pub fn paint(&mut self, arg0: i32, arg1: i32)"),
+        "full-arity wrapper missing; got:\n{src}",
+    );
+    // All-defaults convenience: zero user args, both i32 slots
+    // synthesized.
+    assert!(
+        src.contains("pub fn paint_with_defaults(&mut self)"),
+        "_with_defaults wrapper missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.paint(0_i32, 0_i32)"),
+        "_with_defaults body should forward with synthesized i32 defaults; got:\n{src}",
+    );
+    // Partial-default wrapper: keeps 1 user arg, synthesizes 1 default.
+    assert!(
+        src.contains("pub fn paint_default_1(&mut self, arg0: i32)"),
+        "_default_1 wrapper missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.paint(arg0, 0_i32)"),
+        "_default_1 body should forward arg0 + synthesized default; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m18b_skips_convenience_when_default_arg_type_unsynthesizable() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `take_box(MyBox b = MyBox())` — record-by-value default
+    // can't be safely synthesized. The convenience wrapper
+    // should NOT emit; the full-arity wrapper still does.
+    let header = temp_header(
+        "struct MyBox { int v; };\n\
+         struct W {\n  void take_box(MyBox b = MyBox());\n};\n",
+        "m18b_unsynthesizable_default",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("pub fn take_box(&mut self, arg0: MyBox)"),
+        "full-arity wrapper missing; got:\n{src}",
+    );
+    assert!(
+        !src.contains("take_box_with_defaults"),
+        "convenience wrapper should not emit when record-by-value default isn't synthesizable; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m18b_synthesizes_null_for_pointer_defaults_in_static_methods() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // Static method with `const char* = nullptr` default —
+    // matches FLTK's `static int message_title(const char* m = 0)`
+    // pattern. Expect `null()` synthesis (const ptr).
+    let header = temp_header(
+        "struct W {\n  static int title(const char* msg = 0);\n};\n",
+        "m18b_static_null_default",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Static methods don't take `&self`. The body uses `Self::`
+    // dispatch.
+    assert!(
+        src.contains("pub fn title_with_defaults()"),
+        "static convenience wrapper missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("Self::title(::core::ptr::null())"),
+        "expected null() synthesis for const char*; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m18b_synthesizes_for_ctor_with_nullable_label() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // Models `Fl_Window(int w, int h, const char* title = nullptr)`.
+    // The `_with_defaults` constructor takes (w, h) and
+    // synthesizes `null()` for the label.
+    let header = temp_header(
+        "struct Win {\n  Win(int w, int h, const char* title = 0);\n};\n",
+        "m18b_ctor_nullable_label",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Full ctor.
+    assert!(
+        src.contains("pub fn new(arg0: i32, arg1: i32, arg2: *const i8)")
+            || src.contains("pub fn new(arg0: i32, arg1: i32, arg2: *const u8)"),
+        "full-arity ctor missing; got:\n{src}",
+    );
+    // Convenience with synthesized null label.
+    assert!(
+        src.contains("pub fn new_with_defaults(arg0: i32, arg1: i32) -> Self"),
+        "ctor _with_defaults missing or wrong shape; got:\n{src}",
+    );
+    assert!(
+        src.contains("Self::new(arg0, arg1, ::core::ptr::null())"),
+        "ctor body should forward with null() default; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+// ============================================================
+// M20.b: `&CStr` smart parameter wrappers, opt-in via
+// `cstr_ergonomics: true`. For each `*const c_char` parameter
+// the importer emits a `_cstr` wrapper that takes
+// `&::core::ffi::CStr` and forwards via `.as_ptr()`.
+// ============================================================
+
+#[test]
+fn m20b_emits_cstr_wrapper_for_const_char_param_when_enabled() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* text);\n};\n",
+        "m20b_emit_cstr_wrapper",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Full wrapper still uses the raw `*const c_char` form.
+    assert!(
+        src.contains("pub fn label(&mut self, arg0: *const ::core::ffi::c_char)"),
+        "raw-pointer wrapper missing; got:\n{src}",
+    );
+    // M20.b wrapper takes `&CStr`.
+    assert!(
+        src.contains("pub fn label_cstr(&mut self, arg0: &::core::ffi::CStr)"),
+        "_cstr wrapper missing or wrong shape; got:\n{src}",
+    );
+    // Body forwards via as_ptr.
+    assert!(
+        src.contains("self.label(arg0.as_ptr())"),
+        "expected `.as_ptr()` forward; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m20b_does_not_emit_when_cstr_ergonomics_disabled() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void label(const char* text);\n};\n",
+        "m20b_no_cstr_when_disabled",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: false, // explicit
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        !src.contains("label_cstr"),
+        "_cstr wrapper should not emit when cstr_ergonomics is off; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m20b_handles_mixed_params_with_one_cstr_slot() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `set(int x, const char* msg, int y)` — only the middle
+    // slot is `*const c_char`; outer ints pass through.
+    let header = temp_header(
+        "struct W {\n  void set(int x, const char* msg, int y);\n};\n",
+        "m20b_mixed_params",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains(
+            "pub fn set_cstr(&mut self, arg0: i32, arg1: &::core::ffi::CStr, arg2: i32)"
+        ),
+        "_cstr wrapper signature should keep `i32` slots and swap `const char*`; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.set(arg0, arg1.as_ptr(), arg2)"),
+        "_cstr forward should `.as_ptr()` only the middle slot; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m20b_emits_for_static_methods_and_ctors() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  W(const char* title);\n  static void title(const char* t);\n};\n",
+        "m20b_static_and_ctor",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        cstr_ergonomics: true,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // Ctor wrapper.
+    assert!(
+        src.contains("pub fn new_cstr(arg0: &::core::ffi::CStr) -> Self"),
+        "ctor _cstr wrapper missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("Self::new(arg0.as_ptr())"),
+        "ctor _cstr should call Self::new(arg0.as_ptr()); got:\n{src}",
+    );
+    // Static wrapper.
+    assert!(
+        src.contains("pub fn title_cstr(arg0: &::core::ffi::CStr)"),
+        "static _cstr wrapper missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("Self::title(arg0.as_ptr())"),
+        "static _cstr should call Self::title(arg0.as_ptr()); got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m18b_does_not_emit_when_method_has_no_defaults() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  void plain(int x);\n};\n",
+        "m18b_no_defaults",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    assert!(
+        !src.contains("plain_with_defaults") && !src.contains("plain_default_"),
+        "no defaults → no convenience wrapper; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+// ============================================================
+// M15.b: per-callback-type wrapper structs. For each
+// `using <Alias> = void(... user_data, void*)` (the FLTK /
+// GTK callback shape), the emitter generates an `<Alias>_Wrapper<F>`
+// struct that boxes a Rust closure and exposes
+// `(fn_ptr, user_data)` ready for the C++ API.
+// ============================================================
+
+#[test]
+fn m15b_emits_wrapper_for_callback_alias_with_void_user_data() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // Models FLTK's `using Fl_Callback = void(Fl_Widget*, void*)`.
+    // The trailing `void*` is the user-data slot the wrapper
+    // routes the boxed closure through.
+    let header = temp_header(
+        "struct Fl_Widget { int v; };\n\
+         using Fl_Callback = void(Fl_Widget*, void*);\n",
+        "m15b_callback_with_user_data",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &cfg,
+    )
+    .expect("emit");
+
+    // Plain alias still emits.
+    assert!(
+        src.contains("pub type Fl_Callback ="),
+        "alias declaration missing; got:\n{src}",
+    );
+    // Wrapper struct generic over Fn(*mut Fl_Widget) — the
+    // trailing void* is the user-data slot, not a closure arg.
+    assert!(
+        src.contains(
+            "pub struct Fl_Callback_Wrapper<F: Fn(*mut Fl_Widget) + 'static>"
+        ),
+        "wrapper struct missing or wrong closure arity; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub fn new(f: F) -> Self"),
+        "Wrapper::new constructor missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub fn fn_ptr(&self) -> Fl_Callback"),
+        "Wrapper::fn_ptr accessor missing or wrong return type; got:\n{src}",
+    );
+    assert!(
+        src.contains("pub fn user_data(&self) -> *mut ::core::ffi::c_void"),
+        "Wrapper::user_data accessor missing; got:\n{src}",
+    );
+    // The thunk reclaims the boxed closure on drop.
+    assert!(
+        src.contains("Box::from_raw(self.boxed as *mut F)"),
+        "Drop should reclaim the boxed closure; got:\n{src}",
+    );
+    // The thunk forwards from the C ABI args to the closure.
+    assert!(
+        src.contains("__cxx_Fl_Callback_thunk"),
+        "thunk fn missing; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m15b_skips_wrapper_when_alias_target_isnt_a_callback() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "using MyInt = int;\n\
+         using Real = double;\n",
+        "m15b_skip_non_callback",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(src.contains("pub type MyInt = i32;"));
+    assert!(src.contains("pub type Real = f64;"));
+    assert!(
+        !src.contains("MyInt_Wrapper") && !src.contains("Real_Wrapper"),
+        "non-callback aliases should not get wrapper structs; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+#[test]
+fn m15b_skips_wrapper_when_callback_lacks_void_user_data_slot() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings_with_extras, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // No trailing `void*` slot — can't bind a Rust closure
+    // without somewhere to stash the box pointer. Skip.
+    let header = temp_header(
+        "using SignalHandler = void(int);\n",
+        "m15b_skip_no_user_data",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let (classes, extras) = import_header_with_extras(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings_with_extras(
+        &ctx,
+        &classes,
+        &cxx_importer::AnnotationSet::default(),
+        &extras.aliases,
+        &extras.enums,
+        &cfg,
+    )
+    .expect("emit");
+
+    assert!(src.contains("pub type SignalHandler"));
+    assert!(
+        !src.contains("SignalHandler_Wrapper"),
+        "wrapper should require a void* user-data slot; got:\n{src}",
+    );
+    cleanup(&header);
+}
+
+// ============================================================
 // M15: function pointer types — `void (*)(int)` lowering and
 // emission. Closure-as-callback `CxxCallback<F>` runtime helper
 // lives in `crates/cxx/src/callback.rs` and is exercised by its
