@@ -42,9 +42,11 @@ The resulting `target/release/rust-analyzer` binary is a drop-in replacement for
 | `04-ra-class-arms-hir.patch` | Phase 2 B.3c — 13 Class-arm stubs in the user-facing `hir` crate (from_id, source_analyzer, child_by_source, symbols). |
 | `05-ra-class-arms-tests.patch` | Phase 2 B.3 — 4 test-only Class arms (signatures, layout/tests, closure_captures, variance). |
 | `06-ra-class-signature.patch` | Phase 2 B.2 — `ClassSignature` salsa-tracked type + item-tree `Class` slot + `lower_class` + name-resolution wiring. ClassIds now flow through the pipeline; Generics + ExpressionStore stubs replaced with real `ClassSignature::of(db, id)` calls. |
-| (planned) `07-ra-class-fields.patch` | Phase 2 B.4a — walk `CLASS_MEMBER_LIST` for `VariantFields` lowering (replaces the remaining `signatures.rs` + `src.rs` stubs). |
-| (planned) `08-ra-class-resolve.patch` | Phase 2 B.4 — class-specific method dispatch + inheritance walk. |
-| (planned) `09-ra-class-assists.patch` | Phase 2 B.5 — class-aware refactoring assists. |
+| `07-ra-class-fields.patch` | Phase 2 B.4a — `CLASS_MEMBER_LIST.fields()` walker bypasses `lower_field_list` and feeds `lower_fields` directly. Field access on class instances type-checks; `widget.x` works. Also wires `child_source` for `VariantId::ClassId(_)`. |
+| `08-ra-class-resolve.patch` | Phase 2 B.4 — `hir::Class` user-facing API + `Adt::Class` arms wired across hir / ide-db / ide-completion / ide-assists / ide-diagnostics / ide / lsp. New `SymbolKind::Class` + `CLASS` semantic-token type. Hover, go-to-def, find-references, completion (within class body) work end-to-end. *Method walking via synthesized impl deferred to B.4c; inheritance graph deferred to B.4b.* |
+| `09-ra-class-assists.patch` | Phase 2 B.5 — class-aware refactoring: new `generate_class_new` assist (synthesizes `#[constructor] pub fn new(...) -> Self`); class arms wired into `generate_impl`/`generate_trait_impl`/`generate_derive`/`change_visibility`/`extract_module`; +13 regression tests. |
+| (planned) `10-ra-class-inheritance.patch` | Phase 2 B.4b — surface the path-after-`:` in `class Foo : Bar` as a typed `extends_clause()` accessor; thread `base: Option<TypeRefId>` through `ClassSignature`; `Sema::to_def(class)` returns `Some` so resolution-heavy assists (auto_import, fix_visibility, etc.) light up. |
+| (planned) `11-ra-class-methods.patch` | Phase 2 B.4c — synthesize an inherent impl per class containing the methods from `CLASS_MEMBER_LIST.methods()`. Method completion + go-to-def on `widget.foo()` works. Together with B.4b's inheritance support, `dog.legs()` walks Dog→Animal. |
 
 See [`PHASE-2-PLAN.md`](PHASE-2-PLAN.md) for the full Phase 2 design + sub-deliverable breakdown.
 
