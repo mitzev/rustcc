@@ -2947,6 +2947,124 @@ fn m20b_handles_mixed_params_with_one_cstr_slot() {
 }
 
 // ============================================================
+// M23: pure virtual methods route through the vtable to
+// `__cxa_pure_virtual` (or to the most-derived override at
+// runtime). Closes the long-standing "pure virtual rejected"
+// gap.
+// ============================================================
+
+#[test]
+fn m23_pure_virtual_method_gets_vtable_index_and_emits() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct Shape {\n  virtual int area() const = 0;\n  virtual ~Shape();\n};\n",
+        "m23_pure_virtual_emits",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+
+    // The pure-virtual `area` method should now have a
+    // populated vtable_index (even though the slot's target
+    // symbol is `__cxa_pure_virtual`).
+    let shape_id = class_ids[0];
+    let shape = ctx.class(shape_id);
+    let area = shape
+        .methods
+        .iter()
+        .find(|m| m.name.ident_name() == Some("area"))
+        .expect("area method captured");
+    assert!(
+        matches!(area.virtuality, rustc_abi_cxx::Virtuality::PureVirtual),
+        "area should be pure virtual",
+    );
+    assert!(
+        area.vtable_index.is_some(),
+        "M23: pure virtual should now get a vtable_index; got None",
+    );
+
+    // The bindings emit a wrapper (no longer skipped).
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    assert!(
+        src.contains("pub fn area(&self) -> i32"),
+        "pure-virtual `area` should emit through the vtable path; got:\n{src}",
+    );
+    // The wrapper goes through the vptr lookup machinery
+    // (look for the transmute marker or the vtable-index-
+    // specific code shape). The presence of a wrapper plus
+    // a non-trivial body confirms it.
+    let area_wrapper = src
+        .lines()
+        .skip_while(|l| !l.contains("pub fn area"))
+        .take(20)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        area_wrapper.contains("transmute") || area_wrapper.contains("vptr"),
+        "pure-virtual wrapper should dispatch via vtable; got:\n{area_wrapper}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m23_concrete_virtual_methods_keep_their_existing_emission() {
+    // Sanity: M23's MethodId-based vtable indexing must not
+    // regress regular virtuals. They still get vtable_index
+    // and still emit through the same path.
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct W {\n  virtual void show();\n  virtual void hide();\n};\n",
+        "m23_concrete_virtuals_unaffected",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let class = ctx.class(class_ids[0]);
+    let show = class
+        .methods
+        .iter()
+        .find(|m| m.name.ident_name() == Some("show"))
+        .unwrap();
+    let hide = class
+        .methods
+        .iter()
+        .find(|m| m.name.ident_name() == Some("hide"))
+        .unwrap();
+    assert!(show.vtable_index.is_some(), "show should have vtable_index");
+    assert!(hide.vtable_index.is_some(), "hide should have vtable_index");
+    // The two indices should be distinct.
+    assert_ne!(show.vtable_index, hide.vtable_index);
+
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+    assert!(src.contains("pub fn show(&mut self)"));
+    assert!(src.contains("pub fn hide(&mut self)"));
+    cleanup(&header);
+}
+
+// ============================================================
 // M20.c: `&str` + `Option<&CStr>` smart parameter wrappers,
 // also opt-in via `cstr_ergonomics: true`. Builds on M20.b's
 // detection.

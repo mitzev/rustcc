@@ -1772,28 +1772,30 @@ fn classify_for_direct_extern(
     resolved_rust_name: &str,
     config: &RustBindingsConfig,
 ) -> Result<MethodEmission, BindingsError> {
-    // Per-method gate that used to live at the class level: a
-    // virtual method without a populated `vtable_index` (because
-    // the v0 vtable walker doesn't reach into secondary tables /
-    // virtual bases / multi-inheritance) can't be dispatched
-    // through the vtable, and a pure virtual has no own-class
-    // body to call. Reject both with a clear reason; the caller
-    // converts this into a per-method skip-with-comment instead
-    // of failing the whole class.
-    if method.virtuality == Virtuality::Virtual && method.vtable_index.is_none() {
+    // Per-method gate: virtual methods (regular or pure) without
+    // a populated `vtable_index` can't be dispatched through the
+    // vtable. Reject those with a clear reason; the caller
+    // converts this into a per-method skip-with-comment.
+    //
+    // M23: pure virtuals WITH a vtable_index fall through to be
+    // emitted as regular virtuals. The vtable slot for an
+    // un-overridden pure virtual points to `__cxa_pure_virtual`
+    // (set by `vtable.rs` when the slot's method's virtuality
+    // is `PureVirtual`); calling such a method on the
+    // actually-abstract base class hits that symbol and
+    // terminates, which is the correct C++ semantic. If a
+    // derived class has an override in scope at runtime, the
+    // override fires.
+    if matches!(
+        method.virtuality,
+        Virtuality::Virtual | Virtuality::PureVirtual,
+    ) && method.vtable_index.is_none()
+    {
         return Err(BindingsError::UnsupportedMethod {
             where_: format!("{class_name}::{:?}", method.name),
             why: "virtual method without populated vtable_index (v0 vtable walker \
                   doesn't reach this slot — multi-inheritance / virtual base / \
                   secondary vtable; tracked as M22)."
-                .into(),
-        });
-    }
-    if method.virtuality == Virtuality::PureVirtual {
-        return Err(BindingsError::UnsupportedMethod {
-            where_: format!("{class_name}::{:?}", method.name),
-            why: "pure virtual method (no own-class implementation to call); \
-                  a future revision routes to `__cxa_pure_virtual`."
                 .into(),
         });
     }
@@ -1992,7 +1994,10 @@ fn classify_for_direct_extern(
     // `ctx.is_method_static` for the Static path; virtuals carry
     // their `vtable_index` for the vptr-load-and-transmute path.
     // Everything else falls through to Instance.
-    let kind = if method.virtuality == Virtuality::Virtual {
+    let kind = if matches!(
+        method.virtuality,
+        Virtuality::Virtual | Virtuality::PureVirtual,
+    ) {
         match method.vtable_index {
             Some(vt) => EmissionKind::Virtual { vtable_index: vt },
             None => {

@@ -14,6 +14,17 @@ pub struct FieldId(pub(crate) u32);
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MethodId(pub(crate) u32);
 
+impl MethodId {
+    /// Index back into the owning `class.methods` slice. Used
+    /// by `cxx_importer::populate_vtable_indices` (M23) which
+    /// reads `VTableEntry::FunctionPointer { method, .. }` and
+    /// stamps the slot's rank into the method's
+    /// `vtable_index` — no crate-private field access needed.
+    pub fn as_index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TypeId(pub(crate) u32);

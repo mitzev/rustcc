@@ -2140,50 +2140,37 @@ fn populate_vtable_indices(ctx: &mut CxxTypeCtx, class_id: ClassId) {
         return;
     };
 
-    // Snapshot method symbols before mutating.
-    let class_clone = ctx.class(class_id).clone();
-    let mut wanted: Vec<Option<String>> = Vec::with_capacity(class_clone.methods.len());
-    for m in &class_clone.methods {
-        if m.virtuality == Virtuality::Virtual {
-            // Skip ConversionTo (we don't know how to mangle them
-            // here — the conversion target's TypeId would change
-            // hands and we don't want to drop a borrow on ctx).
-            let mangled = ctx.mangle(&Symbol::Method {
-                class: class_id,
-                name: m.name.clone(),
-                sig: m.sig.clone(),
-            });
-            wanted.push(Some(mangled));
-        } else {
-            wanted.push(None);
-        }
-    }
-
-    // Walk the primary sub-table, count `FunctionPointer` rank,
-    // and remember the rank of any slot whose target matches one
-    // of our methods' mangled symbols.
+    // Walk the primary sub-table and record the function-pointer
+    // rank for every method whose `MethodId` shows up in a
+    // `FunctionPointer` slot.
+    //
+    // M23: this match-by-MethodId path covers pure-virtual
+    // methods correctly. The vtable builder routes pure
+    // virtuals to `__cxa_pure_virtual` for the slot's
+    // `mangled_target`, but the `method: MethodId` field on
+    // the slot still points back at the originating method,
+    // so the walker can assign it the correct vtable_index
+    // without mangled-symbol matching. The downstream
+    // bindings emitter then routes pure-virtual calls
+    // through the regular vtable-lookup path; if the runtime
+    // object is the actually-abstract base, the lookup hits
+    // `__cxa_pure_virtual` and terminates (matching C++
+    // semantics). If a derived override is in scope, that
+    // override fires.
     let mut updates: Vec<(usize, u32)> = Vec::new();
     let mut fp_rank: u32 = 0;
     for entry in &primary.entries {
-        if let VTableEntry::FunctionPointer { mangled_target, .. } = entry {
-            for (m_idx, expected) in wanted.iter().enumerate() {
-                if let Some(sym) = expected {
-                    if sym == mangled_target {
-                        updates.push((m_idx, fp_rank));
-                        // Don't break — defensively allow the same
-                        // method to appear in multiple slots if
-                        // future overload patterns require it. In
-                        // practice each method shows up once.
-                    }
-                }
-            }
+        if let VTableEntry::FunctionPointer { method, .. } = entry {
+            updates.push((method.as_index(), fp_rank));
             fp_rank += 1;
         }
     }
 
     let class_mut = ctx.class_mut(class_id);
     for (m_idx, vt) in updates {
-        class_mut.methods[m_idx].vtable_index = Some(vt);
+        if m_idx < class_mut.methods.len() {
+            class_mut.methods[m_idx].vtable_index = Some(vt);
+        }
     }
 }
 
