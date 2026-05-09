@@ -46,6 +46,50 @@ impl Default for HeaderGraph {
     }
 }
 
+impl HeaderGraph {
+    /// M25: pull any `instantiations:` entries from a parsed
+    /// [`crate::annotations::SidecarSchema`] into this graph's
+    /// `template_instantiations` list. Duplicates against existing
+    /// entries are skipped. The schema's iteration order is
+    /// preserved (BTreeMap on type name, then source order within
+    /// each type's list).
+    ///
+    /// Typical pipeline:
+    ///
+    /// ```ignore
+    /// let schema = cxx_importer::annotations::load_sidecar(&path)?;
+    /// let mut graph = HeaderGraph { roots: …, .. HeaderGraph::default() };
+    /// graph.extend_from_sidecar(&schema);
+    /// let driver = Driver::new(graph);
+    /// driver.parse_all(&mut ctx)?;
+    /// ```
+    ///
+    /// Equivalent to manually appending
+    /// `schema.collect_template_instantiations()`, but dedups
+    /// against the graph's existing list so calling this twice
+    /// (or against a graph that already has hand-added entries)
+    /// is safe.
+    pub fn extend_from_sidecar(
+        &mut self,
+        schema: &crate::annotations::SidecarSchema,
+    ) {
+        // Snapshot existing entries as owned strings so we can
+        // append to `self.template_instantiations` without
+        // overlapping borrows. The dedup set stays small
+        // (typical sidecar has < 20 instantiations).
+        let existing: std::collections::HashSet<String> = self
+            .template_instantiations
+            .iter()
+            .cloned()
+            .collect();
+        for inst in schema.collect_template_instantiations() {
+            if !existing.contains(&inst) {
+                self.template_instantiations.push(inst);
+            }
+        }
+    }
+}
+
 pub struct Driver {
     graph: HeaderGraph,
 }

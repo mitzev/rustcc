@@ -25,7 +25,7 @@ pub mod rust_stubs;
 pub mod shims;
 
 pub use aliases::{AliasSet, TypeAlias};
-pub use annotations::{Annotation, AnnotationSet, SidecarSchema};
+pub use annotations::{load_sidecar, Annotation, AnnotationSet, SidecarSchema};
 pub use enums::{CxxEnumDef, CxxEnumVariant, EnumSet};
 pub use macros::{MacroConst, MacroSet, MacroValue};
 pub use diagnostics::ImportError;

@@ -319,7 +319,7 @@ critical path but are on the larger v2 roadmap.
 | 22  | Multi-inheritance + virtual-base `this`-pointer adjustments + secondary vtables | Required for Qt, LLVM, Chromium. FLTK uses single inheritance only. |
 | 23  | Pure virtual handling (`__cxa_pure_virtual` shim or skip-with-marker)        | Common in any abstract-base-class-heavy library.           |
 | 24  | Method extraction on template specializations                                | Long-standing libclang gap; required for STL-using libraries. |
-| 25  | Sidecar YAML → `HeaderGraph::template_instantiations` plumbing               | Schema and API both exist; the bridge is a one-liner with the right `SidecarSchema` accessor in scope. |
+| 25  | Sidecar YAML → `HeaderGraph::template_instantiations` plumbing               | ✅ shipped (`SidecarSchema::collect_template_instantiations()` aggregates across type entries with dedup; `HeaderGraph::extend_from_sidecar(&schema)` plumbs them into the graph idempotently). |
 | 26  | Build-system integration (drive cmake / collect link inputs from `Cargo.toml`) | Today users build the C++ side themselves. A full `cxx_importer::build` story is a release-worthy feature on its own. |
 
 ---
