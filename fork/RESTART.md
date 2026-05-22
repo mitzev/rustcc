@@ -1,24 +1,56 @@
-# rustcc — session restart (v1 + 1.01 closed + 1.02 + throws + Rank 1 adoption infra + v1.02.0 + v1.03.0 published)
+# rustcc — session restart (post-v1.07.0)
 
-Last updated: **2026-05-04**, Opus 4.7 (1M ctx). **rustcc v1
-milestone complete. Post-v1 shipped: P09.37 (RISC-V ESP32),
-P09.38 (Raspberry Pi Pico), P09.39 (ItemKind::Class), P09.40-44
-(1.01 batch closing items #1-#6), P09.45 (rust-analyzer fork for
-`class` keyword — Phase 1 parser support, 1.02 #1 Phase 1),
-P09.46 (`#[swift_value]` built-in attribute macro, 1.02 #2),
-P09.47 (Rank 1 adoption infra), P09.48 (Swift throws support),
-P09.50 (aarch64 sret routing for cxx_importer forwarders).
-v1.02.0 release published 2026-04-25; v1.03.0 published
-2026-05-04 — both shipped 3 of 4 prebuilt binaries
-(aarch64-darwin + both Linux triples; x86_64-darwin runner pool
-saturated in both windows).** 1.01 fully shipped. 1.02 #1 Phase
-1 in. 1.02 #2 shipped. Swift throws shipped. aarch64 cxx_importer
-forwarders unblocked. Adoption friction reduced from "30-90 min
-source build" to "3 min curl+extract" for published triples.
-Next workable items: 1.02 #1 Phase 2 (RA HIR-level resolution),
-1.1 (multi-inheritance), x86_64-darwin binary backfill.
+Last updated: **2026-05-22** (post-v1.07.0, which tagged on 2026-05-09). **The original
+26-milestone roadmap is fully shipped.** Eight tagged releases
+between v1.02 and v1.07 closed every v1 polish item, the entire
+v2 stretch list (multi-inheritance, template-spec methods,
+`cxx_importer::Build`), the developer-experience layer
+(`rustcc-cli`, `vscode-rustcc`), and **rust-analyzer Phase 2** —
+12 patches in `fork/ra-patches/` that give `class` items full
+IDE parity with structs.
 
-Workspace baseline: `cargo test --workspace` → **235 passed, 0 failed**.
+Workspace baseline at v1.07.0 tip: `cargo test --workspace` →
+clean. The fork rustc itself hasn't changed since v1.04.0 — every
+post-v1.04 milestone lives in `crates/cxx_importer`,
+`crates/rustc_abi_cxx`, `crates/cxx`, `crates/rustcc-cli`,
+`tools/vscode-rustcc`, `fork/ra-patches/`, and `.github/workflows/`.
+
+## Release snapshot
+
+| Tag       | Date       | What shipped                                                                                                                                                                                                                       |
+|-----------|------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| v1.0      | 2026-04-21 | Itanium-C++-ABI + Swift-ABI fork. 11 rustc patches (P09.22 → P09.32). Single inheritance, virtuals, dtors D0/D1/D2, `dynamic_cast`, operator overloading, ARC, VWT, parser `class` keyword.                                       |
+| v1.01     | 2026-04-24 | P09.39–P09.44 batch. `ItemKind::Class` AST variant, generics on class header, non-POD Swift extras, attr-plumbing macro, in-tree test crate, Linux/desktop target probes, three-surface doc.                                       |
+| v1.02.0   | 2026-04-25 | First prebuilt release. P09.45 (rust-analyzer Phase 1 parser), P09.46 (`#[swift_value]` built-in attr macro), P09.47 (Rank 1 adoption infra), P09.48 (Swift `throws`). 3-of-4 binaries (Intel-Mac runner pool saturated).         |
+| v1.03.0   | 2026-05-04 | P09.50 — force-indirect ADT returns under `extern "C++"` (aarch64 sret routing fix for cxx_importer forwarders). 3-of-4 binaries.                                                                                                  |
+| v1.04.0   | 2026-05-08 | `cxx_importer` Phases A + B + C — M1–M21 all shipped (modulo M11.b/c). 13 FLTK classes import cleanly; `examples/fltk_hello/` emits 3,600 lines of valid bindings.                                                                |
+| v1.05.0   | cancelled  | Draft superseded mid-sprint by the v1.06.0 closeout; the 7-skip `fltk_hello` snapshot in v1.06.0 release notes is from this draft.                                                                                                 |
+| v1.06.0   | 2026-05-09 | **Roadmap-complete.** v2 stretch list — M22 (multi-inheritance + secondary vtables), M23 (pure virtuals), M24 (template-spec method extraction), M25 (sidecar template instantiations), M26 (`cxx_importer::build::Build` orchestrator). New `examples/fltk_text_editor` demo. Fork rustc unchanged; stage-1 binaries bit-for-bit identical to v1.04.0. |
+| v1.07.0   | 2026-05-09 | **DX + RA Phase 2.** `crates/rustcc-cli` (install/doctor/init), `tools/vscode-rustcc` (grammar overlay, snippets, commands), JSON skip-emit sidecar, opt-in method flattening, Swift CI integration. 12 RA patches in `fork/ra-patches/` for `class` IDE parity. Stage-1 tarballs identical to v1.04/v1.06; RA prebuilts deferred to v1.07.1. |
+
+Detailed per-release notes live in
+`fork/RELEASE-NOTES-v1.04.0.md`, `…-v1.06.0.md`,
+`…-v1.07.0.md`. The v1.02 / v1.03 latest-addition blocks below
+preserve the original session detail.
+
+## Next workable items
+
+- **v1.07.1 — RA fork distribution.** First `ra-release.yml`
+  runs surfaced that RA's pinned tree wants a very specific
+  rustc (via `rustup-toolchain-install-master` + `RUSTC_BOOTSTRAP=1`).
+  Three simpler approaches (workspace-inherited nightly, latest
+  nightly, plain `RUSTC_BOOTSTRAP`) all hit different
+  incompatibilities. The full recipe is mechanical but didn't
+  land in the v1.07.0 window. Until v1.07.1 ships, users build
+  RA locally via `./fork/ra-patches/build.sh`.
+- **v1.08.0 — documentation refresh.** This pass. Bring every
+  doc in line with the v1.06/v1.07 shipped state.
+- **v1.09.0 — Windows MSVC C++ ABI support.** Out of scope
+  for the Itanium-focused fork up to now; a separate targeting
+  effort. Scoping evaluation in flight.
+- **x86_64-apple-darwin binary backfill.** Intel-Mac runner pool
+  routinely times out the macos-13 leg. Pattern: `gh run cancel`
+  → manual `gh release upload` from a successful artifact.
 
 ## v1 scope
 
@@ -700,12 +732,9 @@ doesn't override. Override + multi-inheritance are v2.
 Validation: `/tmp/p09-35-inherit/` and `/tmp/p09-36-dyncast/`
 both pass end-to-end.
 
-## Release-track backlog (1.01 / 1.02 / 1.1)
+## Release-track backlog — all shipped through v1.07.0
 
-See `project_queue_state.md` memory. **Post-P09.43, 1.01 is
-closed.**
-
-**1.01 — FULLY SHIPPED 2026-04-24**:
+**1.01 — FULLY SHIPPED 2026-04-24** (P09.39–P09.44):
 1. ~~Const generics on class header~~ — P09.41.
 2. ~~Non-POD extras in swift_value!~~ — P09.42.
 3. ~~`rustc_cxx_*` attr-plumbing unification~~ — P09.43.
@@ -715,60 +744,74 @@ closed.**
    (x86_64 / aarch64 / armv7 / rv64 Linux; all zero-code).
 7. ~~Parser-level `ItemKind::Class` AST variant~~ — P09.39.
 
-**1.02 — user-visible class-keyword IDE support**:
+**1.02 — user-visible class-keyword IDE support** — FULLY SHIPPED:
 1. ~~rust-analyzer fork for `class` — Phase 1 parser support~~
-   — P09.45. Phase 2 (HIR-level class→struct+impl synthesis for
-   hover / go-to-def / completion) remains.
+   — P09.45 (v1.02.0). ~~Phase 2 (HIR-level class→struct+impl
+   synthesis for hover / go-to-def / completion)~~ — `fork/ra-patches/01..12`
+   (v1.07.0). 12 patches against PINNED_COMMIT `45b868b19`; `class`
+   items now have full IDE parity with structs.
 2. ~~True compiler auto-synthesis for `#[repr(swift)]`~~
-   — P09.46. `#[swift_value]` built-in attribute macro
+   — P09.46 (v1.02.0). `#[swift_value]` built-in attribute macro
    retires the `swift_value!` proc macro.
 
-**1.1 — multi-inheritance capstone**:
-1. Multi-inheritance + virtual bases (very large).
+**1.1 — multi-inheritance capstone** — FULLY SHIPPED in v1.06.0:
+1. ~~Multi-inheritance + virtual bases~~ — M22 / PRs #16-18.
+   Three smaller pieces: cache-pollution fix in the recursive
+   class-import path, third-pass polymorphism + vtable-index
+   convergence, inherent `as_<base>` cross-base accessors.
 
-Out of scope: Windows MSVC ABI.
+**v2 stretch (M22–M26)** — FULLY SHIPPED in v1.06.0:
+- M22 multi-inheritance + secondary vtables.
+- M23 pure-virtual fall-through via `__cxa_pure_virtual`.
+- M24 template-spec method extraction (via substitution-by-display-name).
+- M25 sidecar template instantiations plumbing.
+- M26 `cxx_importer::build::Build` orchestrator.
+
+**DX layer + RA Phase 2** — FULLY SHIPPED in v1.07.0:
+- `crates/rustcc-cli` (install/doctor/init).
+- `tools/vscode-rustcc` (grammar overlay, snippets, RA-fork installer).
+- `cxx_importer::Build::compile()` JSON skip-emit sidecar.
+- Opt-in M22 method-flattening (`flatten_inherited_methods`).
+- 12-patch rust-analyzer Phase 2 series in `fork/ra-patches/`.
+
+Out of scope through v1.07: Windows MSVC ABI (scoping for v1.09).
 
 ## Morning review checklist
 
-- [ ] Read this file + `fork/PATCHES.md` §§ P09.22–P09.48
-      + Rank 1 + v1.02.0-published latest-addition blocks above.
-- [ ] Verify v1.02.0 release is still live and assets resolve:
-      `gh release view v1.02.0 --repo mitzev/rustcc`
-- [ ] Sanity-check the release workflow YAML
-      (`.github/workflows/release.yml`) — look for mis-quoted
-      strings, runner-label typos. The `workflow_dispatch`
-      `release_tag` input is the dry-run knob.
-- [ ] If comfortable: push a throwaway tag like `v1.02.0-rc1`
-      and watch the 4 matrix jobs. Artifacts land in
-      Actions → Run → Artifacts even if the Release-upload
-      step fails, so you can inspect the tarballs without
-      polluting the real Release page.
+- [ ] Skim `fork/RELEASE-NOTES-v1.07.0.md` (most recent state)
+      + the release snapshot table above.
+- [ ] Verify v1.07.0 release assets resolve:
+      `gh release view v1.07.0 --repo mitzev/rustcc`
+- [ ] `cargo test --workspace` clean on the current tree.
+- [ ] `RUSTC=<stage1> ./fork/tests/run.sh` → 7/7 passing
+      (5 class-keyword probes + 2 swift_* probes).
+- [ ] Optional rust-analyzer Phase 2 probe: run
+      `./fork/ra-patches/build.sh` — clones
+      rust-lang/rust-analyzer at PINNED_COMMIT, applies all 12
+      patches, builds `target/release/rust-analyzer` in ~5 min.
+      Test counts: parser 316/0, syntax 51/0, hir-def 481/0,
+      hir-ty 972/0, ide 1297/0, ide-assists 2764/0 (~7,448 RA
+      tests total, all green).
+- [ ] DX surface smoke test:
+      `cd crates/rustcc-cli && cargo run -- doctor` — runs the
+      6 health checks (rustup, rustc, rustcc, clang, ...).
+- [ ] VS Code extension build:
+      `cd tools/vscode-rustcc && npm install && npm run package`
+      → produces `rustcc-tools-*.vsix`.
+- [ ] `examples/fltk_text_editor` build (end-to-end M22 +
+      cxx_importer Build orchestrator + virtual dispatch):
+      `cd examples/fltk_text_editor && cargo +rustcc build`.
 - [ ] Read `fork/THREE-SURFACES.md` for the surface-selection
-      reference.
-- [ ] `cargo test --workspace` → 235/0.
-- [ ] `RUSTC=<stage1> ./fork/tests/run.sh` → 5/5 passing.
-- [ ] Optional cross-target probe:
+      reference (slightly stale on the RA Phase 2 caveat;
+      v1.08.0 doc refresh fixes it).
+- [ ] Optional cross-target probes (skip on quick regression):
       `RUSTC=<stage1> ./fork/tests/run_targets.sh` → 4/4
-      (~3 min total; skip on quick regression checks).
-- [ ] Optional: diff the rustc-side post-v1 patches 10–12
-      (`fork/patches/10-itemkind-class.patch`,
-      `11-class-generics.patch`, `12-attr-plumbing-macro.patch`).
-- [ ] Optional rust-analyzer probe: apply
-      `fork/ra-patches/01-ra-class-keyword.patch` against a
-      clone of rust-lang/rust-analyzer; `cargo test -p parser`
-      → 315/0. Binary at `target/release/rust-analyzer`.
-- [ ] Verify v1 capstones:
-      - `cd /tmp/p09-35-inherit && ./probe`
-      - `cd /tmp/p09-36-dyncast && ./probe`
-      - `cd /tmp/p09-30-class-kw && ./probe`
-      - `cd /tmp/p09-28-swift-auto && ./probe`
-- [ ] Verify P09.37 RISC-V probe:
-      `cd /tmp/p09-40-riscv32-esp32c3 && RUSTC=<rust-lang-rust>/build/host/stage1/bin/rustc \`
-      `RUSTC_BOOTSTRAP=1 cargo +nightly build --release \`
-      `--target riscv32imc-unknown-none-elf -Zbuild-std=core,compiler_builtins`
-- [ ] Verify P09.38 Pico probe:
-      `cd /tmp/p09-41-rp2040-pico && RUSTC=... cargo +nightly build --release \`
-      `--target thumbv6m-none-eabi -Zbuild-std=core,compiler_builtins`
+      (Linux x86_64 / aarch64 / armv7 / rv64; ~3 min total).
+- [ ] Optional bare-metal probes:
+      - RISC-V ESP32-C3 / Pico 2 RISC-V via
+        `cargo +nightly build --target riscv32imc-unknown-none-elf
+         -Zbuild-std=core,compiler_builtins`
+      - RP2040 Pico via `--target thumbv6m-none-eabi`.
 
 ## Environment notes
 

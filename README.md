@@ -12,10 +12,21 @@ the fork links directly against Clang-compiled C++ and
 constructors, destructors, single inheritance, `dynamic_cast`, ARC,
 and Swift value-witness tables.
 
-> **Status — v1 shipped 2026-04-21.** The fork implements the full v1
-> feature matrix below on x86_64/aarch64 Linux/Darwin, i686 Linux, and
-> bare-metal ARM Cortex-M. See [`fork/PATCHES.md`](fork/PATCHES.md)
-> for the per-patch history (P09.22–P09.36).
+> **Status — v1.07.0 published 2026-05-09.** v1 shipped 2026-04-21
+> with the feature matrix below on x86_64/aarch64 Linux/Darwin,
+> i686 Linux, and bare-metal ARM Cortex-M. Five tagged point
+> releases since: v1.02 / v1.03 closed initial adoption infra (prebuilt
+> binaries) and ABI follow-ups; v1.04 / v1.06 shipped the full
+> 26-milestone `cxx_importer` roadmap (Phases A + B + C through M26
+> — multi-inheritance, template-spec method extraction, build
+> orchestrator, real FLTK text editor demo); v1.07 shipped the
+> developer-experience layer (`rustcc-cli`, `vscode-rustcc`
+> extension) and **rust-analyzer Phase 2** — twelve patches in
+> `fork/ra-patches/` that give `class` items full IDE parity with
+> structs (hover, go-to-def, method completion, assists). See
+> [`fork/PATCHES.md`](fork/PATCHES.md) for per-patch history
+> (P09.22–P09.50) and `fork/RELEASE-NOTES-v1.07.0.md` for the
+> latest release.
 
 ## Why this project exists
 
@@ -64,22 +75,55 @@ If you've written `impl Drop for Widget { fn drop(&mut self) { unsafe
 (non-Windows), bare-metal `thumbv7em-*` / `thumbv7m-*` / `thumbv8m.*`.
 Cross-builds across these are supported.
 
-## v2 roadmap
+## v2 roadmap — shipped
 
-Not yet in v1, targeted for the next milestone:
+The v2 stretch list from the original v1 README is **fully delivered**
+across v1.02–v1.07:
 
-- **Multi-inheritance and virtual bases** — secondary vtable
-  sub-tables, this-adjusting thunks, virtual-base offset slots.
-- **True compiler auto-synthesis for `#[repr(swift)]`** — today's
-  path uses the `swift_value!` proc macro; a HIR-level trait-impl
-  synthesis would let users drop the wrapper.
+- **Multi-inheritance and virtual bases** — shipped in v1.06.0
+  (M22). Secondary vtables, this-adjusting thunks, cross-base
+  `as_<base>` accessors, recursive-import convergence pass.
+- **True compiler auto-synthesis for `#[repr(swift)]`** — shipped
+  in v1.02.0 (P09.46). `#[swift_value]` is now a built-in
+  attribute macro; the proc-macro wrapper is retired.
 - **Multi-field class-backed Swift bindings with non-POD extra
-  fields** — e.g. a class handle that carries another class handle as
-  a sibling field.
-- **Const generics on class headers** — `class Array<T, const N:
-  usize> { ... }`. v1 accepts type and lifetime params only.
-- **Windows MSVC ABI** — out of scope for the Itanium-focused fork;
-  would be a separate targeting effort.
+  fields** — shipped in 1.01 (P09.42). Class-backed `swift_value!`
+  Clone now does per-field clone for non-POD extras.
+- **Const generics on class headers** — shipped in 1.01
+  (P09.41). `class Array<T, const N: usize> { ... }` parses,
+  resolves, and emits correctly; the two-DefId class split
+  threads class generics through both the struct and impl halves.
+- **`cxx_importer` C++ → Rust binding generator** — shipped
+  across v1.04.0 (Phases A + B + C, M1–M21) and v1.06.0 (v2
+  roadmap M22–M26). Real-world target: `examples/fltk_text_editor`
+  pulls in ~50 FLTK classes and produces a working 800x600 editor.
+- **Developer experience layer** — shipped in v1.07.0.
+  `crates/rustcc-cli` (install / doctor / init); `tools/vscode-rustcc`
+  VS Code extension (grammar overlay, snippets, commands, status
+  bar, problems-pane integration with the JSON skip log);
+  `cxx_importer::Build::compile()` writes a structured
+  `bindings.skips.json` sidecar.
+- **rust-analyzer Phase 2** — shipped in v1.07.0
+  (`fork/ra-patches/01..12`). `class` items get full IDE parity
+  with structs: hover, go-to-def, find-references, completion,
+  inherent-method dispatch with C++-style derived-shadows-base,
+  plus class-aware assists (`generate_class_new`,
+  `change_visibility`, `find all overriders`, `implement override`).
+
+Remaining stretch items (not in any near-term release):
+
+- **Windows MSVC ABI** — out of scope for the Itanium-focused
+  fork; would be a separate targeting effort. Tracked as v1.09.0
+  scoping.
+- **Runtime-dispatch CI validation** — the M22 work has strong
+  static evidence (vtable structure, mangled symbols, FLTK link
+  success) but no executed test asserting `&B`-pointing-into-a-C
+  routes through the secondary thunk. Needs a CI runner with the
+  rustcc fork toolchain pre-installed.
+- **STL container support for M24** — implicit instantiation
+  auto-discovery.
+- **Method flattening multi-level walk** — v1.07.0's `flatten_inherited_methods`
+  flag walks one level deep; multi-level is a follow-up.
 
 ## Quick start
 
@@ -202,7 +246,12 @@ More examples in [`examples/`](examples/). Full walkthrough:
 | Doc | Scope |
 |---|---|
 | [`fork/getting-started.html`](fork/getting-started.html) | User-facing guide — install, quickstart, feature reference, build recipes |
-| [`fork/PATCHES.md`](fork/PATCHES.md) | Per-patch history (P09.22–P09.36), authoritative spec for the fork |
+| [`fork/INSTALL.md`](fork/INSTALL.md) | Install recipes — fast path (prebuilt tarball + `rustup link`) and source-build path |
+| [`fork/PATCHES.md`](fork/PATCHES.md) | Per-patch history (P09.22–P09.50), authoritative spec for the rustc fork |
+| [`fork/ra-patches/`](fork/ra-patches/) | 12-patch rust-analyzer series adding `class` Phase 1 parser + Phase 2 HIR/IDE parity |
+| [`crates/rustcc-cli/`](crates/rustcc-cli/) | DX CLI: `rustcc install` / `doctor` / `init` |
+| [`tools/vscode-rustcc/`](tools/vscode-rustcc/) | VS Code extension — grammar overlay, snippets, commands, RA-fork installer |
+| [`docs/cxx_importer.md`](docs/cxx_importer.md) | `cxx_importer` design + Phase A/B/C milestone table (M1–M26 all shipped) |
 | [`docs/repo_layout.md`](docs/repo_layout.md) | Two-repo architecture: workspace vs `rustcc-rustc` compiler fork |
 | [`docs/rustc_abi_cxx.md`](docs/rustc_abi_cxx.md) | Itanium layout, mangling, vtable construction |
 | [`docs/codegen.md`](docs/codegen.md) | LLVM IR generation for cross-language calls, vtables, ctors/dtors |

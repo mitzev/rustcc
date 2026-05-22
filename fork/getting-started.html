@@ -26,10 +26,18 @@
 </head>
 <body>
 
-<h1>rustcc v1</h1>
+<h1>rustcc v1.07.0</h1>
 
 <p><em>Native C++ and Swift interop for Rust — no <code>bindgen</code>, no
 <code>cxx</code> shim crate, no build-script voodoo.</em></p>
+
+<p class="small"><strong>Latest: v1.07.0</strong> ships the
+developer-experience layer (<code>rustcc-cli</code>,
+<code>vscode-rustcc</code>) and rust-analyzer Phase 2 — 12 patches in
+<code>fork/ra-patches/</code> that give <code>class</code> items full IDE
+parity with structs. The original 26-milestone <code>cxx_importer</code>
+roadmap closed in v1.06.0. See
+<code>fork/RELEASE-NOTES-v1.07.0.md</code> for full notes.</p>
 
 <p><code>rustcc</code> is a fork of <code>rustc</code> that teaches the
 compiler to emit <strong>Itanium-C++-ABI-compatible symbols and
@@ -64,7 +72,8 @@ project is for you.</p>
 
 <h2>v1 feature matrix</h2>
 
-<p>As of the v1 milestone (2026-04-21), rustcc supports:</p>
+<p>As of the v1 milestone (2026-04-21; unchanged through v1.07.0 —
+no fork-rustc patches after P09.50), rustcc supports:</p>
 
 <table>
   <tr><th>Capability</th><th>v1 status</th><th>Notes</th></tr>
@@ -90,77 +99,122 @@ project is for you.</p>
   <tr><td>Targets</td><td colspan="2"><code>x86_64-apple-darwin</code>, <code>x86_64-unknown-linux-gnu</code>, <code>aarch64-apple-darwin</code>, <code>aarch64-unknown-linux-gnu</code>, <code>i686-*</code> (non-Windows), bare-metal <code>thumbv6m-*</code> / <code>thumbv7em-*</code> / <code>thumbv7m-*</code> / <code>thumbv8m.*</code>, bare-metal <code>riscv32im*c-unknown-none-elf</code> / <code>riscv32im*c-esp-espidf</code>. Cross-builds across these are supported.</td></tr>
 </table>
 
-<h2>Post-v1 roadmap</h2>
+<h2>Post-v1 roadmap — shipped through v1.07.0</h2>
 
-<p>Grouped by release track. All items are additive — v1 code
-continues to work on every future track.</p>
+<p>Every item from the original v1 post-release roadmap is now
+shipped. Listed here as a delivery history; per-release detail
+in <code>fork/RELEASE-NOTES-v1.04.0.md</code>,
+<code>…-v1.06.0.md</code>, <code>…-v1.07.0.md</code>.</p>
 
-<h3>1.01 — polish (days-to-weeks, non-breaking)</h3>
+<h3>1.01 — polish (shipped 2026-04-24)</h3>
 
 <ul>
-  <li><strong>Const generics on class headers</strong> — <code>class
-      Array&lt;T, const N: usize&gt; { ... }</code>. Parser
-      accepts them today; the path isn't exercised. Probe +
-      whatever fixes surface.</li>
-  <li><strong>Multi-field class-backed Swift bindings with
-      non-POD extra fields</strong> — e.g. a class handle that
-      carries another class handle as a sibling field. Current
-      <code>swift_value!</code> handles POD extras via
-      memcpy+overwrite-ptr-0; non-POD needs per-field
-      <code>Clone</code> logic.</li>
-  <li><strong><code>rustc_cxx_*</code> attribute-plumbing
-      unification</strong> — each attr follows an identical
-      7-file shape; a macro could generate it. Pure cleanup.</li>
-  <li><strong>In-tree test crate</strong> — promote the
-      <code>/tmp/p09-*</code> probes into regression tests that
-      live in the fork.</li>
-  <li><strong>Three-surface doc</strong> — shipped.
-      See <a href="THREE-SURFACES.md"><code>THREE-SURFACES.md</code></a>
-      for the reference on when to use <code>cxx_class!</code> vs
-      <code>cxx_class_native!</code> vs the parser
-      <code>class</code> keyword.</li>
-  <li><strong>Parser-level distinct <code>ItemKind::Class</code>
-      AST variant</strong> — compiler-internal enabler for
-      1.02's rust-analyzer work. Gives rustc's own AST a
-      first-class node for <code>class</code> instead of
-      parse-time desugaring. Invisible to users on its own;
-      ships with 1.01 so the 1.02 RA fork can mirror rustc's
-      AST rather than duplicating the desugaring.</li>
+  <li>✅ <strong>Const generics on class headers</strong> —
+      P09.41. Two-DefId class split threads class generics
+      through struct + impl halves.</li>
+  <li>✅ <strong>Multi-field class-backed Swift bindings with
+      non-POD extra fields</strong> — P09.42. Per-field
+      <code>Clone</code> for non-POD extras.</li>
+  <li>✅ <strong><code>rustc_cxx_*</code> attribute-plumbing
+      unification</strong> — P09.43.
+      <code>rustcc_noargs_attr!</code> collapses 5 attr impls.</li>
+  <li>✅ <strong>In-tree test crate</strong> —
+      <code>fork/tests/class_keyword/</code> + <code>run.sh</code>;
+      7/7 probes pass on stage-1 since v1.02.0.</li>
+  <li>✅ <strong>Three-surface doc</strong> —
+      <a href="THREE-SURFACES.md"><code>THREE-SURFACES.md</code></a>.</li>
+  <li>✅ <strong>Parser-level distinct <code>ItemKind::Class</code>
+      AST variant</strong> — P09.39.</li>
 </ul>
 
-<h3>1.02 — structural user-visible (weeks)</h3>
+<h3>1.02 — IDE support + Swift built-in (shipped 2026-04-25 + v1.07.0)</h3>
 
 <ul>
-  <li><strong>True compiler auto-synthesis for
-      <code>#[repr(swift)]</code></strong> — today's path uses the
-      <code>swift_value!</code> proc macro; HIR-level
-      trait-impl synthesis would let users drop the wrapper.</li>
-  <li><strong>rust-analyzer fork for the <code>class</code>
-      keyword</strong> — teach RA's parser about <code>class
-      Foo { ... }</code> so editor autocomplete, hover,
-      go-to-def, and rename all work on
-      <code>class</code>-declared types. Without this, stock
-      RA chokes on the <code>class</code> token and the rest
-      of the file becomes a parse error. <strong>This is the
-      item that actually delivers editor support to users.</strong>
-      Builds on top of 1.01's <code>ItemKind::Class</code>.</li>
+  <li>✅ <strong>True compiler auto-synthesis for
+      <code>#[repr(swift)]</code></strong> — P09.46 (v1.02.0).
+      <code>#[swift_value]</code> built-in attribute macro
+      retires the proc-macro wrapper.</li>
+  <li>✅ <strong>rust-analyzer fork for the <code>class</code>
+      keyword</strong> — Phase 1 (parser) in P09.45 (v1.02.0);
+      <strong>Phase 2 (HIR / IDE parity) in v1.07.0</strong> —
+      12 patches at <code>fork/ra-patches/01..12</code> against
+      PINNED_COMMIT <code>45b868b19</code>. Class items now have
+      hover, go-to-def, find-references, completion, inherent-method
+      dispatch (with C++-style derived-shadows-base), and class-aware
+      assists (<code>generate_class_new</code>,
+      <code>change_visibility</code>, find-all-overriders,
+      implement-override).</li>
+  <li>✅ <strong>Swift <code>throws</code></strong> — P09.48
+      (v1.02.0). <code>#[rustc_swift_throws]</code> + LLVM
+      <code>swifterror</code> attribute.</li>
 </ul>
 
-<h3>1.1 — multi-inheritance capstone (weeks-to-months)</h3>
+<h3>v2 stretch — out of FLTK's path but generally useful (shipped v1.06.0)</h3>
 
 <ul>
-  <li><strong>Multi-inheritance + virtual bases</strong> —
-      secondary vtable sub-tables, this-adjusting thunks,
-      virtual-base offset slots. Completes the polymorphic
-      story started in v1's single-inheritance path.</li>
+  <li>✅ <strong>M22 multi-inheritance + virtual bases</strong>
+      — Multi-inheritance via <code>cxx_importer</code>:
+      secondary vtables, this-adjusting thunks, cross-base
+      <code>as_&lt;base&gt;</code> accessors. Three closeout PRs
+      (#16/#17/#18) — see v1.06.0 release notes.</li>
+  <li>✅ <strong>M23 pure virtuals</strong> — <code>__cxa_pure_virtual</code>
+      fall-through. Walker rewrite uses <code>MethodId</code> directly.</li>
+  <li>✅ <strong>M24 template-spec method extraction</strong> —
+      substitution-by-display-name through the underlying
+      <code>ClassTemplate</code>'s child walk.</li>
+  <li>✅ <strong>M25 sidecar template instantiations</strong>.</li>
+  <li>✅ <strong>M26 <code>cxx_importer::build::Build</code></strong> —
+      <code>cc::Build</code>-style orchestrator from a downstream
+      <code>build.rs</code>.</li>
 </ul>
 
-<h3>Out of scope</h3>
+<h3>Developer experience layer (shipped v1.07.0)</h3>
 
 <ul>
-  <li><strong>Windows MSVC ABI</strong> — the fork is
-      Itanium-focused. A separate targeting effort, not
-      blocking any release above.</li>
+  <li><strong><code>crates/rustcc-cli</code></strong> —
+      <code>rustcc install</code> / <code>doctor</code> /
+      <code>init</code>. ~700 KB binary, dep tree =
+      <code>clap</code> + std. Shells out to <code>curl</code>
+      / <code>tar</code> / <code>rustup</code> /
+      <code>shasum</code>.</li>
+  <li><strong><code>tools/vscode-rustcc</code></strong> —
+      sideloadable VS Code extension. Grammar overlay,
+      6 snippets, 5 commands (incl. Install RA Fork), status
+      bar showing active toolchain pin, problems-pane integration
+      that watches <code>bindings.skips.json</code>.</li>
+  <li><strong><code>cxx_importer</code> JSON skip-emit
+      sidecar</strong> — <code>bindings.skips.json</code> next to
+      <code>bindings.rs</code> for editor tooling.</li>
+  <li><strong>Opt-in method flattening</strong> —
+      <code>RustBindingsConfig::flatten_inherited_methods</code>;
+      <code>c.a_only()</code> works directly instead of
+      <code>c.as_base().a_only()</code>.</li>
+</ul>
+
+<h3>Open follow-ups</h3>
+
+<ul>
+  <li><strong>Windows MSVC ABI</strong> — Itanium-focused fork
+      through v1.07; MSVC tracked as a separate targeting
+      effort, scoping for v1.09.0.</li>
+  <li><strong>RA prebuilt binaries</strong> — first runs of
+      <code>ra-release.yml</code> surfaced that RA's pinned
+      tree needs a very specific rustc (via
+      <code>rustup-toolchain-install-master</code> +
+      <code>RUSTC_BOOTSTRAP=1</code>). Deferred to v1.07.1.
+      Until then, build locally:
+      <code>./fork/ra-patches/build.sh</code> (~5 min).</li>
+  <li><strong>Runtime-dispatch CI validation</strong> — M22 has
+      strong static evidence but no executed test asserting a
+      <code>&amp;B</code>-pointing-into-a-C call routes through
+      the secondary thunk. Needs a CI runner with the fork
+      pre-installed.</li>
+  <li><strong>STL container auto-discovery for M24</strong> —
+      implicit instantiation auto-discovery.</li>
+  <li><strong>Method flattening multi-level</strong> — v1.07.0's
+      flag is one-level-deep; multi-level walk is a follow-up.</li>
+  <li><strong>Ctor-overload disambiguation</strong> — surfaces
+      in <code>bindings.skips.json</code> for the FLTK demo.</li>
 </ul>
 
 <h2>Install the forked compiler</h2>
@@ -178,7 +232,7 @@ Release</a>, extract, link with rustup:</p>
                               #   x86_64-apple-darwin /
                               #   x86_64-unknown-linux-gnu /
                               #   aarch64-unknown-linux-gnu
-VERSION=v1.02.0               # or grab from the Releases page
+VERSION=v1.07.0               # or grab from the Releases page
 
 BASE="https://github.com/rustcc/rustcc/releases/download/$VERSION"
 curl -fsSL -o rustcc.tar.xz "$BASE/rustcc-$TARGET.tar.xz"
@@ -1086,13 +1140,13 @@ parts (C3, C6, H2, P4) run Rust today.</div>
   <tr><td>Single inheritance</td><td>Supported</td><td>—</td></tr>
   <tr><td><code>dynamic_cast</code> across inheritance</td><td>Supported</td><td>—</td></tr>
   <tr><td>Virtual method override</td><td>Supported</td><td>Derived class methods with the same name as a base virtual replace the base's vtable slot (P09.34)</td></tr>
-  <tr><td>Multi-inheritance / virtual bases</td><td>1.1</td><td>Use composition-over-inheritance at the C++ API boundary</td></tr>
-  <tr><td>Virtual-override signature-compat lint</td><td>1.01</td><td>Name-match today; mismatched sigs are user error. A lint is future polish.</td></tr>
-  <tr><td>Windows MSVC ABI</td><td>Out of scope</td><td>Itanium-only; use a different build for Windows</td></tr>
+  <tr><td>Multi-inheritance / virtual bases</td><td>Supported (via <code>cxx_importer</code>, v1.06.0)</td><td>Imported classes with multi-inheritance work end-to-end: secondary vtables, this-adjusting thunks, cross-base <code>as_&lt;base&gt;</code> accessors. Hand-written fork-side multi-inheritance (in <code>class</code>-keyword source) still single-inheritance only.</td></tr>
+  <tr><td>Virtual-override signature-compat lint</td><td>Future polish</td><td>Name-match today; mismatched sigs are user error. A lint is future polish.</td></tr>
+  <tr><td>Windows MSVC ABI</td><td>Scoping (v1.09.0)</td><td>Itanium-only through v1.07; MSVC tracked as a separate targeting effort.</td></tr>
   <tr><td><code>isize</code> / <code>usize</code> in C++ sigs</td><td>Rejected (target-dependent mangling)</td><td>Use explicit <code>i64</code>/<code>u64</code></tr>
   <tr><td>Tuples, slices, <code>&amp;str</code>, fn pointers in C++ sigs</td><td>Rejected</td><td>Pass as struct / ptr+len / raw fn ptr</td></tr>
   <tr><td>Non-trivial move ctors (move-only C++ types)</td><td>Partial — covered by <code>!Copy</code> heuristic</td><td>Verify with a probe if precise move semantics matter</td></tr>
-  <tr><td>Const generics on <code>class</code> header</td><td>1.01</td><td>Use type / lifetime params for v1; const generics parse but aren't tested</td></tr>
+  <tr><td>Const generics on <code>class</code> header</td><td>Supported (v1.01, P09.41)</td><td>Two-DefId class split threads class generics through both the struct and impl halves.</td></tr>
 </table>
 
 <div class="caveat"><b>Error early, not at link time.</b> If you write a C++ signature

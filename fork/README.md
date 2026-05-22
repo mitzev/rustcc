@@ -61,6 +61,22 @@ What the fork does that forwarders can't:
 
 ## Status
 
-**Investigation.** Patches are described but not yet applied / built.
-Running the fork requires a stage-1 rustc build (~30–90 min on a
-fast machine) which is out of scope for the current session.
+**Shipped.** v1.0 went out 2026-04-21 with the original 11-patch
+P09.22–P09.32 series applied end-to-end against the pinned
+nightly. Eight tagged point releases since (v1.02 → v1.07) bring
+the rustc-fork series to 15 patches (P09.50 / `15-cpp-abi-force-sret-record-ret.patch`
+is the most recent — v1.03.0). Stage-1 tarballs for the four
+prebuilt triples (aarch64-darwin, x86_64-darwin, aarch64-linux,
+x86_64-linux) are published on the
+[GitHub Releases page](https://github.com/mitzev/rustcc/releases);
+see [`INSTALL.md`](INSTALL.md) for the fast-path install.
+
+The fork rustc binaries haven't changed since v1.04.0 — every
+post-v1.04 milestone lives in workspace crates (`crates/cxx_importer`,
+`crates/rustc_abi_cxx`, `crates/cxx`, `crates/rustcc-cli`),
+`tools/vscode-rustcc/`, or as patches against rust-analyzer
+under [`ra-patches/`](ra-patches/) (12-patch Phase 2 series for
+`class` IDE parity, applied at PINNED_COMMIT `45b868b19`).
+
+For a fresh source build (~30–90 min on a fast machine), use
+[`build.sh`](build.sh).

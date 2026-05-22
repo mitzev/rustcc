@@ -1,8 +1,8 @@
 # `cxx_importer` — C++ headers → rustcc HIR
 
-**Status:** draft v0.1
+**Status:** shipped — M1–M26 closed in v1.04.0 + v1.06.0 (every milestone in §14 below is `✅`).
 **Depends on:** `rustc_abi_cxx` for all layout/mangling queries.
-**Consumers:** rustcc frontend — name resolution, HIR lowering, typeck.
+**Consumers:** rustcc frontend — name resolution, HIR lowering, typeck; `cxx_importer::Build` orchestrator (M26) for downstream `build.rs`.
 
 ---
 
@@ -259,22 +259,27 @@ into dozens of "unknown identifier" errors downstream.
 
 ## 14. Milestones
 
+**Status as of v1.07.0: every milestone in the table below is shipped.**
 The roadmap is organized into three phases. **Phase A (M1–M10)** is the
-foundation — the design's original milestone set, mostly shipped.
-**Phase B (M11–M14)** is the smallest viable surface for "FLTK Hello
-World runs": four items the foundation can't handle today that block
-even a one-window FLTK program. **Phase C (M15–M21)** is the surface
-for "useful subset of FLTK": callbacks, custom widgets, basic styling.
+foundation; closed in v1.04.0. **Phase B (M11–M14)** is the smallest
+viable surface for "FLTK Hello World runs"; closed in v1.04.0 + v1.06.0
+(M11.b/c landed in v1.06.0). **Phase C (M15–M21)** is the surface for
+"useful subset of FLTK": callbacks, custom widgets, basic styling; closed
+in v1.04.0 + v1.06.0 (M15.b / M16.b / M17.b / M18.b / M20.b/c/d / M21.b/c
+sub-milestones landed in v1.06.0). The **out-of-FLTK v2 stretch list
+(M22–M26)** also shipped in v1.06.0. The design notes in §15 and §16
+below describe the original scoping; the table rows record what actually
+shipped.
 
 ### Phase A — Foundation
 
 | M# | Deliverable                                                                                                               | Status |
 |----|---------------------------------------------------------------------------------------------------------------------------|--------|
 | 1  | Clang driver: parse header graph, produce `CXTranslationUnit`                                                             | ✅ shipped |
-| 2  | Lower primitive types, free functions, namespaces                                                                         | 🟨 partial (primitive types + namespaces ✓; free functions deferred to M11) |
+| 2  | Lower primitive types, free functions, namespaces                                                                         | ✅ shipped (primitive types + namespaces in M2 proper; free functions in M11.b — v1.06.0 — via `FreeFnSet` + `unsafe extern "C++"` block + `pub fn` wrappers) |
 | 3  | Lower POD classes with fields and non-virtual methods                                                                     | ✅ shipped |
 | 4  | Overload renaming + operator mapping                                                                                      | ✅ shipped |
-| 5  | Inheritance (non-virtual, single), `CxxBase` emission                                                                     | 🟨 partial (BaseSpec lowering ✓; upcast emission deferred to M19) |
+| 5  | Inheritance (non-virtual, single), `CxxBase` emission                                                                     | ✅ shipped (BaseSpec lowering in M5; `CxxBase<T>` upcast emission in M19 — v1.04.0) |
 | 6  | Virtual methods → vtable-index-aware emission                                                                             | ✅ shipped (single-inheritance; pure virtuals + secondary vtables open) |
 | 7  | Annotation processing (inline attrs + sidecar YAML)                                                                       | ✅ shipped (libclang `[[clang::annotate("rustcc::…")]]` walker + emitter wiring; sidecar YAML parser already shipped) |
 | 8  | Explicit template instantiation import                                                                                    | ✅ shipped (`HeaderGraph::template_instantiations` synthesizes a root that force-instantiates each entry) |
@@ -305,7 +310,7 @@ of Phase B.
 | 16  | `enum class` + plain `enum` body lowering                                   | `enum class Fl_Boxtype { … }`, `enum Fl_When { … }`         | ✅ shipped (M16: TU/namespace-scope `EnumSet`; emitter picks `#[repr(int)] pub enum` for scoped+unique vs. `#[repr(transparent)] pub struct + assoc consts` for unscoped/aliasing. **M16.b also shipped**: class-scope enums flatten to `<Outer>_<Inner>` at module root with the same per-enum shape selection. Anonymous enums still skipped.) |
 | 17  | Type aliases (`using` / `typedef`) emission                                 | `typedef unsigned int Fl_Color;`, `using Fl_Callback = …;`  | ✅ shipped (M17: `AliasSet`, `import_header_with_extras`, namespace-tree integration; emits `pub type X = Y;` inside owning `pub mod`. **M17.b also shipped**: class-scope aliases flatten to `pub type <Outer>_<Inner> = …;` at module root since Rust forbids `pub type` inside `impl` blocks.) |
 | 18  | Default-argument fan-out (max-arity wrapper + documented defaults)          | `void redraw(int delay = 0)`                                | ✅ shipped — count-only doc hint (M18) + per-arity convenience wrappers (M18.b: `_with_defaults` for the all-defaults variant + `_default_<n>` for each partial-drop level). Synthesizes Rust default literals for primitives (int → `0_<repr>`, float → `0.0`, bool → `false`, raw ptr → `null()`/`null_mut()`, unscoped enum → underlying-zero); skips emission entirely when any trailing default-arg type can't be safely synthesized (record-by-value, references, function pointers). |
-| 19  | M5 finish — `CxxBase<T>` upcast emission OR derived-class method flattening | `Fl_Button btn; btn.show();` (inherits `Fl_Widget::show`)   | ✅ shipped (one `impl ::cxx::CxxBase<Base> for Derived` per non-virtual base, offset baked in from `RecordLayout::base_offsets`; offset-0 cases elide `.add(0)`. Virtual bases deferred to M22 — their offsets are dynamic via the vtable.) |
+| 19  | M5 finish — `CxxBase<T>` upcast emission OR derived-class method flattening | `Fl_Button btn; btn.show();` (inherits `Fl_Widget::show`)   | ✅ shipped — M19 emits one `impl ::cxx::CxxBase<Base> for Derived` per non-virtual base, offset baked in from `RecordLayout::base_offsets`; offset-0 cases elide `.add(0)`. **Virtual bases now handled by M22 (✅ shipped in v1.06.0).** Optional method flattening shipped in v1.07.0 as `RustBindingsConfig::flatten_inherited_methods` (one-level walk, default off). |
 | 20  | `const char*` ↔ `&CStr` / `&str` ergonomics layer                            | Labels, tooltips, file paths                                | ✅ shipped — M20 (`cstr_ergonomics` knob) + M20.b (`_cstr`) + M20.c (`_str` + `_opt_cstr`) + **M20.d** (combined `_str_with_defaults` + `_opt_cstr_with_defaults` for methods with both default args AND cstr params; suppresses when every cstr is in the default-args tail since M18.b's `_with_defaults` already covers that). Return-side `&CStr` is tracked as M20.e if/when callers ask. |
 | 21  | Bitfield-aware layout in `rustc_abi_cxx`                                    | Some FLTK structs use `unsigned when_:8;`-style fields. Verify `rustc_abi_cxx::layout` handles them; add support if missing. | ✅ shipped — M21 (probe-then-poison) → **M21.b** (real Itanium bit-packing) → **M21.c** (per-field getter/setter accessors). The whole bitfield path is closed: `bitfield_widths` sidecar + `field_bit_offsets`/`field_bit_widths` parallel arrays in `RecordLayout` + auto-emitted `pub fn <name>(&self) -> T` / `pub fn set_<name>(&mut self, v: T)` accessors that do the bit-shift + mask via `read_unaligned` / `write_unaligned` (sign-extension on read for signed bitfields, mask-clear-or pattern for setters). Width-zero bitfields skip accessor emission; non-integer container types fall back to the existing skip path. |
 
@@ -316,9 +321,9 @@ critical path but are on the larger v2 roadmap.
 
 | M#  | Deliverable                                                                  | Why                                                        |
 |-----|------------------------------------------------------------------------------|------------------------------------------------------------|
-| 22  | Multi-inheritance + virtual-base `this`-pointer adjustments + secondary vtables | Required for Qt, LLVM, Chromium. FLTK uses single inheritance only. |
+| 22  | Multi-inheritance + virtual-base `this`-pointer adjustments + secondary vtables | ✅ shipped in v1.06.0 — PRs #16/#17/#18 closed the M22 surface as three smaller pieces: (a) cache-pollution fix in the recursive class-import path (Fl_Image was permanently half-imported because `IncompleteArray` lowering bubbled `?` after the placeholder ClassDef registered), (b) a third workspace-wide pass that recomputes `is_polymorphic` + re-runs `populate_vtable_indices` to a fixed point (fixes recursive-import-cycle stale dtor slots on Fl_Group / Fl_Window / Fl_RGB_Image), (c) inherent `as_<base>(&self) -> &Base` and `as_<base>_mut` accessors per non-virtual base for ergonomic upcasts. Runtime-dispatch CI validation remains an open follow-up. |
 | 23  | Pure virtual handling (`__cxa_pure_virtual` shim or skip-with-marker)        | ✅ shipped — pure virtuals now get a populated `vtable_index` (the rust_abi_cxx vtable builder writes `__cxa_pure_virtual` as the slot's `mangled_target` when the method is pure-virtual; the bindings emitter dispatches through the regular vtable-lookup path). Calling on the actually-abstract base hits `__cxa_pure_virtual` and terminates (matching C++ semantics); calling on a derived override fires the override. The walker rewrite uses `MethodId` directly instead of mangled-symbol matching, which made M23 a 1-day add. |
-| 24  | Method extraction on template specializations                                | Long-standing libclang gap; required for STL-using libraries. |
+| 24  | Method extraction on template specializations                                | ✅ shipped in v1.06.0 — libclang's child walk on `ClassTemplateSpecialization` returns no methods (they live on the underlying generic `ClassTemplate` cursor, with parameters as `TypeKind::Unexposed` display-name `"T"` / `"const T"` / etc.). `import_class` for spec entities chains back via `entity.get_template()`, builds a name → TypeId substitution map by pairing the template's `TemplateTypeParameter` children with the spec's `get_template_argument_types()`, and stashes on `importer.current_template_subst` for the template's child walk. `import_type` then substitutes on `Unexposed` by display name; `ident_of_class_with_ctx` + `type_arg_ident` render `TemplateSpec` segments to unique Rust idents (`Box<int>` → `Box_i32`). STL container auto-discovery via implicit instantiation tracked as a follow-up. |
 | 25  | Sidecar YAML → `HeaderGraph::template_instantiations` plumbing               | ✅ shipped (`SidecarSchema::collect_template_instantiations()` aggregates across type entries with dedup; `HeaderGraph::extend_from_sidecar(&schema)` plumbs them into the graph idempotently). |
 | 26  | Build-system integration (drive cmake / collect link inputs from `Cargo.toml`) | ✅ shipped — `cxx_importer::build::Build` is a `cc::Build`-style orchestrator: parse → emit Rust + C++ shims → invoke `cc` → produce `lib<name>.a` archive + Cargo `link-search`/`link-lib`/`link-arg` directives. Closes the click-run-see-a-window gap modulo the fork-rustc requirement for `extern "C++"`. Real-world test: `examples/fltk_hello/build_demo` produces a 666-symbol archive against FLTK 1.4.5 (453 extern "C" trampolines, ~92% of the public surface). |
 
