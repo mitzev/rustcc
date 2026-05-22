@@ -151,16 +151,28 @@ fn build_subtable_entries(
     let col = ctx.mangle_msvc(&Symbol::TypeInfo(most_derived));
     entries.push(VTableEntry::Rtti(col));
 
-    // Function-pointer slots. Walk inheritance chain of `subobj`
-    // (innermost first) and place each virtual method into a slot;
-    // overrides in derived classes overwrite the same slot.
-    let slots = compute_slots(ctx, subobj);
+    // Function-pointer slots. The subtable for `most_derived` is
+    // built from the chain rooted at `subobj` (the subobject this
+    // subtable serves dispatch for). For the primary subtable
+    // these are the same class; for inheritance-induced
+    // subtables `subobj` is a polymorphic base of `most_derived`.
+    let slots = compute_slots(ctx, most_derived);
+    let _ = subobj; // subobj equals most_derived for the primary subtable
     for slot in &slots {
         // Find the most-derived overrider of `slot.method`. We walk
-        // from `most_derived` down toward `subobj`; the first class
-        // that re-declares the method with a matching signature wins.
-        let target_class = find_overrider(ctx, most_derived, subobj, &slot.method);
-        let method = &ctx.class(target_class).methods[slot.method.as_index()];
+        // from `most_derived` down toward the class that originally
+        // declared the slot; the first class that re-declares the
+        // method with a matching signature wins.
+        let target_class = find_overrider(ctx, most_derived, slot.declared_in, &slot.method);
+        // Resolve the actual MethodDef on `target_class` rather than
+        // assuming the slot index matches there.
+        let original = ctx.class(slot.declared_in).methods[slot.method.as_index()].clone();
+        let method = ctx
+            .class(target_class)
+            .methods
+            .iter()
+            .find(|m| methods_override(&original, m))
+            .unwrap_or(&ctx.class(slot.declared_in).methods[slot.method.as_index()]);
         let mangled = if matches!(method.special, Some(SpecialMember::Dtor)) {
             // MSVC's vtable dtor slot points at the scalar deleting
             // dtor `??_G`, not the base dtor. We model that as a
@@ -235,7 +247,16 @@ fn is_virtual(m: &MethodDef) -> bool {
 }
 
 fn methods_override(base: &MethodDef, derived: &MethodDef) -> bool {
-    // Signature match: same name, same params, same cv, same ret.
+    // Destructors override across the type hierarchy regardless of
+    // their per-class source name — `~A` and `~B` are the same
+    // virtual slot from the dispatch table's perspective. Special-
+    // case this before name comparison.
+    if matches!(base.special, Some(SpecialMember::Dtor))
+        && matches!(derived.special, Some(SpecialMember::Dtor))
+    {
+        return true;
+    }
+    // For non-dtor methods: signature match.
     base.name == derived.name
         && base.sig.params == derived.sig.params
         && base.sig.cv == derived.sig.cv
