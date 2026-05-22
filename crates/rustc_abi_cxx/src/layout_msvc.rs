@@ -192,6 +192,15 @@ fn compute_layout(ctx: &CxxTypeCtx, class_id: ClassId) -> Result<RecordLayout, L
             st.size = st.cursor;
         }
         st.bump_align(base_align);
+        // Inherit the vptr flag from any base that has one. The
+        // primary polymorphic base case is already covered (vptr
+        // skipped above for the derived class itself), but the
+        // logical `has_vptr` for the derived class is still true
+        // because the vptr is accessible through the inherited
+        // base subobject.
+        if base_layout.has_vptr {
+            st.has_vptr = true;
+        }
     }
 
     // 3. vbptr — inserted after non-virtual bases / fields-so-far,
@@ -256,13 +265,30 @@ fn compute_layout(ctx: &CxxTypeCtx, class_id: ClassId) -> Result<RecordLayout, L
         }
     }
 
-    // 5. Non-virtual size snapshot — recorded for inheritance use.
-    let nv_size = st.size;
-    let nv_align = st.align;
+    // 5. Source-level `alignas` (applied before the nv-size snapshot
+    //    so it folds into the non-virtual tail padding too).
+    if let Some(src_align) = class.source_alignment {
+        if src_align > st.align {
+            st.align = src_align;
+        }
+    }
 
-    // 6. Virtual base subobjects. These are appended to the end of
+    // 6. Non-virtual size + alignment snapshot. MSVC reports nv_size
+    //    as the *tail-padded* size — i.e. what `sizeof` would yield
+    //    for the class if it had no virtual bases. Round up here.
+    let nv_align = st.align.max(1);
+    let nv_size = round_up(st.size, nv_align);
+
+    // 7. Virtual base subobjects. These are appended to the end of
     //    the most-derived class only; intermediate classes lay them
     //    out for their own state but the final commit happens here.
+    //    We start virtual bases from the nv-tail-padded offset, not
+    //    the raw `st.size`, so the vbase subobjects sit at well-
+    //    aligned offsets relative to the nv-size boundary.
+    st.cursor = nv_size;
+    if st.cursor > st.size {
+        st.size = st.cursor;
+    }
     for base in &class.bases {
         if !base.virtual_ {
             continue;
@@ -278,22 +304,8 @@ fn compute_layout(ctx: &CxxTypeCtx, class_id: ClassId) -> Result<RecordLayout, L
         }
     }
 
-    // 7. Source-level `alignas`.
-    if let Some(src_align) = class.source_alignment {
-        if src_align > st.align {
-            st.align = src_align;
-        }
-    }
-
-    // 8. Tail-padding round-up. MSVC pads the final size up to
-    //    `align`. (Same as Itanium for the topmost class — the
-    //    difference is in *base* sub-objects, handled above.)
-    let final_size = if st.align == 0 {
-        st.size
-    } else {
-        let rem = st.size % st.align;
-        if rem == 0 { st.size } else { st.size + (st.align - rem) }
-    };
+    // 8. Final tail-padding round-up.
+    let final_size = round_up(st.size, st.align.max(1));
 
     // Empty classes still get 1 byte (matching the Itanium rule).
     let empty = class.fields.is_empty()
@@ -324,6 +336,14 @@ fn compute_layout(ctx: &CxxTypeCtx, class_id: ClassId) -> Result<RecordLayout, L
         virtual_base_offsets: st.virtual_base_offsets,
         empty_subobjects: st.empty_subobjects,
     })
+}
+
+fn round_up(value: u64, align: u64) -> u64 {
+    if align <= 1 {
+        return value;
+    }
+    let rem = value % align;
+    if rem == 0 { value } else { value + (align - rem) }
 }
 
 fn type_size_align(ctx: &CxxTypeCtx, ty: TypeId) -> Result<(u64, u64), LayoutError> {
