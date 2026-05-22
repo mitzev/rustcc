@@ -109,21 +109,33 @@ across v1.02–v1.07:
   inherent-method dispatch with C++-style derived-shadows-base,
   plus class-aware assists (`generate_class_new`,
   `change_visibility`, `find all overriders`, `implement override`).
+- **Windows MSVC C++ ABI** — shipped across v1.09.0 (workspace-side
+  mangler / record layout / vtable, 65 cross-validated golden cases
+  against Apple-clang's `-target x86_64-pc-windows-msvc` output) and
+  v1.09.1 (fork rustc patches: target routing, vftable+COL
+  emission, scalar deleting dtor, sret-via-RCX on x64 + X8 on
+  ARM64, dllexport). v1.09.2 adds the runtime smoke matrix
+  (5/5 PE32+ tests pass under Wine on macOS) + ARM64 HFA
+  detection + Windows CI runners.
 
 Remaining stretch items (not in any near-term release):
 
-- **Windows MSVC ABI** — out of scope for the Itanium-focused
-  fork; would be a separate targeting effort. Tracked as v1.09.0
-  scoping.
-- **Runtime-dispatch CI validation** — the M22 work has strong
-  static evidence (vtable structure, mangled symbols, FLTK link
-  success) but no executed test asserting `&B`-pointing-into-a-C
-  routes through the secondary thunk. Needs a CI runner with the
-  rustcc fork toolchain pre-installed.
+- **Runtime-dispatch CI validation for Itanium MI** — M22 work
+  has strong static evidence (vtable structure, mangled symbols,
+  FLTK link success) and v1.09.2's Wine smoke validates
+  single-inheritance virtual dispatch end-to-end. A test
+  specifically asserting `&B`-pointing-into-a-C routes through
+  the secondary thunk on Itanium multi-inheritance is still
+  pending — needs an Itanium-flavored multi-inheritance probe.
 - **STL container support for M24** — implicit instantiation
-  auto-discovery.
-- **Method flattening multi-level walk** — v1.07.0's `flatten_inherited_methods`
-  flag walks one level deep; multi-level is a follow-up.
+  auto-discovery. Tracked at `docs/cxx_importer.md` row 24.
+- **Method flattening multi-level walk** — v1.07.0's
+  `flatten_inherited_methods` flag walks one level deep;
+  multi-level recursion is a follow-up. The current single-level
+  walk is at `crates/cxx_importer/src/rust_bindings.rs:2828`.
+- **`extern "C++"` throw-lowering** — design committed in
+  `fork/CXX-THROW-PLAN.md` (v1.09.2); implementation is a
+  focused v1.09.3 sprint (~1700 LoC, 3-4 weeks).
 
 ## Quick start
 

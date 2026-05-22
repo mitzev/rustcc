@@ -22,7 +22,7 @@ mod vtable_msvc;
 
 pub use ctx::CxxTypeCtx;
 pub use diag::LayoutError;
-pub use layout::RecordLayout;
+pub use layout::{HfaElem, HfaKind, RecordLayout};
 pub use mangle::{CtorVariant, DtorVariant, Symbol};
 pub use target::{AbiFlavor, LongDoubleKind, Target};
 pub use ty::{

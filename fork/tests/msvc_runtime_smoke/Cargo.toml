@@ -1,0 +1,37 @@
+[package]
+name = "msvc_test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "msvc_test"
+path = "src/main.rs"
+
+# v1.09.2-c: polymorphic-class probe. Exercises the fork rustc's
+# MSVC vtable emission (P09.56) + scalar deleting dtor (P09.57)
+# at runtime under Wine.
+[[bin]]
+name = "msvc_polymorphic"
+path = "src/polymorphic.rs"
+
+[[bin]]
+name = "msvc_nonvirtual"
+path = "src/non_virtual.rs"
+
+# v1.09.2-c: virtual destructor runs at scope exit.
+[[bin]]
+name = "msvc_virtual_dtor"
+path = "src/virtual_dtor.rs"
+
+# v1.09.2-c: virtual-method override picks most-derived slot.
+[[bin]]
+name = "msvc_override"
+path = "src/override.rs"
+
+[workspace]
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
