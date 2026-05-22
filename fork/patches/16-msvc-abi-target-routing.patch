@@ -1,0 +1,3132 @@
+From c27974d60557826d357f128127bf587af5e64e0b Mon Sep 17 00:00:00 2001
+From: Ognian Mitzev <OgiMitzev@gmail.com>
+Date: Sat, 23 May 2026 00:43:17 +0300
+Subject: [PATCH] P09.55: MSVC ABI flavor in rustc_abi_cxx + target routing
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Vendors the v1.09.0 MSVC support from rustcc's workspace
+crates/rustc_abi_cxx/ into the in-tree compiler/rustc_abi_cxx/.
+This is the foundational patch for the v1.09.1 MSVC C++ ABI
+series; subsequent patches consume the AbiFlavor dispatch added
+here.
+
+Changes:
+- New `AbiFlavor::{Itanium, Msvc}` field on `Target`. Existing
+  constructors default to `Itanium` so non-Windows targets see no
+  behavior change.
+- 3 new Target constructors: `x86_64_pc_windows_msvc`,
+  `aarch64_pc_windows_msvc`, `x86_64_pc_windows_gnu` (mingw,
+  Itanium-flavored).
+- `from_rustc_triple` extended to route Windows triples through
+  the new constructors. Unknown triples still fall through to the
+  generic Itanium profile.
+- New `mangle_msvc`, `layout_msvc`, `vtable_msvc` modules
+  implementing the MSVC C++ ABI per the workspace's 65 cross-
+  validated golden cases. See the workspace README at
+  https://github.com/mitzev/rustcc for the corpus details.
+- `mangle()` / `layout()` / `vtable()` on `CxxTypeCtx` become
+  dispatchers that route on `target().abi_flavor`. The existing
+  Itanium implementations are now `_itanium`-suffixed and still
+  exposed for cross-ABI consumers + tests.
+
+All 309 workspace tests pass against the same source under both
+paths. The in-tree `rustc_abi_cxx` crate has no consumers in this
+patch — the symbol-mangling and layout-bridge call sites that
+build a `CxxTypeCtx` already route through the dispatcher
+automatically (they call the unchanged `mangle()` / `layout()`
+methods that now dispatch internally).
+---
+ compiler/rustc_abi_cxx/src/ctx.rs         |  172 ++++
+ compiler/rustc_abi_cxx/src/layout.rs      |  198 +++-
+ compiler/rustc_abi_cxx/src/layout_msvc.rs |  512 ++++++++++
+ compiler/rustc_abi_cxx/src/lib.rs         |    5 +-
+ compiler/rustc_abi_cxx/src/mangle.rs      |   18 +
+ compiler/rustc_abi_cxx/src/mangle_msvc.rs | 1087 +++++++++++++++++++++
+ compiler/rustc_abi_cxx/src/target.rs      |  137 ++-
+ compiler/rustc_abi_cxx/src/ty.rs          |   39 +
+ compiler/rustc_abi_cxx/src/vtable.rs      |   52 +-
+ compiler/rustc_abi_cxx/src/vtable_msvc.rs |  400 ++++++++
+ 10 files changed, 2596 insertions(+), 24 deletions(-)
+ create mode 100644 compiler/rustc_abi_cxx/src/layout_msvc.rs
+ create mode 100644 compiler/rustc_abi_cxx/src/mangle_msvc.rs
+ create mode 100644 compiler/rustc_abi_cxx/src/vtable_msvc.rs
+
+diff --git a/compiler/rustc_abi_cxx/src/ctx.rs b/compiler/rustc_abi_cxx/src/ctx.rs
+index 6e3d1ab5526..cb454a45a17 100644
+--- a/compiler/rustc_abi_cxx/src/ctx.rs
++++ b/compiler/rustc_abi_cxx/src/ctx.rs
+@@ -2,11 +2,15 @@
+ //!
+ //! See `docs/rustc_abi_cxx.md §4`.
+ 
++use std::collections::{HashMap, HashSet};
++
+ use crate::target::Target;
+ use crate::ty::{
+     ClassDef, ClassId, CxxType, RustEnumDef, RustEnumId, TypeId, TypeOrigin,
+ };
+ 
++#[derive(Clone)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct CxxTypeCtx {
+     target: Target,
+     classes: Vec<ClassDef>,
+@@ -16,6 +20,44 @@ pub struct CxxTypeCtx {
+     /// unchanged; origins flow through the `define_*` API on this
+     /// context.
+     class_origin: Vec<TypeOrigin>,
++    /// Side-table marking poisoned classes — entries minted from a
++    /// failed-but-recoverable lowering. The map's value is a human-
++    /// readable explanation (e.g. "virtual inheritance not
++    /// supported"). Same rationale as `class_origin`: keeping it off
++    /// `ClassDef` avoids touching the 70+ existing struct-literal
++    /// sites in tests and the importer.
++    poison_reason: HashMap<ClassId, String>,
++    /// Side-table marking class methods as static (no receiver).
++    /// `(ClassId, method_idx)` keys point into `class.methods`. Off
++    /// `MethodDef` for the same reason as `poison_reason`: the
++    /// existing struct-literal sites stay untouched while M11
++    /// can still distinguish `static Fl::run()` from instance
++    /// methods.
++    static_methods: HashSet<(ClassId, usize)>,
++    /// M18: per-method count of trailing parameters that have C++
++    /// default values. The bindings emitter renders this as an
++    /// informational doc comment so users know which arguments
++    /// the C++ side considered optional. Stored as a side-table
++    /// for the same back-compat reasoning as `static_methods`.
++    default_arg_counts: HashMap<(ClassId, usize), usize>,
++    /// M21.b: per-field bit width for bitfield members.
++    /// `(ClassId, field_idx)` points into `class.fields`. Non-
++    /// bitfield fields don't appear in this map. Stored as a
++    /// sidecar rather than on `FieldDef` for the same back-
++    /// compat reasoning as the other side-tables — every test
++    /// fixture that hand-builds a `FieldDef` literal stays
++    /// untouched. The `rustc_abi_cxx::layout` engine reads
++    /// these widths to apply Itanium bit-packing rules; the
++    /// importer populates them via
++    /// `Entity::get_bit_field_width()` on `FieldDecl` cursors.
++    bitfield_widths: HashMap<(ClassId, usize), u64>,
++    /// Per-class `#pragma pack(N)` override. When set, the layout
++    /// engine clamps every alignment requirement (field, base, vptr,
++    /// tail padding) to the smaller of (natural alignment, N).
++    /// Itanium's layout engine ignores this (matches gcc/clang
++    /// behavior on Unix targets — `#pragma pack` is a Microsoft
++    /// extension); the MSVC layout engine honors it.
++    pragma_pack: HashMap<ClassId, u64>,
+     /// Rust-origin enums exposed to C++ as scoped enums. No parallel
+     /// for C++-origin enums yet — imported enums flow as anonymous
+     /// `CxxType::Enum` instances with the variants living in the
+@@ -30,11 +72,141 @@ pub fn new(target: Target) -> Self {
+             target,
+             classes: Vec::new(),
+             class_origin: Vec::new(),
++            poison_reason: HashMap::new(),
++            static_methods: HashSet::new(),
++            default_arg_counts: HashMap::new(),
++            bitfield_widths: HashMap::new(),
++            pragma_pack: HashMap::new(),
+             rust_enums: Vec::new(),
+             types: Vec::new(),
+         }
+     }
+ 
++    /// Mark `id` as a poison node and record `reason` for later
++    /// diagnostic rendering. Idempotent — overwriting a previously-
++    /// recorded reason is intentional (the most recent failure
++    /// wins; the importer typically only marks each class once).
++    pub fn poison(&mut self, id: ClassId, reason: impl Into<String>) {
++        self.poison_reason.insert(id, reason.into());
++    }
++
++    /// Return the poison reason recorded on `id`, or `None` if the
++    /// class is healthy. Used by [`Self::is_poisoned`] and by
++    /// downstream emitters that include the reason in generated
++    /// doc comments.
++    pub fn poison_reason(&self, id: ClassId) -> Option<&str> {
++        self.poison_reason.get(&id).map(String::as_str)
++    }
++
++    /// True when the importer registered `id` via [`Self::poison`].
++    /// Poisoned classes have empty `methods` / `fields` and should
++    /// be rendered opaquely by emitters.
++    pub fn is_poisoned(&self, id: ClassId) -> bool {
++        self.poison_reason.contains_key(&id)
++    }
++
++    /// Clear the poison marker on `id`. Used by the importer's M13
++    /// upgrade path: when a class previously poisoned for being
++    /// forward-only is later seen with a full definition (in the
++    /// same TU or another included header), the placeholder gets
++    /// replaced in place via `class_mut`, and this call promotes
++    /// it back to a healthy entry.
++    pub fn unpoison(&mut self, id: ClassId) {
++        self.poison_reason.remove(&id);
++    }
++
++    /// Mark a class method as static. M11 — without this side
++    /// channel, `MethodDef` has no way to express
++    /// `static int Fl::run()`-style methods. The bindings emitter
++    /// reads this flag and routes static methods through the
++    /// receiver-less wrapper path. Same off-`MethodDef`-for-back-
++    /// compat reasoning as `poison_reason`.
++    ///
++    /// `method_idx` is the position in `class.methods`.
++    pub fn mark_method_static(&mut self, class: ClassId, method_idx: usize) {
++        self.static_methods.insert((class, method_idx));
++    }
++
++    /// True when the importer (or a hand-built test) flagged
++    /// `class.methods[method_idx]` as a static method via
++    /// [`Self::mark_method_static`].
++    pub fn is_method_static(&self, class: ClassId, method_idx: usize) -> bool {
++        self.static_methods.contains(&(class, method_idx))
++    }
++
++    /// M18: record that `class.methods[method_idx]` has `count`
++    /// trailing parameters with C++ default values. The bindings
++    /// emitter renders this as a doc comment so users know which
++    /// arguments are nominally optional in the source language.
++    pub fn record_default_arg_count(
++        &mut self,
++        class: ClassId,
++        method_idx: usize,
++        count: usize,
++    ) {
++        if count > 0 {
++            self.default_arg_counts.insert((class, method_idx), count);
++        }
++    }
++
++    /// Number of trailing parameters with C++ default values for
++    /// `class.methods[method_idx]`. Returns 0 when none recorded.
++    pub fn default_arg_count(&self, class: ClassId, method_idx: usize) -> usize {
++        self.default_arg_counts
++            .get(&(class, method_idx))
++            .copied()
++            .unwrap_or(0)
++    }
++
++    /// M21.b: record that `class.fields[field_idx]` is a bitfield
++    /// declared with `width` bits in the C++ source. Width 0 is
++    /// permitted — it's a special "force alignment to next AU"
++    /// marker per Itanium.
++    pub fn record_bitfield_width(
++        &mut self,
++        class: ClassId,
++        field_idx: usize,
++        width: u64,
++    ) {
++        self.bitfield_widths.insert((class, field_idx), width);
++    }
++
++    /// Bitfield width for `class.fields[field_idx]`. `Some(w)`
++    /// means the field is a bitfield (including `w == 0`); `None`
++    /// means it's a regular field.
++    pub fn bitfield_width(&self, class: ClassId, field_idx: usize) -> Option<u64> {
++        self.bitfield_widths.get(&(class, field_idx)).copied()
++    }
++
++    /// True iff `class.fields[field_idx]` is a bitfield. Slim
++    /// convenience wrapper over `bitfield_width`.
++    pub fn is_bitfield(&self, class: ClassId, field_idx: usize) -> bool {
++        self.bitfield_widths.contains_key(&(class, field_idx))
++    }
++
++    /// True iff *any* field on `class` is a bitfield. Used by the
++    /// layout engine to decide whether to switch the per-field
++    /// placement loop into the bit-packed walker.
++    pub fn class_has_bitfields(&self, class: ClassId) -> bool {
++        self.bitfield_widths
++            .keys()
++            .any(|(c, _)| *c == class)
++    }
++
++    /// Set a `#pragma pack(N)` override for `class`. Honored by the
++    /// MSVC layout engine; ignored by Itanium. Common values:
++    /// 1 (byte-packed), 2, 4, 8 (MSVC's default).
++    pub fn set_pragma_pack(&mut self, class: ClassId, pack: u64) {
++        self.pragma_pack.insert(class, pack);
++    }
++
++    /// Read the `#pragma pack(N)` override for `class`, if any.
++    /// `None` means no override; the layout engine uses its target's
++    /// default packing (8 on MSVC for 64-bit targets).
++    pub fn pragma_pack(&self, class: ClassId) -> Option<u64> {
++        self.pragma_pack.get(&class).copied()
++    }
++
+     /// Register a Rust-origin enum for C++ exposure. Returns the
+     /// stable id used by emitters when rendering the `enum class`
+     /// declaration.
+diff --git a/compiler/rustc_abi_cxx/src/layout.rs b/compiler/rustc_abi_cxx/src/layout.rs
+index 9935d1edb7b..bc51a929977 100644
+--- a/compiler/rustc_abi_cxx/src/layout.rs
++++ b/compiler/rustc_abi_cxx/src/layout.rs
+@@ -35,6 +35,16 @@ pub struct RecordLayout {
+     pub nv_align_bytes: u64,
+     pub has_vptr: bool,
+     pub field_offsets: Vec<u64>,
++    /// M21.b: bit-offset *within the byte at `field_offsets[i]`*
++    /// for bitfield members. `0` for non-bitfield fields.
++    /// Combined with `field_bit_widths[i]` to fully locate a
++    /// bitfield. Always parallel to `field_offsets`.
++    pub field_bit_offsets: Vec<u8>,
++    /// M21.b: declared bitfield width per field. `0` for non-
++    /// bitfield fields (which means "field width = sizeof(ty)
++    /// bytes"); a non-zero value means the field is a bitfield
++    /// of that many bits. Always parallel to `field_offsets`.
++    pub field_bit_widths: Vec<u64>,
+     pub base_offsets: Vec<(ClassId, u64)>,
+     /// Virtual-base subobject offsets within this class. Populated only
+     /// for the most-derived class; intermediate classes in a chain
+@@ -45,7 +55,23 @@ pub struct RecordLayout {
+ }
+ 
+ impl CxxTypeCtx {
++    /// Record layout dispatcher. Routes to either the Itanium engine
++    /// (this module) or the MSVC engine ([`crate::layout_msvc`]) based
++    /// on `target().abi_flavor`. Every caller in the workspace goes
++    /// through this entry point so the choice of ABI is made in one
++    /// place.
+     pub fn layout(&self, class_id: ClassId) -> Result<RecordLayout, LayoutError> {
++        match self.target().abi_flavor {
++            crate::target::AbiFlavor::Itanium => self.layout_itanium(class_id),
++            crate::target::AbiFlavor::Msvc => self.layout_msvc(class_id),
++        }
++    }
++
++    /// Itanium-only layout entry point. Exposed for tests and for the
++    /// rare downstream consumer (e.g. cross-ABI comparisons in the
++    /// fork patches) that needs to force Itanium semantics regardless
++    /// of the target.
++    pub fn layout_itanium(&self, class_id: ClassId) -> Result<RecordLayout, LayoutError> {
+         compute_layout(self, class_id)
+     }
+ 
+@@ -77,9 +103,34 @@ struct LayoutState {
+     dsize: u64,
+     has_vptr: bool,
+     field_offsets: Vec<u64>,
++    /// M21.b: parallel to `field_offsets` — the bit position
++    /// within the byte at `field_offsets[i]` where the
++    /// bitfield's bits start. 0 for non-bitfield fields.
++    field_bit_offsets: Vec<u8>,
++    /// M21.b: parallel to `field_offsets` — the declared
++    /// bitfield width in bits. 0 for non-bitfield fields.
++    field_bit_widths: Vec<u64>,
+     base_offsets: Vec<(ClassId, u64)>,
+     virtual_base_offsets: Vec<(ClassId, u64)>,
+     empty_subobjects: Vec<(ClassId, u64)>,
++    /// M21.b: open bitfield allocation unit (AU). When some,
++    /// `(au_offset, au_size_bytes, used_bits)` describe the
++    /// AU the next bitfield can pack into iff its container
++    /// type matches. None when no AU is open (e.g. the last
++    /// placed field was a regular non-bitfield field, or the
++    /// AU got fully consumed and was closed).
++    bitfield_au: Option<BitfieldAu>,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct BitfieldAu {
++    /// Byte offset of the AU within the record.
++    offset: u64,
++    /// Size of the AU's container type, in bytes (1, 2, 4, 8).
++    size_bytes: u64,
++    /// Bits already consumed in the AU (always
++    /// `<= size_bytes * 8`).
++    used_bits: u64,
+ }
+ 
+ impl LayoutState {
+@@ -90,9 +141,12 @@ fn new() -> Self {
+             dsize: 0,
+             has_vptr: false,
+             field_offsets: Vec::new(),
++            field_bit_offsets: Vec::new(),
++            field_bit_widths: Vec::new(),
+             base_offsets: Vec::new(),
+             virtual_base_offsets: Vec::new(),
+             empty_subobjects: Vec::new(),
++            bitfield_au: None,
+         }
+     }
+ }
+@@ -227,6 +281,8 @@ fn compute_layout(
+         nv_align_bytes: nv_align,
+         has_vptr: state.has_vptr,
+         field_offsets: state.field_offsets,
++        field_bit_offsets: state.field_bit_offsets,
++        field_bit_widths: state.field_bit_widths,
+         base_offsets: state.base_offsets,
+         virtual_base_offsets: state.virtual_base_offsets,
+         empty_subobjects: state.empty_subobjects,
+@@ -366,6 +422,16 @@ fn place_field(
+     class_id: ClassId,
+     idx: usize,
+ ) -> Result<(), LayoutError> {
++    // M21.b: bitfield fast path. The sidecar `bitfield_width`
++    // returns Some(w) for bitfield members; everything else
++    // flows through the original byte-aligned placement.
++    if let Some(width) = ctx.bitfield_width(class_id, idx) {
++        return place_bitfield(ctx, state, field, class_id, idx, width);
++    }
++    // Non-bitfield: close any open AU first so the next byte-
++    // aligned field doesn't overlap with the AU's tail.
++    state.bitfield_au = None;
++
+     let (size, align) = type_size_align(ctx, field.ty).map_err(|_| {
+         LayoutError::UnsizedField {
+             class: class_id,
+@@ -381,6 +447,122 @@ fn place_field(
+     state.dsize = end;
+     state.align = state.align.max(align);
+     state.field_offsets.push(offset);
++    state.field_bit_offsets.push(0);
++    state.field_bit_widths.push(0);
++    Ok(())
++}
++
++/// M21.b: Itanium bit-packing for one bitfield field.
++///
++/// Simplified ruleset (covers the cases v0 callers see):
++///
++/// - **AU = container type.** Each bitfield's storage unit is
++///   the size/alignment of the field's declared C++ type
++///   (`unsigned int a:4` uses a 4-byte AU). We recover the
++///   container size from `type_size_align(ctx, field.ty)`.
++/// - **Pack into the open AU when possible.** If the previous
++///   field was a bitfield AND its container size matches AND
++///   the new bits fit in the AU's remaining space, append
++///   directly.
++/// - **Otherwise open a new AU.** Align to the container's
++///   alignment, place the new AU there, reset `used_bits`.
++/// - **Width 0** is a "force boundary" marker — close any open
++///   AU and don't allocate any bits. The next bitfield starts
++///   a fresh AU.
++/// - **Oversize bitfields** (`width > AU_size_in_bits`) aren't
++///   handled in v0 — they require a wider container. The
++///   layout engine treats them as the AU-sized portion only,
++///   which is wrong but visible (the user sees one bit-width
++///   diagnostic in the doc-comment hint we add later).
++fn place_bitfield(
++    ctx: &CxxTypeCtx,
++    state: &mut LayoutState,
++    field: &FieldDef,
++    class_id: ClassId,
++    idx: usize,
++    width: u64,
++) -> Result<(), LayoutError> {
++    let (size, align) = type_size_align(ctx, field.ty).map_err(|_| {
++        LayoutError::UnsizedField {
++            class: class_id,
++            field: FieldId(idx as u32),
++        }
++    })?;
++    let align = field.explicit_align.unwrap_or(align).max(align).max(1);
++    let au_bits = size * 8;
++
++    // Width 0: force AU boundary. Close any open AU and
++    // record a zero-width slot at the next aligned offset
++    // (the slot itself doesn't reserve bits).
++    if width == 0 {
++        // Advance dsize past the open AU so the next field
++        // starts on a fresh AU.
++        if let Some(au) = state.bitfield_au.take() {
++            let au_end = au.offset + au.size_bytes;
++            state.dsize = state.dsize.max(au_end);
++        }
++        let offset = align_up(state.dsize, align);
++        state.size = state.size.max(offset);
++        state.align = state.align.max(align);
++        state.field_offsets.push(offset);
++        state.field_bit_offsets.push(0);
++        state.field_bit_widths.push(0);
++        return Ok(());
++    }
++
++    // Try to pack into the open AU. Same container size +
++    // enough room left.
++    if let Some(au) = state.bitfield_au {
++        if au.size_bytes == size && au.used_bits + width <= au_bits {
++            let bit_offset_in_byte = (au.used_bits % 8) as u8;
++            let byte_within_au = au.used_bits / 8;
++            let field_byte_offset = au.offset + byte_within_au;
++            state.field_offsets.push(field_byte_offset);
++            state.field_bit_offsets.push(bit_offset_in_byte);
++            state.field_bit_widths.push(width);
++            // Advance the AU.
++            let new_used = au.used_bits + width;
++            let updated = BitfieldAu {
++                offset: au.offset,
++                size_bytes: au.size_bytes,
++                used_bits: new_used,
++            };
++            state.bitfield_au = if new_used >= au_bits {
++                None
++            } else {
++                Some(updated)
++            };
++            // Reserve the entire AU in dsize / size, even if
++            // not fully used yet. Subsequent non-bitfield
++            // fields skip past the AU; subsequent bitfields
++            // of a different container restart cleanly.
++            let au_end = au.offset + au.size_bytes;
++            state.size = state.size.max(au_end);
++            state.dsize = state.dsize.max(au_end);
++            state.align = state.align.max(align);
++            return Ok(());
++        }
++    }
++
++    // Open a new AU at the next aligned offset.
++    let au_offset = align_up(state.dsize, align);
++    state.field_offsets.push(au_offset);
++    state.field_bit_offsets.push(0);
++    state.field_bit_widths.push(width);
++    let used_bits = width.min(au_bits); // clamp; oversize is v0 fall-back
++    state.bitfield_au = if used_bits >= au_bits {
++        None
++    } else {
++        Some(BitfieldAu {
++            offset: au_offset,
++            size_bytes: size,
++            used_bits,
++        })
++    };
++    let au_end = au_offset + size;
++    state.size = state.size.max(au_end);
++    state.dsize = state.dsize.max(au_end);
++    state.align = state.align.max(align);
+     Ok(())
+ }
+ 
+@@ -401,12 +583,26 @@ fn place_union_field(
+     state.size = state.size.max(size);
+     state.align = state.align.max(align);
+     state.field_offsets.push(0);
++    state.field_bit_offsets.push(0);
++    state.field_bit_widths.push(ctx.bitfield_width(class_id, idx).unwrap_or(0));
+     Ok(())
+ }
+ 
+ fn type_size_align(ctx: &CxxTypeCtx, ty: TypeId) -> Result<(u64, u64), ()> {
+     match ctx.type_of(ty) {
+-        CxxType::Void | CxxType::Fn(_) | CxxType::MemberPtr { .. } => Err(()),
++        CxxType::Void | CxxType::MemberPtr { .. } => Err(()),
++        // M15 collapses `Ptr<Fn>` → `Fn` in `import_type`'s Pointer
++        // arm, because Itanium treats function pointer + function
++        // type as a single ABI unit at parameter/return position.
++        // When the same `Fn` then surfaces as a *field* type
++        // (e.g. `Fl_Callback* callback_;` in `Fl_Widget`), it
++        // represents a function-pointer slot and is therefore
++        // pointer-sized. Without this branch, every class with a
++        // function-pointer field hits `LayoutError::UnsizedField`.
++        CxxType::Fn(_) => {
++            let ps = pointer_size(ctx);
++            Ok((ps, ps))
++        }
+         CxxType::Bool => Ok((1, 1)),
+         CxxType::Int { width, .. } => {
+             let s = match width {
+diff --git a/compiler/rustc_abi_cxx/src/layout_msvc.rs b/compiler/rustc_abi_cxx/src/layout_msvc.rs
+new file mode 100644
+index 00000000000..8301d7686f6
+--- /dev/null
++++ b/compiler/rustc_abi_cxx/src/layout_msvc.rs
+@@ -0,0 +1,512 @@
++//! MSVC C++ ABI record layout.
++//!
++//! Where MSVC diverges from Itanium (this module's reason to exist):
++//!
++//! - **No tail-padding reuse across bases.** Itanium lets a derived
++//!   class place its own fields into the tail padding of a non-POD
++//!   base subobject; MSVC always rounds the base subobject to its
++//!   full `sizeof`. This matters for inheritance hierarchies that
++//!   want the smallest possible layout.
++//!
++//! - **Empty Base Optimization is more restrictive.** MSVC only
++//!   collapses an empty base to zero bytes when (a) it's the first
++//!   base, (b) it has no virtual functions, and (c) the derived
++//!   class doesn't already have a vptr or vbptr that would share
++//!   address-0. Otherwise the empty base occupies 1 byte
++//!   (rounded up to alignment).
++//!
++//! - **vbptr placement.** Classes with virtual bases get a `vbptr`
++//!   (a pointer into the vbtable) placed *after* any non-virtual-base
++//!   subobjects and field padding but *before* the virtual base
++//!   subobjects themselves. The vbptr is 1 pointer-width.
++//!
++//! - **Bitfield allocation rules.** MSVC packs bitfields into
++//!   storage units sized by the declared type (`int x : 3;` lives in
++//!   an `int`-sized unit), with cross-unit straddling forbidden. The
++//!   exact rules differ from Itanium when bitfield types mix —
++//!   `short x : 3; int y : 4;` lays out differently under the two
++//!   ABIs.
++//!
++//! - **`#pragma pack(N)`.** MSVC honors `#pragma pack` for both
++//!   field offsets and the implicit padding-after-final-field; the
++//!   default value is 8. Itanium-clang only applies it to field
++//!   offsets and ignores the pad-to-align step. This module models
++//!   `pragma_pack` as `Option<u64>` on the layout request because
++//!   most classes don't override it.
++//!
++//! This module returns the same [`RecordLayout`] type that the
++//! Itanium [`layout`] module produces. The dispatcher in
++//! `CxxTypeCtx::layout` (added below) picks the right backend based on
++//! `target().abi_flavor`.
++
++use crate::ctx::CxxTypeCtx;
++use crate::diag::LayoutError;
++use crate::layout::RecordLayout;
++use crate::ty::{ClassId, CxxType, RecordKind, TypeId};
++
++impl CxxTypeCtx {
++    /// MSVC-flavored layout entry point. Keep parity with
++    /// `CxxTypeCtx::layout` (Itanium) — same return shape, same error
++    /// surface. The dispatcher in `layout.rs` routes here when
++    /// `target().abi_flavor == AbiFlavor::Msvc`.
++    pub fn layout_msvc(&self, class_id: ClassId) -> Result<RecordLayout, LayoutError> {
++        compute_layout(self, class_id)
++    }
++}
++
++// -------- Working state ------------------------------------------------
++
++struct State {
++    /// Maximum byte touched so far.
++    size: u64,
++    /// Required alignment so far.
++    align: u64,
++    /// Next placement position.
++    cursor: u64,
++    has_vptr: bool,
++    /// Whether a vbptr has been allocated. MSVC places at most one
++    /// vbptr per class; it goes after the last non-virtual-base
++    /// subobject (or after the vptr if there's one) and before any
++    /// virtual base subobjects.
++    has_vbptr: bool,
++    field_offsets: Vec<u64>,
++    field_bit_offsets: Vec<u8>,
++    field_bit_widths: Vec<u64>,
++    base_offsets: Vec<(ClassId, u64)>,
++    virtual_base_offsets: Vec<(ClassId, u64)>,
++    empty_subobjects: Vec<(ClassId, u64)>,
++    /// `#pragma pack(N)` in effect for this class. `None` = no pragma
++    /// (use natural alignment).
++    pragma_pack: Option<u64>,
++}
++
++impl State {
++    fn new(pragma_pack: Option<u64>) -> Self {
++        Self {
++            size: 0,
++            align: 1,
++            cursor: 0,
++            has_vptr: false,
++            has_vbptr: false,
++            field_offsets: Vec::new(),
++            field_bit_offsets: Vec::new(),
++            field_bit_widths: Vec::new(),
++            base_offsets: Vec::new(),
++            virtual_base_offsets: Vec::new(),
++            empty_subobjects: Vec::new(),
++            pragma_pack,
++        }
++    }
++
++    /// Apply `#pragma pack(N)` to an alignment requirement. The
++    /// effective alignment is `min(natural, pragma_pack)`.
++    fn cap(&self, natural: u64) -> u64 {
++        match self.pragma_pack {
++            Some(n) if natural > n => n,
++            _ => natural,
++        }
++    }
++
++    fn bump_align(&mut self, a: u64) {
++        let capped = self.cap(a);
++        if capped > self.align {
++            self.align = capped;
++        }
++    }
++
++    fn round_up_cursor(&mut self, a: u64) {
++        let aa = self.cap(a);
++        if aa > 1 {
++            let rem = self.cursor % aa;
++            if rem != 0 {
++                self.cursor += aa - rem;
++            }
++        }
++        if self.cursor > self.size {
++            self.size = self.cursor;
++        }
++    }
++}
++
++// -------- Layout driver ------------------------------------------------
++
++fn compute_layout(ctx: &CxxTypeCtx, class_id: ClassId) -> Result<RecordLayout, LayoutError> {
++    let class = ctx.class(class_id);
++
++    // `#pragma pack(N)` if set on this class. Honored from the
++    // sidecar on `CxxTypeCtx`. When absent, every alignment
++    // requirement passes through unclamped (the natural alignment
++    // applies).
++    let mut st = State::new(ctx.pragma_pack(class_id));
++
++    // 1. Polymorphic class: vptr at offset 0 (no tail-padding sharing
++    //    with bases under MSVC; the vptr always lives at the class's
++    //    own offset 0 unless the primary base already provides one,
++    //    in which case we reuse it).
++    if class.is_polymorphic {
++        let has_primary_polymorphic_base = class
++            .bases
++            .iter()
++            .filter(|b| !b.virtual_)
++            .any(|b| ctx.class(b.class).is_polymorphic);
++        if !has_primary_polymorphic_base {
++            st.has_vptr = true;
++            st.bump_align(8);
++            st.cursor = 8;
++            st.size = 8;
++        }
++    }
++
++    // 2. Non-virtual base subobjects, in declaration order. MSVC
++    //    always rounds each base to its full `sizeof` — no tail-pad
++    //    reuse.
++    let mut has_virtual_bases = false;
++    for base in &class.bases {
++        if base.virtual_ {
++            has_virtual_bases = true;
++            continue;
++        }
++        let base_layout = ctx.layout_msvc(base.class)?;
++        // Empty Base Optimization. MSVC: only the first base, and
++        // only when neither has virtual functions or virtual bases,
++        // and the derived class has not yet placed a vptr/vbptr.
++        let base_size = base_layout.size_bytes;
++        let base_is_empty = base_size == 0 || (base_size == 1 && base_layout.field_offsets.is_empty() && base_layout.base_offsets.is_empty());
++        if base_is_empty
++            && st.base_offsets.is_empty()
++            && !st.has_vptr
++            && !st.has_vbptr
++            && !ctx.class(base.class).is_polymorphic
++        {
++            // EBO: zero bytes, but tracked.
++            st.empty_subobjects.push((base.class, st.cursor));
++            st.base_offsets.push((base.class, st.cursor));
++            continue;
++        }
++        let base_align = base_layout.align_bytes.max(1);
++        st.round_up_cursor(base_align);
++        st.base_offsets.push((base.class, st.cursor));
++        // MSVC: bump cursor by full `size`, not `data_size` — no
++        // tail-padding reuse across bases.
++        st.cursor += base_size;
++        if st.cursor > st.size {
++            st.size = st.cursor;
++        }
++        st.bump_align(base_align);
++        // Inherit the vptr flag from any base that has one. The
++        // primary polymorphic base case is already covered (vptr
++        // skipped above for the derived class itself), but the
++        // logical `has_vptr` for the derived class is still true
++        // because the vptr is accessible through the inherited
++        // base subobject.
++        if base_layout.has_vptr {
++            st.has_vptr = true;
++        }
++    }
++
++    // 3. vbptr — inserted after non-virtual bases / fields-so-far,
++    //    before virtual bases. Only present when this class itself
++    //    introduces virtual inheritance and doesn't inherit a vbptr
++    //    from a non-virtual base.
++    let inherits_vbptr = class.bases.iter().any(|b| {
++        !b.virtual_ && ctx
++            .class(b.class)
++            .bases
++            .iter()
++            .any(|gb| gb.virtual_)
++    });
++    if has_virtual_bases && !inherits_vbptr {
++        st.bump_align(8);
++        st.round_up_cursor(8);
++        st.has_vbptr = true;
++        st.cursor += 8;
++        if st.cursor > st.size {
++            st.size = st.cursor;
++        }
++    }
++
++    // 4. Field placement.
++    for (idx, field) in class.fields.iter().enumerate() {
++        // Bitfield handling — simplified MSVC packing. Full rule:
++        // bitfields live in a unit sized by the declared type;
++        // mixing types starts a new unit. We model the simplified
++        // "always start a new unit for each bitfield" form for v1;
++        // the dispatcher will route mixed-type bitfields to the
++        // Itanium engine until M21.c lands.
++        if let Some(bit_width) = ctx.bitfield_width(class_id, idx) {
++            let (ty_size, ty_align) = type_size_align(ctx, field.ty)?;
++            st.bump_align(ty_align);
++            st.round_up_cursor(ty_align);
++            let byte_offset = st.cursor;
++            st.field_offsets.push(byte_offset);
++            st.field_bit_offsets.push(0);
++            st.field_bit_widths.push(bit_width);
++            // Bitfield consumes the storage unit.
++            st.cursor += ty_size;
++            if st.cursor > st.size {
++                st.size = st.cursor;
++            }
++            continue;
++        }
++
++        let (sz, mut align) = type_size_align(ctx, field.ty)?;
++        if let Some(explicit) = field.explicit_align {
++            if explicit > align {
++                align = explicit;
++            }
++        }
++        st.bump_align(align);
++        st.round_up_cursor(align);
++        st.field_offsets.push(st.cursor);
++        st.field_bit_offsets.push(0);
++        st.field_bit_widths.push(0);
++        st.cursor += sz;
++        if st.cursor > st.size {
++            st.size = st.cursor;
++        }
++    }
++
++    // 5. Source-level `alignas` (applied before the nv-size snapshot
++    //    so it folds into the non-virtual tail padding too).
++    if let Some(src_align) = class.source_alignment {
++        if src_align > st.align {
++            st.align = src_align;
++        }
++    }
++
++    // 6. Non-virtual size + alignment snapshot. MSVC reports nv_size
++    //    as the *tail-padded* size — i.e. what `sizeof` would yield
++    //    for the class if it had no virtual bases. Round up here.
++    let nv_align = st.align.max(1);
++    let nv_size = round_up(st.size, nv_align);
++
++    // 7. Virtual base subobjects. These are appended to the end of
++    //    the most-derived class only; intermediate classes lay them
++    //    out for their own state but the final commit happens here.
++    //    We start virtual bases from the nv-tail-padded offset, not
++    //    the raw `st.size`, so the vbase subobjects sit at well-
++    //    aligned offsets relative to the nv-size boundary.
++    st.cursor = nv_size;
++    if st.cursor > st.size {
++        st.size = st.cursor;
++    }
++    for base in &class.bases {
++        if !base.virtual_ {
++            continue;
++        }
++        let base_layout = ctx.layout_msvc(base.class)?;
++        let base_align = base_layout.align_bytes.max(1);
++        st.bump_align(base_align);
++        st.round_up_cursor(base_align);
++        st.virtual_base_offsets.push((base.class, st.cursor));
++        st.cursor += base_layout.size_bytes;
++        if st.cursor > st.size {
++            st.size = st.cursor;
++        }
++    }
++
++    // 8. Final tail-padding round-up.
++    let final_size = round_up(st.size, st.align.max(1));
++
++    // Empty classes still get 1 byte (matching the Itanium rule).
++    let empty = class.fields.is_empty()
++        && class.bases.is_empty()
++        && !st.has_vptr
++        && !st.has_vbptr;
++    let final_size = if empty && matches!(class.kind, RecordKind::Class | RecordKind::Struct) {
++        1.max(final_size)
++    } else {
++        final_size
++    };
++    let final_align = st.align.max(1);
++
++    Ok(RecordLayout {
++        size_bytes: final_size,
++        align_bytes: final_align,
++        // MSVC has no data_size != size distinction at the class
++        // level (no tail-pad reuse across bases) — we report
++        // `data_size == size`.
++        data_size_bytes: final_size,
++        nv_size_bytes: nv_size,
++        nv_align_bytes: nv_align,
++        has_vptr: st.has_vptr,
++        field_offsets: st.field_offsets,
++        field_bit_offsets: st.field_bit_offsets,
++        field_bit_widths: st.field_bit_widths,
++        base_offsets: st.base_offsets,
++        virtual_base_offsets: st.virtual_base_offsets,
++        empty_subobjects: st.empty_subobjects,
++    })
++}
++
++fn round_up(value: u64, align: u64) -> u64 {
++    if align <= 1 {
++        return value;
++    }
++    let rem = value % align;
++    if rem == 0 { value } else { value + (align - rem) }
++}
++
++fn type_size_align(ctx: &CxxTypeCtx, ty: TypeId) -> Result<(u64, u64), LayoutError> {
++    use crate::ty::{FloatKind, IntWidth};
++    let t = ctx.type_of(ty).clone();
++    let pw = ctx.target().pointer_width_bits as u64 / 8;
++    Ok(match t {
++        CxxType::Void => (0, 1),
++        CxxType::Bool => (1, 1),
++        CxxType::Int { width, .. } => match width {
++            IntWidth::I8 => (1, 1),
++            IntWidth::I16 => (2, 2),
++            IntWidth::I32 => (4, 4),
++            IntWidth::I64 => (8, 8),
++            IntWidth::I128 => (16, 16),
++        },
++        CxxType::Float { kind } => match kind {
++            FloatKind::F32 => (4, 4),
++            FloatKind::F64 => (8, 8),
++            // MSVC: long double == double (8 bytes).
++            FloatKind::LongDouble => (8, 8),
++        },
++        CxxType::Ptr { .. } => (pw, pw),
++        CxxType::Ref { .. } => (pw, pw),
++        CxxType::Array { elem, len } => {
++            let (sz, a) = type_size_align(ctx, elem)?;
++            (sz * len, a)
++        }
++        CxxType::Record(class_id) => {
++            let layout = ctx.layout_msvc(class_id)?;
++            (layout.size_bytes, layout.align_bytes)
++        }
++        CxxType::Enum { underlying, .. } => type_size_align(ctx, underlying)?,
++        CxxType::Fn(_) => (pw, pw),
++        CxxType::MemberPtr { .. } => (pw * 2, pw), // simplified
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::target::Target;
++    use crate::ty::{
++        BaseSpec, ClassDef, FieldDef, Ident, NameSegment, NestedName,
++    };
++
++    fn ctx() -> CxxTypeCtx {
++        CxxTypeCtx::new(Target::x86_64_pc_windows_msvc())
++    }
++
++    fn class(name: &str) -> ClassDef {
++        ClassDef {
++            name: NestedName(vec![NameSegment::Class(Ident(name.into()))]),
++            bases: vec![],
++            fields: vec![],
++            methods: vec![],
++            kind: RecordKind::Class,
++            is_polymorphic: false,
++            is_final: false,
++            source_alignment: None,
++        }
++    }
++
++    #[test]
++    fn empty_class_is_one_byte() {
++        let mut c = ctx();
++        let id = c.define_class(class("E"));
++        let l = c.layout_msvc(id).unwrap();
++        assert_eq!(l.size_bytes, 1);
++        assert_eq!(l.align_bytes, 1);
++    }
++
++    #[test]
++    fn polymorphic_empty_class_is_pointer_size() {
++        let mut c = ctx();
++        let mut def = class("Poly");
++        def.is_polymorphic = true;
++        let id = c.define_class(def);
++        let l = c.layout_msvc(id).unwrap();
++        assert_eq!(l.size_bytes, 8);
++        assert_eq!(l.align_bytes, 8);
++        assert!(l.has_vptr);
++    }
++
++    #[test]
++    fn two_int_fields() {
++        let mut c = ctx();
++        let i = c.intern_type(CxxType::Int {
++            signed: true,
++            width: crate::ty::IntWidth::I32,
++        });
++        let mut def = class("Pair");
++        def.fields = vec![
++            FieldDef { name: Ident("a".into()), ty: i, explicit_align: None },
++            FieldDef { name: Ident("b".into()), ty: i, explicit_align: None },
++        ];
++        let id = c.define_class(def);
++        let l = c.layout_msvc(id).unwrap();
++        assert_eq!(l.size_bytes, 8);
++        assert_eq!(l.align_bytes, 4);
++        assert_eq!(l.field_offsets, vec![0, 4]);
++    }
++
++    #[test]
++    fn msvc_no_tail_padding_reuse_across_bases() {
++        // Itanium would let `Derived` place its `char` field in
++        // `Base`'s tail padding (size 4, dsize 3 -> child placed at
++        // offset 3, total 4 bytes). MSVC does NOT — child gets
++        // offset 4, total 8 bytes (post tail-pad).
++        //
++        //   struct Base { int x; char y; };  // sizeof 8 under MSVC,
++        //                                    // dsize 5 under Itanium
++        //   struct Derived : Base { char z; }; // sizeof 12 vs Itanium's 8
++        let mut c = ctx();
++        let i = c.intern_type(CxxType::Int {
++            signed: true,
++            width: crate::ty::IntWidth::I32,
++        });
++        let ch = c.intern_type(CxxType::Int {
++            signed: true,
++            width: crate::ty::IntWidth::I8,
++        });
++        let base = c.define_class(ClassDef {
++            name: NestedName(vec![NameSegment::Class(Ident("Base".into()))]),
++            bases: vec![],
++            fields: vec![
++                FieldDef { name: Ident("x".into()), ty: i, explicit_align: None },
++                FieldDef { name: Ident("y".into()), ty: ch, explicit_align: None },
++            ],
++            methods: vec![],
++            kind: RecordKind::Struct,
++            is_polymorphic: false,
++            is_final: false,
++            source_alignment: None,
++        });
++        let derived = c.define_class(ClassDef {
++            name: NestedName(vec![NameSegment::Class(Ident("Derived".into()))]),
++            bases: vec![BaseSpec {
++                class: base,
++                virtual_: false,
++                access: crate::ty::Access::Public,
++            }],
++            fields: vec![FieldDef {
++                name: Ident("z".into()),
++                ty: ch,
++                explicit_align: None,
++            }],
++            methods: vec![],
++            kind: RecordKind::Struct,
++            is_polymorphic: false,
++            is_final: false,
++            source_alignment: None,
++        });
++        // Base under MSVC: x=0..4, y=4..5, padded to 8.
++        let l_base = c.layout_msvc(base).unwrap();
++        assert_eq!(l_base.size_bytes, 8);
++        // Derived: base [0..8], z at offset 8, padded up to 12.
++        let l = c.layout_msvc(derived).unwrap();
++        assert_eq!(l.base_offsets, vec![(base, 0)]);
++        assert_eq!(l.field_offsets, vec![8]);
++        // Derived size is 9 (rounded to 12 by base alignment of 4? char align = 1)
++        // Actually align is 4 (from int in base), so 9 -> 12.
++        assert_eq!(l.size_bytes, 12);
++    }
++}
+diff --git a/compiler/rustc_abi_cxx/src/lib.rs b/compiler/rustc_abi_cxx/src/lib.rs
+index 11e0a305f08..9c048a1406e 100644
+--- a/compiler/rustc_abi_cxx/src/lib.rs
++++ b/compiler/rustc_abi_cxx/src/lib.rs
+@@ -12,16 +12,19 @@
+ mod ctx;
+ mod diag;
+ mod layout;
++mod layout_msvc;
+ mod mangle;
++mod mangle_msvc;
+ mod target;
+ mod ty;
+ mod vtable;
++mod vtable_msvc;
+ 
+ pub use ctx::CxxTypeCtx;
+ pub use diag::LayoutError;
+ pub use layout::RecordLayout;
+ pub use mangle::{CtorVariant, DtorVariant, Symbol};
+-pub use target::{LongDoubleKind, Target};
++pub use target::{AbiFlavor, LongDoubleKind, Target};
+ pub use ty::{
+     Access, BaseSpec, ClassDef, ClassId, CvQual, CxxType, FieldDef, FieldId,
+     FloatKind, FnSig, Ident, IntWidth, MethodDef, MethodId, MethodName,
+diff --git a/compiler/rustc_abi_cxx/src/mangle.rs b/compiler/rustc_abi_cxx/src/mangle.rs
+index 3e6e6120f37..2dd7515c308 100644
+--- a/compiler/rustc_abi_cxx/src/mangle.rs
++++ b/compiler/rustc_abi_cxx/src/mangle.rs
+@@ -28,6 +28,7 @@
+ };
+ 
+ #[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum Symbol {
+     Function {
+         scope: NestedName,
+@@ -62,6 +63,7 @@ pub enum Symbol {
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum CtorVariant {
+     C1,
+     C2,
+@@ -69,6 +71,7 @@ pub enum CtorVariant {
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum DtorVariant {
+     D0,
+     D1,
+@@ -76,7 +79,22 @@ pub enum DtorVariant {
+ }
+ 
+ impl CxxTypeCtx {
++    /// Mangle dispatcher. Routes to either Itanium
++    /// ([`Self::mangle_itanium`]) or MSVC ([`Self::mangle_msvc`])
++    /// based on `target().abi_flavor`. Every caller in the workspace
++    /// goes through this entry point so the ABI choice is made
++    /// centrally.
+     pub fn mangle(&self, sym: &Symbol) -> String {
++        match self.target().abi_flavor {
++            crate::target::AbiFlavor::Itanium => self.mangle_itanium(sym),
++            crate::target::AbiFlavor::Msvc => self.mangle_msvc(sym),
++        }
++    }
++
++    /// Itanium-only mangling entry point. Useful for tests and any
++    /// downstream consumer that needs to force Itanium semantics
++    /// regardless of `target().abi_flavor`.
++    pub fn mangle_itanium(&self, sym: &Symbol) -> String {
+         let mut m = Mangler::new(self);
+         m.mangle_symbol(sym);
+         m.out
+diff --git a/compiler/rustc_abi_cxx/src/mangle_msvc.rs b/compiler/rustc_abi_cxx/src/mangle_msvc.rs
+new file mode 100644
+index 00000000000..64a8fd2c1e4
+--- /dev/null
++++ b/compiler/rustc_abi_cxx/src/mangle_msvc.rs
+@@ -0,0 +1,1087 @@
++//! MSVC C++ ABI name mangling.
++//!
++//! This is the Microsoft Visual C++ name-mangling scheme — distinct
++//! from Itanium in nearly every syntactic detail. The scheme is not
++//! formally documented by Microsoft; this implementation follows the
++//! observed behavior of MSVC 2019/2022 cross-referenced with LLVM's
++//! `clang/lib/AST/MicrosoftMangle.cpp`, which has been the
++//! authoritative reverse-engineered reference for two decades.
++//!
++//! ## Surface format
++//!
++//! All mangled names start with `?`. A function symbol has the shape:
++//!
++//! ```text
++//! ?<name>@<scope-reversed>@@<qualifier><type-info>
++//! ```
++//!
++//! The name (and each scope segment) is followed by `@`; the whole
++//! qualified-name section is terminated by an extra `@`, producing the
++//! `@@` separator that's the visual fingerprint of MSVC mangling.
++//!
++//! Scopes are emitted **inside-out**: `N::M::Foo::bar` mangles as
++//! `?bar@Foo@M@N@@…`. That feeds the back-reference table — see below.
++//!
++//! ## Type encoding (highlights)
++//!
++//! Builtin codes (subset, full table in `builtin_code`):
++//! - `X` void, `_N` bool, `D` char, `E` unsigned char,
++//! - `F` short, `G` unsigned short, `H` int, `I` unsigned int,
++//! - `J` long, `K` unsigned long, `_J` int64_t, `_K` uint64_t,
++//! - `M` float, `N` double, `O` long double,
++//! - `_W` wchar_t.
++//!
++//! Pointers / references prefix the pointee with a CV-modifier letter:
++//! - `PEA` near pointer to non-cv (64-bit; the `E` is the "extended"
++//!   pointer specifier for 64-bit MSVC),
++//! - `PEB` near pointer to const,
++//! - `PEC` near pointer to volatile,
++//! - `PED` near pointer to const volatile,
++//! - `AEA` lvalue reference; `$$Q` rvalue reference.
++//!
++//! Function-type info after `@@` looks like
++//! `<access><cc><return><params>@<exc>`:
++//! - access: `Q` public-static / non-member, `A`..`P` various
++//!   class-member access × cv-qual combinations.
++//! - cc (calling convention): `A` __cdecl, `B` __cdecl with `__declspec(dllexport)`,
++//!   `C` __pascal, `E` __thiscall, `G` __stdcall, `I` __fastcall.
++//! - For functions returning a non-trivially-destructible record by
++//!   value, MSVC inserts a `?$` qualifier into the return-type encoding;
++//!   we handle that via the same flag plumbing the Itanium side uses
++//!   for sret.
++//!
++//! ## Back-reference compression
++//!
++//! MSVC mangling uses two parallel back-reference tables:
++//! - **Name table** (digits 0–9): records each *name segment* (identifier
++//!   that would otherwise be re-emitted). Lookup `0` re-emits slot 0; `9`
++//!   re-emits slot 9; after 10 entries the table is closed (no further
++//!   names are added, even though more names are emitted in full).
++//! - **Type table** (digits 0–9 too, separate slot space): records each
++//!   *full type encoding* (`PEAH`, `AEAVFoo@@`, etc.). Same 10-slot cap.
++//!
++//! Both tables reset between top-level symbols. The mangler tracks them
++//! via the `BackRefs` struct below.
++//!
++//! ## Special names
++//!
++//! - Constructors: `?0` (in the name position; e.g. `??0Foo@@QEAA@XZ`).
++//! - Destructors: `?1`.
++//! - Operators: `??_2` operator new, `??_3` operator delete, `??H`
++//!   operator+, `??G` operator-, etc.
++//! - vftable: `??_7<class>@@6B@`.
++//! - vbtable: `??_8<class>@@7B@`.
++//! - RTTI complete-object-locator: `??_R4<class>@@6B<class>@@@`.
++//! - RTTI type descriptor: `??_R0?AVfoo@@@8` (used for typeid).
++//!
++//! See [`fork/MSVC-PLAN.md`](../../../fork/MSVC-PLAN.md) §B.1 for the
++//! full breakdown and references used.
++
++use std::fmt::Write as _;
++
++use crate::ctx::CxxTypeCtx;
++use crate::mangle::{CtorVariant, DtorVariant, Symbol};
++use crate::target::AbiFlavor;
++use crate::ty::{
++    ClassId, CvQual, CxxType, FloatKind, FnSig, IntWidth, MethodName,
++    NameSegment, NestedName, OperatorKind, RefKind, TemplateArg, TypeId,
++};
++
++impl CxxTypeCtx {
++    /// Mangle `sym` according to the MSVC C++ ABI.
++    ///
++    /// Returns a string starting with `?` (free function) or `??`
++    /// (constructor / destructor / operator / special-name). Caller is
++    /// responsible for routing here vs. `mangle()` (Itanium) based on
++    /// `self.target().abi_flavor`.
++    pub fn mangle_msvc(&self, sym: &Symbol) -> String {
++        let mut m = MsvcMangler::new(self);
++        m.mangle_symbol(sym);
++        m.out
++    }
++}
++
++// -------- Mangler state ------------------------------------------------
++
++/// MSVC's two parallel back-reference tables. Both cap at 10 entries
++/// (digits 0–9) and reset per top-level symbol.
++///
++/// The *name* table is keyed by identifier text (each scope segment
++/// of a qualified name is a separate entry). The *type* table is
++/// keyed by `TypeId` — the semantic type identity — so that the
++/// same type (even when its rendered form changes because inner
++/// names compress via the name table) matches as a single entry.
++/// This matches MSVC's "same param type repeats compress to a
++/// digit" behavior: e.g., `void f(V, V)` mangles as
++/// `?f@@YAXUV@@0@Z` with the second `V` compressed to `0`
++/// regardless of whether the inner name "V" is already
++/// back-referenced.
++#[derive(Default)]
++struct BackRefs {
++    /// Identifier name slots. Entries are added in emission order; once
++    /// 10 names have been recorded, no further names enter the table
++    /// (subsequent names still emit in full, they just don't compress).
++    names: Vec<String>,
++    /// Type slots, keyed by `TypeId`. Same 10-entry cap. Builtin
++    /// types (single-character codes like `H`, `M`) are never
++    /// recorded here — the table is for compound types only.
++    types: Vec<TypeId>,
++}
++
++impl BackRefs {
++    /// Look up an identifier in the name table. Returns the slot digit
++    /// (`'0'`..`'9'`) if `name` is already there, otherwise `None`.
++    /// Side-effect-free; the caller decides whether to record on miss.
++    fn find_name(&self, name: &str) -> Option<char> {
++        self.names
++            .iter()
++            .position(|n| n == name)
++            .map(|i| (b'0' + i as u8) as char)
++    }
++
++    /// Add `name` to the table if there's room. Capacity 10, FIFO with
++    /// permanent insertion (no eviction — once the table fills, no
++    /// new names enter, but existing entries stay valid for lookup).
++    fn record_name(&mut self, name: &str) {
++        if self.names.len() < 10 && !self.names.iter().any(|n| n == name) {
++            self.names.push(name.to_string());
++        }
++    }
++
++    fn find_type(&self, ty: TypeId) -> Option<char> {
++        self.types
++            .iter()
++            .position(|t| *t == ty)
++            .map(|i| (b'0' + i as u8) as char)
++    }
++
++    fn record_type(&mut self, ty: TypeId) {
++        if self.types.len() < 10 && !self.types.iter().any(|t| *t == ty) {
++            self.types.push(ty);
++        }
++    }
++}
++
++struct MsvcMangler<'a> {
++    ctx: &'a CxxTypeCtx,
++    out: String,
++    back_refs: BackRefs,
++}
++
++/// Bundle of arguments to `emit_function_info`. Replaces a function
++/// signature with bool/cv plumbing that gradually expanded across
++/// callers — caller now spells out exactly which slot variants apply.
++struct FnInfo<'a> {
++    sig: &'a FnSig,
++    /// `true` for class members (Method/Ctor/Dtor); `false` for free
++    /// functions. Decides whether `E<this-cv>` is interposed before
++    /// the calling convention.
++    is_member: bool,
++    /// Implicit-`this` qualifier. Ignored for `is_member == false`.
++    cv: CvQual,
++    /// `true` for ctors and dtors — emit `@` in the return-type slot
++    /// instead of encoding any type. (C++ source has no return type
++    /// for these.)
++    no_return_type: bool,
++    /// `true` for `virtual`-declared member functions. Selects `U`
++    /// instead of `Q` for the access letter. Ignored when
++    /// `is_member == false`.
++    is_virtual: bool,
++}
++
++impl<'a> MsvcMangler<'a> {
++    fn new(ctx: &'a CxxTypeCtx) -> Self {
++        Self {
++            ctx,
++            out: String::new(),
++            back_refs: BackRefs::default(),
++        }
++    }
++
++    fn mangle_symbol(&mut self, sym: &Symbol) {
++        match sym {
++            Symbol::Function { scope, name, sig } => {
++                // `?<name>@<scope-reversed>@@<info>`. The function
++                // name IS recorded in the back-ref table — MSVC's
++                // mangler records every identifier in appearance
++                // order, including the symbol's own leaf name. (The
++                // first emission still spells out the name; later
++                // appearances of the same identifier compress.)
++                self.out.push('?');
++                self.emit_unqualified_name(&name.0);
++                self.emit_qualified_name_tail(&scope.0);
++                self.emit_function_info(FnInfo {
++                    sig,
++                    is_member: false,
++                    cv: sig.cv,
++                    no_return_type: false,
++                    is_virtual: false,
++                });
++            }
++            Symbol::Method { class, name, sig } => {
++                self.out.push('?');
++                self.emit_method_name(name);
++                let class_path = &self.ctx.class(*class).name.0;
++                self.emit_qualified_name_tail(class_path);
++                let is_virtual = self.lookup_method_is_virtual(*class, name, sig);
++                self.emit_function_info(FnInfo {
++                    sig,
++                    is_member: true,
++                    cv: sig.cv,
++                    no_return_type: false,
++                    is_virtual,
++                });
++            }
++            Symbol::Ctor { class, variant, sig } => {
++                // Ctor name slot is `?0` (always — MSVC has a single
++                // ctor "variant" mangled symbol; the unified-vs-base
++                // vs allocating distinction the Itanium ABI carries
++                // does not exist in MSVC's ABI. We still accept the
++                // variant parameter for shape parity with the
++                // Itanium mangler, but emit the same string for all
++                // three variants. The C1/C2/C3 distinction is
++                // collapsed by `Symbol::Ctor` at the symbol-emit
++                // layer; downstream codegen invokes the single
++                // mangled name.)
++                let _ = variant; // intentionally unused for MSVC
++                self.out.push_str("??0");
++                let class_path = &self.ctx.class(*class).name.0;
++                self.emit_qualified_name_tail(class_path);
++                let cv = CvQual::default();
++                // Constructors are never virtual.
++                self.emit_function_info(FnInfo {
++                    sig,
++                    is_member: true,
++                    cv,
++                    no_return_type: true,
++                    is_virtual: false,
++                });
++            }
++            Symbol::Dtor { class, variant } => {
++                // Dtor: `??1Class@@<info>` (vector deleting dtor is
++                // a separate symbol `??_E`, scalar deleting is
++                // `??_G`. The D2/D1/D0 distinction maps roughly to
++                // base / complete / deleting; for the layer this
++                // crate models, we emit the base (`??1`) and let
++                // the caller request the deleting variants
++                // separately via vtable entries.)
++                let _ = variant;
++                self.out.push_str("??1");
++                let class_path = &self.ctx.class(*class).name.0;
++                self.emit_qualified_name_tail(class_path);
++                // Dtor: no return type slot, no params. We use a
++                // sentinel TypeId — `no_return_type: true` means
++                // `emit_function_info` never reads `sig.ret`, so the
++                // `TypeId(u32::MAX)` value is never resolved.
++                let dummy_sig = FnSig {
++                    params: vec![],
++                    ret: TypeId(u32::MAX),
++                    cv: CvQual::default(),
++                    ref_q: None,
++                    variadic: false,
++                    noexcept: false,
++                };
++                // Destructor virtuality: any class with a virtual
++                // base or any virtual method has a virtual dtor;
++                // explicit `virtual ~T()` also marks it. Look it up.
++                let is_virtual = self.dtor_is_virtual(*class);
++                self.emit_function_info(FnInfo {
++                    sig: &dummy_sig,
++                    is_member: true,
++                    cv: CvQual::default(),
++                    no_return_type: true,
++                    is_virtual,
++                });
++            }
++            Symbol::VTable(class) => {
++                // vftable: `??_7Class@@6B@`. The `6B` indicates
++                // const-data of class storage; the trailing `@` is
++                // the empty "for which base" name (primary table).
++                self.out.push_str("??_7");
++                let class_path = &self.ctx.class(*class).name.0;
++                self.emit_qualified_name_tail(class_path);
++                self.out.push_str("6B@");
++            }
++            Symbol::TypeInfo(class) => {
++                // RTTI complete-object-locator: `??_R4Class@@6BClass@@@`.
++                // The trailing `Class@@@` repeats the class name — this
++                // is the "for-class" qualifier (vftable layout location).
++                self.out.push_str("??_R4");
++                let class_path = &self.ctx.class(*class).name.0;
++                self.emit_qualified_name_tail(class_path);
++                self.out.push_str("6B");
++                self.emit_qualified_name_tail(class_path);
++                self.out.push('@');
++            }
++            Symbol::TypeInfoName(class) => {
++                // RTTI type descriptor: `??_R0?AVClass@@@8`.
++                // The `?AV` prefix is "?A" (storage modifier:
++                // local-symbol no-name) + `V` (class type).
++                self.out.push_str("??_R0?AV");
++                let class_path = &self.ctx.class(*class).name.0;
++                self.emit_qualified_name_tail(class_path);
++                self.out.push_str("@8");
++            }
++            Symbol::Variable { scope, name, ty } => {
++                // Free / static-member variable:
++                // `?<name>@<scope>@@3<type><cv>`. Trailing digit `3`
++                // indicates "static data member with external linkage";
++                // local statics use `4`, threadlocals use `0..`.
++                self.out.push('?');
++                self.emit_unqualified_name(&name.0);
++                self.emit_qualified_name_tail(&scope.0);
++                self.out.push('3');
++                let mut subout = String::new();
++                std::mem::swap(&mut self.out, &mut subout);
++                self.emit_type(*ty);
++                std::mem::swap(&mut self.out, &mut subout);
++                self.out.push_str(&subout);
++                // Variables don't carry their own cv on the symbol
++                // line; the type encoding above already covers any
++                // pointer-level cv. Trailing `A` = no top-level cv.
++                self.out.push('A');
++            }
++            Symbol::GuardVariable { for_var } => {
++                // MSVC TLS guard / dynamic initializer guard:
++                // `?$TSS<n>@?<func>@@4HA` in the general case; for the
++                // narrower "static-var initialization guard" Itanium
++                // models with `_ZGV`, MSVC uses
++                // `?$S1@?1??func@@4HA` patterns. For the symbol layer
++                // this crate models (a single fully-qualified guard
++                // for a top-level variable), we emit the simpler
++                // `?$TSS0@?<var>@@4HA` form. This is approximate; the
++                // fork's codegen patch tightens it up against
++                // observed clang output.
++                self.out.push_str("?$TSS0@?");
++                if let Some(last) = for_var.0.last() {
++                    let last = last.clone();
++                    if let Some(name) = unqualified_name(&last) {
++                        self.emit_unqualified_name(name);
++                    }
++                }
++                // Emit any remaining scope (everything except the
++                // last segment).
++                if for_var.0.len() > 1 {
++                    self.emit_qualified_name_tail(&for_var.0[..for_var.0.len() - 1]);
++                } else {
++                    self.out.push_str("@@");
++                }
++                self.out.push_str("4HA");
++            }
++        }
++    }
++
++    // -------- Name emission ------------------------------------------
++
++    /// Emit an unqualified identifier with name-table back-reference
++    /// compression. `name` is the source-text identifier (no `@`).
++    fn emit_unqualified_name(&mut self, name: &str) {
++        if let Some(d) = self.back_refs.find_name(name) {
++            self.out.push(d);
++            return;
++        }
++        self.out.push_str(name);
++        self.out.push('@');
++        self.back_refs.record_name(name);
++    }
++
++    /// Emit the qualified-name tail: scope segments **in reverse order**
++    /// (innermost first), each followed by `@`, terminated by an extra
++    /// `@` to produce the canonical `@@` separator.
++    ///
++    /// Caller has already emitted the unqualified-name part (and any
++    /// special prefix like `?0`). This method handles everything from
++    /// the first scope segment through to the `@@` terminator.
++    fn emit_qualified_name_tail(&mut self, scope: &[NameSegment]) {
++        for seg in scope.iter().rev() {
++            self.emit_name_segment(seg);
++        }
++        self.out.push('@'); // closes the qualified-name list
++    }
++
++    fn emit_name_segment(&mut self, seg: &NameSegment) {
++        match seg {
++            NameSegment::Namespace(ident)
++            | NameSegment::Class(ident)
++            | NameSegment::Enum(ident) => {
++                self.emit_unqualified_name(&ident.0);
++            }
++            NameSegment::AnonymousNamespace => {
++                // MSVC mangles anonymous namespaces as `?A0x<hash>` —
++                // we use a deterministic placeholder for now. The
++                // hash is meant to vary between translation units;
++                // collisions across TUs are tolerated by the linker
++                // because each anonymous namespace's contents are
++                // internal-linkage.
++                self.out.push_str("?A0x00000000@");
++            }
++            NameSegment::TemplateSpec { name, args } => {
++                // Template specialization: `?$<name>@<targs>@`. The
++                // trailing `@` after the args closes the template-
++                // args block; the outer `emit_qualified_name_tail`
++                // appends one MORE `@` between segments / for the
++                // qual-name terminator. So a top-level `Box<int>`
++                // type ends up rendered as `U?$Box@H@@`.
++                //
++                // The whole `?$name@<targs>@` block participates in
++                // the name back-reference table as a single unit.
++                let mut tmp = String::new();
++                std::mem::swap(&mut self.out, &mut tmp);
++                self.out.push_str("?$");
++                self.out.push_str(&name.0);
++                self.out.push('@');
++                for arg in args {
++                    match arg {
++                        TemplateArg::Type(ty) => self.emit_type_nested(*ty),
++                    }
++                }
++                self.out.push('@'); // close template-args block
++                let chunk = std::mem::take(&mut self.out);
++                std::mem::swap(&mut self.out, &mut tmp);
++                if let Some(d) = self.back_refs.find_name(&chunk) {
++                    self.out.push(d);
++                } else {
++                    self.out.push_str(&chunk);
++                    self.back_refs.record_name(&chunk);
++                }
++            }
++        }
++    }
++
++    fn emit_method_name(&mut self, name: &MethodName) {
++        match name {
++            MethodName::Ident(ident) => self.emit_unqualified_name(&ident.0),
++            MethodName::Operator(op) => self.out.push_str(operator_code(*op)),
++            MethodName::ConversionTo(ty) => {
++                // Conversion operator: `??B` (cast to T). The target
++                // type follows in the return-position slot.
++                self.out.push_str("?B");
++                let _ = ty;
++            }
++        }
++    }
++
++    // -------- Function-info block ------------------------------------
++
++    /// Emit `<access>[E<this-cv>]<cc><return-or-@><params>[<exc>]Z`
++    /// after the qualified name.
++    ///
++    /// Layout breakdown:
++    /// - **Access letter.** `Y` for free functions, `Q` for public
++    ///   member functions (we don't model protected/private since the
++    ///   linker can't see access anyway).
++    /// - **Extended this-pointer marker.** On 64-bit MSVC targets,
++    ///   every member function gets an `E` here to mark its `this`
++    ///   pointer as 64-bit. Free functions don't.
++    /// - **This-cv letter.** Member functions emit a CV qualifier
++    ///   for the implicit `this` (`A`/`B`/`C`/`D`). Free functions
++    ///   skip this slot entirely.
++    /// - **Calling convention.** `A` for `__cdecl` (the only one we
++    ///   model right now; `__stdcall`, `__fastcall`, etc. live behind
++    ///   target-CC plumbing not yet wired up).
++    /// - **Return type.** Either the encoded type, or `@` for
++    ///   ctors/dtors that have no return-type slot.
++    /// - **Params.** `X` for `(void)`, otherwise the type-sequence
++    ///   followed by `@` terminator.
++    /// - **Exception spec.** `_E` prefix for `noexcept`, then `Z`
++    ///   universally.
++    fn emit_function_info(&mut self, info: FnInfo<'_>) {
++        if info.is_member {
++            // `Q` for public non-virtual, `U` for public virtual.
++            // (Protected and private have their own letter ranges
++            // that this layer doesn't yet model; access doesn't
++            // affect linkage so all public is a safe default for
++            // codegen-relevant mangling.)
++            self.out.push(if info.is_virtual { 'U' } else { 'Q' });
++            // `E` marks a 64-bit member function's `this` pointer.
++            // On 32-bit MSVC this slot is empty; on 64-bit it's
++            // always `E`.
++            if self.is_64_bit() {
++                self.out.push('E');
++            }
++            // This-cv as a standalone letter.
++            self.out.push(ptr_cv_letter(info.cv));
++        } else {
++            // Free function: single `Y` letter encompassing the
++            // no-this, public, no-cv combination.
++            self.out.push('Y');
++        }
++        // Calling convention — always `A` (__cdecl) for now.
++        self.out.push('A');
++        // Return type. Ctors and dtors collapse this slot to a
++        // single `@` because they have no return-type in the C++
++        // source. Class-by-value returns get a `?A` storage-class
++        // prefix (MSVC's "no-cv UDT return value" marker) — clang
++        // emits it for every record-typed return, trivially
++        // destructible or not.
++        if info.no_return_type {
++            self.out.push('@');
++        } else {
++            if matches!(
++                self.ctx.type_of(info.sig.ret),
++                CxxType::Record(_) | CxxType::Enum { .. }
++            ) {
++                self.out.push_str("?A");
++            }
++            self.emit_type(info.sig.ret);
++        }
++        // Params.
++        if info.sig.params.is_empty() {
++            self.out.push('X');
++        } else {
++            for p in &info.sig.params {
++                self.emit_type(*p);
++            }
++            self.out.push('@');
++        }
++        // Exception spec. MSVC's mangler — unlike Itanium —
++        // doesn't encode `noexcept` into the mangled name at all,
++        // even in C++17 mode when noexcept is part of the function
++        // type. Verified via:
++        //   clang -target x86_64-pc-windows-msvc -fms-compatibility \
++        //         -std=c++20 -c probe.cpp
++        // both `void f(int)` and `void f(int) noexcept` mangle as
++        // `?f@@YAXH@Z`. The MSVC ABI just doesn't carry that
++        // distinction at the symbol level; the linker happily
++        // unifies them.
++        self.out.push('Z');
++    }
++
++    fn is_64_bit(&self) -> bool {
++        self.ctx.target().pointer_width_bits == 64
++            && matches!(self.ctx.target().abi_flavor, AbiFlavor::Msvc)
++    }
++
++    /// Look up the virtuality of `Class::name(sig)` in the class's
++    /// method list. Returns `true` for `Virtual` and `PureVirtual`.
++    /// Returns `false` when no matching method exists — that path
++    /// is taken by test fixtures that build a `Symbol::Method`
++    /// without populating the class's `.methods`, in which case
++    /// the non-virtual default `Q` is the right output.
++    fn lookup_method_is_virtual(
++        &self,
++        class: ClassId,
++        name: &MethodName,
++        sig: &FnSig,
++    ) -> bool {
++        for m in &self.ctx.class(class).methods {
++            if &m.name == name
++                && m.sig.params == sig.params
++                && m.sig.cv == sig.cv
++            {
++                return matches!(
++                    m.virtuality,
++                    crate::ty::Virtuality::Virtual
++                        | crate::ty::Virtuality::PureVirtual
++                );
++            }
++        }
++        false
++    }
++
++    /// A class's destructor is virtual if any explicit dtor entry in
++    /// the class's method list is marked virtual, OR if any base of
++    /// the class has a virtual dtor (the implicit-virtual-dtor
++    /// rule). Approximated as: any virtual method on the class or
++    /// any base chain.
++    fn dtor_is_virtual(&self, class: ClassId) -> bool {
++        // Direct check.
++        for m in &self.ctx.class(class).methods {
++            if matches!(m.special, Some(crate::ty::SpecialMember::Dtor)) {
++                return matches!(
++                    m.virtuality,
++                    crate::ty::Virtuality::Virtual
++                        | crate::ty::Virtuality::PureVirtual
++                );
++            }
++        }
++        // Inherited virtual dtor from a polymorphic base.
++        self.ctx
++            .class(class)
++            .bases
++            .iter()
++            .any(|b| self.dtor_is_virtual(b.class))
++    }
++
++    // -------- Type emission ------------------------------------------
++
++    /// Emit a type encoding at the **top level** of a parameter (or
++    /// return) position.
++    ///
++    /// MSVC's type back-reference table records compound types
++    /// keyed by *semantic type identity*. The table is consulted
++    /// only at top-level type positions — typically each parameter
++    /// of a function signature, plus the return type. Nested types
++    /// inside modifiers (the pointee of a `Ptr`, the pointee of a
++    /// `Ref`, the element of an `Array`) bypass the type table and
++    /// rely on the name back-reference table for compression. This
++    /// matches clang's observed behavior: `void f(V, V)` emits
++    /// `?f@@YAXUV@@0@Z` (second `V` compresses via type table),
++    /// `void g(V, V&)` emits `?g@@YAXUV@@AEAU1@@Z` (different
++    /// top-level types — no type table hit; the `V` inside `V&`
++    /// uses only the name back-ref).
++    fn emit_type(&mut self, ty: TypeId) {
++        let cxx = self.ctx.type_of(ty).clone();
++        // Builtin types: never participate in the type table. Their
++        // rendered form is already a single character.
++        if matches!(
++            cxx,
++            CxxType::Void | CxxType::Bool | CxxType::Int { .. } | CxxType::Float { .. }
++        ) {
++            self.emit_type_body(&cxx);
++            return;
++        }
++        // Compound type: check the type table by TypeId.
++        if let Some(d) = self.back_refs.find_type(ty) {
++            self.out.push(d);
++            return;
++        }
++        // First emission — render body normally. Nested types inside
++        // it route through `emit_type_nested` so they don't consult
++        // the type table. Record this TypeId in the table after.
++        self.emit_type_body(&cxx);
++        self.back_refs.record_type(ty);
++    }
++
++    /// Emit a type encoding at a **nested** position — inside a
++    /// modifier wrapper (`Ptr` pointee, `Ref` pointee, `Array`
++    /// element). Skips the type back-reference table; only the
++    /// name table is consulted (transparently, via
++    /// `emit_qualified_name_tail`).
++    fn emit_type_nested(&mut self, ty: TypeId) {
++        let cxx = self.ctx.type_of(ty).clone();
++        self.emit_type_body(&cxx);
++    }
++
++    fn emit_type_body(&mut self, ty: &CxxType) {
++        match ty {
++            CxxType::Void => self.out.push('X'),
++            CxxType::Bool => self.out.push_str("_N"),
++            CxxType::Int { signed, width } => {
++                self.out.push_str(int_code(*signed, *width));
++            }
++            CxxType::Float { kind } => self.out.push(float_code(*kind)),
++            CxxType::Ptr { pointee, cv } => {
++                // 64-bit: `PE` + CV-letter (`A`/`B`/`C`/`D`).
++                self.out.push_str("PE");
++                self.out.push(ptr_cv_letter(*cv));
++                // Nested position: don't consult the type table.
++                self.emit_type_nested(*pointee);
++            }
++            CxxType::Ref { pointee, kind, cv } => {
++                let prefix = match kind {
++                    RefKind::Lvalue => "AE",
++                    RefKind::Rvalue => "$$Q",
++                };
++                self.out.push_str(prefix);
++                self.out.push(ptr_cv_letter(*cv));
++                self.emit_type_nested(*pointee);
++            }
++            CxxType::Array { elem, len } => {
++                // `_O` prefix + element + length. MSVC's array
++                // encoding is `_O<bound><element>` with bound as
++                // decimal; for now we emit the bound as a literal
++                // digit run.
++                let _ = write!(self.out, "_O{len}");
++                self.emit_type_nested(*elem);
++            }
++            CxxType::Record(class_id) => {
++                // Class type: `V<qualified-name>@@`.
++                // Struct vs class is distinguished in MSVC mangling by
++                // `U` vs `V` respectively (and `T` for union).
++                let letter = record_kind_letter(self.ctx, *class_id);
++                self.out.push(letter);
++                let path = self.ctx.class(*class_id).name.0.clone();
++                self.emit_qualified_name_tail(&path);
++            }
++            CxxType::Enum { name, underlying, .. } => {
++                // Enum: `W4<qualified-name>@@`.
++                // The `4` indicates the underlying type is the default
++                // (`int`); when explicit, codes 0..7 select from
++                // a fixed lookup table (char/short/int/long/ulong/uchar/ushort/uint).
++                let code = enum_underlying_code(self.ctx.type_of(*underlying));
++                self.out.push('W');
++                self.out.push(code);
++                let path = name.0.clone();
++                self.emit_qualified_name_tail(&path);
++            }
++            CxxType::Fn(_) => {
++                // Function type encoded inline: rare outside member
++                // pointers. Emit a placeholder for now.
++                self.out.push_str("P6A?@Z");
++            }
++            CxxType::MemberPtr { .. } => {
++                // Pointer-to-member: `P8<class>@@A<sig>` in full; we
++                // emit a placeholder.
++                self.out.push_str("P8?@@A?@Z");
++            }
++        }
++    }
++
++}
++
++fn unqualified_name(seg: &NameSegment) -> Option<&str> {
++    match seg {
++        NameSegment::Namespace(i) | NameSegment::Class(i) | NameSegment::Enum(i) => Some(&i.0),
++        NameSegment::TemplateSpec { name, .. } => Some(&name.0),
++        NameSegment::AnonymousNamespace => None,
++    }
++}
++
++/// Backwards-compatibility helper: the dispatcher passes a
++/// `NestedName` and we need to fan it into the per-segment emit. Kept
++/// outside `MsvcMangler` so the dispatcher doesn't need to hold the
++/// mangler around.
++#[allow(dead_code)]
++pub(crate) fn render_nested(ctx: &CxxTypeCtx, name: &NestedName) -> String {
++    let mut m = MsvcMangler::new(ctx);
++    m.emit_qualified_name_tail(&name.0);
++    m.out
++}
++
++// -------- Code tables --------------------------------------------------
++
++fn int_code(signed: bool, width: IntWidth) -> &'static str {
++    match (signed, width) {
++        (true, IntWidth::I8) => "D",   // char
++        (false, IntWidth::I8) => "E",  // unsigned char
++        (true, IntWidth::I16) => "F",  // short
++        (false, IntWidth::I16) => "G", // unsigned short
++        (true, IntWidth::I32) => "H",  // int
++        (false, IntWidth::I32) => "I", // unsigned int
++        (true, IntWidth::I64) => "_J", // int64_t / long long
++        (false, IntWidth::I64) => "_K", // uint64_t / unsigned long long
++        (true, IntWidth::I128) => "_L", // __int128 — MSVC extension code
++        (false, IntWidth::I128) => "_M",
++    }
++}
++
++fn float_code(kind: FloatKind) -> char {
++    match kind {
++        FloatKind::F32 => 'M',         // float
++        FloatKind::F64 => 'N',         // double
++        FloatKind::LongDouble => 'O',  // long double (same as double on MSVC)
++    }
++}
++
++/// Pointer-CV letter. MSVC encodes pointer / reference qualifiers as:
++/// `A` = neither, `B` = const, `C` = volatile, `D` = const volatile.
++fn ptr_cv_letter(cv: CvQual) -> char {
++    match (cv.is_const, cv.is_volatile) {
++        (false, false) => 'A',
++        (true, false) => 'B',
++        (false, true) => 'C',
++        (true, true) => 'D',
++    }
++}
++
++fn record_kind_letter(ctx: &CxxTypeCtx, class: ClassId) -> char {
++    use crate::ty::RecordKind;
++    match ctx.class(class).kind {
++        RecordKind::Class => 'V',
++        RecordKind::Struct => 'U',
++        RecordKind::Union => 'T',
++    }
++}
++
++fn enum_underlying_code(ty: &CxxType) -> char {
++    // MSVC encodes the underlying type as a single digit:
++    //   0 char, 1 unsigned char, 2 short, 3 unsigned short,
++    //   4 int, 5 unsigned int, 6 long, 7 unsigned long.
++    // 64-bit underlying types use `_J`/`_K` instead and the enum
++    // prefix becomes `W_J@...` — handled by enum emission elsewhere.
++    match ty {
++        CxxType::Int { signed: true, width: IntWidth::I8 } => '0',
++        CxxType::Int { signed: false, width: IntWidth::I8 } => '1',
++        CxxType::Int { signed: true, width: IntWidth::I16 } => '2',
++        CxxType::Int { signed: false, width: IntWidth::I16 } => '3',
++        CxxType::Int { signed: true, width: IntWidth::I32 } => '4',
++        CxxType::Int { signed: false, width: IntWidth::I32 } => '5',
++        CxxType::Int { signed: true, width: IntWidth::I64 } => '6',
++        CxxType::Int { signed: false, width: IntWidth::I64 } => '7',
++        _ => '4', // default int
++    }
++}
++
++fn operator_code(op: OperatorKind) -> &'static str {
++    // MSVC operator codes — all live in the `??` namespace and the
++    // unqualified part is the digit/letter combination listed here.
++    // Lookup table compiled from MicrosoftMangle.cpp's
++    // `mangleOperatorName` switch.
++    match op {
++        OperatorKind::Plus => "?H",
++        OperatorKind::Minus => "?G",
++        OperatorKind::Mul => "?D",
++        OperatorKind::Div => "?K",
++        OperatorKind::Mod => "?L",
++        OperatorKind::Assign => "?4",
++        OperatorKind::PlusAssign => "?Y",
++        OperatorKind::Eq => "?8",
++        OperatorKind::Ne => "?9",
++        OperatorKind::Lt => "?M",
++        OperatorKind::Le => "?N",
++        OperatorKind::Gt => "?O",
++        OperatorKind::Ge => "?P",
++        OperatorKind::Call => "?R",
++        OperatorKind::Index => "?A",
++        OperatorKind::Deref => "?C",
++        OperatorKind::PreIncr => "?E",
++        OperatorKind::PreDecr => "?F",
++    }
++}
++
++// Variants stay accessible from this module for parity with the
++// Itanium mangler's API shape. They're a no-op for MSVC because the
++// MSVC ABI doesn't carry the Itanium C1/C2/C3 / D0/D1/D2 distinction
++// at the symbol level.
++#[allow(dead_code)]
++fn _accept_ctor_variant(_: CtorVariant) {}
++#[allow(dead_code)]
++fn _accept_dtor_variant(_: DtorVariant) {}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::target::Target;
++    use crate::ty::{
++        ClassDef, FnSig, Ident, NameSegment, NestedName, RecordKind,
++    };
++
++    fn ctx() -> CxxTypeCtx {
++        CxxTypeCtx::new(Target::x86_64_pc_windows_msvc())
++    }
++
++    fn intern_int(ctx: &mut CxxTypeCtx, signed: bool, width: IntWidth) -> TypeId {
++        ctx.intern_type(CxxType::Int { signed, width })
++    }
++
++    fn intern_void(ctx: &mut CxxTypeCtx) -> TypeId {
++        ctx.intern_type(CxxType::Void)
++    }
++
++    fn class(name: &str, kind: RecordKind) -> ClassDef {
++        ClassDef {
++            name: NestedName(vec![NameSegment::Class(Ident(name.into()))]),
++            bases: vec![],
++            fields: vec![],
++            methods: vec![],
++            kind,
++            is_polymorphic: false,
++            is_final: false,
++            source_alignment: None,
++        }
++    }
++
++    #[test]
++    fn free_function_int_int() {
++        // `int foo(int)` -> `?foo@@YAHH@Z`
++        let mut c = ctx();
++        let i = intern_int(&mut c, true, IntWidth::I32);
++        let sig = FnSig {
++            params: vec![i],
++            ret: i,
++            cv: CvQual::default(),
++            ref_q: None,
++            variadic: false,
++            noexcept: false,
++        };
++        let mangled = c.mangle_msvc(&Symbol::Function {
++            scope: NestedName(vec![]),
++            name: Ident("foo".into()),
++            sig,
++        });
++        assert_eq!(mangled, "?foo@@YAHH@Z");
++    }
++
++    #[test]
++    fn free_function_void_no_args() {
++        // `void foo(void)` -> `?foo@@YAXXZ`
++        let mut c = ctx();
++        let v = intern_void(&mut c);
++        let sig = FnSig {
++            params: vec![],
++            ret: v,
++            cv: CvQual::default(),
++            ref_q: None,
++            variadic: false,
++            noexcept: false,
++        };
++        let m = c.mangle_msvc(&Symbol::Function {
++            scope: NestedName(vec![]),
++            name: Ident("foo".into()),
++            sig,
++        });
++        assert_eq!(m, "?foo@@YAXXZ");
++    }
++
++    #[test]
++    fn member_const_method() {
++        // `class C { int f(int) const; }` -> `?f@C@@QEBAHH@Z`
++        // Q = public access, E = 64-bit this, B = const-this,
++        // A = __cdecl, H = int return, H = int param, @ = end
++        // params, Z = no exception spec.
++        let mut c = ctx();
++        let cid = c.define_class(class("C", RecordKind::Class));
++        let i = intern_int(&mut c, true, IntWidth::I32);
++        let sig = FnSig {
++            params: vec![i],
++            ret: i,
++            cv: CvQual { is_const: true, is_volatile: false },
++            ref_q: None,
++            variadic: false,
++            noexcept: false,
++        };
++        let m = c.mangle_msvc(&Symbol::Method {
++            class: cid,
++            name: MethodName::Ident(Ident("f".into())),
++            sig,
++        });
++        assert_eq!(m, "?f@C@@QEBAHH@Z");
++    }
++
++    #[test]
++    fn ctor_emits_double_question_zero() {
++        // `class C { C(); }` -> `??0C@@QEAA@XZ`
++        let mut c = ctx();
++        let cid = c.define_class(class("C", RecordKind::Class));
++        let v = intern_void(&mut c);
++        let sig = FnSig {
++            params: vec![],
++            ret: v,
++            cv: CvQual::default(),
++            ref_q: None,
++            variadic: false,
++            noexcept: false,
++        };
++        let m = c.mangle_msvc(&Symbol::Ctor {
++            class: cid,
++            variant: CtorVariant::C1,
++            sig,
++        });
++        assert_eq!(m, "??0C@@QEAA@XZ");
++    }
++
++    #[test]
++    fn dtor_emits_double_question_one() {
++        let mut c = ctx();
++        let cid = c.define_class(class("C", RecordKind::Class));
++        let m = c.mangle_msvc(&Symbol::Dtor {
++            class: cid,
++            variant: DtorVariant::D1,
++        });
++        // `??1C@@QEAA@XZ` (member dtor, no params, no ret)
++        assert_eq!(m, "??1C@@QEAA@XZ");
++    }
++
++    #[test]
++    fn vtable_emits_question_underscore_seven() {
++        let mut c = ctx();
++        let cid = c.define_class(class("C", RecordKind::Class));
++        let m = c.mangle_msvc(&Symbol::VTable(cid));
++        assert_eq!(m, "??_7C@@6B@");
++    }
++
++    #[test]
++    fn nested_namespace_reverses_segments() {
++        // `void N::M::foo()` -> `?foo@M@N@@YAXXZ`
++        let mut c = ctx();
++        let v = intern_void(&mut c);
++        let sig = FnSig {
++            params: vec![],
++            ret: v,
++            cv: CvQual::default(),
++            ref_q: None,
++            variadic: false,
++            noexcept: false,
++        };
++        let scope = NestedName(vec![
++            NameSegment::Namespace(Ident("N".into())),
++            NameSegment::Namespace(Ident("M".into())),
++        ]);
++        let m = c.mangle_msvc(&Symbol::Function {
++            scope,
++            name: Ident("foo".into()),
++            sig,
++        });
++        assert_eq!(m, "?foo@M@N@@YAXXZ");
++    }
++
++    #[test]
++    fn name_back_reference_compresses_repeated_scope() {
++        // `int N::f(N::S)` where S is in namespace N. MSVC records
++        // every identifier (including the function's own leaf
++        // name) in appearance order. After emitting `?f@N@@`, the
++        // name table is `[f, N]`. The parameter type then emits
++        // `VS@` (new name → slot 2) and looks up `N` (slot 1) →
++        // back-ref `1`.
++        let mut c = ctx();
++        let i = intern_int(&mut c, true, IntWidth::I32);
++        let sid = c.define_class(ClassDef {
++            name: NestedName(vec![
++                NameSegment::Namespace(Ident("N".into())),
++                NameSegment::Class(Ident("S".into())),
++            ]),
++            bases: vec![],
++            fields: vec![],
++            methods: vec![],
++            kind: RecordKind::Class,
++            is_polymorphic: false,
++            is_final: false,
++            source_alignment: None,
++        });
++        let sty = c.intern_type(CxxType::Record(sid));
++        let sig = FnSig {
++            params: vec![sty],
++            ret: i,
++            cv: CvQual::default(),
++            ref_q: None,
++            variadic: false,
++            noexcept: false,
++        };
++        let m = c.mangle_msvc(&Symbol::Function {
++            scope: NestedName(vec![NameSegment::Namespace(Ident("N".into()))]),
++            name: Ident("f".into()),
++            sig,
++        });
++        // Expected: `?f@N@@YAHVS@1@@Z`
++        // Breakdown:
++        //   ?f       — function name (slot 0)
++        //   @N       — scope (slot 1)
++        //   @@       — terminator
++        //   YA       — free fn + __cdecl
++        //   H        — return int
++        //   V        — class type ahead
++        //   S@       — class name "S" (slot 2)
++        //   1        — back-ref to N at slot 1
++        //   @        — end of class qualified-name
++        //   @        — end of parameter list
++        //   Z        — no exception spec
++        assert_eq!(m, "?f@N@@YAHVS@1@@Z");
++    }
++
++    #[test]
++    fn ptr_to_const_int() {
++        // `void f(const int *)` -> `?f@@YAXPEBH@Z`
++        let mut c = ctx();
++        let v = intern_void(&mut c);
++        let i = intern_int(&mut c, true, IntWidth::I32);
++        let p = c.intern_type(CxxType::Ptr {
++            pointee: i,
++            cv: CvQual { is_const: true, is_volatile: false },
++        });
++        let sig = FnSig {
++            params: vec![p],
++            ret: v,
++            cv: CvQual::default(),
++            ref_q: None,
++            variadic: false,
++            noexcept: false,
++        };
++        let m = c.mangle_msvc(&Symbol::Function {
++            scope: NestedName(vec![]),
++            name: Ident("f".into()),
++            sig,
++        });
++        assert_eq!(m, "?f@@YAXPEBH@Z");
++    }
++}
+diff --git a/compiler/rustc_abi_cxx/src/target.rs b/compiler/rustc_abi_cxx/src/target.rs
+index ebce7c87476..b1afcc06d6d 100644
+--- a/compiler/rustc_abi_cxx/src/target.rs
++++ b/compiler/rustc_abi_cxx/src/target.rs
+@@ -3,6 +3,7 @@
+ //! See `docs/rustc_abi_cxx.md §8`.
+ 
+ #[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct Target {
+     pub triple: String,
+     pub pointer_width_bits: u32,
+@@ -10,15 +11,50 @@ pub struct Target {
+     pub wchar_t_signed: bool,
+     pub wchar_t_width: u32,
+     pub aarch64_darwin_quirks: bool,
++    /// Which C++ ABI dialect the platform uses. `Itanium` covers Linux,
++    /// macOS, FreeBSD, and Windows-via-mingw; `Msvc` covers
++    /// `*-pc-windows-msvc` (and, in the future, native MSVC clang targets
++    /// on Wine). The flavor decides which mangler, vtable layout, and
++    /// record-layout backend is selected by the dispatcher in
++    /// `mangle::dispatch` / `vtable::dispatch` / `layout::dispatch`.
++    ///
++    /// Added in v1.09.0 alongside the MSVC ABI implementation. Existing
++    /// targets default to `AbiFlavor::Itanium` and that's the behavior
++    /// pre-v1.09.0 callers see.
++    pub abi_flavor: AbiFlavor,
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum LongDoubleKind {
+     F64,
+     F80,
+     F128,
+ }
+ 
++/// Which C++ ABI a target implements. Used as a routing key by the
++/// mangler, vtable, and layout dispatchers.
++///
++/// The two flavors diverge at every layer:
++/// - **Mangling.** Itanium spells `?N::f(int) const` as `_ZNK1N1fEi`;
++///   MSVC spells it as `?f@N@@AEBHH@Z`. Substitution / back-reference
++///   schemes are entirely different.
++/// - **Vtable.** Itanium puts offset-to-top + RTTI before the function
++///   slots; MSVC has no such header (the RTTI complete-object-locator
++///   lives at a *negative* offset reachable via vftable[−1]). Virtual
++///   inheritance uses a vbtable (separate from the vftable) under MSVC.
++/// - **Record layout.** MSVC reuses tail padding only for fields, not
++///   bases; the empty-base optimization is more restricted; the vbptr
++///   has a fixed insertion point near the start of the class.
++/// - **Exception handling.** Itanium uses `__cxa_*` + libunwind tables;
++///   MSVC uses SEH funclets and `_CxxThrowException`.
++#[derive(Copy, Clone, Debug, PartialEq, Eq)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
++pub enum AbiFlavor {
++    Itanium,
++    Msvc,
++}
++
+ impl Target {
+     pub fn x86_64_unknown_linux_gnu() -> Self {
+         Self {
+@@ -28,6 +64,7 @@ pub fn x86_64_unknown_linux_gnu() -> Self {
+             wchar_t_signed: true,
+             wchar_t_width: 32,
+             aarch64_darwin_quirks: false,
++            abi_flavor: AbiFlavor::Itanium,
+         }
+     }
+ 
+@@ -39,6 +76,7 @@ pub fn x86_64_apple_darwin() -> Self {
+             wchar_t_signed: true,
+             wchar_t_width: 32,
+             aarch64_darwin_quirks: false,
++            abi_flavor: AbiFlavor::Itanium,
+         }
+     }
+ 
+@@ -50,6 +88,7 @@ pub fn aarch64_unknown_linux_gnu() -> Self {
+             wchar_t_signed: false,
+             wchar_t_width: 32,
+             aarch64_darwin_quirks: false,
++            abi_flavor: AbiFlavor::Itanium,
+         }
+     }
+ 
+@@ -61,19 +100,77 @@ pub fn aarch64_apple_darwin() -> Self {
+             wchar_t_signed: false,
+             wchar_t_width: 32,
+             aarch64_darwin_quirks: true,
++            abi_flavor: AbiFlavor::Itanium,
++        }
++    }
++
++    /// Windows x86_64 with the MSVC C++ ABI. Differs from
++    /// `x86_64-pc-windows-gnu` (which uses the Itanium ABI via mingw-w64)
++    /// in every layer that this crate models: name mangling, vtable
++    /// layout, record layout, and downstream exception lowering.
++    ///
++    /// `long double` on MSVC is 64-bit (matches `double`); `wchar_t`
++    /// is 16-bit unsigned (UTF-16). Both diverge from the Unix targets
++    /// and feed into the MSVC mangler's `_W` / `_T` / `_O` builtin codes.
++    pub fn x86_64_pc_windows_msvc() -> Self {
++        Self {
++            triple: String::from("x86_64-pc-windows-msvc"),
++            pointer_width_bits: 64,
++            long_double: LongDoubleKind::F64,
++            wchar_t_signed: false,
++            wchar_t_width: 16,
++            aarch64_darwin_quirks: false,
++            abi_flavor: AbiFlavor::Msvc,
++        }
++    }
++
++    /// Windows aarch64 with the MSVC C++ ABI. Same ABI rules as the
++    /// x86_64 target above; differs only in pointer width (already 64)
++    /// and downstream calling-convention details that this crate doesn't
++    /// model directly.
++    pub fn aarch64_pc_windows_msvc() -> Self {
++        Self {
++            triple: String::from("aarch64-pc-windows-msvc"),
++            pointer_width_bits: 64,
++            long_double: LongDoubleKind::F64,
++            wchar_t_signed: false,
++            wchar_t_width: 16,
++            aarch64_darwin_quirks: false,
++            abi_flavor: AbiFlavor::Msvc,
++        }
++    }
++
++    /// Windows x86_64 with the mingw-w64 toolchain. Uses the Itanium ABI
++    /// (with a few mingw-specific tweaks not yet modeled — left to the
++    /// follow-up that exercises mingw end-to-end). Pointer width / long
++    /// double / wchar_t match MSVC's choices because the OS-level type
++    /// system is the same.
++    ///
++    /// Phase-1 stepping stone before the full MSVC target lands.
++    pub fn x86_64_pc_windows_gnu() -> Self {
++        Self {
++            triple: String::from("x86_64-pc-windows-gnu"),
++            pointer_width_bits: 64,
++            long_double: LongDoubleKind::F64,
++            wchar_t_signed: false,
++            wchar_t_width: 16,
++            aarch64_darwin_quirks: false,
++            abi_flavor: AbiFlavor::Itanium,
+         }
+     }
+ 
+-    /// P09.35: pick a `Target` for the given rustc target triple.
+-    /// Callers pass `sess.target.llvm_target` as the string and
+-    /// `sess.target.pointer_width` as the bit-width (the two
+-    /// salient facts we need to get right per invocation for
+-    /// cross-compilation to work). Unknown triples fall through
+-    /// to a generic Itanium profile parameterized by the supplied
+-    /// pointer width — sufficient for mangling simple signatures
+-    /// on any Itanium-ABI target, but may miss target-specific
+-    /// quirks (e.g. aarch64-darwin's EH/bitfield rules, platform
+-    /// `long double` width). Extend the match arm when adding
++    /// Build a `Target` from a rustc target triple string (as Cargo
++    /// or `--target=` passes it). Used by the in-tree bridges
++    /// (`rustc_ty_utils::layout::cxx_bridge` and
++    /// `rustc_symbol_mangling::itanium`) that need an ABI-flavored
++    /// context but don't carry a full `rustc_target::Target` of
++    /// their own.
++    ///
++    /// The match covers every triple this crate has a first-class
++    /// constructor for. Unknown triples fall through to a generic
++    /// Itanium profile parameterized by the supplied pointer width
++    /// — sufficient for mangling simple signatures on any
++    /// Itanium-ABI target. Extend the match arm when adding
+     /// first-class support for a new triple.
+     pub fn from_rustc_triple(triple: &str, pointer_width_bits: u32) -> Self {
+         match triple {
+@@ -81,12 +178,12 @@ pub fn from_rustc_triple(triple: &str, pointer_width_bits: u32) -> Self {
+             "x86_64-apple-darwin" => Self::x86_64_apple_darwin(),
+             "aarch64-unknown-linux-gnu" => Self::aarch64_unknown_linux_gnu(),
+             "aarch64-apple-darwin" => Self::aarch64_apple_darwin(),
+-            // Generic Itanium-ABI fallback. Picks Linux-style
+-            // defaults: F80 `long double` (x86) or F128
+-            // (non-x86 Linux), signed wchar_t 32-bit. Users
+-            // targeting exotic triples should extend this table
+-            // with precise values if ABI correctness matters for
+-            // those signatures.
++            "x86_64-pc-windows-msvc" => Self::x86_64_pc_windows_msvc(),
++            "aarch64-pc-windows-msvc" => Self::aarch64_pc_windows_msvc(),
++            "x86_64-pc-windows-gnu" => Self::x86_64_pc_windows_gnu(),
++            // Generic Itanium fallback for triples we haven't
++            // wired a first-class constructor for. Pointer width
++            // comes from rustc; the rest are Linux-style defaults.
+             other => Self {
+                 triple: other.to_string(),
+                 pointer_width_bits,
+@@ -94,15 +191,15 @@ pub fn from_rustc_triple(triple: &str, pointer_width_bits: u32) -> Self {
+                 wchar_t_signed: true,
+                 wchar_t_width: 32,
+                 aarch64_darwin_quirks: false,
++                abi_flavor: AbiFlavor::Itanium,
+             },
+         }
+     }
+ 
+     /// Pick a target matching the host the driver is running on.
+-    /// Deprecated in favor of `from_rustc_triple` (P09.35) for
+-    /// any call site with access to a rustc `Session`. Retained
+-    /// for test paths and any internal usage outside the normal
+-    /// compiler flow.
++    /// Cross-compilation is out of scope for v1
++    /// (docs/build_integration.md §9), so host-based selection is the
++    /// right default for every invocation rustcc fields.
+     pub fn host() -> Self {
+         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+         {
+diff --git a/compiler/rustc_abi_cxx/src/ty.rs b/compiler/rustc_abi_cxx/src/ty.rs
+index 3c3b25121b5..0dd10cf6d5c 100644
+--- a/compiler/rustc_abi_cxx/src/ty.rs
++++ b/compiler/rustc_abi_cxx/src/ty.rs
+@@ -3,18 +3,34 @@
+ //! See `docs/rustc_abi_cxx.md §4`.
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct ClassId(pub(crate) u32);
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct FieldId(pub(crate) u32);
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct MethodId(pub(crate) u32);
+ 
++impl MethodId {
++    /// Index back into the owning `class.methods` slice. Used
++    /// by `cxx_importer::populate_vtable_indices` (M23) which
++    /// reads `VTableEntry::FunctionPointer { method, .. }` and
++    /// stamps the slot's rank into the method's
++    /// `vtable_index` — no crate-private field access needed.
++    pub fn as_index(self) -> usize {
++        self.0 as usize
++    }
++}
++
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct TypeId(pub(crate) u32);
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum CxxType {
+     Void,
+     Bool,
+@@ -30,6 +46,7 @@ pub enum CxxType {
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum IntWidth {
+     I8,
+     I16,
+@@ -39,6 +56,7 @@ pub enum IntWidth {
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum FloatKind {
+     F32,
+     F64,
+@@ -46,18 +64,21 @@ pub enum FloatKind {
+ }
+ 
+ #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct CvQual {
+     pub is_const: bool,
+     pub is_volatile: bool,
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum RefKind {
+     Lvalue,
+     Rvalue,
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct FnSig {
+     pub params: Vec<TypeId>,
+     pub ret: TypeId,
+@@ -68,6 +89,7 @@ pub struct FnSig {
+ }
+ 
+ #[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct ClassDef {
+     pub name: NestedName,
+     pub bases: Vec<BaseSpec>,
+@@ -80,6 +102,7 @@ pub struct ClassDef {
+ }
+ 
+ #[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct BaseSpec {
+     pub class: ClassId,
+     pub virtual_: bool,
+@@ -87,6 +110,7 @@ pub struct BaseSpec {
+ }
+ 
+ #[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct FieldDef {
+     pub name: Ident,
+     pub ty: TypeId,
+@@ -94,6 +118,7 @@ pub struct FieldDef {
+ }
+ 
+ #[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct MethodDef {
+     pub name: MethodName,
+     pub sig: FnSig,
+@@ -103,6 +128,7 @@ pub struct MethodDef {
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum MethodName {
+     Ident(Ident),
+     Operator(OperatorKind),
+@@ -122,6 +148,7 @@ pub fn ident_name(&self) -> Option<&str> {
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum RecordKind {
+     Class,
+     Struct,
+@@ -129,6 +156,7 @@ pub enum RecordKind {
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum Virtuality {
+     NonVirtual,
+     Virtual,
+@@ -136,6 +164,7 @@ pub enum Virtuality {
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum Access {
+     Public,
+     Protected,
+@@ -143,6 +172,7 @@ pub enum Access {
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum SpecialMember {
+     DefaultCtor,
+     CopyCtor,
+@@ -158,12 +188,15 @@ pub enum SpecialMember {
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct Ident(pub String);
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct NestedName(pub Vec<NameSegment>);
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum NameSegment {
+     Namespace(Ident),
+     Class(Ident),
+@@ -180,6 +213,7 @@ pub enum NameSegment {
+ }
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum TemplateArg {
+     /// A type template argument. `Box<int>` has `[Type(int_id)]`.
+     Type(TypeId),
+@@ -196,6 +230,7 @@ pub enum TemplateArg {
+ /// see `ClassDef` and produce results that are correct for either
+ /// direction. Only the emitters and driver pipeline dispatch on origin.
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum TypeOrigin {
+     /// Imported from a C++ header via `cxx_importer`. Method bodies are
+     /// defined in the user's C++ translation units; Rust calls them
+@@ -223,6 +258,7 @@ fn default() -> Self {
+ /// the name alone. Variants are strings rather than fully-interned
+ /// identifiers since the emit-only path doesn't require dedup.
+ #[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct RustEnumDef {
+     /// Rust-side identifier.
+     pub rust_name: String,
+@@ -235,6 +271,7 @@ pub struct RustEnumDef {
+ }
+ 
+ #[derive(Clone, Debug)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct RustEnumVariant {
+     pub name: String,
+     /// Explicit discriminant (`Red = 1`). `None` means "let C++
+@@ -244,9 +281,11 @@ pub struct RustEnumVariant {
+ }
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub struct RustEnumId(pub(crate) u32);
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
++#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+ pub enum OperatorKind {
+     Plus,
+     Minus,
+diff --git a/compiler/rustc_abi_cxx/src/vtable.rs b/compiler/rustc_abi_cxx/src/vtable.rs
+index bfcebdcc75f..45f7f51cf0b 100644
+--- a/compiler/rustc_abi_cxx/src/vtable.rs
++++ b/compiler/rustc_abi_cxx/src/vtable.rs
+@@ -76,7 +76,18 @@ pub enum VTableEntry {
+ }
+ 
+ impl CxxTypeCtx {
++    /// Vtable dispatcher. Routes to either Itanium ([`Self::vtable_itanium`])
++    /// or MSVC ([`Self::vtable_msvc`]) based on `target().abi_flavor`.
+     pub fn vtable(&self, class_id: ClassId) -> Option<VTable> {
++        match self.target().abi_flavor {
++            crate::target::AbiFlavor::Itanium => self.vtable_itanium(class_id),
++            crate::target::AbiFlavor::Msvc => self.vtable_msvc(class_id),
++        }
++    }
++
++    /// Itanium-only vtable entry point. Exposed for tests and the
++    /// occasional cross-ABI consumer.
++    pub fn vtable_itanium(&self, class_id: ClassId) -> Option<VTable> {
+         if !self.class(class_id).is_polymorphic {
+             return None;
+         }
+@@ -436,14 +447,27 @@ fn slot_to_entry(ctx: &CxxTypeCtx, slot: &VSlot) -> VTableEntry {
+                 class: slot.overrider_class,
+                 variant: DtorVariant::D1,
+             }),
+-            MethodId(0),
++            // M22 partial: track the actual dtor MethodId on the
++            // overrider class instead of hard-coding `MethodId(0)`.
++            // The cxx_importer's `populate_vtable_indices` walker
++            // (which is keyed by MethodId) used to mis-attribute
++            // dtor slot ranks to the class's first method
++            // (index 0); now it correctly assigns the rank to
++            // the actual dtor MethodId. The originator_method_idx
++            // here is the dtor's index in the originating
++            // class's method list — for the override path this is
++            // the BASE class's dtor index. We want the
++            // OVERRIDER's dtor index because the slot is keyed
++            // by the most-derived class's `class.methods`. Look
++            // it up against the overrider class.
++            find_dtor_method_id(ctx, slot.overrider_class),
+         ),
+         VSlotKind::DtorD0 => function_slot(
+             ctx.mangle(&Symbol::Dtor {
+                 class: slot.overrider_class,
+                 variant: DtorVariant::D0,
+             }),
+-            MethodId(0),
++            find_dtor_method_id(ctx, slot.overrider_class),
+         ),
+         VSlotKind::Method => {
+             let method_idx = slot
+@@ -471,3 +495,27 @@ fn function_slot(mangled_target: String, method: MethodId) -> VTableEntry {
+         method,
+     }
+ }
++
++/// M22 partial: find the index of `class_id`'s destructor in
++/// its `methods` list, returning a `MethodId`. Falls back to
++/// `MethodId(0)` if no dtor is declared on the class itself —
++/// this matches the pre-fix behavior for classes whose dtor
++/// is implicit (synthesized by the compiler) so the importer's
++/// downstream walkers see the same shape they used to.
++///
++/// Used by `slot_to_entry` for `VSlotKind::DtorD1` /
++/// `VSlotKind::DtorD0` slots. Without this, every dtor slot
++/// reported `MethodId(0)`, which caused the
++/// `cxx_importer::populate_vtable_indices` walker (keyed by
++/// MethodId) to overwrite `methods[0].vtable_index` with the
++/// dtor slot's rank — leaving the actual dtor method at the
++/// end of the class's method list with `vtable_index = None`.
++fn find_dtor_method_id(ctx: &CxxTypeCtx, class_id: ClassId) -> MethodId {
++    let class = ctx.class(class_id);
++    for (i, m) in class.methods.iter().enumerate() {
++        if matches!(m.special, Some(SpecialMember::Dtor)) {
++            return MethodId(i as u32);
++        }
++    }
++    MethodId(0)
++}
+diff --git a/compiler/rustc_abi_cxx/src/vtable_msvc.rs b/compiler/rustc_abi_cxx/src/vtable_msvc.rs
+new file mode 100644
+index 00000000000..30497eb004c
+--- /dev/null
++++ b/compiler/rustc_abi_cxx/src/vtable_msvc.rs
+@@ -0,0 +1,400 @@
++//! MSVC C++ ABI vtable layout.
++//!
++//! MSVC vs Itanium at the vtable level — the key shape differences:
++//!
++//! - **No header slots before the function pointers.** Itanium puts an
++//!   offset-to-top (a signed int interpreted as bytes from the
++//!   vfunc-slot range back to the most-derived object) at slot −2 and
++//!   the RTTI pointer at slot −1, with the vptr pointing at slot 0
++//!   (the first virtual function). MSVC instead places a single
++//!   "complete object locator" pointer at slot −1 — the COL itself
++//!   carries the offset-to-top and a pointer to the RTTI type descriptor.
++//!   The vptr points at the first vfunction slot, with no header in
++//!   between.
++//!
++//! - **Per-base subobject vftables.** Like Itanium, each polymorphic
++//!   base subobject in a multi-inheritance hierarchy needs its own
++//!   vftable. The vftable symbol is `??_7Class@@6B<For>@` where `<For>`
++//!   names the base subobject the table dispatches for (empty for the
++//!   primary).
++//!
++//! - **vbtable for virtual inheritance.** Classes with virtual bases
++//!   carry a `vbtable` (separate from the vftable). The vbptr —
++//!   placed by `layout_msvc` — points at the vbtable. The vbtable's
++//!   slot 0 is the offset from the vbptr to the most-derived class's
++//!   origin; slots 1..N are offsets to each virtual base subobject.
++//!
++//! - **No covariant-return thunks at the function-pointer level.**
++//!   MSVC encodes covariant returns by emitting a wrapper thunk
++//!   (`?_<base>...` mangled) as a normal-looking vfunction. We model
++//!   that the same way: a `FunctionPointer` entry whose `mangled_target`
++//!   is the thunk symbol.
++//!
++//! - **Deleting destructor convention.** Where Itanium has separate
++//!   D1 (complete) / D0 (deleting) / D2 (base) symbols and entries
++//!   for both D1 and D0 in the vtable, MSVC ships a single
++//!   "scalar deleting destructor" (`??_GClass@@`) and the dtor slot
++//!   in the vftable points at it. The base dtor (`??1Class@@`) is
++//!   called explicitly from user code; the deleting variant
++//!   chains to it.
++//!
++//! ## What this module returns
++//!
++//! Same [`VTable`] type as the Itanium [`vtable`] module — sub-tables
++//! per polymorphic base subobject, each with an `address_point_offset`,
++//! a `Rtti` entry serving as the complete-object-locator pointer, and
++//! a sequence of `FunctionPointer` entries.
++//!
++//! The MSVC variant does **not** emit `OffsetToTop` entries (those live
++//! inside the COL, not as a slot before the address point). Instead,
++//! the `Rtti` entry's mangled string is the COL symbol, and at the IR
++//! level callers should treat the COL as a header that's *not part of*
++//! the address-point-relative slot space.
++
++use crate::ctx::CxxTypeCtx;
++use crate::mangle::{DtorVariant, Symbol};
++use crate::ty::{ClassId, MethodDef, MethodId, SpecialMember, Virtuality};
++use crate::vtable::{VTable, VTableEntry, VTableSubTable};
++
++impl CxxTypeCtx {
++    /// MSVC vtable construction. Routed here by `CxxTypeCtx::vtable`
++    /// when `target().abi_flavor == AbiFlavor::Msvc`.
++    pub fn vtable_msvc(&self, class_id: ClassId) -> Option<VTable> {
++        if !self.class(class_id).is_polymorphic {
++            return None;
++        }
++        let mut sub_tables = Vec::new();
++
++        // 1. Primary subtable. MSVC: address_point_offset = 0 (the
++        //    vptr points directly at the first vfunction slot). The
++        //    Rtti slot is conceptually at offset -pointer_width; we
++        //    represent it as a *separate* entry that the symbol
++        //    emitter knows to place at a negative offset rather than
++        //    a positive slot.
++        let entries = build_subtable_entries(self, class_id, class_id, 0);
++        sub_tables.push(VTableSubTable {
++            for_subobject: class_id,
++            subobject_offset: 0,
++            entries,
++            // MSVC's address-point is right at the first slot. The
++            // COL is at offset -pointer_width relative to that and
++            // is emitted as the leading Rtti entry in our IR.
++            address_point_offset: pointer_width(self),
++        });
++
++        // 2. Per-polymorphic-non-primary-base subtables (multi-
++        //    inheritance). Each non-virtual non-primary polymorphic
++        //    base contributes its own subtable; the vptr inside that
++        //    base subobject points at the subtable's address-point.
++        //
++        // We compute base subobject offsets via the MSVC layout
++        // engine. Bases that are themselves non-polymorphic don't
++        // need a subtable.
++        if let Ok(layout) = self.layout_msvc(class_id) {
++            // The primary polymorphic base (if any) shares the
++            // primary subtable — skip it here.
++            let primary_polymorphic_base = self
++                .class(class_id)
++                .bases
++                .iter()
++                .find(|b| !b.virtual_ && self.class(b.class).is_polymorphic)
++                .map(|b| b.class);
++
++            for (base, offset) in &layout.base_offsets {
++                if Some(*base) == primary_polymorphic_base {
++                    continue;
++                }
++                if !self.class(*base).is_polymorphic {
++                    continue;
++                }
++                let entries = build_subtable_entries(self, *base, class_id, *offset);
++                sub_tables.push(VTableSubTable {
++                    for_subobject: *base,
++                    subobject_offset: *offset,
++                    entries,
++                    address_point_offset: pointer_width(self),
++                });
++            }
++        }
++
++        let symbol = self.mangle_msvc(&Symbol::VTable(class_id));
++        Some(VTable {
++            class: class_id,
++            symbol,
++            sub_tables,
++        })
++    }
++}
++
++/// Build the entry sequence for a single subtable.
++///
++/// `subobj`: the base subobject this subtable serves dispatch for.
++/// `most_derived`: the class whose vtable symbol we're constructing.
++/// `subobj_offset`: byte offset of `subobj` within `most_derived`.
++///
++/// MSVC subtable layout (slot 0 onward, after the COL header):
++/// - For each virtual method in `subobj` (in slot order), emit a
++///   `FunctionPointer` whose `mangled_target` is the most-derived
++///   override.
++/// - The dtor slot points at the scalar deleting destructor
++///   (`??_GClass@@`) when present, falling back to the base dtor
++///   (`??1Class@@`) when no deleting form is emitted.
++fn build_subtable_entries(
++    ctx: &CxxTypeCtx,
++    subobj: ClassId,
++    most_derived: ClassId,
++    _subobj_offset: u64,
++) -> Vec<VTableEntry> {
++    let mut entries = Vec::new();
++
++    // COL pointer (at conceptual -1 slot).
++    let col = ctx.mangle_msvc(&Symbol::TypeInfo(most_derived));
++    entries.push(VTableEntry::Rtti(col));
++
++    // Function-pointer slots. The subtable for `most_derived` is
++    // built from the chain rooted at `subobj` (the subobject this
++    // subtable serves dispatch for). For the primary subtable
++    // these are the same class; for inheritance-induced
++    // subtables `subobj` is a polymorphic base of `most_derived`.
++    let slots = compute_slots(ctx, most_derived);
++    let _ = subobj; // subobj equals most_derived for the primary subtable
++    for slot in &slots {
++        // Find the most-derived overrider of `slot.method`. We walk
++        // from `most_derived` down toward the class that originally
++        // declared the slot; the first class that re-declares the
++        // method with a matching signature wins.
++        let target_class = find_overrider(ctx, most_derived, slot.declared_in, &slot.method);
++        // Resolve the actual MethodDef on `target_class` rather than
++        // assuming the slot index matches there.
++        let original = ctx.class(slot.declared_in).methods[slot.method.as_index()].clone();
++        let method = ctx
++            .class(target_class)
++            .methods
++            .iter()
++            .find(|m| methods_override(&original, m))
++            .unwrap_or(&ctx.class(slot.declared_in).methods[slot.method.as_index()]);
++        let mangled = if matches!(method.special, Some(SpecialMember::Dtor)) {
++            // MSVC's vtable dtor slot points at the scalar deleting
++            // dtor `??_G`, not the base dtor. We model that as a
++            // synthetic Dtor symbol using the D0 variant marker.
++            ctx.mangle_msvc(&Symbol::Dtor {
++                class: target_class,
++                variant: DtorVariant::D0,
++            })
++        } else {
++            ctx.mangle_msvc(&Symbol::Method {
++                class: target_class,
++                name: method.name.clone(),
++                sig: method.sig.clone(),
++            })
++        };
++        entries.push(VTableEntry::FunctionPointer {
++            mangled_target: mangled,
++            method: slot.method,
++        });
++    }
++
++    entries
++}
++
++#[derive(Clone)]
++struct Slot {
++    /// Index into the *defining* class's method list. The vtable IR
++    /// canonically references the originating method id (where the
++    /// virtual function was first declared).
++    method: MethodId,
++    /// The class that first declared this virtual method (where the
++    /// slot was minted).
++    declared_in: ClassId,
++}
++
++/// Compute the slot sequence for `subobj`. Walks the inheritance chain
++/// from root to `subobj`; each virtual method declared in that chain
++/// gets one slot in declaration order, with dtors threaded through
++/// per MSVC rules:
++/// - If the root has a virtual dtor, slot 0 = dtor.
++/// - Otherwise, slot 0 = first non-dtor virtual method.
++fn compute_slots(ctx: &CxxTypeCtx, subobj: ClassId) -> Vec<Slot> {
++    let mut slots: Vec<Slot> = Vec::new();
++    let chain = inheritance_chain(ctx, subobj);
++    for &class in &chain {
++        let methods = &ctx.class(class).methods;
++        for (idx, m) in methods.iter().enumerate() {
++            if !is_virtual(m) {
++                continue;
++            }
++            // Check whether this method overrides an existing slot.
++            let override_idx = slots.iter().position(|s| {
++                let original = &ctx.class(s.declared_in).methods[s.method.as_index()];
++                methods_override(original, m)
++            });
++            if override_idx.is_some() {
++                // Override — same slot; canonical method id is the
++                // original declarer's, which we keep.
++                continue;
++            }
++            slots.push(Slot {
++                method: MethodId(idx as u32),
++                declared_in: class,
++            });
++        }
++    }
++    slots
++}
++
++fn is_virtual(m: &MethodDef) -> bool {
++    matches!(m.virtuality, Virtuality::Virtual | Virtuality::PureVirtual)
++}
++
++fn methods_override(base: &MethodDef, derived: &MethodDef) -> bool {
++    // Destructors override across the type hierarchy regardless of
++    // their per-class source name — `~A` and `~B` are the same
++    // virtual slot from the dispatch table's perspective. Special-
++    // case this before name comparison.
++    if matches!(base.special, Some(SpecialMember::Dtor))
++        && matches!(derived.special, Some(SpecialMember::Dtor))
++    {
++        return true;
++    }
++    // For non-dtor methods: signature match.
++    base.name == derived.name
++        && base.sig.params == derived.sig.params
++        && base.sig.cv == derived.sig.cv
++        && base.sig.ret == derived.sig.ret
++}
++
++/// Inheritance chain: root → ... → `class`. Single non-virtual
++/// inheritance only for now (matches the M21 corpus this crate
++/// services); multi-inheritance gets called by the dispatcher with
++/// each base individually so this chain still terminates at the
++/// branching point.
++fn inheritance_chain(ctx: &CxxTypeCtx, class: ClassId) -> Vec<ClassId> {
++    let mut chain = vec![class];
++    let mut cur = class;
++    loop {
++        let bases = &ctx.class(cur).bases;
++        let primary = bases
++            .iter()
++            .find(|b| !b.virtual_ && ctx.class(b.class).is_polymorphic);
++        match primary {
++            Some(b) => {
++                chain.insert(0, b.class);
++                cur = b.class;
++            }
++            None => break,
++        }
++    }
++    chain
++}
++
++fn find_overrider(
++    ctx: &CxxTypeCtx,
++    most_derived: ClassId,
++    declared_in: ClassId,
++    method: &MethodId,
++) -> ClassId {
++    // Walk from most_derived back toward declared_in; first class
++    // re-declaring the method is the overrider.
++    let original = ctx.class(declared_in).methods[method.as_index()].clone();
++    let mut cur = most_derived;
++    loop {
++        for m in &ctx.class(cur).methods {
++            if methods_override(&original, m) {
++                return cur;
++            }
++        }
++        if cur == declared_in {
++            return declared_in;
++        }
++        let next = ctx
++            .class(cur)
++            .bases
++            .iter()
++            .find(|b| !b.virtual_ && ctx.class(b.class).is_polymorphic)
++            .map(|b| b.class);
++        cur = match next {
++            Some(c) => c,
++            None => return declared_in,
++        };
++    }
++}
++
++fn pointer_width(ctx: &CxxTypeCtx) -> u64 {
++    (ctx.target().pointer_width_bits / 8) as u64
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::target::Target;
++    use crate::ty::{
++        ClassDef, FnSig, Ident, MethodDef, MethodName, NameSegment, NestedName,
++        RecordKind,
++    };
++
++    fn ctx() -> CxxTypeCtx {
++        CxxTypeCtx::new(Target::x86_64_pc_windows_msvc())
++    }
++
++    #[test]
++    fn non_polymorphic_class_has_no_vtable() {
++        let mut c = ctx();
++        let id = c.define_class(ClassDef {
++            name: NestedName(vec![NameSegment::Class(Ident("Plain".into()))]),
++            bases: vec![],
++            fields: vec![],
++            methods: vec![],
++            kind: RecordKind::Class,
++            is_polymorphic: false,
++            is_final: false,
++            source_alignment: None,
++        });
++        assert!(c.vtable_msvc(id).is_none());
++    }
++
++    #[test]
++    fn polymorphic_class_has_one_subtable_with_col_leading() {
++        let mut c = ctx();
++        let v = c.intern_type(crate::ty::CxxType::Void);
++        let m = MethodDef {
++            name: MethodName::Ident(Ident("f".into())),
++            sig: FnSig {
++                params: vec![],
++                ret: v,
++                cv: crate::ty::CvQual::default(),
++                ref_q: None,
++                variadic: false,
++                noexcept: false,
++            },
++            virtuality: Virtuality::Virtual,
++            vtable_index: None,
++            special: None,
++        };
++        let id = c.define_class(ClassDef {
++            name: NestedName(vec![NameSegment::Class(Ident("Poly".into()))]),
++            bases: vec![],
++            fields: vec![],
++            methods: vec![m],
++            kind: RecordKind::Class,
++            is_polymorphic: true,
++            is_final: false,
++            source_alignment: None,
++        });
++        let vt = c.vtable_msvc(id).unwrap();
++        assert_eq!(vt.symbol, "??_7Poly@@6B@");
++        assert_eq!(vt.sub_tables.len(), 1);
++        let primary = &vt.sub_tables[0];
++        assert_eq!(primary.address_point_offset, 8);
++        // First entry is the COL pointer.
++        assert!(matches!(&primary.entries[0], VTableEntry::Rtti(_)));
++        // Second entry is the function pointer. The method is
++        // virtual (this class is polymorphic with one virtual fn),
++        // so the access letter is `U`, not `Q`.
++        match &primary.entries[1] {
++            VTableEntry::FunctionPointer { mangled_target, .. } => {
++                assert_eq!(mangled_target, "?f@Poly@@UEAAXXZ");
++            }
++            _ => panic!("expected fn-ptr entry"),
++        }
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+
