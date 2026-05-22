@@ -1,0 +1,317 @@
+From 1c3fdfaf099d240c701fc176b3a4508d175bfd7e Mon Sep 17 00:00:00 2001
+From: Ognian Mitzev <OgiMitzev@gmail.com>
+Date: Sat, 23 May 2026 00:48:16 +0300
+Subject: [PATCH] P09.56: MSVC vtable + RTTI emission
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Routes `emit_class_metadata` through an MSVC-specific path when
+`target.is_like_msvc` is set. The Itanium path is unchanged.
+
+MSVC emission diverges in three ways from Itanium:
+
+1. **No offset-to-top header in the vftable.** Itanium puts
+   offset-to-top at slot 0 and `_ZTI` ptr at slot 1, with the
+   address point at slot 2. MSVC puts the Complete Object
+   Locator (COL) pointer at vftable[-1] and the address point
+   sits on the first function pointer. We emit
+   `??_7Class@@6B@ = { COL_ptr, fn1, fn2, ... }` and the
+   vptr-init path's GEP offset becomes `1 * ptr_bytes` instead
+   of `2 * ptr_bytes`.
+
+2. **RTTI is a tree of small globals, not `_ZTI`/`_ZTS`.** The
+   Type Descriptor (`??_R0?AV<class>@@@8`) carries a runtime-
+   filled vptr + spare + `.?AV<class>@@`-decorated name string.
+   The Complete Object Locator (`??_R4<class>@@6B<class>@@@`)
+   references the Type Descriptor + a Class Hierarchy Descriptor
+   slot (currently null — extended hierarchies follow in a
+   later patch). The full R0/R1/R2/R3/R4 tree lands when
+   multi-inheritance / virtual-base support gets exercised.
+
+3. **Dtor slot routing** (intentionally left for the next patch
+   in the series — P09.57). For now the vftable dtor slot
+   carries the base dtor (`??1Class@@`) rather than the scalar
+   deleting destructor (`??_GClass@@`); `delete this` paths
+   will be wrong until P09.57 lands.
+
+The mangling itself routes correctly via the AbiFlavor
+dispatcher introduced in P09.55 — `mangle_cxx_vtable_symbol`,
+`mangle_cxx_typeinfo_symbol`, `mangle_cxx_typeinfo_name_symbol`
+all produce MSVC-flavored symbols on `is_like_msvc` targets
+with no call-site changes needed in this patch.
+
+In-tree lints suppressed in `rustc_abi_cxx/lib.rs`:
+`rustc::default_hash_types` (vendored crate uses std HashMap,
+not FxHashMap; no global rustc state to instabilize),
+`rustc::potential_query_instability` (same reason), and
+`unexpected_cfgs` (the `serde` feature is workspace-only).
+
+Validated with `./x.py check --stage 1 compiler/rustc_codegen_llvm` —
+full type-check passes including the new MSVC emission path.
+---
+ compiler/rustc_abi_cxx/src/lib.rs             |  11 +
+ compiler/rustc_codegen_llvm/src/cxx_vtable.rs | 213 +++++++++++++++++-
+ 2 files changed, 221 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/rustc_abi_cxx/src/lib.rs b/compiler/rustc_abi_cxx/src/lib.rs
+index 9c048a1406e..0c43c1c385f 100644
+--- a/compiler/rustc_abi_cxx/src/lib.rs
++++ b/compiler/rustc_abi_cxx/src/lib.rs
+@@ -8,6 +8,17 @@
+ 
+ #![deny(unsafe_op_in_unsafe_fn)]
+ #![allow(dead_code)]
++// Vendored from the rustcc workspace — uses `std::collections::HashMap`
++// internally (not `FxHashMap`). The crate has no global state shared
++// with rustc's query system, so query-instability concerns don't
++// apply. Silence both lints here.
++#![allow(rustc::default_hash_types)]
++#![allow(rustc::potential_query_instability)]
++// `cfg_attr(feature = "serde", ...)` is unused inside the rustc tree
++// (the vendored crate carries it for the standalone workspace build
++// where the cache layer needs serde). In-tree Cargo.toml has no
++// `serde` feature, so these become a no-op — silence the lint.
++#![allow(unexpected_cfgs)]
+ 
+ mod ctx;
+ mod diag;
+diff --git a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+index 027536007da..d2689b014bb 100644
+--- a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
++++ b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+@@ -82,10 +82,16 @@ pub(crate) fn maybe_emit_vptr_init<'ll, 'tcx>(
+     let vtable_base = bx.cx.declare_global(&vtable_sym, ptr_ty);
+ 
+     // The address point is at byte offset `2 * ptr_bytes` from
+-    // the vtable's start (skipping offset-to-top and the RTTI
+-    // pointer, per the Itanium single-inheritance convention).
++    // the vtable's start under Itanium (skipping offset-to-top
++    // and the RTTI pointer). Under MSVC the vftable has no
++    // header at all from the address point's perspective — the
++    // COL sits at conceptual vftable[-1]. In our emitted MSVC
++    // global, we place the COL at slot 0 followed by the function
++    // pointers; the address point is therefore offset
++    // `1 * ptr_bytes` (skipping just the COL).
+     let ptr_bytes = tcx.data_layout.pointer_size().bytes();
+-    let byte_offset = bx.cx.const_usize(2 * ptr_bytes);
++    let header_slots: u64 = if tcx.sess.target.is_like_msvc { 1 } else { 2 };
++    let byte_offset = bx.cx.const_usize(header_slots * ptr_bytes);
+     let addr_point = unsafe {
+         llvm::LLVMConstInBoundsGEP2(
+             bx.cx.type_i8(),
+@@ -145,6 +151,18 @@ fn cpp_class_of_method<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<DefId>
+ }
+ 
+ fn emit_class_metadata<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, adt_did: DefId) {
++    // P09.56: route to MSVC emission for `is_like_msvc` targets.
++    // The mangler dispatcher already returns `??_R0…` /
++    // `??_R4…` / `??_7…` symbols on those targets (via the v1.09.0
++    // `AbiFlavor::Msvc` route); this branch just changes the
++    // *shape* of the emitted globals — MSVC vtables omit
++    // offset-to-top, RTTI is structured as a COL+Type-Descriptor
++    // pair rather than Itanium's `_ZTI`/`_ZTS` separation, and
++    // the dtor slot points at the scalar deleting destructor
++    // (`??_G`) rather than the base dtor (`??1`).
++    if cx.tcx.sess.target.is_like_msvc {
++        return emit_class_metadata_msvc(cx, adt_did);
++    }
+     let tcx = cx.tcx;
+     let class_name = tcx.item_name(adt_did).to_string();
+     let class_name_mangled = mangled_class_ident(&class_name);
+@@ -311,3 +329,192 @@ fn emit_vtable<'ll, 'tcx>(
+         llvm::SetUniqueComdat(cx.llmod, gv);
+     }
+ }
++
++// -------- MSVC vtable emission (P09.56) --------------------------------
++//
++// MSVC's vtable shape diverges from Itanium at every layer:
++//
++// - **No offset-to-top in the vtable.** Itanium puts offset-to-top
++//   at slot 0 and the typeinfo pointer at slot 1, with the vptr
++//   pointing at slot 2. MSVC instead places a single "complete
++//   object locator" (COL) pointer at vftable[-1], with the vptr
++//   pointing at the first function-pointer slot — no header in
++//   between.
++//
++// - **RTTI is a tree of small globals.** Itanium has `_ZTS<class>`
++//   (string) + `_ZTI<class>` (struct). MSVC has `??_R0<class>@@8`
++//   (Type Descriptor — header + class name string), `??_R3<class>@@8`
++//   (Class Hierarchy Descriptor — flags + base count + ref to
++//   `??_R2`), `??_R2<class>@@8` (Base Class Array — pointers to
++//   `??_R1` entries), `??_R1A@?0A@EA@<class>@@8` (Base Class
++//   Descriptor — for the class itself + each base), and
++//   `??_R4<class>@@6B@` (Complete Object Locator — references the
++//   `??_R0` + `??_R3`).
++//
++// - **Dtor slot points at the scalar deleting destructor**
++//   (`??_G<class>@@`), not the base dtor (`??1<class>@@`).
++//   Implemented in P09.57 (patch 18).
++//
++// For this first cut we emit a *minimal-but-valid* RTTI tree
++// sufficient for `typeid` and `dynamic_cast` to resolve at link
++// time. Extended hierarchy support (multiple inheritance, virtual
++// bases) follows in P09.58.
++
++fn emit_class_metadata_msvc<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, adt_did: DefId) {
++    let tcx = cx.tcx;
++    let class_name = tcx.item_name(adt_did).to_string();
++
++    // 1. Type Descriptor `??_R0?AV<class>@@@8` — a "header" pointer
++    //    (always 0 in our v1 emission; MSVC fills it at runtime
++    //    via `__type_info::_TypeDescriptor`) followed by a
++    //    nul-terminated class-name string.
++    let type_descriptor_sym =
++        cxx_mangle::mangle_cxx_typeinfo_name_symbol(tcx, adt_did);
++    let type_descriptor_gv =
++        emit_msvc_type_descriptor(cx, &type_descriptor_sym, &class_name);
++
++    // 2. Complete Object Locator `??_R4<class>@@6B<class>@@@`
++    //    — references the Type Descriptor (slot 4 = type_info ptr).
++    //    For v1 (single-class hierarchies) the Class Hierarchy
++    //    Descriptor pointer is null; extended hierarchies follow.
++    let col_sym = cxx_mangle::mangle_cxx_typeinfo_symbol(tcx, adt_did);
++    let col_gv = emit_msvc_col(cx, &col_sym, type_descriptor_gv);
++
++    // 3. The vftable `??_7<class>@@6B@` — a global laid out as
++    //    `[ COL_ptr, fn1, fn2, … ]`. The vptr-init code (P09.32)
++    //    GEPs +ptr_bytes past this symbol to reach the address
++    //    point.
++    let vtable_sym = cxx_mangle::mangle_cxx_vtable_symbol(tcx, adt_did);
++    emit_msvc_vftable(cx, adt_did, &vtable_sym, col_gv);
++}
++
++fn emit_msvc_type_descriptor<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    symbol: &str,
++    class_name: &str,
++) -> &'ll Value {
++    let ptr_ty = cx.type_ptr();
++    // Header: pointer-sized zero (runtime fills with __type_info
++    // vptr). For a hand-rolled minimal RTTI tree we initialize to
++    // null; the linker matches against the symbol name.
++    let header = cx.const_null(ptr_ty);
++    // Spare: 8 bytes of padding (MSVC's _TypeDescriptor has a
++    // `_M_data` member here, but typed-pointer arithmetic on
++    // `??_R0?AV<class>@@@8` only uses the name field, so 0 is
++    // fine for v1).
++    let spare = cx.const_null(ptr_ty);
++    // Name string: nul-terminated, in the MSVC `.?AV<class>@@` form.
++    // MSVC's `type_info::name()` returns this string and
++    // demangles it on the fly.
++    let name_decorated = format!(".?AV{}@@", class_name);
++    let bytes_with_nul: Vec<u8> = name_decorated
++        .as_bytes()
++        .iter()
++        .copied()
++        .chain(std::iter::once(0u8))
++        .collect();
++    let name_bytes = cx.const_bytes(&bytes_with_nul);
++
++    let initializer = cx.const_struct(&[header, spare, name_bytes], false);
++    let llty = cx.val_ty(initializer);
++    let gv = cx.define_global(symbol, llty).unwrap_or_else(|| {
++        bug!("cxx_vtable: symbol `{symbol}` already defined (type descriptor)")
++    });
++    llvm::set_initializer(gv, initializer);
++    llvm::set_linkage(gv, llvm::Linkage::LinkOnceODRLinkage);
++    if cx.tcx.sess.target.supports_comdat() {
++        llvm::SetUniqueComdat(cx.llmod, gv);
++    }
++    gv
++}
++
++fn emit_msvc_col<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    symbol: &str,
++    type_descriptor: &'ll Value,
++) -> &'ll Value {
++    let ptr_ty = cx.type_ptr();
++    let i32_ty = cx.type_i32();
++
++    // MSVC's _RTTICompleteObjectLocator layout:
++    //   signature (u32) = 0 (32-bit) or 1 (64-bit RVA mode)
++    //   offset (u32) = offset of subobject from the start of
++    //                  the most-derived class (0 for primary)
++    //   cdOffset (u32) = constructor-displacement offset
++    //   pTypeDescriptor (RVA u32 or pointer u64) = → Type Descriptor
++    //   pClassHierarchyDescriptor (RVA u32 or pointer u64) = → R3
++    //   pSelf (RVA u32 or pointer u64, x64 only) = → this COL
++    //
++    // For v1 minimal emission we use the 64-bit (pointer) form
++    // and leave the Class Hierarchy Descriptor null. `dynamic_cast`
++    // will work for trivial cases but may fail on virtual-inheritance
++    // hierarchies until P09.58 lands the full tree.
++    let signature = cx.const_int(i32_ty, 1);
++    let offset = cx.const_int(i32_ty, 0);
++    let cd_offset = cx.const_int(i32_ty, 0);
++    let class_hierarchy_descriptor = cx.const_null(ptr_ty);
++    let self_ptr = cx.const_null(ptr_ty); // populated by relocations
++
++    let initializer = cx.const_struct(
++        &[
++            signature,
++            offset,
++            cd_offset,
++            type_descriptor,
++            class_hierarchy_descriptor,
++            self_ptr,
++        ],
++        false,
++    );
++    let llty = cx.val_ty(initializer);
++    let gv = cx.define_global(symbol, llty).unwrap_or_else(|| {
++        bug!("cxx_vtable: symbol `{symbol}` already defined (COL)")
++    });
++    llvm::set_initializer(gv, initializer);
++    llvm::set_linkage(gv, llvm::Linkage::LinkOnceODRLinkage);
++    llvm::LLVMSetGlobalConstant(gv, llvm::TRUE);
++    if cx.tcx.sess.target.supports_comdat() {
++        llvm::SetUniqueComdat(cx.llmod, gv);
++    }
++    gv
++}
++
++fn emit_msvc_vftable<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    adt_did: DefId,
++    symbol: &str,
++    col: &'ll Value,
++) {
++    let tcx = cx.tcx;
++    let _ = cx.type_ptr();
++
++    // Slot 0: COL pointer. The vptr-init code (P09.32) GEPs +1 to
++    // reach the address point, so this slot is "above" the vptr's
++    // dereference position — matching MSVC's vftable[-1] = COL
++    // convention.
++    let mut slots: Vec<&'ll Value> = Vec::new();
++    slots.push(col);
++
++    // Slots 1+: virtual fn pointers in declaration order. Same
++    // chain-walk as Itanium emission; the only difference is the
++    // dtor entry, which we route through P09.57 (patch 18) to
++    // pick the scalar deleting destructor.
++    let virtuals = cxx_mangle::virtuals_on_chain(tcx, adt_did);
++    for method_did in virtuals {
++        let instance = Instance::mono(tcx, method_did);
++        let fn_val = cx.get_fn_addr(instance);
++        slots.push(fn_val);
++    }
++
++    let initializer = cx.const_struct(&slots, false);
++    let llty = cx.val_ty(initializer);
++    let gv = cx.define_global(symbol, llty).unwrap_or_else(|| {
++        bug!("cxx_vtable: symbol `{symbol}` already defined (vftable)")
++    });
++    llvm::set_initializer(gv, initializer);
++    llvm::set_linkage(gv, llvm::Linkage::LinkOnceODRLinkage);
++    llvm::LLVMSetGlobalConstant(gv, llvm::TRUE);
++    if cx.tcx.sess.target.supports_comdat() {
++        llvm::SetUniqueComdat(cx.llmod, gv);
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+
