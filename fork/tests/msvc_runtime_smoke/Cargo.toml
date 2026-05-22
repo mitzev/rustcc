@@ -8,6 +8,17 @@ publish = false
 name = "msvc_test"
 path = "src/main.rs"
 
+# v1.09.2-c: polymorphic-class probe. Exercises the fork rustc's
+# MSVC vtable emission (P09.56) + scalar deleting dtor (P09.57)
+# at runtime under Wine.
+[[bin]]
+name = "msvc_polymorphic"
+path = "src/polymorphic.rs"
+
+[[bin]]
+name = "msvc_nonvirtual"
+path = "src/non_virtual.rs"
+
 [workspace]
 
 [profile.dev]

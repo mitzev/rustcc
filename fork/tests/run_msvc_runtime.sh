@@ -53,15 +53,29 @@ echo "   via fork rustc + -Zbuild-std=core,panic_abort"
 cargo +rustcc-stage1 -Zbuild-std=core,panic_abort \
     build --target x86_64-pc-windows-msvc --release 2>&1
 
-EXE="$SMOKE_DIR/target/x86_64-pc-windows-msvc/release/msvc_test.exe"
-if [ ! -f "$EXE" ]; then
-    echo "FAIL: .exe not produced" >&2
-    exit 1
-fi
+BINS_DIR="$SMOKE_DIR/target/x86_64-pc-windows-msvc/release"
 
-echo
-echo "=> .exe produced at $EXE"
-file "$EXE"
+# Map of binary name → expected exit code.
+declare -a TESTS=(
+    "msvc_test:3"            # add(1,2) — basic add via mainCRTStartup
+    "msvc_nonvirtual:17"     # class with ctor + method (no virtual)
+    "msvc_polymorphic:17"    # class with #[cpp_virtual] method
+)
+
+ALL_PASS=1
+for entry in "${TESTS[@]}"; do
+    NAME="${entry%%:*}"
+    EXPECTED="${entry##*:}"
+    EXE="$BINS_DIR/$NAME.exe"
+    if [ ! -f "$EXE" ]; then
+        echo "FAIL: $NAME — .exe not produced at $EXE" >&2
+        ALL_PASS=0
+        continue
+    fi
+    echo
+    echo "=> $NAME"
+    file "$EXE" | sed 's/^/   /'
+done
 
 # Optional: run via Wine if available. Exit code should be 3 (1+2).
 #
@@ -76,31 +90,43 @@ elif command -v wine64 >/dev/null 2>&1; then
     WINE_BIN=wine64
 fi
 
-if [ -n "$WINE_BIN" ]; then
+if [ -z "$WINE_BIN" ]; then
     echo
-    echo "=> Running under $WINE_BIN"
-    # Suppress Wine's first-run chatter unless WINEDEBUG is set.
-    : "${WINEDEBUG:=-all}"
-    export WINEDEBUG
-    set +e
-    "$WINE_BIN" "$EXE"
-    RC=$?
-    set -e
-    echo "   exit code: $RC (expected 3)"
-    if [ "$RC" -eq 3 ]; then
-        echo
-        echo "PASS"
-        exit 0
-    fi
-    echo
-    echo "FAIL: expected exit code 3 from add(1,2), got $RC" >&2
-    if [ "$WINE_BIN" = "wine" ] && [ "$RC" -ge 126 ]; then
-        echo "hint: macOS may be blocking wine via Gatekeeper. Try:" >&2
-        echo "      sudo xattr -dr com.apple.quarantine '/Applications/Wine Stable.app'" >&2
-    fi
-    exit 1
+    echo "PASS (compile-only — wine not installed, runtime checks skipped)"
+    exit 0
 fi
 
+# Suppress Wine's first-run chatter unless WINEDEBUG is set.
+: "${WINEDEBUG:=-all}"
+export WINEDEBUG
+
 echo
-echo "PASS (compile-only — wine not installed, runtime check skipped)"
-exit 0
+echo "=> Running each .exe under $WINE_BIN"
+for entry in "${TESTS[@]}"; do
+    NAME="${entry%%:*}"
+    EXPECTED="${entry##*:}"
+    EXE="$BINS_DIR/$NAME.exe"
+    [ ! -f "$EXE" ] && continue
+    set +e
+    "$WINE_BIN" "$EXE" > /dev/null 2>&1
+    RC=$?
+    set -e
+    if [ "$RC" -eq "$EXPECTED" ]; then
+        echo "   $NAME -> $RC ✓"
+    else
+        echo "   $NAME -> $RC ✗ (expected $EXPECTED)" >&2
+        ALL_PASS=0
+        if [ "$WINE_BIN" = "wine" ] && [ "$RC" -ge 126 ]; then
+            echo "   hint: macOS may be blocking wine via Gatekeeper. Try:" >&2
+            echo "         sudo xattr -dr com.apple.quarantine '/Applications/Wine Stable.app'" >&2
+        fi
+    fi
+done
+
+echo
+if [ "$ALL_PASS" -eq 1 ]; then
+    echo "PASS"
+    exit 0
+fi
+echo "FAIL" >&2
+exit 1
