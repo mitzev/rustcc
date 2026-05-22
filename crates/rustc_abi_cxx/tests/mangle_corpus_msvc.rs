@@ -773,6 +773,135 @@ fn msvc_inherit_matches_clang_virtual_access_letter() {
     );
 }
 
+// -------- mangle_substitutions (type + name back-refs) ---------------
+
+const SUBS_EXPECTED: &[(&str, &str)] = &[
+    // Two by-value V — top-level type back-ref fires.
+    ("g_vv(V, V)", "?g_vv@@YAXUV@@0@Z"),
+    // V then V& — different top-level types. Inner V name back-refs.
+    ("g_vr(V, V&)", "?g_vr@@YAXUV@@AEAU1@@Z"),
+    // Two V* — top-level type back-ref.
+    ("g_pp(V*, V*)", "?g_pp@@YAXPEAUV@@0@Z"),
+    // V*, V&, V — three different top-level types. Name back-refs
+    // throughout.
+    ("g_pvr(V*, V&, V)", "?g_pvr@@YAXPEAUV@@AEAU1@U1@@Z"),
+    // int* repeated — top-level type back-ref on builtins-via-ptr.
+    ("g_ipp(int*, int*)", "?g_ipp@@YAXPEAH0@Z"),
+    ("g_ippp(int*, int*, int*)", "?g_ippp@@YAXPEAH00@Z"),
+];
+
+#[test]
+fn msvc_substitutions_golden_has_expected_symbols() {
+    let d = load("mangle_substitutions");
+    assert_all_msvc(&d, SUBS_EXPECTED);
+}
+
+#[test]
+fn msvc_substitutions_matches_clang() {
+    fn ctx_with_v() -> (CxxTypeCtx, ClassId, TypeId, TypeId, TypeId, TypeId) {
+        let mut c = ctx();
+        let i = intern_int(&mut c, true, IntWidth::I32);
+        let v_class = c.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("V".into()))]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![],
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        let v_ty = c.intern_type(CxxType::Record(v_class));
+        let v_ptr = c.intern_type(CxxType::Ptr { pointee: v_ty, cv: CvQual::default() });
+        let v_ref = c.intern_type(CxxType::Ref {
+            pointee: v_ty,
+            kind: RefKind::Lvalue,
+            cv: CvQual::default(),
+        });
+        (c, v_class, i, v_ty, v_ptr, v_ref)
+    }
+
+    fn mangle_free(c: &mut CxxTypeCtx, name: &str, params: Vec<TypeId>, ret: TypeId) -> String {
+        let sig = FnSig {
+            params,
+            ret,
+            cv: CvQual::default(),
+            ref_q: None,
+            variadic: false,
+            noexcept: false,
+        };
+        c.mangle_msvc(&Symbol::Function {
+            scope: NestedName(vec![]),
+            name: Ident(name.into()),
+            sig,
+        })
+    }
+
+    // g_vv(V, V) → ?g_vv@@YAXUV@@0@Z
+    {
+        let (mut c, _, _, v_ty, _, _) = ctx_with_v();
+        let v = intern_void(&mut c);
+        assert_eq!(
+            mangle_free(&mut c, "g_vv", vec![v_ty, v_ty], v),
+            "?g_vv@@YAXUV@@0@Z"
+        );
+    }
+
+    // g_vr(V, V&) → ?g_vr@@YAXUV@@AEAU1@@Z
+    {
+        let (mut c, _, _, v_ty, _, v_ref) = ctx_with_v();
+        let v = intern_void(&mut c);
+        assert_eq!(
+            mangle_free(&mut c, "g_vr", vec![v_ty, v_ref], v),
+            "?g_vr@@YAXUV@@AEAU1@@Z"
+        );
+    }
+
+    // g_pp(V*, V*) → ?g_pp@@YAXPEAUV@@0@Z
+    {
+        let (mut c, _, _, _, v_ptr, _) = ctx_with_v();
+        let v = intern_void(&mut c);
+        assert_eq!(
+            mangle_free(&mut c, "g_pp", vec![v_ptr, v_ptr], v),
+            "?g_pp@@YAXPEAUV@@0@Z"
+        );
+    }
+
+    // g_pvr(V*, V&, V) → ?g_pvr@@YAXPEAUV@@AEAU1@U1@@Z
+    {
+        let (mut c, _, _, v_ty, v_ptr, v_ref) = ctx_with_v();
+        let v = intern_void(&mut c);
+        assert_eq!(
+            mangle_free(&mut c, "g_pvr", vec![v_ptr, v_ref, v_ty], v),
+            "?g_pvr@@YAXPEAUV@@AEAU1@U1@@Z"
+        );
+    }
+
+    // g_ipp(int*, int*) → ?g_ipp@@YAXPEAH0@Z
+    {
+        let mut c = ctx();
+        let v = intern_void(&mut c);
+        let i = intern_int(&mut c, true, IntWidth::I32);
+        let ip = c.intern_type(CxxType::Ptr { pointee: i, cv: CvQual::default() });
+        assert_eq!(
+            mangle_free(&mut c, "g_ipp", vec![ip, ip], v),
+            "?g_ipp@@YAXPEAH0@Z"
+        );
+    }
+
+    // g_ippp(int*, int*, int*) → ?g_ippp@@YAXPEAH00@Z
+    {
+        let mut c = ctx();
+        let v = intern_void(&mut c);
+        let i = intern_int(&mut c, true, IntWidth::I32);
+        let ip = c.intern_type(CxxType::Ptr { pointee: i, cv: CvQual::default() });
+        assert_eq!(
+            mangle_free(&mut c, "g_ippp", vec![ip, ip, ip], v),
+            "?g_ippp@@YAXPEAH00@Z"
+        );
+    }
+}
+
 // -------- Itanium-vs-MSVC dispatcher round-trip -----------------------
 
 #[test]

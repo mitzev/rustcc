@@ -105,16 +105,27 @@ impl CxxTypeCtx {
 
 /// MSVC's two parallel back-reference tables. Both cap at 10 entries
 /// (digits 0–9) and reset per top-level symbol.
+///
+/// The *name* table is keyed by identifier text (each scope segment
+/// of a qualified name is a separate entry). The *type* table is
+/// keyed by `TypeId` — the semantic type identity — so that the
+/// same type (even when its rendered form changes because inner
+/// names compress via the name table) matches as a single entry.
+/// This matches MSVC's "same param type repeats compress to a
+/// digit" behavior: e.g., `void f(V, V)` mangles as
+/// `?f@@YAXUV@@0@Z` with the second `V` compressed to `0`
+/// regardless of whether the inner name "V" is already
+/// back-referenced.
 #[derive(Default)]
 struct BackRefs {
     /// Identifier name slots. Entries are added in emission order; once
     /// 10 names have been recorded, no further names enter the table
     /// (subsequent names still emit in full, they just don't compress).
     names: Vec<String>,
-    /// Type encoding slots. Same 10-entry cap. The key is the full
-    /// substring that would otherwise be emitted (e.g. `PEAH` or
-    /// `AEAVFoo@@`).
-    types: Vec<String>,
+    /// Type slots, keyed by `TypeId`. Same 10-entry cap. Builtin
+    /// types (single-character codes like `H`, `M`) are never
+    /// recorded here — the table is for compound types only.
+    types: Vec<TypeId>,
 }
 
 impl BackRefs {
@@ -137,16 +148,16 @@ impl BackRefs {
         }
     }
 
-    fn find_type(&self, ty: &str) -> Option<char> {
+    fn find_type(&self, ty: TypeId) -> Option<char> {
         self.types
             .iter()
-            .position(|t| t == ty)
+            .position(|t| *t == ty)
             .map(|i| (b'0' + i as u8) as char)
     }
 
-    fn record_type(&mut self, ty: &str) {
-        if self.types.len() < 10 && !self.types.iter().any(|t| t == ty) {
-            self.types.push(ty.to_string());
+    fn record_type(&mut self, ty: TypeId) {
+        if self.types.len() < 10 && !self.types.iter().any(|t| *t == ty) {
+            self.types.push(ty);
         }
     }
 }
@@ -582,42 +593,52 @@ impl<'a> MsvcMangler<'a> {
 
     // -------- Type emission ------------------------------------------
 
-    /// Emit a type encoding.
+    /// Emit a type encoding at the **top level** of a parameter (or
+    /// return) position.
     ///
-    /// MSVC's type back-reference table only records *modified*
-    /// types — pointers, references, member pointers, function-like
-    /// types — not plain record/enum/builtin types. Plain class types
-    /// reach compression via the *name* back-reference table inside
-    /// their qualified-name encoding. We mirror that exactly:
-    /// emission of `Record`/`Enum`/builtins goes straight to body
-    /// emission, while `Ptr`/`Ref`/`MemberPtr` consult the type
-    /// table.
+    /// MSVC's type back-reference table records compound types
+    /// keyed by *semantic type identity*. The table is consulted
+    /// only at top-level type positions — typically each parameter
+    /// of a function signature, plus the return type. Nested types
+    /// inside modifiers (the pointee of a `Ptr`, the pointee of a
+    /// `Ref`, the element of an `Array`) bypass the type table and
+    /// rely on the name back-reference table for compression. This
+    /// matches clang's observed behavior: `void f(V, V)` emits
+    /// `?f@@YAXUV@@0@Z` (second `V` compresses via type table),
+    /// `void g(V, V&)` emits `?g@@YAXUV@@AEAU1@@Z` (different
+    /// top-level types — no type table hit; the `V` inside `V&`
+    /// uses only the name back-ref).
     fn emit_type(&mut self, ty: TypeId) {
         let cxx = self.ctx.type_of(ty).clone();
-        let table_participant = matches!(
+        // Builtin types: never participate in the type table. Their
+        // rendered form is already a single character.
+        if matches!(
             cxx,
-            CxxType::Ptr { .. } | CxxType::Ref { .. } | CxxType::MemberPtr { .. }
-        );
-        if !table_participant {
+            CxxType::Void | CxxType::Bool | CxxType::Int { .. } | CxxType::Float { .. }
+        ) {
             self.emit_type_body(&cxx);
             return;
         }
-        // Render to a scratch buffer to get the full encoding as a
-        // back-ref key. Inner classes / inner names still consult
-        // the shared `back_refs` via `self`, so name compression
-        // inside the type body still fires.
-        let mut buf = String::new();
-        std::mem::swap(&mut self.out, &mut buf);
-        self.emit_type_body(&cxx);
-        let rendered = std::mem::take(&mut self.out);
-        std::mem::swap(&mut self.out, &mut buf);
-
-        if let Some(d) = self.back_refs.find_type(&rendered) {
+        // Compound type: check the type table by TypeId.
+        if let Some(d) = self.back_refs.find_type(ty) {
             self.out.push(d);
-        } else {
-            self.out.push_str(&rendered);
-            self.back_refs.record_type(&rendered);
+            return;
         }
+        // First emission — render body normally. Nested types inside
+        // it route through `emit_type_nested` so they don't consult
+        // the type table. Record this TypeId in the table after.
+        self.emit_type_body(&cxx);
+        self.back_refs.record_type(ty);
+    }
+
+    /// Emit a type encoding at a **nested** position — inside a
+    /// modifier wrapper (`Ptr` pointee, `Ref` pointee, `Array`
+    /// element). Skips the type back-reference table; only the
+    /// name table is consulted (transparently, via
+    /// `emit_qualified_name_tail`).
+    fn emit_type_nested(&mut self, ty: TypeId) {
+        let cxx = self.ctx.type_of(ty).clone();
+        self.emit_type_body(&cxx);
     }
 
     fn emit_type_body(&mut self, ty: &CxxType) {
@@ -632,7 +653,8 @@ impl<'a> MsvcMangler<'a> {
                 // 64-bit: `PE` + CV-letter (`A`/`B`/`C`/`D`).
                 self.out.push_str("PE");
                 self.out.push(ptr_cv_letter(*cv));
-                self.emit_type(*pointee);
+                // Nested position: don't consult the type table.
+                self.emit_type_nested(*pointee);
             }
             CxxType::Ref { pointee, kind, cv } => {
                 let prefix = match kind {
@@ -641,7 +663,7 @@ impl<'a> MsvcMangler<'a> {
                 };
                 self.out.push_str(prefix);
                 self.out.push(ptr_cv_letter(*cv));
-                self.emit_type(*pointee);
+                self.emit_type_nested(*pointee);
             }
             CxxType::Array { elem, len } => {
                 // `_O` prefix + element + length. MSVC's array
@@ -649,7 +671,7 @@ impl<'a> MsvcMangler<'a> {
                 // decimal; for now we emit the bound as a literal
                 // digit run.
                 let _ = write!(self.out, "_O{len}");
-                self.emit_type(*elem);
+                self.emit_type_nested(*elem);
             }
             CxxType::Record(class_id) => {
                 // Class type: `V<qualified-name>@@`.

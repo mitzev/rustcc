@@ -340,3 +340,92 @@ fn msvc_layout_inherit_matches_clang() {
     });
     assert_record_matches(&c, with_empty_base, by_name["WithEmptyBase"]);
 }
+
+// -------- layout_multi_inherit ---------------------------------------
+
+#[test]
+fn msvc_layout_multi_inherit_matches_clang() {
+    let goldens = load_golden("layout_multi_inherit");
+    let by_name: HashMap<&str, &ExpectedRecord> =
+        goldens.iter().map(|r| (r.name.as_str(), r)).collect();
+
+    let mut c = ctx();
+    let i = intern_int(&mut c, true, IntWidth::I32);
+
+    // struct A { int a; };
+    let a = c.define_class(ClassDef {
+        fields: vec![FieldDef {
+            name: Ident("a".into()),
+            ty: i,
+            explicit_align: None,
+        }],
+        ..class_def("A", RecordKind::Struct)
+    });
+    assert_record_matches(&c, a, by_name["A"]);
+
+    // struct B { int b; };
+    let b = c.define_class(ClassDef {
+        fields: vec![FieldDef {
+            name: Ident("b".into()),
+            ty: i,
+            explicit_align: None,
+        }],
+        ..class_def("B", RecordKind::Struct)
+    });
+    assert_record_matches(&c, b, by_name["B"]);
+
+    // struct C : A, B { int c; };
+    let c_class = c.define_class(ClassDef {
+        bases: vec![
+            BaseSpec { class: a, virtual_: false, access: Access::Public },
+            BaseSpec { class: b, virtual_: false, access: Access::Public },
+        ],
+        fields: vec![FieldDef {
+            name: Ident("c".into()),
+            ty: i,
+            explicit_align: None,
+        }],
+        ..class_def("C", RecordKind::Struct)
+    });
+    assert_record_matches(&c, c_class, by_name["C"]);
+
+    // struct VA { virtual void f(); int x; };
+    let va = c.define_class(ClassDef {
+        fields: vec![FieldDef {
+            name: Ident("x".into()),
+            ty: i,
+            explicit_align: None,
+        }],
+        is_polymorphic: true,
+        ..class_def("VA", RecordKind::Struct)
+    });
+    assert_record_matches(&c, va, by_name["VA"]);
+
+    // struct VB { virtual void g(); int y; };
+    let vb = c.define_class(ClassDef {
+        fields: vec![FieldDef {
+            name: Ident("y".into()),
+            ty: i,
+            explicit_align: None,
+        }],
+        is_polymorphic: true,
+        ..class_def("VB", RecordKind::Struct)
+    });
+    assert_record_matches(&c, vb, by_name["VB"]);
+
+    // struct VC : VA, VB { int z; };
+    let vc = c.define_class(ClassDef {
+        bases: vec![
+            BaseSpec { class: va, virtual_: false, access: Access::Public },
+            BaseSpec { class: vb, virtual_: false, access: Access::Public },
+        ],
+        fields: vec![FieldDef {
+            name: Ident("z".into()),
+            ty: i,
+            explicit_align: None,
+        }],
+        is_polymorphic: true,
+        ..class_def("VC", RecordKind::Struct)
+    });
+    assert_record_matches(&c, vc, by_name["VC"]);
+}
