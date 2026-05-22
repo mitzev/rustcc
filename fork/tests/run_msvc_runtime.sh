@@ -64,42 +64,43 @@ echo "=> .exe produced at $EXE"
 file "$EXE"
 
 # Optional: run via Wine if available. Exit code should be 3 (1+2).
-if command -v wine64 >/dev/null 2>&1; then
-    echo
-    echo "=> Running under wine64"
-    if wine64 "$EXE"; then
-        RC=$?
-    else
-        RC=$?
-    fi
-    echo "   exit code: $RC (expected 3)"
-    if [ "$RC" -eq 3 ]; then
-        echo
-        echo "PASS"
-        exit 0
-    else
-        echo
-        echo "FAIL: expected exit code 3 from add(1,2), got $RC" >&2
-        exit 1
-    fi
-elif command -v wine >/dev/null 2>&1; then
-    echo
-    echo "=> Running under wine"
-    if wine "$EXE"; then
-        RC=$?
-    else
-        RC=$?
-    fi
-    echo "   exit code: $RC (expected 3)"
-    if [ "$RC" -eq 3 ]; then
-        echo
-        echo "PASS"
-        exit 0
-    fi
-    echo "FAIL: expected 3, got $RC"
-    exit 1
-else
-    echo
-    echo "PASS (compile-only — wine not installed, runtime check skipped)"
-    exit 0
+#
+# Modern macOS Wine (9.0+) ships a single `wine` binary that handles
+# 64-bit natively — `wine64` no longer exists separately (Apple
+# dropped 32-bit in Catalina). Prefer `wine`, fall back to `wine64`
+# on Linux runners that still split them.
+WINE_BIN=""
+if command -v wine >/dev/null 2>&1; then
+    WINE_BIN=wine
+elif command -v wine64 >/dev/null 2>&1; then
+    WINE_BIN=wine64
 fi
+
+if [ -n "$WINE_BIN" ]; then
+    echo
+    echo "=> Running under $WINE_BIN"
+    # Suppress Wine's first-run chatter unless WINEDEBUG is set.
+    : "${WINEDEBUG:=-all}"
+    export WINEDEBUG
+    set +e
+    "$WINE_BIN" "$EXE"
+    RC=$?
+    set -e
+    echo "   exit code: $RC (expected 3)"
+    if [ "$RC" -eq 3 ]; then
+        echo
+        echo "PASS"
+        exit 0
+    fi
+    echo
+    echo "FAIL: expected exit code 3 from add(1,2), got $RC" >&2
+    if [ "$WINE_BIN" = "wine" ] && [ "$RC" -ge 126 ]; then
+        echo "hint: macOS may be blocking wine via Gatekeeper. Try:" >&2
+        echo "      sudo xattr -dr com.apple.quarantine '/Applications/Wine Stable.app'" >&2
+    fi
+    exit 1
+fi
+
+echo
+echo "PASS (compile-only — wine not installed, runtime check skipped)"
+exit 0
