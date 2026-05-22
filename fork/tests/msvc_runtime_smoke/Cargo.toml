@@ -19,6 +19,16 @@ path = "src/polymorphic.rs"
 name = "msvc_nonvirtual"
 path = "src/non_virtual.rs"
 
+# v1.09.2-c: virtual destructor runs at scope exit.
+[[bin]]
+name = "msvc_virtual_dtor"
+path = "src/virtual_dtor.rs"
+
+# v1.09.2-c: virtual-method override picks most-derived slot.
+[[bin]]
+name = "msvc_override"
+path = "src/override.rs"
+
 [workspace]
 
 [profile.dev]

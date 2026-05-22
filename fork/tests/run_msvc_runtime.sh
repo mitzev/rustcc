@@ -60,6 +60,8 @@ declare -a TESTS=(
     "msvc_test:3"            # add(1,2) — basic add via mainCRTStartup
     "msvc_nonvirtual:17"     # class with ctor + method (no virtual)
     "msvc_polymorphic:17"    # class with #[cpp_virtual] method
+    "msvc_virtual_dtor:100"  # patch 18: scalar deleting dtor side-effect
+    "msvc_override:14"       # patch 17: derived class vtable override
 )
 
 ALL_PASS=1
