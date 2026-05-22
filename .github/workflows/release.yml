@@ -126,6 +126,11 @@ jobs:
           ninja --version
 
       - name: Run fork/build.sh (clone + apply patches + stage-1 compiler)
+        # Force bash on every runner. On Windows the default is
+        # PowerShell which chokes on `./x.py` and bash idioms in
+        # `fork/build.sh`. Git Bash ships on windows-latest /
+        # windows-11-arm and runs the shell script correctly.
+        shell: bash
         env:
           CLONE_DIR: ${{ runner.temp }}/rust-lang-rust
         run: |
@@ -153,6 +158,7 @@ jobs:
         # integration tests. Maintainers can still pull the
         # workflow-scoped artifact (uploaded only on success) by
         # re-running the job after fixing the regression.
+        shell: bash
         env:
           CLONE_DIR: ${{ runner.temp }}/rust-lang-rust
         run: |
@@ -170,6 +176,7 @@ jobs:
           RUSTC="$STAGE1_RUSTC" ./fork/tests/run.sh
 
       - name: Package stage-1 toolchain
+        shell: bash
         env:
           CLONE_DIR: ${{ runner.temp }}/rust-lang-rust
         run: |
@@ -213,6 +220,7 @@ jobs:
         if: >
           startsWith(github.ref, 'refs/tags/v') ||
           (github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '')
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.event.inputs.release_tag || github.ref_name }}
