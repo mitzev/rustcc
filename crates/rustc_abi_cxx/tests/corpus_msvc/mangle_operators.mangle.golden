@@ -1,0 +1,8 @@
+# Generated from clang -target x86_64-pc-windows-msvc output.
+# Do not hand-edit; regenerate via fork/tests/refresh-msvc-corpus.sh.
+target x86_64-pc-windows-msvc
+symbol ??4Vec@@QEAAAEAU0@AEBU0@@Z
+symbol ??8Vec@@QEBA_NAEBU0@@Z
+symbol ??AVec@@QEAAHH@Z
+symbol ??HVec@@QEBA?AU0@AEBU0@@Z
+symbol ??MVec@@QEBA_NAEBU0@@Z

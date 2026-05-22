@@ -1,0 +1,22 @@
+# Generated from clang -target x86_64-pc-windows-msvc output.
+# Do not hand-edit; regenerate via fork/tests/refresh-msvc-corpus.sh.
+target x86_64-pc-windows-msvc
+symbol ?p_const_int@@YAXPEBH@Z
+symbol ?p_const_volatile_int@@YAXPEDH@Z
+symbol ?p_int@@YAXPEAH@Z
+symbol ?p_p_int@@YAXPEAPEAH@Z
+symbol ?p_volatile_int@@YAXPECH@Z
+symbol ?r_const_int@@YAXAEBH@Z
+symbol ?r_int@@YAXAEAH@Z
+symbol ?t_bool@@YAX_N@Z
+symbol ?t_f32@@YAXM@Z
+symbol ?t_f64@@YAXN@Z
+symbol ?t_int16@@YAXF@Z
+symbol ?t_int32@@YAXH@Z
+symbol ?t_int64@@YAX_J@Z
+symbol ?t_int8@@YAXD@Z
+symbol ?t_uint16@@YAXG@Z
+symbol ?t_uint32@@YAXI@Z
+symbol ?t_uint64@@YAX_K@Z
+symbol ?t_uint8@@YAXE@Z
+symbol ?t_void@@YAXXZ

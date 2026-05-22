@@ -172,6 +172,10 @@ struct FnInfo<'a> {
     /// instead of encoding any type. (C++ source has no return type
     /// for these.)
     no_return_type: bool,
+    /// `true` for `virtual`-declared member functions. Selects `U`
+    /// instead of `Q` for the access letter. Ignored when
+    /// `is_member == false`.
+    is_virtual: bool,
 }
 
 impl<'a> MsvcMangler<'a> {
@@ -186,18 +190,21 @@ impl<'a> MsvcMangler<'a> {
     fn mangle_symbol(&mut self, sym: &Symbol) {
         match sym {
             Symbol::Function { scope, name, sig } => {
-                // `?<name>@<scope-reversed>@@<info>`. Free-function
-                // names are NOT recorded in the back-reference table
-                // (only identifiers reached via a scope-tail are).
+                // `?<name>@<scope-reversed>@@<info>`. The function
+                // name IS recorded in the back-ref table — MSVC's
+                // mangler records every identifier in appearance
+                // order, including the symbol's own leaf name. (The
+                // first emission still spells out the name; later
+                // appearances of the same identifier compress.)
                 self.out.push('?');
-                self.out.push_str(&name.0);
-                self.out.push('@');
+                self.emit_unqualified_name(&name.0);
                 self.emit_qualified_name_tail(&scope.0);
                 self.emit_function_info(FnInfo {
                     sig,
                     is_member: false,
                     cv: sig.cv,
                     no_return_type: false,
+                    is_virtual: false,
                 });
             }
             Symbol::Method { class, name, sig } => {
@@ -205,11 +212,13 @@ impl<'a> MsvcMangler<'a> {
                 self.emit_method_name(name);
                 let class_path = &self.ctx.class(*class).name.0;
                 self.emit_qualified_name_tail(class_path);
+                let is_virtual = self.lookup_method_is_virtual(*class, name, sig);
                 self.emit_function_info(FnInfo {
                     sig,
                     is_member: true,
                     cv: sig.cv,
                     no_return_type: false,
+                    is_virtual,
                 });
             }
             Symbol::Ctor { class, variant, sig } => {
@@ -228,11 +237,13 @@ impl<'a> MsvcMangler<'a> {
                 let class_path = &self.ctx.class(*class).name.0;
                 self.emit_qualified_name_tail(class_path);
                 let cv = CvQual::default();
+                // Constructors are never virtual.
                 self.emit_function_info(FnInfo {
                     sig,
                     is_member: true,
                     cv,
                     no_return_type: true,
+                    is_virtual: false,
                 });
             }
             Symbol::Dtor { class, variant } => {
@@ -259,11 +270,16 @@ impl<'a> MsvcMangler<'a> {
                     variadic: false,
                     noexcept: false,
                 };
+                // Destructor virtuality: any class with a virtual
+                // base or any virtual method has a virtual dtor;
+                // explicit `virtual ~T()` also marks it. Look it up.
+                let is_virtual = self.dtor_is_virtual(*class);
                 self.emit_function_info(FnInfo {
                     sig: &dummy_sig,
                     is_member: true,
                     cv: CvQual::default(),
                     no_return_type: true,
+                    is_virtual,
                 });
             }
             Symbol::VTable(class) => {
@@ -455,8 +471,12 @@ impl<'a> MsvcMangler<'a> {
     ///   universally.
     fn emit_function_info(&mut self, info: FnInfo<'_>) {
         if info.is_member {
-            // Q for public — we don't track access yet.
-            self.out.push('Q');
+            // `Q` for public non-virtual, `U` for public virtual.
+            // (Protected and private have their own letter ranges
+            // that this layer doesn't yet model; access doesn't
+            // affect linkage so all public is a safe default for
+            // codegen-relevant mangling.)
+            self.out.push(if info.is_virtual { 'U' } else { 'Q' });
             // `E` marks a 64-bit member function's `this` pointer.
             // On 32-bit MSVC this slot is empty; on 64-bit it's
             // always `E`.
@@ -474,10 +494,19 @@ impl<'a> MsvcMangler<'a> {
         self.out.push('A');
         // Return type. Ctors and dtors collapse this slot to a
         // single `@` because they have no return-type in the C++
-        // source.
+        // source. Class-by-value returns get a `?A` storage-class
+        // prefix (MSVC's "no-cv UDT return value" marker) — clang
+        // emits it for every record-typed return, trivially
+        // destructible or not.
         if info.no_return_type {
             self.out.push('@');
         } else {
+            if matches!(
+                self.ctx.type_of(info.sig.ret),
+                CxxType::Record(_) | CxxType::Enum { .. }
+            ) {
+                self.out.push_str("?A");
+            }
             self.emit_type(info.sig.ret);
         }
         // Params.
@@ -500,24 +529,83 @@ impl<'a> MsvcMangler<'a> {
             && matches!(self.ctx.target().abi_flavor, AbiFlavor::Msvc)
     }
 
+    /// Look up the virtuality of `Class::name(sig)` in the class's
+    /// method list. Returns `true` for `Virtual` and `PureVirtual`.
+    /// Returns `false` when no matching method exists — that path
+    /// is taken by test fixtures that build a `Symbol::Method`
+    /// without populating the class's `.methods`, in which case
+    /// the non-virtual default `Q` is the right output.
+    fn lookup_method_is_virtual(
+        &self,
+        class: ClassId,
+        name: &MethodName,
+        sig: &FnSig,
+    ) -> bool {
+        for m in &self.ctx.class(class).methods {
+            if &m.name == name
+                && m.sig.params == sig.params
+                && m.sig.cv == sig.cv
+            {
+                return matches!(
+                    m.virtuality,
+                    crate::ty::Virtuality::Virtual
+                        | crate::ty::Virtuality::PureVirtual
+                );
+            }
+        }
+        false
+    }
+
+    /// A class's destructor is virtual if any explicit dtor entry in
+    /// the class's method list is marked virtual, OR if any base of
+    /// the class has a virtual dtor (the implicit-virtual-dtor
+    /// rule). Approximated as: any virtual method on the class or
+    /// any base chain.
+    fn dtor_is_virtual(&self, class: ClassId) -> bool {
+        // Direct check.
+        for m in &self.ctx.class(class).methods {
+            if matches!(m.special, Some(crate::ty::SpecialMember::Dtor)) {
+                return matches!(
+                    m.virtuality,
+                    crate::ty::Virtuality::Virtual
+                        | crate::ty::Virtuality::PureVirtual
+                );
+            }
+        }
+        // Inherited virtual dtor from a polymorphic base.
+        self.ctx
+            .class(class)
+            .bases
+            .iter()
+            .any(|b| self.dtor_is_virtual(b.class))
+    }
+
     // -------- Type emission ------------------------------------------
 
-    /// Emit a type encoding. Records the full encoding in the type
-    /// back-reference table on first emission; on repeat, emits the
-    /// digit shortcut.
+    /// Emit a type encoding.
+    ///
+    /// MSVC's type back-reference table only records *modified*
+    /// types — pointers, references, member pointers, function-like
+    /// types — not plain record/enum/builtin types. Plain class types
+    /// reach compression via the *name* back-reference table inside
+    /// their qualified-name encoding. We mirror that exactly:
+    /// emission of `Record`/`Enum`/builtins goes straight to body
+    /// emission, while `Ptr`/`Ref`/`MemberPtr` consult the type
+    /// table.
     fn emit_type(&mut self, ty: TypeId) {
         let cxx = self.ctx.type_of(ty).clone();
-        // Builtin types never participate in the type back-reference
-        // table — only compound types do.
-        if matches!(
+        let table_participant = matches!(
             cxx,
-            CxxType::Void | CxxType::Bool | CxxType::Int { .. } | CxxType::Float { .. }
-        ) {
+            CxxType::Ptr { .. } | CxxType::Ref { .. } | CxxType::MemberPtr { .. }
+        );
+        if !table_participant {
             self.emit_type_body(&cxx);
             return;
         }
-        // Compound type: render into a scratch buffer so we have the
-        // full encoding to use as a back-reference key.
+        // Render to a scratch buffer to get the full encoding as a
+        // back-ref key. Inner classes / inner names still consult
+        // the shared `back_refs` via `self`, so name compression
+        // inside the type body still fires.
         let mut buf = String::new();
         std::mem::swap(&mut self.out, &mut buf);
         self.emit_type_body(&cxx);
@@ -886,20 +974,12 @@ mod tests {
 
     #[test]
     fn name_back_reference_compresses_repeated_scope() {
-        // Free-function names are NOT recorded in the back-ref table
-        // — only identifiers reached via the scope tail and within
-        // type encodings are. So when `N` appears as the function
-        // scope and later as part of the parameter type's scope,
-        // the second emission compresses to slot 0.
-        // Two consecutive calls with the same `N` namespace —
-        // within a single mangling, the second emission of `N`
-        // becomes back-reference `0` (slot 0).
-        //
-        // `int N::f(N::S)`  where S is in namespace N. Scope of
-        // the function is `[N]`; the parameter type's scope is
-        // also `[N]`. After emitting the function scope, `N` is in
-        // back-ref slot 0, so the param-side `N` should compress
-        // to `0`.
+        // `int N::f(N::S)` where S is in namespace N. MSVC records
+        // every identifier (including the function's own leaf
+        // name) in appearance order. After emitting `?f@N@@`, the
+        // name table is `[f, N]`. The parameter type then emits
+        // `VS@` (new name → slot 2) and looks up `N` (slot 1) →
+        // back-ref `1`.
         let mut c = ctx();
         let i = intern_int(&mut c, true, IntWidth::I32);
         let sid = c.define_class(ClassDef {
@@ -929,20 +1009,20 @@ mod tests {
             name: Ident("f".into()),
             sig,
         });
-        // Expected: `?f@N@@YAHVS@0@@Z`
+        // Expected: `?f@N@@YAHVS@1@@Z`
         // Breakdown:
-        //   ?f       — function name
-        //   @N       — scope (innermost first): N
-        //   @@       — terminator for qualified-name section
+        //   ?f       — function name (slot 0)
+        //   @N       — scope (slot 1)
+        //   @@       — terminator
         //   YA       — free fn + __cdecl
         //   H        — return int
         //   V        — class type ahead
-        //   S@       — class name "S"
-        //   0        — back-ref slot 0 for the scope `N` already emitted
+        //   S@       — class name "S" (slot 2)
+        //   1        — back-ref to N at slot 1
         //   @        — end of class qualified-name
         //   @        — end of parameter list
         //   Z        — no exception spec
-        assert_eq!(m, "?f@N@@YAHVS@0@@Z");
+        assert_eq!(m, "?f@N@@YAHVS@1@@Z");
     }
 
     #[test]

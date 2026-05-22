@@ -366,10 +366,12 @@ mod tests {
         assert_eq!(primary.address_point_offset, 8);
         // First entry is the COL pointer.
         assert!(matches!(&primary.entries[0], VTableEntry::Rtti(_)));
-        // Second entry is the function pointer.
+        // Second entry is the function pointer. The method is
+        // virtual (this class is polymorphic with one virtual fn),
+        // so the access letter is `U`, not `Q`.
         match &primary.entries[1] {
             VTableEntry::FunctionPointer { mangled_target, .. } => {
-                assert_eq!(mangled_target, "?f@Poly@@QEAAXXZ");
+                assert_eq!(mangled_target, "?f@Poly@@UEAAXXZ");
             }
             _ => panic!("expected fn-ptr entry"),
         }

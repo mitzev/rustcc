@@ -1,0 +1,5 @@
+# Generated from clang -target x86_64-pc-windows-msvc output.
+# Do not hand-edit; regenerate via fork/tests/refresh-msvc-corpus.sh.
+target x86_64-pc-windows-msvc
+symbol ?f@M@N@@YAHUS@12@@Z
+symbol ?g@N@@YAHUS@M@1@@Z
