@@ -336,6 +336,9 @@ fn compute_layout(ctx: &CxxTypeCtx, class_id: ClassId) -> Result<RecordLayout, L
         base_offsets: st.base_offsets,
         virtual_base_offsets: st.virtual_base_offsets,
         empty_subobjects: st.empty_subobjects,
+        // HFA detection is target-agnostic — same rule on Itanium
+        // and MSVC. ARM64 codegen consults this; non-ARM64 ignores.
+        hfa_kind: crate::layout::detect_hfa(ctx, class_id),
     })
 }
 

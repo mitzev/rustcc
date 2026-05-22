@@ -52,6 +52,43 @@ pub struct RecordLayout {
     /// most-derived class lays them out at its own end).
     pub virtual_base_offsets: Vec<(ClassId, u64)>,
     pub empty_subobjects: Vec<(ClassId, u64)>,
+    /// v1.09.2: Homogeneous Float / Vector Aggregate detection.
+    /// `Some` when the record is an HFA/HVA per AAPCS64 — every
+    /// leaf field has the same primitive float / vector type and
+    /// the total leaf count is 1..=4. Consumed by the ARM64
+    /// codegen path to route extern "C++" parameters/returns
+    /// into V0..V3 individually rather than as a packed struct.
+    ///
+    /// `None` on every non-ARM64 target's consumer side (the
+    /// detection logic still runs but the field is ignored). The
+    /// rule is target-agnostic per AAPCS64 §B.2.5; only the codegen
+    /// dispatch is target-specific.
+    pub hfa_kind: Option<HfaKind>,
+}
+
+/// HFA / HVA classification per AAPCS64 §B.2.5.
+///
+/// - `count` is the number of leaf elements (1..=4 for a valid
+///   HFA/HVA; anything outside that range never becomes an HFA).
+/// - `elem` is the leaf type — `f32`, `f64`, or a SIMD vector
+///   width. (v1 supports just the float variants — vector
+///   support follows when we add `#[repr(simd)]` plumbing.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct HfaKind {
+    pub elem: HfaElem,
+    pub count: u8,
+}
+
+/// Leaf-element kind that an HFA's fields all share.
+///
+/// v1 supports the two float forms. Vector kinds (`V64`, `V128`)
+/// come with `#[repr(simd)]` support in a follow-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum HfaElem {
+    F32,
+    F64,
 }
 
 impl CxxTypeCtx {
@@ -286,7 +323,124 @@ fn compute_layout(
         base_offsets: state.base_offsets,
         virtual_base_offsets: state.virtual_base_offsets,
         empty_subobjects: state.empty_subobjects,
+        hfa_kind: detect_hfa(ctx, class_id),
     })
+}
+
+/// v1.09.2 patch 19c: HFA / HVA detection per AAPCS64 §B.2.5.
+///
+/// An HFA (Homogeneous Float Aggregate) is a struct whose every
+/// leaf scalar field has the same primitive float type and whose
+/// total leaf count is 1..=4. Detection is recursive — nested
+/// structs flatten their fields. Bases count toward the leaf set
+/// the same way.
+///
+/// Returns `None` if any of:
+/// - The class is polymorphic (has vptr — disqualifies)
+/// - The class has any non-float leaf field
+/// - The leaf count is 0 or > 4
+/// - Any field type isn't a primitive float (Int, Ptr, Ref, etc.)
+///
+/// The detection is target-agnostic — it runs on every layout
+/// computation. ARM64 codegen consults `RecordLayout::hfa_kind`
+/// to route eligible types into V0..V3; non-ARM64 targets just
+/// ignore the field.
+pub(crate) fn detect_hfa(ctx: &CxxTypeCtx, class_id: ClassId) -> Option<HfaKind> {
+    if ctx.class(class_id).is_polymorphic {
+        return None;
+    }
+    let mut probe = HfaProbe { elem: None, count: 0 };
+    if !probe.walk_class(ctx, class_id) {
+        return None;
+    }
+    let elem = probe.elem?;
+    if probe.count == 0 || probe.count > 4 {
+        return None;
+    }
+    Some(HfaKind {
+        elem,
+        count: probe.count,
+    })
+}
+
+struct HfaProbe {
+    /// Established leaf-type for the aggregate, set on the first
+    /// scalar field encountered. Subsequent leaves must match.
+    elem: Option<HfaElem>,
+    count: u8,
+}
+
+impl HfaProbe {
+    /// Walk every leaf field of `class_id`. Returns `false` to
+    /// abort detection (e.g. unsupported field type encountered);
+    /// `true` to continue. Mutates `self.elem`/`self.count` to
+    /// record discoveries.
+    fn walk_class(&mut self, ctx: &CxxTypeCtx, class_id: ClassId) -> bool {
+        // Bases recurse first so the order matches source layout.
+        for base in &ctx.class(class_id).bases {
+            if base.virtual_ {
+                // Virtual bases disqualify an aggregate from being
+                // an HFA — they introduce vbptr indirection.
+                return false;
+            }
+            if !self.walk_class(ctx, base.class) {
+                return false;
+            }
+        }
+        for field in &ctx.class(class_id).fields {
+            if !self.walk_type(ctx, field.ty) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn walk_type(&mut self, ctx: &CxxTypeCtx, ty: TypeId) -> bool {
+        use crate::ty::FloatKind;
+        match ctx.type_of(ty).clone() {
+            CxxType::Float { kind: FloatKind::F32 } => self.record(HfaElem::F32),
+            CxxType::Float { kind: FloatKind::F64 } => self.record(HfaElem::F64),
+            // LongDouble: 64-bit on Apple/Windows, 80-bit on x86-Linux,
+            // 128-bit on aarch64-linux. Conservatively reject — codegen
+            // for ARM64-MSVC sees long double as 64-bit but the wider
+            // forms break the HFA invariant.
+            CxxType::Float { kind: FloatKind::LongDouble } => false,
+            // Arrays of float — every element counts as a leaf.
+            CxxType::Array { elem, len } => {
+                let saved_count = self.count;
+                for _ in 0..len {
+                    if !self.walk_type(ctx, elem) {
+                        return false;
+                    }
+                    // Short-circuit: once count exceeds 4 we know
+                    // we're not an HFA. Stop walking further
+                    // elements to avoid blowing the budget.
+                    if self.count > 4 {
+                        self.count = saved_count;
+                        return false;
+                    }
+                }
+                true
+            }
+            // Nested struct: recurse.
+            CxxType::Record(inner) => self.walk_class(ctx, inner),
+            // Anything else (Int, Ptr, Ref, Bool, Void, Enum, Fn,
+            // MemberPtr) disqualifies the aggregate from HFA status.
+            _ => false,
+        }
+    }
+
+    fn record(&mut self, e: HfaElem) -> bool {
+        match self.elem {
+            None => {
+                self.elem = Some(e);
+            }
+            Some(existing) if existing == e => {}
+            Some(_) => return false, // type mismatch — not homogeneous
+        }
+        self.count = self.count.saturating_add(1);
+        true
+    }
 }
 
 /// Does `class_id` (or any class reachable through non-virtual bases)
@@ -717,11 +871,12 @@ fn pointer_size(ctx: &CxxTypeCtx) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::align_up;
+    use super::{align_up, HfaElem, HfaKind};
     use crate::ctx::CxxTypeCtx;
     use crate::target::Target;
     use crate::ty::{
-        ClassDef, Ident, NameSegment, NestedName, RecordKind,
+        ClassDef, CxxType, FieldDef, FloatKind, Ident, IntWidth, NameSegment,
+        NestedName, RecordKind,
     };
 
     #[test]
@@ -791,5 +946,212 @@ mod tests {
                 "alignas({alignas}) empty: size not a multiple of align",
             );
         }
+    }
+
+    // -------- v1.09.2 patch 19c: HFA detection ----------------------
+
+    /// Build a struct with the given field types and return its
+    /// `hfa_kind`. Helper for the HFA tests below.
+    fn hfa_of(field_types: &[CxxType]) -> Option<HfaKind> {
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let fields: Vec<FieldDef> = field_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| FieldDef {
+                name: Ident(format!("f{i}")),
+                ty: ctx.intern_type(t.clone()),
+                explicit_align: None,
+            })
+            .collect();
+        let id = ctx.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("H".into()))]),
+            bases: Vec::new(),
+            fields,
+            methods: Vec::new(),
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        ctx.layout(id).unwrap().hfa_kind
+    }
+
+    fn f32_ty() -> CxxType {
+        CxxType::Float { kind: FloatKind::F32 }
+    }
+    fn f64_ty() -> CxxType {
+        CxxType::Float { kind: FloatKind::F64 }
+    }
+    fn int_ty() -> CxxType {
+        CxxType::Int {
+            signed: true,
+            width: IntWidth::I32,
+        }
+    }
+
+    #[test]
+    fn hfa_single_f32() {
+        // `struct { float; }` — count 1, F32.
+        assert_eq!(
+            hfa_of(&[f32_ty()]),
+            Some(HfaKind { elem: HfaElem::F32, count: 1 })
+        );
+    }
+
+    #[test]
+    fn hfa_three_f64() {
+        // `struct { double; double; double; }` — count 3, F64.
+        assert_eq!(
+            hfa_of(&[f64_ty(), f64_ty(), f64_ty()]),
+            Some(HfaKind { elem: HfaElem::F64, count: 3 })
+        );
+    }
+
+    #[test]
+    fn hfa_four_f32_is_max() {
+        // `struct { float; float; float; float; }` — count 4, F32.
+        assert_eq!(
+            hfa_of(&[f32_ty(), f32_ty(), f32_ty(), f32_ty()]),
+            Some(HfaKind { elem: HfaElem::F32, count: 4 })
+        );
+    }
+
+    #[test]
+    fn hfa_five_f32_disqualified() {
+        // 5 floats exceed AAPCS64 §B.2.5 limit of 1..=4 — not HFA.
+        assert_eq!(
+            hfa_of(&[f32_ty(), f32_ty(), f32_ty(), f32_ty(), f32_ty()]),
+            None
+        );
+    }
+
+    #[test]
+    fn hfa_mixed_types_disqualified() {
+        // `struct { float; double; }` — not homogeneous.
+        assert_eq!(hfa_of(&[f32_ty(), f64_ty()]), None);
+    }
+
+    #[test]
+    fn hfa_int_field_disqualifies() {
+        // Any non-float leaf disqualifies — even one int.
+        assert_eq!(hfa_of(&[f32_ty(), int_ty()]), None);
+    }
+
+    #[test]
+    fn hfa_empty_struct_is_not_hfa() {
+        // Empty count → no HFA. The "1..=4" rule excludes 0.
+        assert_eq!(hfa_of(&[]), None);
+    }
+
+    #[test]
+    fn hfa_array_flattens_into_leaf_count() {
+        // `struct { float[3]; }` — array of 3 floats becomes a 3-leaf
+        // count, qualifying as an HFA.
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let f = ctx.intern_type(f32_ty());
+        let arr = ctx.intern_type(CxxType::Array { elem: f, len: 3 });
+        let id = ctx.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("Pos".into()))]),
+            bases: Vec::new(),
+            fields: vec![FieldDef {
+                name: Ident("xs".into()),
+                ty: arr,
+                explicit_align: None,
+            }],
+            methods: Vec::new(),
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        assert_eq!(
+            ctx.layout(id).unwrap().hfa_kind,
+            Some(HfaKind { elem: HfaElem::F32, count: 3 })
+        );
+    }
+
+    #[test]
+    fn hfa_array_of_5_floats_disqualifies() {
+        // Array element count > 4 also exceeds the limit.
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let f = ctx.intern_type(f32_ty());
+        let arr = ctx.intern_type(CxxType::Array { elem: f, len: 5 });
+        let id = ctx.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("Five".into()))]),
+            bases: Vec::new(),
+            fields: vec![FieldDef {
+                name: Ident("xs".into()),
+                ty: arr,
+                explicit_align: None,
+            }],
+            methods: Vec::new(),
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        assert_eq!(ctx.layout(id).unwrap().hfa_kind, None);
+    }
+
+    #[test]
+    fn hfa_polymorphic_disqualified() {
+        // Any vptr disqualifies — the inherited base subobject
+        // breaks the homogeneous-leaves invariant.
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let f = ctx.intern_type(f32_ty());
+        let id = ctx.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("Poly".into()))]),
+            bases: Vec::new(),
+            fields: vec![FieldDef {
+                name: Ident("x".into()),
+                ty: f,
+                explicit_align: None,
+            }],
+            methods: Vec::new(),
+            kind: RecordKind::Struct,
+            is_polymorphic: true,
+            is_final: false,
+            source_alignment: None,
+        });
+        assert_eq!(ctx.layout(id).unwrap().hfa_kind, None);
+    }
+
+    #[test]
+    fn hfa_nested_struct_flattens() {
+        // `struct Outer { Inner; float; }` where `Inner { float; float; }`
+        // → 3 floats total, qualifies as F32 HFA count 3.
+        let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+        let f = ctx.intern_type(f32_ty());
+        let inner = ctx.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("Inner".into()))]),
+            bases: Vec::new(),
+            fields: vec![
+                FieldDef { name: Ident("a".into()), ty: f, explicit_align: None },
+                FieldDef { name: Ident("b".into()), ty: f, explicit_align: None },
+            ],
+            methods: Vec::new(),
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        let inner_ty = ctx.intern_type(CxxType::Record(inner));
+        let outer = ctx.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::Class(Ident("Outer".into()))]),
+            bases: Vec::new(),
+            fields: vec![
+                FieldDef { name: Ident("i".into()), ty: inner_ty, explicit_align: None },
+                FieldDef { name: Ident("c".into()), ty: f, explicit_align: None },
+            ],
+            methods: Vec::new(),
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        assert_eq!(
+            ctx.layout(outer).unwrap().hfa_kind,
+            Some(HfaKind { elem: HfaElem::F32, count: 3 })
+        );
     }
 }
