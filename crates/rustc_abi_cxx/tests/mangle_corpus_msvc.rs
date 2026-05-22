@@ -1026,6 +1026,54 @@ fn msvc_templates_matches_clang() {
     }
 }
 
+// -------- noexcept doesn't affect MSVC mangling ----------------------
+//
+// MSVC's mangler — unlike Itanium — doesn't encode `noexcept` into
+// the mangled name even in C++17/20 modes when noexcept is part of
+// the function type. Verified against
+//   clang -target x86_64-pc-windows-msvc -std=c++20 -c probe.cpp
+// where both `void f(int)` and `void f(int) noexcept` mangle as
+// `?f@@YAXH@Z`. This test locks in that behavior — if a future
+// refactor accidentally reintroduces an `_E` prefix, it will fail.
+
+#[test]
+fn msvc_noexcept_does_not_affect_mangling() {
+    let mut c = ctx();
+    let i = intern_int(&mut c, true, IntWidth::I32);
+    let v = intern_void(&mut c);
+
+    let sig_plain = FnSig {
+        params: vec![i],
+        ret: v,
+        cv: CvQual::default(),
+        ref_q: None,
+        variadic: false,
+        noexcept: false,
+    };
+    let sig_noex = FnSig {
+        params: vec![i],
+        ret: v,
+        cv: CvQual::default(),
+        ref_q: None,
+        variadic: false,
+        noexcept: true,
+    };
+
+    let plain = c.mangle_msvc(&Symbol::Function {
+        scope: NestedName(vec![]),
+        name: Ident("f".into()),
+        sig: sig_plain,
+    });
+    let noex = c.mangle_msvc(&Symbol::Function {
+        scope: NestedName(vec![]),
+        name: Ident("f".into()),
+        sig: sig_noex,
+    });
+    assert_eq!(plain, "?f@@YAXH@Z");
+    assert_eq!(noex, "?f@@YAXH@Z");
+    assert_eq!(plain, noex);
+}
+
 // -------- Itanium-vs-MSVC dispatcher round-trip -----------------------
 
 #[test]

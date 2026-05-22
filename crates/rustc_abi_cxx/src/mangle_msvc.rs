@@ -534,9 +534,16 @@ impl<'a> MsvcMangler<'a> {
             }
             self.out.push('@');
         }
-        if info.sig.noexcept {
-            self.out.push_str("_E");
-        }
+        // Exception spec. MSVC's mangler — unlike Itanium —
+        // doesn't encode `noexcept` into the mangled name at all,
+        // even in C++17 mode when noexcept is part of the function
+        // type. Verified via:
+        //   clang -target x86_64-pc-windows-msvc -fms-compatibility \
+        //         -std=c++20 -c probe.cpp
+        // both `void f(int)` and `void f(int) noexcept` mangle as
+        // `?f@@YAXH@Z`. The MSVC ABI just doesn't carry that
+        // distinction at the symbol level; the linker happily
+        // unifies them.
         self.out.push('Z');
     }
 
