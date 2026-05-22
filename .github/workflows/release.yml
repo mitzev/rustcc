@@ -57,6 +57,15 @@ jobs:
           # comment this matrix entry out and ship 3 binaries instead.
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          # v1.09.2: Windows MSVC targets. windows-latest ships VS 2022
+          # Community + the MSVC C++ build tools pre-installed, so the
+          # fork rustc's stage-1 build can use cl.exe / link.exe / lib.exe
+          # natively. windows-11-arm is GitHub's ARM64 Windows runner
+          # (in public preview as of late 2025).
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     timeout-minutes: 240
     steps:
@@ -97,6 +106,24 @@ jobs:
           # || true` so we don't fail if they're already installed.
           brew list cmake >/dev/null 2>&1 || brew install cmake
           brew list ninja >/dev/null 2>&1 || brew install ninja
+
+      - name: Install build deps (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # windows-latest ships VS 2022 Community + the MSVC C++
+          # build tools (cl, link, lib, MSBuild) pre-installed, plus
+          # Git, Python 3, cmake. We need ninja for the LLVM build
+          # path inside `./x.py build --stage 1 compiler`.
+          #
+          # `choco install ninja` is available but slow; the runner's
+          # pre-installed `cmake` ships with a vendored `ninja` we can
+          # surface via the `Visual Studio Installer` PATH it set up.
+          # If ninja is missing, fall back to choco.
+          if ! command -v ninja >/dev/null 2>&1; then
+            choco install --no-progress -y ninja
+          fi
+          ninja --version
 
       - name: Run fork/build.sh (clone + apply patches + stage-1 compiler)
         env:
