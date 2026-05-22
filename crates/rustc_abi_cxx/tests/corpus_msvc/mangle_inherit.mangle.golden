@@ -1,0 +1,9 @@
+# Generated from clang -target x86_64-pc-windows-msvc output.
+# Do not hand-edit; regenerate via fork/tests/refresh-msvc-corpus.sh.
+target x86_64-pc-windows-msvc
+symbol ??1Base@@UEAA@XZ
+symbol ??1Derived@@UEAA@XZ
+symbol ?f@Base@@UEAAXH@Z
+symbol ?f@Derived@@UEAAXH@Z
+symbol ?g@Base@@UEBAHXZ
+symbol ?g@Derived@@UEBAHXZ

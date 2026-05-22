@@ -1,0 +1,31 @@
+[package]
+name = "msvc_smoke"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Smoke test for the v1.09.0 MSVC C++ ABI surface.
+#
+# Doesn't try to link against a real Windows binary — the test just
+# runs `cxx_importer`'s binding generation against an MSVC target
+# and asserts the emitted Rust source contains the expected
+# MSVC-mangled `#[link_name = "..."]` attributes. Validates the
+# end-to-end pipeline from libclang parse → ctx.mangle → emitted
+# bindings without requiring a Windows runner or the fork rustc
+# patches.
+
+[dependencies]
+cxx_importer = { path = "../../../crates/cxx_importer", features = ["libclang", "build"] }
+rustc_abi_cxx = { path = "../../../crates/rustc_abi_cxx" }
+
+[features]
+# This package depends on libclang at build time. CI runners
+# without libclang (the bare runner on macOS) skip the test
+# via this feature gate.
+default = ["libclang"]
+libclang = []
+
+# Standalone — not part of the workspace, like the other
+# fork/tests/* probes. Keeps the workspace clean of one-off
+# Cargo.lock files.
+[workspace]

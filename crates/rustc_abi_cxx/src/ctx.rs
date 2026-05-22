@@ -51,6 +51,13 @@ pub struct CxxTypeCtx {
     /// importer populates them via
     /// `Entity::get_bit_field_width()` on `FieldDecl` cursors.
     bitfield_widths: HashMap<(ClassId, usize), u64>,
+    /// Per-class `#pragma pack(N)` override. When set, the layout
+    /// engine clamps every alignment requirement (field, base, vptr,
+    /// tail padding) to the smaller of (natural alignment, N).
+    /// Itanium's layout engine ignores this (matches gcc/clang
+    /// behavior on Unix targets — `#pragma pack` is a Microsoft
+    /// extension); the MSVC layout engine honors it.
+    pragma_pack: HashMap<ClassId, u64>,
     /// Rust-origin enums exposed to C++ as scoped enums. No parallel
     /// for C++-origin enums yet — imported enums flow as anonymous
     /// `CxxType::Enum` instances with the variants living in the
@@ -69,6 +76,7 @@ impl CxxTypeCtx {
             static_methods: HashSet::new(),
             default_arg_counts: HashMap::new(),
             bitfield_widths: HashMap::new(),
+            pragma_pack: HashMap::new(),
             rust_enums: Vec::new(),
             types: Vec::new(),
         }
@@ -183,6 +191,20 @@ impl CxxTypeCtx {
         self.bitfield_widths
             .keys()
             .any(|(c, _)| *c == class)
+    }
+
+    /// Set a `#pragma pack(N)` override for `class`. Honored by the
+    /// MSVC layout engine; ignored by Itanium. Common values:
+    /// 1 (byte-packed), 2, 4, 8 (MSVC's default).
+    pub fn set_pragma_pack(&mut self, class: ClassId, pack: u64) {
+        self.pragma_pack.insert(class, pack);
+    }
+
+    /// Read the `#pragma pack(N)` override for `class`, if any.
+    /// `None` means no override; the layout engine uses its target's
+    /// default packing (8 on MSVC for 64-bit targets).
+    pub fn pragma_pack(&self, class: ClassId) -> Option<u64> {
+        self.pragma_pack.get(&class).copied()
     }
 
     /// Register a Rust-origin enum for C++ exposure. Returns the

@@ -1,0 +1,23 @@
+# Generated from clang -target x86_64-pc-windows-msvc -fdump-record-layouts.
+target x86_64-pc-windows-msvc
+
+record Base size=8 align=4 nvsize=8 nvalign=4
+  field x offset=0
+  field y offset=4
+
+record Derived size=12 align=4 nvsize=12 nvalign=4
+  base Base offset=0
+  field z offset=8
+
+record Poly size=16 align=8 nvsize=16 nvalign=8 has_vptr=true
+  field x offset=8
+
+record PolyDerived size=24 align=8 nvsize=24 nvalign=8 has_vptr=true
+  base Poly offset=0
+  field y offset=16
+
+record EmptyBase size=1 align=1 nvsize=0 nvalign=1
+
+record WithEmptyBase size=4 align=4 nvsize=4 nvalign=4
+  base EmptyBase offset=0 empty=true
+  field x offset=0

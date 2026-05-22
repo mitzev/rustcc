@@ -12,16 +12,19 @@
 mod ctx;
 mod diag;
 mod layout;
+mod layout_msvc;
 mod mangle;
+mod mangle_msvc;
 mod target;
 mod ty;
 mod vtable;
+mod vtable_msvc;
 
 pub use ctx::CxxTypeCtx;
 pub use diag::LayoutError;
 pub use layout::RecordLayout;
 pub use mangle::{CtorVariant, DtorVariant, Symbol};
-pub use target::{LongDoubleKind, Target};
+pub use target::{AbiFlavor, LongDoubleKind, Target};
 pub use ty::{
     Access, BaseSpec, ClassDef, ClassId, CvQual, CxxType, FieldDef, FieldId,
     FloatKind, FnSig, Ident, IntWidth, MethodDef, MethodId, MethodName,

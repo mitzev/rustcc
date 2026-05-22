@@ -79,7 +79,22 @@ pub enum DtorVariant {
 }
 
 impl CxxTypeCtx {
+    /// Mangle dispatcher. Routes to either Itanium
+    /// ([`Self::mangle_itanium`]) or MSVC ([`Self::mangle_msvc`])
+    /// based on `target().abi_flavor`. Every caller in the workspace
+    /// goes through this entry point so the ABI choice is made
+    /// centrally.
     pub fn mangle(&self, sym: &Symbol) -> String {
+        match self.target().abi_flavor {
+            crate::target::AbiFlavor::Itanium => self.mangle_itanium(sym),
+            crate::target::AbiFlavor::Msvc => self.mangle_msvc(sym),
+        }
+    }
+
+    /// Itanium-only mangling entry point. Useful for tests and any
+    /// downstream consumer that needs to force Itanium semantics
+    /// regardless of `target().abi_flavor`.
+    pub fn mangle_itanium(&self, sym: &Symbol) -> String {
         let mut m = Mangler::new(self);
         m.mangle_symbol(sym);
         m.out

@@ -1,0 +1,8 @@
+# Generated from clang -target x86_64-pc-windows-msvc -fdump-vtable-layouts.
+target x86_64-pc-windows-msvc
+
+vtable A primary
+  entry 0 rtti A
+  entry 1 fn A::f
+  entry 2 fn A::g
+  entry 3 fn A::~A

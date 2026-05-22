@@ -1,0 +1,24 @@
+# Generated from clang -target x86_64-pc-windows-msvc -fdump-record-layouts.
+target x86_64-pc-windows-msvc
+
+record A size=4 align=4 nvsize=4 nvalign=4
+  field a offset=0
+
+record B size=4 align=4 nvsize=4 nvalign=4
+  field b offset=0
+
+record C size=12 align=4 nvsize=12 nvalign=4
+  base A offset=0
+  base B offset=4
+  field c offset=8
+
+record VA size=16 align=8 nvsize=16 nvalign=8 has_vptr=true
+  field x offset=8
+
+record VB size=16 align=8 nvsize=16 nvalign=8 has_vptr=true
+  field y offset=8
+
+record VC size=40 align=8 nvsize=40 nvalign=8 has_vptr=true
+  base VA offset=0
+  base VB offset=16
+  field z offset=32

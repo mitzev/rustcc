@@ -344,6 +344,32 @@ impl Build {
         // ----- 1. Build the HeaderGraph + Driver. -----
         let mut full_clang_flags: Vec<String> = Vec::new();
         full_clang_flags.push(format!("-std={}", self.cpp_std));
+        // Resolve the target before we build clang flags so a
+        // cross-target (e.g. Windows MSVC from a Linux host)
+        // gets `-target <triple>` + `-fms-compatibility` injected
+        // into the libclang argv. If the user already supplied
+        // `-target` in `clang_flags`, we don't override.
+        let target_for_argv = self
+            .target
+            .clone()
+            .unwrap_or_else(target_from_cargo_env);
+        let user_set_target = self
+            .clang_flags
+            .iter()
+            .any(|f| f == "-target" || f.starts_with("-target="));
+        if !user_set_target {
+            full_clang_flags.push("-target".into());
+            full_clang_flags.push(target_for_argv.triple.clone());
+            if matches!(
+                target_for_argv.abi_flavor,
+                rustc_abi_cxx::AbiFlavor::Msvc
+            ) {
+                // MSVC mode: enable MS extensions + ABI compat so
+                // libclang parses Microsoft headers correctly.
+                full_clang_flags.push("-fms-compatibility".into());
+                full_clang_flags.push("-fms-extensions".into());
+            }
+        }
         full_clang_flags.extend(self.clang_flags.iter().cloned());
         let graph = HeaderGraph {
             roots: self.headers.clone(),
@@ -361,11 +387,9 @@ impl Build {
         // segfault fix from PR #9 (`Driver::parse_all` Clang
         // hoist) is preserved by routing through the same
         // helper internally.
-        let target = self
-            .target
-            .clone()
-            .unwrap_or_else(target_from_cargo_env);
-        let mut ctx = CxxTypeCtx::new(target);
+        // Use the same Target we used to build the argv so the
+        // Rust-side ctx and the libclang TU agree on ABI flavor.
+        let mut ctx = CxxTypeCtx::new(target_for_argv);
         let annotations = AnnotationSet::default();
         let mut aliases = AliasSet::default();
         let mut enums = EnumSet::default();
@@ -731,6 +755,11 @@ fn target_from_cargo_env() -> Target {
     // CFG vars. The build.rs runtime environment is the
     // canonical source — these strings match what
     // `rustc --print cfg` emits.
+    //
+    // Windows targets distinguish `-msvc` from `-gnu` via the
+    // `target_env` slot: `msvc` => MSVC C++ ABI (mangler =
+    // `mangle_msvc`, vtable = MSVC layout); `gnu` => Itanium ABI
+    // via mingw-w64 (same backend as Linux Itanium).
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").ok();
     let os = std::env::var("CARGO_CFG_TARGET_OS").ok();
     let env = std::env::var("CARGO_CFG_TARGET_ENV").ok();
@@ -739,6 +768,15 @@ fn target_from_cargo_env() -> Target {
         (Some("x86_64"), Some("macos"), _) => Target::x86_64_apple_darwin(),
         (Some("aarch64"), Some("linux"), _) => Target::aarch64_unknown_linux_gnu(),
         (Some("x86_64"), Some("linux"), _) => Target::x86_64_unknown_linux_gnu(),
+        (Some("x86_64"), Some("windows"), Some("msvc")) => {
+            Target::x86_64_pc_windows_msvc()
+        }
+        (Some("aarch64"), Some("windows"), Some("msvc")) => {
+            Target::aarch64_pc_windows_msvc()
+        }
+        (Some("x86_64"), Some("windows"), Some("gnu")) => {
+            Target::x86_64_pc_windows_gnu()
+        }
         // Outside a build.rs run (or unrecognized triple) —
         // pick a sensible default. The generated bindings
         // are syntactically the same on every target; the
@@ -753,11 +791,20 @@ fn target_from_cargo_env() -> Target {
             { Target::aarch64_unknown_linux_gnu() }
             #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
             { Target::x86_64_unknown_linux_gnu() }
+            #[cfg(all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"))]
+            { Target::x86_64_pc_windows_msvc() }
+            #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+            { Target::aarch64_pc_windows_msvc() }
+            #[cfg(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"))]
+            { Target::x86_64_pc_windows_gnu() }
             #[cfg(not(any(
                 all(target_arch = "aarch64", target_os = "macos"),
                 all(target_arch = "x86_64", target_os = "macos"),
                 all(target_arch = "aarch64", target_os = "linux"),
                 all(target_arch = "x86_64", target_os = "linux"),
+                all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"),
+                all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"),
+                all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"),
             )))]
             { Target::x86_64_unknown_linux_gnu() }
         }

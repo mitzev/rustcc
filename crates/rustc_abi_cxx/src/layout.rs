@@ -55,7 +55,23 @@ pub struct RecordLayout {
 }
 
 impl CxxTypeCtx {
+    /// Record layout dispatcher. Routes to either the Itanium engine
+    /// (this module) or the MSVC engine ([`crate::layout_msvc`]) based
+    /// on `target().abi_flavor`. Every caller in the workspace goes
+    /// through this entry point so the choice of ABI is made in one
+    /// place.
     pub fn layout(&self, class_id: ClassId) -> Result<RecordLayout, LayoutError> {
+        match self.target().abi_flavor {
+            crate::target::AbiFlavor::Itanium => self.layout_itanium(class_id),
+            crate::target::AbiFlavor::Msvc => self.layout_msvc(class_id),
+        }
+    }
+
+    /// Itanium-only layout entry point. Exposed for tests and for the
+    /// rare downstream consumer (e.g. cross-ABI comparisons in the
+    /// fork patches) that needs to force Itanium semantics regardless
+    /// of the target.
+    pub fn layout_itanium(&self, class_id: ClassId) -> Result<RecordLayout, LayoutError> {
         compute_layout(self, class_id)
     }
 
