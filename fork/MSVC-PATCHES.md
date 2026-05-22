@@ -149,6 +149,54 @@ mangling (`??2@YAPEAX_K@Z`) instead of Itanium's (`_Znwm`).
 
 **LoC estimate**: 100–200.
 
+### `19b-arm64-msvc-sret-x8-routing.patch`
+
+**Goal**: ARM64 MSVC passes the sret pointer in **X8** (a dedicated
+register that doesn't shift the regular argument stream), unlike x64
+MSVC which uses RCX and shifts `this`/args one slot right. Patch 19
+covers the x64 routing; this patch covers ARM64.
+
+**Touches**:
+- Same `force_sret_for_record_returns` from patch 15 / 19, with an
+  arch dispatch on `target.options.arch == "aarch64"` paired with
+  `target.options.is_like_msvc`.
+- `compiler/rustc_target/src/abi/call/aarch64_win64.rs` (LLVM upstream
+  has this — the fork's `extern "C++"` shim routes through it).
+
+**Test**:
+- Compile `struct Big { int a[8]; }; Big f();` against
+  `aarch64-pc-windows-msvc`; check the LLVM IR shows `Big* sret %0`
+  and that the caller passes it in X8.
+
+**LoC estimate**: 100–150.
+
+### `19c-arm64-hfa-detection.patch`
+
+**Goal**: ARM64 AAPCS64 (followed by Windows ARM64) requires homogeneous
+float/vector aggregates (HFA/HVA — 1–4 same-type floats or vectors) to
+be passed in V0–V3 individually rather than as a packed struct. Without
+this patch, `extern "C++"` calls passing FP-aggregate types like
+`struct Pos { float x, y, z; }` ABI-violate.
+
+**Touches**:
+- `rustc_abi_cxx::layout` — new `RecordLayout::hfa_kind: Option<HfaKind>`
+  carrying `(elem_type, count)`. Detection runs at the end of layout
+  computation: walk all fields recursively; if every leaf field is the
+  same primitive float/vector type and the total count is 1–4, it's an
+  HFA. (This logic is target-agnostic from `rustc_abi_cxx`'s POV — the
+  field carries information used by `extern "C++"` callers; non-ARM64
+  targets just ignore it.)
+- `compiler/rustc_codegen_llvm/src/abi.rs` — when targeting ARM64 MSVC
+  and the param/return type is an HFA, route through LLVM's
+  `aarch64_apple` / `aarch64_win64` HFA-aware ABI engine.
+
+**Test**:
+- `tests/codegen/rustcc/hfa-aarch64-msvc.rs`: pass `struct Pos { float;
+  float; float; }` to and from an `extern "C++"` fn; verify the IR
+  uses 3 separate `float` register args + return values.
+
+**LoC estimate**: 300–500.
+
 ### `22-msvc-dllexport-dllimport.patch`
 
 **Goal**: when a `#[repr(cpp)]` class is exported from a Rust
@@ -179,7 +227,8 @@ behavior.
 ```
 16 (routing)
  ├── 17 (vtable emission) ── 18 (dtor)
- ├── 19 (sret)
+ ├── 19 (sret x64) ── 19b (sret arm64)
+ │                ── 19c (arm64 HFA)
  ├── 20 (SEH) ────────────────── depends on 16
  ├── 21 (operator new)
  └── 22 (dll storage)
@@ -187,7 +236,26 @@ behavior.
 
 16 must land first (it's the routing layer); the others can
 land in any order though 17 → 18 makes logical sense
-(vtable emission gates the dtor slot's behavior).
+(vtable emission gates the dtor slot's behavior). 19 → 19b/19c
+makes sense (introduce the arch-dispatch pattern on x64 first,
+then add the ARM64 split).
+
+**Arch coverage matrix:**
+
+| Patch | x64-msvc | aarch64-msvc | Notes |
+|---|---|---|---|
+| 16 (routing) | ✓ | ✓ | Same code |
+| 17 (vtable) | ✓ | ✓ | Same LLVM output shape |
+| 18 (dtor) | ✓ | ✓ | Same ABI |
+| 19 (sret) | ✓ | — | RCX-via-shift (x64) |
+| 19b (sret arm64) | — | ✓ | X8 (arm64) |
+| 19c (HFA arm64) | — | ✓ | AAPCS64 HFA passing |
+| 20 (SEH) | ✓ | ✓ | LLVM handles unwind format diff |
+| 21 (operator new) | ✓ | ✓ | C++ stdlib handles mangling |
+| 22 (dll storage) | ✓ | ✓ | Same `dllimport`/`dllexport` |
+
+The bulk (16, 17, 18, 20, 21, 22) is arch-agnostic. Only patches
+19 / 19b / 19c carry per-arch logic, and they're small.
 
 ## Per-patch LoC + time estimates
 
@@ -196,11 +264,13 @@ land in any order though 17 → 18 makes logical sense
 | 16 routing | 80–120 | 2–3 days | 1 day |
 | 17 vtable | 400–600 | 1 week | 2–3 days |
 | 18 dtor | 500–800 | 1.5 weeks | 3–5 days |
-| 19 sret | 150–250 | 3 days | 1 day |
+| 19 sret (x64) | 150–250 | 3 days | 1 day |
+| 19b sret (arm64) | 100–150 | 2 days | < 1 day |
+| 19c HFA (arm64) | 300–500 | 1 week | 2–3 days |
 | 20 SEH | 2500–4000 | 4–6 weeks | 1–2 weeks |
 | 21 operator new | 100–200 | 2 days | 1 day |
 | 22 dll storage | 200–300 | 3 days | 1 day |
-| **Total** | **~6000** | **~8 weeks** | **~3 weeks** |
+| **Total** | **~6500** | **~9 weeks** | **~3.5 weeks** |
 
 These slot into Phase 2's overall 3–4 month estimate. Patch 20
 is the long pole; everything else is mechanical once 16 + 17 are
