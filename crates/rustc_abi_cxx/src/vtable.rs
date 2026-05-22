@@ -76,7 +76,18 @@ pub enum VTableEntry {
 }
 
 impl CxxTypeCtx {
+    /// Vtable dispatcher. Routes to either Itanium ([`Self::vtable_itanium`])
+    /// or MSVC ([`Self::vtable_msvc`]) based on `target().abi_flavor`.
     pub fn vtable(&self, class_id: ClassId) -> Option<VTable> {
+        match self.target().abi_flavor {
+            crate::target::AbiFlavor::Itanium => self.vtable_itanium(class_id),
+            crate::target::AbiFlavor::Msvc => self.vtable_msvc(class_id),
+        }
+    }
+
+    /// Itanium-only vtable entry point. Exposed for tests and the
+    /// occasional cross-ABI consumer.
+    pub fn vtable_itanium(&self, class_id: ClassId) -> Option<VTable> {
         if !self.class(class_id).is_polymorphic {
             return None;
         }
