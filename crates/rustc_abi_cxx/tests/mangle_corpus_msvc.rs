@@ -964,7 +964,7 @@ fn msvc_templates_matches_clang() {
 
     // take_int_box(Box<int>)
     {
-        let (mut c, v, box_int_ty, _, _) = make_ctx();
+        let (c, v, box_int_ty, _, _) = make_ctx();
         let sig = FnSig {
             params: vec![box_int_ty],
             ret: v,
@@ -985,7 +985,7 @@ fn msvc_templates_matches_clang() {
 
     // take_two(Box<int>, Box<int>) — back-ref `0` on second.
     {
-        let (mut c, v, box_int_ty, _, _) = make_ctx();
+        let (c, v, box_int_ty, _, _) = make_ctx();
         let sig = FnSig {
             params: vec![box_int_ty, box_int_ty],
             ret: v,
@@ -1006,7 +1006,7 @@ fn msvc_templates_matches_clang() {
 
     // take_int_and_float(Box<int>, Box<float>) — different types.
     {
-        let (mut c, v, box_int_ty, box_float_ty, _) = make_ctx();
+        let (c, v, box_int_ty, box_float_ty, _) = make_ctx();
         let sig = FnSig {
             params: vec![box_int_ty, box_float_ty],
             ret: v,
