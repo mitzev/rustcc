@@ -341,6 +341,54 @@ fn msvc_layout_inherit_matches_clang() {
     assert_record_matches(&c, with_empty_base, by_name["WithEmptyBase"]);
 }
 
+// -------- layout_packed ----------------------------------------------
+
+#[test]
+fn msvc_layout_packed_matches_clang() {
+    let goldens = load_golden("layout_packed");
+    let by_name: HashMap<&str, &ExpectedRecord> =
+        goldens.iter().map(|r| (r.name.as_str(), r)).collect();
+
+    let mut c = ctx();
+    let i = intern_int(&mut c, true, IntWidth::I32);
+    let ch = intern_int(&mut c, true, IntWidth::I8);
+    let ll = intern_int(&mut c, true, IntWidth::I64);
+
+    // #pragma pack(1) struct Packed1 { char a; int b; };
+    let packed1 = c.define_class(ClassDef {
+        fields: vec![
+            FieldDef { name: Ident("a".into()), ty: ch, explicit_align: None },
+            FieldDef { name: Ident("b".into()), ty: i, explicit_align: None },
+        ],
+        ..class_def("Packed1", RecordKind::Struct)
+    });
+    c.set_pragma_pack(packed1, 1);
+    assert_record_matches(&c, packed1, by_name["Packed1"]);
+
+    // #pragma pack(2) struct Packed2 { char a; int b; long long c; };
+    let packed2 = c.define_class(ClassDef {
+        fields: vec![
+            FieldDef { name: Ident("a".into()), ty: ch, explicit_align: None },
+            FieldDef { name: Ident("b".into()), ty: i, explicit_align: None },
+            FieldDef { name: Ident("c".into()), ty: ll, explicit_align: None },
+        ],
+        ..class_def("Packed2", RecordKind::Struct)
+    });
+    c.set_pragma_pack(packed2, 2);
+    assert_record_matches(&c, packed2, by_name["Packed2"]);
+
+    // struct Default { char a; int b; long long c; }; (no pragma)
+    let default_class = c.define_class(ClassDef {
+        fields: vec![
+            FieldDef { name: Ident("a".into()), ty: ch, explicit_align: None },
+            FieldDef { name: Ident("b".into()), ty: i, explicit_align: None },
+            FieldDef { name: Ident("c".into()), ty: ll, explicit_align: None },
+        ],
+        ..class_def("Default", RecordKind::Struct)
+    });
+    assert_record_matches(&c, default_class, by_name["Default"]);
+}
+
 // -------- layout_multi_inherit ---------------------------------------
 
 #[test]

@@ -1,0 +1,16 @@
+# Generated from clang -target x86_64-pc-windows-msvc -fdump-record-layouts.
+target x86_64-pc-windows-msvc
+
+record Packed1 size=5 align=1 nvsize=5 nvalign=1
+  field a offset=0
+  field b offset=1
+
+record Packed2 size=14 align=2 nvsize=14 nvalign=2
+  field a offset=0
+  field b offset=2
+  field c offset=6
+
+record Default size=16 align=8 nvsize=16 nvalign=8
+  field a offset=0
+  field b offset=4
+  field c offset=8

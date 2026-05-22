@@ -133,10 +133,11 @@ impl State {
 fn compute_layout(ctx: &CxxTypeCtx, class_id: ClassId) -> Result<RecordLayout, LayoutError> {
     let class = ctx.class(class_id);
 
-    // Pragma pack is not yet plumbed through the side-tables on
-    // `CxxTypeCtx` — when it lands, replace `None` with a context
-    // lookup. For now MSVC default (8) is implicit.
-    let mut st = State::new(None);
+    // `#pragma pack(N)` if set on this class. Honored from the
+    // sidecar on `CxxTypeCtx`. When absent, every alignment
+    // requirement passes through unclamped (the natural alignment
+    // applies).
+    let mut st = State::new(ctx.pragma_pack(class_id));
 
     // 1. Polymorphic class: vptr at offset 0 (no tail-padding sharing
     //    with bases under MSVC; the vptr always lives at the class's
