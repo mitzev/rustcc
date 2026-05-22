@@ -1,0 +1,16 @@
+# Cross-link config for the v1.09.2 MSVC runtime smoke test.
+#
+# Requires:
+# - `lld-link` on PATH (`brew install lld` provides it).
+# - `xwin` SDK splatted to `$HOME/.xwin/` via
+#   `cargo install xwin && xwin --accept-license splat -o ~/.xwin`.
+#
+# Paths below assume xwin in `$HOME/.xwin`; adjust if elsewhere.
+[target.x86_64-pc-windows-msvc]
+linker = "lld-link"
+rustflags = [
+  "-Lnative=/Users/ogi/.xwin/crt/lib/x86_64",
+  "-Lnative=/Users/ogi/.xwin/sdk/lib/um/x86_64",
+  "-Lnative=/Users/ogi/.xwin/sdk/lib/ucrt/x86_64",
+  "-Clink-arg=/subsystem:console",
+]

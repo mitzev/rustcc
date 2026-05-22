@@ -28,3 +28,6 @@ Cargo.lock.bak
 # fltk_text_editor example outputs
 examples/fltk_text_editor/Cargo.lock
 examples/fltk_text_editor/target/
+
+# fork/tests/msvc_runtime_smoke build output
+fork/tests/msvc_runtime_smoke/target/

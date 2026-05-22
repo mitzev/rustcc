@@ -1,0 +1,16 @@
+[package]
+name = "msvc_test"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "msvc_test"
+path = "src/main.rs"
+
+[workspace]
+
+[profile.dev]
+panic = "abort"
+[profile.release]
+panic = "abort"
