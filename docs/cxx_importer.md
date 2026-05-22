@@ -246,6 +246,50 @@ into dozens of "unknown identifier" errors downstream.
 - Annotation contents participate in the USR key; changing an
   annotation invalidates only the affected entities.
 
+## 12.5 Target ABI flavor (v1.09.0)
+
+`cxx_importer` auto-picks the `rustc_abi_cxx::Target` based on the
+Cargo target triple it runs under. As of v1.09.0, the supported
+ABI flavors are:
+
+- **Itanium** (default) — Linux, macOS, FreeBSD; Windows via
+  mingw-w64 (`*-pc-windows-gnu`).
+- **MSVC** (new in v1.09.0) — `x86_64-pc-windows-msvc` and
+  `aarch64-pc-windows-msvc`.
+
+When the chosen target's `abi_flavor` is `Msvc`, three things
+change automatically:
+
+1. The libclang argv gets `-target <triple> -fms-compatibility
+   -fms-extensions` injected so the parse honors MSVC extensions
+   and the AST carries MS-flavored decoration.
+2. `ctx.mangle()` routes to the MSVC mangler — emitted
+   `#[link_name = "..."]` attributes carry `?Foo@Bar@@QEAA...`
+   shape instead of `_ZN3Bar3FooE...`.
+3. `ctx.layout()` and `ctx.vtable()` route to the MSVC backends,
+   which model the divergences from Itanium: no tail-padding
+   reuse across bases, restrictive empty-base optimization,
+   per-base subobject vftables, single dtor slot pointing at the
+   scalar deleting destructor.
+
+A downstream crate that pins `target = "x86_64-pc-windows-msvc"`
+in its Cargo config gets MSVC-mangled bindings transparently —
+no `Build::target()` override needed. The override is still
+available for cross-target dev loops (e.g. generating MSVC
+bindings from a macOS host as part of an editor preview).
+
+`#[pragma_pack(N)]` per-class overrides are honored by the MSVC
+layout engine; set via `ctx.set_pragma_pack(class, N)` on the
+sidecar.
+
+**Limitation (as of v1.09.0):** the fork rustc itself still routes
+through the Itanium codegen path for Windows targets. Patches
+16–22 (designed in `fork/MSVC-PATCHES.md`) close that gap in
+v1.09.1. Until then, MSVC support is "binding-generation only" —
+the emitted Rust code carries the right mangling for cross-
+compiling, but the fork rustc that consumes it doesn't yet emit
+MSVC-flavored vtable/SEH/sret code.
+
 ## 13. Open questions
 
 1. **libclang version floor.** Clang's record-layout output has changed
