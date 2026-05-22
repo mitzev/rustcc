@@ -30,13 +30,32 @@ The **P01 … P09.38 sections below** are the authoritative design
 record. Each documents the intent, validation probe, and any
 compiler-internal trade-offs for one unit of work. The numbering is
 historical — it tracks the order the work was done, not the layout
-of the current eight-file delivery. Read the P-sections when you
+of the current fifteen-file delivery. Read the P-sections when you
 want to know *why* a change looks the way it does.
 
 Verified against `rust-lang/rust` master at ~2025-04 (structurally
 equivalent to nightly-2025-10-03, which our workspace pins). Line
 numbers are approximate — look for the anchor text in each hunk
 rather than trusting `:N:` if master has drifted.
+
+### Post-v1.04 rustc-fork stability
+
+**P09.50 (v1.03.0, `15-cpp-abi-force-sret-record-ret.patch`) is
+the most recent fork-rustc patch.** Every release after v1.04.0
+ships fork-rustc binaries that are bit-for-bit identical to
+v1.04.0's. The v1.06.0 / v1.07.0 milestones — multi-inheritance,
+template-spec method extraction, build orchestrator, DX layer —
+live in workspace crates (`crates/cxx_importer`,
+`crates/rustc_abi_cxx`, `crates/cxx`, `crates/rustcc-cli`),
+`tools/vscode-rustcc/`, or as patches against rust-analyzer
+under `fork/ra-patches/` (12-patch series for class IDE parity,
+applied at PINNED_COMMIT `45b868b19`; see
+[`ra-patches/README.md`](ra-patches/README.md) and
+[`ra-patches/PHASE-2-PLAN.md`](ra-patches/PHASE-2-PLAN.md)).
+
+Future fork-rustc patches (e.g. for Windows MSVC ABI support
+in v1.09.0) will continue the P09.* numbering scheme and
+extend the file series above.
 
 ---
 

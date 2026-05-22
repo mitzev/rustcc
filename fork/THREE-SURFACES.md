@@ -142,12 +142,18 @@ recognizes the polymorphic base subobject automatically.
 - You're OK with fork-only source files.
 
 **Give up**:
-- Source files won't compile on stock rustc — editor support
-  also breaks (rust-analyzer's parser rejects the `class` token
-  until the 1.02 RA fork ships).
+- Source files won't compile on stock rustc.
 - Less grep-able than `struct Foo` + `impl Foo`: the struct name
   and method list are in the same AST item. Tooling that scans
   for `struct` won't find classes.
+
+Editor support is shipped: the patched rust-analyzer in
+`fork/ra-patches/` (Phase 1 parser via P09.45 + Phase 2 HIR / IDE
+parity via the 12-patch series in v1.07.0) gives `class` items
+full hover, go-to-def, find-references, completion, and assist
+support. Install the RA fork via the `vscode-rustcc` extension's
+`Install RA Fork (latest)` command, or build locally with
+`./fork/ra-patches/build.sh`.
 
 ---
 
