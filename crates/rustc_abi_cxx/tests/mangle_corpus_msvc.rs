@@ -15,7 +15,7 @@ use rustc_abi_cxx::{
     Access, BaseSpec, ClassDef, ClassId, CtorVariant, CvQual, CxxType,
     CxxTypeCtx, DtorVariant, FloatKind, FnSig, Ident, IntWidth, MethodName,
     NameSegment, NestedName, OperatorKind, RecordKind, RefKind, Symbol,
-    Target, TypeId, Virtuality,
+    TemplateArg, Target, TypeId, Virtuality,
 };
 use test_support::golden::{self, MangleDump};
 
@@ -898,6 +898,130 @@ fn msvc_substitutions_matches_clang() {
         assert_eq!(
             mangle_free(&mut c, "g_ippp", vec![ip, ip, ip], v),
             "?g_ippp@@YAXPEAH00@Z"
+        );
+    }
+}
+
+// -------- mangle_templates (class-template specializations) ----------
+
+const TEMPLATES_EXPECTED: &[(&str, &str)] = &[
+    // take_int_box(Box<int>) → `U?$Box@H@@`
+    ("take_int_box(Box<int>)", "?take_int_box@@YAXU?$Box@H@@@Z"),
+    // take_two(Box<int>, Box<int>) — second is type back-ref `0`.
+    ("take_two(Box<int>, Box<int>)", "?take_two@@YAXU?$Box@H@@0@Z"),
+    // take_int_and_float — different instantiations, no compression.
+    (
+        "take_int_and_float(Box<int>, Box<float>)",
+        "?take_int_and_float@@YAXU?$Box@H@@U?$Box@M@@@Z",
+    ),
+];
+
+#[test]
+fn msvc_templates_golden_has_expected_symbols() {
+    let d = load("mangle_templates");
+    assert_all_msvc(&d, TEMPLATES_EXPECTED);
+}
+
+#[test]
+fn msvc_templates_matches_clang() {
+    fn make_ctx() -> (CxxTypeCtx, TypeId, TypeId, TypeId, TypeId) {
+        let mut c = ctx();
+        let v = intern_void(&mut c);
+        let i = intern_int(&mut c, true, IntWidth::I32);
+        let f = intern_float(&mut c, FloatKind::F32);
+        // Two ClassDefs: Box<int> and Box<float>. Each carries the
+        // TemplateSpec segment as its NestedName.
+        let box_int = c.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::TemplateSpec {
+                name: Ident("Box".into()),
+                args: vec![TemplateArg::Type(i)],
+            }]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![],
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        let box_float = c.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::TemplateSpec {
+                name: Ident("Box".into()),
+                args: vec![TemplateArg::Type(f)],
+            }]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![],
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        let box_int_ty = c.intern_type(CxxType::Record(box_int));
+        let box_float_ty = c.intern_type(CxxType::Record(box_float));
+        (c, v, box_int_ty, box_float_ty, i)
+    }
+
+    // take_int_box(Box<int>)
+    {
+        let (mut c, v, box_int_ty, _, _) = make_ctx();
+        let sig = FnSig {
+            params: vec![box_int_ty],
+            ret: v,
+            cv: CvQual::default(),
+            ref_q: None,
+            variadic: false,
+            noexcept: false,
+        };
+        assert_eq!(
+            c.mangle_msvc(&Symbol::Function {
+                scope: NestedName(vec![]),
+                name: Ident("take_int_box".into()),
+                sig,
+            }),
+            "?take_int_box@@YAXU?$Box@H@@@Z"
+        );
+    }
+
+    // take_two(Box<int>, Box<int>) — back-ref `0` on second.
+    {
+        let (mut c, v, box_int_ty, _, _) = make_ctx();
+        let sig = FnSig {
+            params: vec![box_int_ty, box_int_ty],
+            ret: v,
+            cv: CvQual::default(),
+            ref_q: None,
+            variadic: false,
+            noexcept: false,
+        };
+        assert_eq!(
+            c.mangle_msvc(&Symbol::Function {
+                scope: NestedName(vec![]),
+                name: Ident("take_two".into()),
+                sig,
+            }),
+            "?take_two@@YAXU?$Box@H@@0@Z"
+        );
+    }
+
+    // take_int_and_float(Box<int>, Box<float>) — different types.
+    {
+        let (mut c, v, box_int_ty, box_float_ty, _) = make_ctx();
+        let sig = FnSig {
+            params: vec![box_int_ty, box_float_ty],
+            ret: v,
+            cv: CvQual::default(),
+            ref_q: None,
+            variadic: false,
+            noexcept: false,
+        };
+        assert_eq!(
+            c.mangle_msvc(&Symbol::Function {
+                scope: NestedName(vec![]),
+                name: Ident("take_int_and_float".into()),
+                sig,
+            }),
+            "?take_int_and_float@@YAXU?$Box@H@@U?$Box@M@@@Z"
         );
     }
 }

@@ -416,9 +416,15 @@ impl<'a> MsvcMangler<'a> {
                 self.out.push_str("?A0x00000000@");
             }
             NameSegment::TemplateSpec { name, args } => {
-                // Template specialization: `?$<name>@<targs>@`.
-                // The whole `?$name@...@` block participates in the
-                // name back-reference table as a single unit.
+                // Template specialization: `?$<name>@<targs>@`. The
+                // trailing `@` after the args closes the template-
+                // args block; the outer `emit_qualified_name_tail`
+                // appends one MORE `@` between segments / for the
+                // qual-name terminator. So a top-level `Box<int>`
+                // type ends up rendered as `U?$Box@H@@`.
+                //
+                // The whole `?$name@<targs>@` block participates in
+                // the name back-reference table as a single unit.
                 let mut tmp = String::new();
                 std::mem::swap(&mut self.out, &mut tmp);
                 self.out.push_str("?$");
@@ -426,11 +432,10 @@ impl<'a> MsvcMangler<'a> {
                 self.out.push('@');
                 for arg in args {
                     match arg {
-                        TemplateArg::Type(ty) => self.emit_type(*ty),
+                        TemplateArg::Type(ty) => self.emit_type_nested(*ty),
                     }
                 }
-                // No trailing `@` here — the outer `emit_qualified_name_tail`
-                // appends one between segments.
+                self.out.push('@'); // close template-args block
                 let chunk = std::mem::take(&mut self.out);
                 std::mem::swap(&mut self.out, &mut tmp);
                 if let Some(d) = self.back_refs.find_name(&chunk) {
