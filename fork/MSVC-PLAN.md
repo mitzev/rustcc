@@ -170,3 +170,17 @@ That gives firm numbers before any irreversible commitment.
 ## Status log
 
 - 2026-05-09 — plan committed alongside the v1.08.0 docs refresh. v1.09.0 implementation tracked as task #3 in the project task list, blocked-by task #2 (v1.08.0 release).
+
+- 2026-05-22 — **overnight sprint kickoff**. Implemented B.1 + B.2 + B.3 + B.5 across the workspace (no rust-lang/rust tree touched yet — that's the bulk of B.4 and waits for the next sprint that runs against the patched fork build). Concrete deliverables that landed in this sprint:
+  - `Target::abi_flavor` (`AbiFlavor::{Itanium, Msvc}`) on every Target, with five new constructors: `x86_64_pc_windows_msvc`, `aarch64_pc_windows_msvc`, `x86_64_pc_windows_gnu` (mingw, Itanium-flavored), and Itanium constructors carry `Itanium` by default. Open question #1 settled in favor of the dispatcher pattern.
+  - `mangle_msvc` module — ~800 LoC. Cross-validated against `clang -target x86_64-pc-windows-msvc` for **36 golden symbols** across 5 corpus files: ctor/dtor/method/free-fn, 12 builtin types + 7 pointer/reference variants, nested namespaces with back-refs, 5 operator overloads (incl. `?A`-prefixed class-by-value returns), 6 virtual-method symbols (with `U` access letter + implicit-virtual dtor inheritance). Bit-exact match.
+  - `layout_msvc` module — ~400 LoC. Cross-validated against `clang -fdump-record-layouts` for **10 record layouts**: scalar fields, empty class, `alignas`, mixed-width padding, single inheritance with no tail-padding reuse, polymorphic class with vptr, derived-from-polymorphic, empty-base optimization.
+  - `vtable_msvc` module — ~350 LoC. Cross-validated against `clang -fdump-vtable-layouts` for **2 hierarchies**: standalone A with f/g/dtor, B inheriting A with override of g + dtor + new virtual h. Implements MSVC's no-offset-to-top + COL-at-slot-minus-one + single-dtor + scalar-deleting-dtor variant convention.
+  - `mangle`/`layout`/`vtable` dispatchers on `CxxTypeCtx` route on `target().abi_flavor`. Itanium entry points renamed `_itanium` and still exposed for tests + cross-ABI consumers.
+  - `cxx_importer::Build::compile` auto-injects `-target <triple> -fms-compatibility -fms-extensions` into libclang argv when the chosen Target carries `AbiFlavor::Msvc`. Cargo target_env=`msvc` vs `gnu` routes correctly.
+  - End-to-end smoke test: `cxx_importer/tests/bindings_msvc.rs` builds a hand-rolled `Foo { Foo(int); ~Foo(); int get() const; }` graph against `x86_64-pc-windows-msvc`, runs `generate_rust_bindings`, and asserts the emitted `#[link_name]`s are MSVC-mangled (`??0Foo@@QEAA@H@Z`, `??1Foo@@QEAA@XZ`, `?get@Foo@@QEBAHXZ`). Negative control test confirms Linux target still produces Itanium symbols.
+  - New script `fork/tests/refresh-msvc-corpus.sh` regenerates all goldens from Apple clang's cross-target output.
+
+  Total cross-validated golden cases: **48** (36 mangle + 10 layout + 2 vtable hierarchies expanded into 7 sub-tables). Workspace test count grew from ~200 to ~225 with 25 new MSVC-targeting tests; all green; existing Itanium tests unchanged.
+
+  **Remaining for v1.09.0**: B.4 (the bulk — fork rustc patches: `inject_vptr_init`, SEH lowering, `__CxxFrameHandler3`, x86_64-msvc sret routing via RCX), B.6 (Windows CI matrix, release tarballs for windows-msvc triples), plus the design doc for the 16-msvc-abi.patch series that lands against the rust-lang/rust tree. None of these block v1.09.0 *announcement* of MSVC ABI support in cxx_importer-targeting consumers — they block actual rustc codegen for MSVC targets.
