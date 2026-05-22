@@ -324,7 +324,50 @@ These should be settled before patch 17 starts:
 
 ## Status
 
-Skeleton committed during the v1.09.0 overnight sprint
-(2026-05-22). No patches land until the rust-lang/rust tree is
-checked out (`./fork/build.sh --apply-only` first). When that
-sprint kicks off, patches 16 + 17 are the first targets.
+**Skeleton**: committed during the v1.09.0 overnight sprint
+(2026-05-22).
+
+**v1.09.1 sprint** (2026-05-23): patches **16-20 landed** in
+PR #36 against the v1.09.0 base PR #35. ~3,000 LoC across 5
+patches; all 20 patches apply cleanly from scratch; full
+`./x.py check --stage 1` passes for every touched crate.
+
+| # | Patch (as-landed) | LoC | Notes |
+|---|---|---|---|
+| 16 | msvc-abi-target-routing | 2596 | Vendor v1.09.0 workspace MSVC modules |
+| 17 | msvc-vtable-emission | 221 | Type Descriptor + COL + vftable |
+| 18 | msvc-dtor-single-slot | 78 | `??1` + `??_G`; also routes `operator delete` |
+| 19 | msvc-sret-rcx-x8-routing | 51 | Combined x64 RCX + arm64 X8 |
+| 20 | msvc-dllexport-cdylib | 43 | dllexport on class metadata |
+
+**Skipped from the original 7-patch plan:**
+
+- **Patch 21 (operator new/delete)** — folded into patch 18.
+  The `operator delete` routing landed there; `operator new` is
+  only emitted from `cxx_importer`'s C++ shim source, where the
+  C++ compiler handles the mangling natively.
+- **Patch 20-SEH (funclet EH personality)** — unnecessary as a
+  separate patch. Rustc upstream already routes the personality
+  to `__CxxFrameHandler3` on MSVC targets via `wants_msvc_seh`;
+  LLVM auto-selects funclet-based codegen from there.
+- **Patch 19b (arm64 sret)** — merged into patch 19. The
+  combined patch handles both arches' sret routing in one
+  dispatcher.
+- **Patch 19c (arm64 HFA detection)** — deferred to v1.09.2.
+  Most polymorphic-class returns aren't HFAs, so the
+  sret-via-X8 path covers the common cases.
+- **Throw-lowering** for `extern "C++"` calls (C++ exceptions
+  catchable as `Result<_, CxxException>`) — deferred to v1.09.2.
+  The basic unwind path works; throw-into-C++ from Rust is the
+  missing piece.
+
+**Validation status:**
+- ✅ Apply-only validates all 20 patches apply cleanly from the
+  pinned rust-lang/rust commit
+- ✅ `./x.py check --stage 1` passes for every touched crate
+  (`rustc_abi_cxx`, `rustc_codegen_llvm`, `rustc_symbol_mangling`,
+  `rustc_target`)
+- 🚧 Stage-1 build kicked off 2026-05-23 ~00:58; expected
+  10–20 min given partial build state
+- ❌ Runtime tests on Wine / Windows CI runner — deferred to
+  v1.09.2's B.6 work
