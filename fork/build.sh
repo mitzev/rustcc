@@ -90,7 +90,12 @@ if [[ ! -f "$CLONE_DIR/bootstrap.toml" ]]; then
   python3 - "$CLONE_DIR/bootstrap.toml" <<'PY'
 import sys, re
 path = sys.argv[1]
-with open(path) as f: text = f.read()
+# Explicit UTF-8 encoding on both read + write — Python on Windows
+# defaults to cp1252 which encodes ASCII-only safely but emits
+# Latin-1 bytes for any non-ASCII character. bootstrap.py opens
+# this file expecting UTF-8 and chokes on the cp1252 bytes;
+# ASCII-only content sidesteps the issue.
+with open(path, encoding='utf-8') as f: text = f.read()
 text = re.sub(r'^#?\s*assertions\s*=.*$', 'assertions = false', text, flags=re.M)
 # Append a final `[llvm]` block that turns off download-ci-llvm.
 # Template versions use dotted (`llvm.download-ci-llvm = ...`)
@@ -98,15 +103,18 @@ text = re.sub(r'^#?\s*assertions\s*=.*$', 'assertions = false', text, flags=re.M
 # the commented-out defaults don't match a single regex. TOML
 # resolves later values last, so appending an explicit section
 # at the end overrides any earlier setting regardless of form.
+#
+# Keep this block ASCII-only (no em-dashes, smart quotes, etc.)
+# so it round-trips through Windows' cp1252-default fs.
 if not text.endswith('\n'):
     text += '\n'
 text += (
-    '\n# rustcc fork override — see fork/build.sh for why the\n'
+    '\n# rustcc fork override - see fork/build.sh for why the\n'
     '# pinned upstream commit can no longer use the CI LLVM.\n'
     '[llvm]\n'
     'download-ci-llvm = false\n'
 )
-with open(path, 'w') as f: f.write(text)
+with open(path, 'w', encoding='utf-8') as f: f.write(text)
 PY
 fi
 
@@ -115,8 +123,9 @@ fi
 # we still need to guarantee the LLVM override. Append the same
 # block idempotently every run.
 if ! grep -q "^# rustcc fork override" "$CLONE_DIR/bootstrap.toml"; then
+  # ASCII-only — see Windows-cp1252 caveat in the python block above.
   {
-    printf '\n# rustcc fork override — see fork/build.sh for why the\n'
+    printf '\n# rustcc fork override - see fork/build.sh for why the\n'
     printf '# pinned upstream commit can no longer use the CI LLVM.\n'
     printf '[llvm]\n'
     printf 'download-ci-llvm = false\n'
