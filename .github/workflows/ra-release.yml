@@ -58,9 +58,36 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
 
-      # Cache the RA clone + cargo target dir between runs. The
-      # patches change rarely; the bulk of the time is recompiling
-      # rust-analyzer's dependency tree.
+      # rust-analyzer pins its build to a specific rust-lang/rust
+      # commit via a `rust-version` file. Trying to compile RA's
+      # tree against any stock nightly (latest or rustcc's pinned
+      # nightly-2025-10-03) fails: either `if let` guards aren't
+      # stable yet (old), or `extern crate rustc_abi` is no longer
+      # public (new). RA's own CI works around this with
+      # `rustup-toolchain-install-master` — installs rustc + cargo
+      # built at a specific git SHA, then sets RUSTC_BOOTSTRAP=1 to
+      # emulate a "nightly" channel. Mirror that here.
+      - name: Resolve RA's pinned rustc SHA
+        id: ra-version
+        run: |
+          # The build.sh script clones RA and writes `rust-version` to
+          # the clone root. We pre-fetch the SHA here so the toolchain
+          # install can run BEFORE build.sh, avoiding a chicken-and-egg
+          # ordering issue.
+          RA_SHA=$(curl -fsSL \
+            "https://raw.githubusercontent.com/rust-lang/rust-analyzer/$(cat fork/ra-patches/PINNED_COMMIT)/rust-version")
+          echo "sha=$RA_SHA" >> "$GITHUB_OUTPUT"
+          echo "RA pinned rustc SHA: $RA_SHA"
+
+      - name: Install rustup-toolchain-install-master
+        run: cargo install rustup-toolchain-install-master@1.11.0
+
+      - name: Install RA's pinned rustc
+        run: |
+          RA_SHA="${{ steps.ra-version.outputs.sha }}"
+          rustup-toolchain-install-master "$RA_SHA" -c cargo -c rust-src
+          rustup default "$RA_SHA"
+
       - name: Cache RA build
         uses: actions/cache@v4
         with:
@@ -73,28 +100,23 @@ jobs:
 
       - name: Build patched rust-analyzer
         env:
-          # Inside the workspace so cargo picks up rustcc's
-          # rust-toolchain.toml (nightly-2025-10-03). That matches
-          # rust-analyzer's pinned `rust-version` (same rust-lang/rust
-          # commit). Newer nightlies break RA's tree because of
-          # tightened crate visibility (`rustc_abi` re-export is
-          # private now). build.sh sets RUSTC_BOOTSTRAP=1 to lift
-          # any feature gates in the contemporary RA tree.
-          RA_CLONE_DIR: ${{ github.workspace }}/.ra-clone
+          # Outside the workspace so cargo doesn't pick up rustcc's
+          # workspace `rust-toolchain.toml`. We just installed RA's
+          # exact pinned rustc via rustup-toolchain-install-master
+          # and set it as the default — that's what cargo should use.
+          RA_CLONE_DIR: ${{ runner.temp }}/rust-analyzer-rustcc
+          # Emulate a nightly channel — same as RA's own CI does.
+          # The toolchain we installed reports a stable-flavored
+          # version string, but it's built from the rust-lang/rust
+          # nightly tree, so it has every nightly feature available.
+          RUSTC_BOOTSTRAP: "1"
         run: |
           ./fork/ra-patches/build.sh
           test -x "$RA_CLONE_DIR/target/release/rust-analyzer"
 
       - name: Package
         env:
-          # Inside the workspace so cargo picks up rustcc's
-          # rust-toolchain.toml (nightly-2025-10-03). That matches
-          # rust-analyzer's pinned `rust-version` (same rust-lang/rust
-          # commit). Newer nightlies break RA's tree because of
-          # tightened crate visibility (`rustc_abi` re-export is
-          # private now). build.sh sets RUSTC_BOOTSTRAP=1 to lift
-          # any feature gates in the contemporary RA tree.
-          RA_CLONE_DIR: ${{ github.workspace }}/.ra-clone
+          RA_CLONE_DIR: ${{ runner.temp }}/rust-analyzer-rustcc
         run: |
           # Tarball the binary with a small wrapper README so users
           # know what they got.
