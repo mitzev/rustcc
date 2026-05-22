@@ -34,6 +34,11 @@ struct ExpectedRecord {
 struct ExpectedBase {
     name: String,
     offset: u64,
+    /// Parsed from `empty=true` markers in the golden but not yet
+    /// asserted against. Reserved for an empty-subobject corpus
+    /// check that's left to a follow-up; for now we just confirm
+    /// the base offset matches.
+    #[allow(dead_code)]
     empty: bool,
 }
 
