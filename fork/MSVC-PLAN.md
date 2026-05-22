@@ -171,7 +171,7 @@ That gives firm numbers before any irreversible commitment.
 
 - 2026-05-09 — plan committed alongside the v1.08.0 docs refresh. v1.09.0 implementation tracked as task #3 in the project task list, blocked-by task #2 (v1.08.0 release).
 
-- 2026-05-22 — **overnight sprint kickoff**. Implemented B.1 + B.2 + B.3 + B.5 across the workspace (no rust-lang/rust tree touched yet — that's the bulk of B.4 and waits for the next sprint that runs against the patched fork build). Concrete deliverables that landed in this sprint:
+- 2026-05-22 → 2026-05-23 — **overnight sprint completed**. Implemented B.1 + B.2 + B.3 + B.5 across the workspace (no rust-lang/rust tree touched yet — that's the bulk of B.4 and waits for the next sprint that runs against the patched fork build). PR #35 carries the full delta: https://github.com/mitzev/rustcc/pull/35. Concrete deliverables:
   - `Target::abi_flavor` (`AbiFlavor::{Itanium, Msvc}`) on every Target, with five new constructors: `x86_64_pc_windows_msvc`, `aarch64_pc_windows_msvc`, `x86_64_pc_windows_gnu` (mingw, Itanium-flavored), and Itanium constructors carry `Itanium` by default. Open question #1 settled in favor of the dispatcher pattern.
   - `mangle_msvc` module — ~800 LoC. Cross-validated against `clang -target x86_64-pc-windows-msvc` for **36 golden symbols** across 5 corpus files: ctor/dtor/method/free-fn, 12 builtin types + 7 pointer/reference variants, nested namespaces with back-refs, 5 operator overloads (incl. `?A`-prefixed class-by-value returns), 6 virtual-method symbols (with `U` access letter + implicit-virtual dtor inheritance). Bit-exact match.
   - `layout_msvc` module — ~400 LoC. Cross-validated against `clang -fdump-record-layouts` for **10 record layouts**: scalar fields, empty class, `alignas`, mixed-width padding, single inheritance with no tail-padding reuse, polymorphic class with vptr, derived-from-polymorphic, empty-base optimization.
@@ -181,6 +181,18 @@ That gives firm numbers before any irreversible commitment.
   - End-to-end smoke test: `cxx_importer/tests/bindings_msvc.rs` builds a hand-rolled `Foo { Foo(int); ~Foo(); int get() const; }` graph against `x86_64-pc-windows-msvc`, runs `generate_rust_bindings`, and asserts the emitted `#[link_name]`s are MSVC-mangled (`??0Foo@@QEAA@H@Z`, `??1Foo@@QEAA@XZ`, `?get@Foo@@QEBAHXZ`). Negative control test confirms Linux target still produces Itanium symbols.
   - New script `fork/tests/refresh-msvc-corpus.sh` regenerates all goldens from Apple clang's cross-target output.
 
-  Total cross-validated golden cases: **48** (36 mangle + 10 layout + 2 vtable hierarchies expanded into 7 sub-tables). Workspace test count grew from ~200 to ~225 with 25 new MSVC-targeting tests; all green; existing Itanium tests unchanged.
+  Total cross-validated golden cases (final sprint): **65 symbols + records + vtable sub-tables** across 9 corpus files:
+  - 48 mangle (basic 6, types 19, nested 2, operators 5, inherit 6, substitutions 6, templates 3, noexcept 1)
+  - 15 layout (basic 4, inherit 6, multi-inherit 6, packed 3)
+  - 2 vtable hierarchies expanded into 7 sub-tables
+  Workspace test count: 200 (pre-sprint) → **310 (post-sprint)** across 57 suites. All green. Existing Itanium tests bit-for-bit unchanged.
 
-  **Remaining for v1.09.0**: B.4 (the bulk — fork rustc patches: `inject_vptr_init`, SEH lowering, `__CxxFrameHandler3`, x86_64-msvc sret routing via RCX), B.6 (Windows CI matrix, release tarballs for windows-msvc triples), plus the design doc for the 16-msvc-abi.patch series that lands against the rust-lang/rust tree. None of these block v1.09.0 *announcement* of MSVC ABI support in cxx_importer-targeting consumers — they block actual rustc codegen for MSVC targets.
+  Additional polish added during the sprint:
+  - `#[pragma_pack(N)]` sidecar support on `CxxTypeCtx` plumbed into the MSVC layout engine. Cross-validated for pack(1), pack(2), and no-pack.
+  - Discovered + fixed three latent mangler bugs via clang cross-check: (a) function-name back-ref recording (was incorrectly skipped), (b) type back-ref keyed by `TypeId` not rendered string (mismatched compression for same-class-different-modifier cases), (c) type back-ref check skipped for nested-in-modifier types (the `Vec` inside `const Vec&` shouldn't type-table-compress even if the same Vec was already in the table).
+  - Discovered noexcept doesn't enter MSVC mangling at all (unlike Itanium) — removed the spurious `_E` prefix.
+  - Discovered destructor override matching needs to be name-agnostic (`~A` vs `~B` are same vfunction slot) — fixed in vtable_msvc.
+  - cxx_importer documentation extended (docs/cxx_importer.md §12.5).
+  - v1.09.0 release notes drafted (fork/RELEASE-NOTES-v1.09.0-DRAFT.md).
+
+  **Remaining for v1.09.x**: B.4 (the bulk — fork rustc patches per `fork/MSVC-PATCHES.md`: `inject_vptr_init`, SEH lowering, `__CxxFrameHandler3`, x86_64-msvc sret routing via RCX), B.6 (Windows CI matrix, release tarballs for windows-msvc triples). The Rust-side workspace surface (this PR) ships as-is to v1.09.0; the fork rustc patches land in v1.09.1 and the Windows release tarballs in v1.09.2. None of these block the v1.09.0 cxx_importer-side announcement of MSVC ABI support; they block actual rustc codegen for MSVC targets.
