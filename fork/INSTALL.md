@@ -8,6 +8,110 @@ Two paths, pick one:
   rustcc patch series, build stage-1 yourself. Works everywhere;
   needed if you want to modify the fork.
 
+## Prerequisites by platform
+
+Both paths need `rustup` (the standard rust toolchain manager) plus
+`curl` and `tar`/`xz`. The **source path** additionally needs a host
+C/C++ toolchain, `cmake`, `git`, `python3`, `pkg-config`, and
+`libssl-dev`. The **C++ interop examples** (FLTK, fmtlib) want
+`libclang` (for `cxx_importer`) and the relevant native library.
+
+Pick the one-liner for your OS:
+
+### macOS (Apple Silicon or Intel)
+
+```bash
+# rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Source-path build prereqs (Xcode CLT covers clang + git + make)
+xcode-select --install
+brew install cmake pkg-config xz
+
+# Optional: C++ interop demos
+brew install llvm fltk        # llvm gives libclang for cxx_importer
+```
+
+`brew install llvm` exposes libclang at
+`$(brew --prefix llvm)/lib/libclang.dylib`. If `cxx_importer`'s build
+script can't find it, set `LIBCLANG_PATH=$(brew --prefix llvm)/lib`.
+
+### Debian / Ubuntu
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Fast-path needs: curl, xz-utils (usually preinstalled)
+sudo apt-get update
+sudo apt-get install -y curl xz-utils
+
+# Source-path additional prereqs
+sudo apt-get install -y \
+  build-essential cmake pkg-config libssl-dev git python3
+
+# Optional: C++ interop demos
+sudo apt-get install -y libclang-dev libfltk1.3-dev
+```
+
+### Fedora / RHEL / Rocky
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+sudo dnf install -y \
+  gcc gcc-c++ cmake pkgconf-pkg-config openssl-devel git python3 \
+  xz curl
+
+# Optional: C++ interop demos
+sudo dnf install -y clang-devel fltk-devel
+```
+
+### Arch Linux
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+sudo pacman -S --needed \
+  base-devel cmake pkgconf openssl git python xz curl
+
+# Optional: C++ interop demos
+sudo pacman -S --needed clang fltk
+```
+
+### Alpine
+
+```bash
+apk add curl xz tar
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# Source-path additional prereqs
+apk add build-base cmake pkgconfig openssl-dev git python3 \
+        linux-headers musl-dev
+
+# Optional: C++ interop demos
+apk add clang-dev fltk-dev
+```
+
+Note: prebuilt rustcc tarballs are built against glibc. On Alpine
+(musl) you'll typically want the **source path** unless you're
+running glibc-compat shims.
+
+### Windows
+
+Native Windows MSVC C++ ABI support shipped in v1.09.0 + v1.09.1.
+The fork rustc emits real PE32+ binaries that link against the
+MSVC CRT and route through `??_7Class@@6B@` vftables + `??_G`
+scalar deleting dtors at runtime.
+
+For Windows hosts, see [Supported host triples](#supported-host-triples)
+below; prebuilt tarballs land in v1.09.2's release matrix
+(currently in flight — until they're up, build from source via
+`./fork/build.sh` on Windows or WSL2 + the Debian/Ubuntu recipe).
+
+For Mac/Linux hosts cross-compiling to MSVC, see
+[`fork/CROSS-COMPILE-MSVC.md`](CROSS-COMPILE-MSVC.md) (v1.09.2)
+for the `xwin` + `lld-link` + Wine toolchain setup.
+
 ## Fast path
 
 ### 1. Download and extract
@@ -109,11 +213,85 @@ regression probes against the stage-1 binary (~1 min). See
 
 ## Rust-analyzer (for editor support)
 
-rustcc's `class` keyword confuses stock rust-analyzer. A parser
-fork that accepts `class` as a weak keyword lives under
-[`fork/ra-patches/`](ra-patches/). See the [RA install
-recipe](ra-patches/README.md) for the one-line `git am` + build +
-point-your-editor-at-the-binary workflow.
+rustcc's `class` keyword confuses stock rust-analyzer. A patched
+RA that accepts `class` and gives it full IDE parity with structs
+lives under [`fork/ra-patches/`](ra-patches/) (12 patches as of
+v1.07.0 / v1.08.0).
+
+**Fast path** — download the prebuilt tarball (new in v1.08.0):
+
+```bash
+TARGET=aarch64-apple-darwin   # pick yours; same triples as rustcc
+VERSION=v1.08.0
+BASE="https://github.com/rustcc/rustcc/releases/download/$VERSION"
+curl -fsSL -o ra.tar.xz "$BASE/rust-analyzer-rustcc-$TARGET.tar.xz"
+mkdir -p "$HOME/.rustcc/$VERSION"
+tar -xJf ra.tar.xz -C "$HOME/.rustcc/$VERSION"
+
+# Point your editor at:
+#   $HOME/.rustcc/$VERSION/rust-analyzer-rustcc/rust-analyzer
+# VS Code (settings.json):
+#   "rust-analyzer.server.path": "/Users/you/.rustcc/v1.08.0/rust-analyzer-rustcc/rust-analyzer"
+```
+
+VS Code users with the rustcc extension installed (see below) can
+skip the curl/tar dance: `Cmd-Shift-P → rustcc: Install RA Fork
+(latest)` does the download + `rust-analyzer.server.path` wiring in
+one command.
+
+**Source path** — build the patched RA yourself (~5 min):
+
+```bash
+./fork/ra-patches/build.sh
+# Produces $HOME/rust-analyzer-rustcc/target/release/rust-analyzer
+```
+
+See [`fork/ra-patches/README.md`](ra-patches/README.md) for the
+per-patch breakdown.
+
+## Developer tooling (optional but recommended)
+
+Three pieces of optional tooling shipped in v1.07.0 / v1.08.0:
+
+### `rustcc-cli`
+
+CLI wrapper that bundles the install + doctor + project-scaffolding
+workflow. From a source checkout:
+
+```bash
+cargo install --path crates/rustcc-cli
+rustcc install              # download tarball + register with rustup
+rustcc doctor               # 6 health checks
+rustcc init my-app          # scaffold a new rustcc project
+rustcc init my-app --surface cxx-class   # opt for the macro surface
+```
+
+Dep tree is just `clap` + std; shells out to `curl` / `tar` /
+`rustup` / `shasum` (same recipe as the fast path above). No Node /
+no extra runtime.
+
+### `vscode-rustcc` extension
+
+Sideloadable VS Code extension under `tools/vscode-rustcc/`:
+
+```bash
+cd tools/vscode-rustcc
+npm install
+npm run package
+code --install-extension rustcc-tools-*.vsix
+```
+
+Provides: grammar overlay for `class` / `extern "C++"` /
+`extern "swiftcall"` / rustcc attributes, 6 snippets, 5 commands
+(including **Install RA Fork (latest)**), a status-bar pin
+indicator, and Problems-pane diagnostics fed by
+`bindings.skips.json`.
+
+### Prebuilt rust-analyzer fork binary
+
+Covered in the [Rust-analyzer](#rust-analyzer-for-editor-support)
+section above — new in v1.08.0; ships alongside the rustcc tarball
+on every release.
 
 ## CI: install rustcc in GitHub Actions
 
@@ -158,7 +336,17 @@ a complete minimal example.
 | `x86_64-unknown-linux-gnu` | ✅ | ✅ |
 | `aarch64-unknown-linux-gnu` | ✅ | ✅ |
 | `i686-unknown-linux-gnu` | — | ✅ |
-| `x86_64-pc-windows-*` | — | — (out of scope: fork is Itanium-only) |
+| `x86_64-pc-windows-gnu` | — | ✅ (mingw-w64, Itanium ABI via v1.09.0+) |
+| `x86_64-pc-windows-msvc` | 🚧 v1.09.2 | ✅ shipped v1.09.0 + v1.09.1 |
+| `aarch64-pc-windows-msvc` | 🚧 v1.09.2 | ✅ shipped v1.09.0 + v1.09.1 |
+
+Native Windows MSVC C++ ABI support landed across v1.09.0
+(workspace-side mangler/layout/vtable) and v1.09.1 (fork rustc
+patches: target routing, vftable emission, scalar deleting dtor,
+sret-via-RCX/X8, dllexport). Prebuilt MSVC tarballs are tracked
+under v1.09.2; until that release lands, build from source on
+Windows via `./fork/build.sh` or use the Mac/Linux cross-link
+setup (see [`fork/CROSS-COMPILE-MSVC.md`](CROSS-COMPILE-MSVC.md)).
 
 Cross-compilation targets (ESP32-C3, STM32, Raspberry Pi Pico,
 etc.) work from any supported host — see
@@ -192,3 +380,23 @@ its header for the prereq list.
 internal"**: that's a warning, not an error. The fork intentionally
 uses `rustc_attrs` for its custom attributes. Add
 `#![allow(internal_features)]` to silence if it bothers you.
+
+**"libclang.so/dylib not found"** when building `cxx_importer` or
+running the FLTK demos: install libclang for your OS (see
+[Prerequisites by platform](#prerequisites-by-platform)) and, if
+the build script still can't locate it, set `LIBCLANG_PATH`
+explicitly:
+
+```bash
+# macOS Homebrew
+export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+# Debian/Ubuntu
+export LIBCLANG_PATH=/usr/lib/llvm-14/lib   # adjust version
+# Fedora
+export LIBCLANG_PATH=/usr/lib64
+```
+
+**"rust-analyzer doesn't recognize `class`"**: you're still on
+stock RA. Install the prebuilt RA fork binary (see
+[Rust-analyzer](#rust-analyzer-for-editor-support)) and confirm
+`rust-analyzer --version` reports a build from the rustcc tree.
