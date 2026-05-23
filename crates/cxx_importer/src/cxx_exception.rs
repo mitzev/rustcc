@@ -494,6 +494,104 @@ pub fn collect_class_method_throws_catches(
     out
 }
 
+/// P09.70 / 1.13 throws Phase 2E: mangle a C++ type name to
+/// its Itanium typeinfo symbol (the form
+/// `_ZTI<len><name>` for global-namespace classes, with the
+/// `St` (std) abbreviation prefix when the type lives in
+/// `std::`).
+///
+/// Returns `None` when the type name uses syntax this helper
+/// doesn't understand yet (nested namespaces beyond `std::`,
+/// templates, references, qualifiers). Downstream code falls
+/// back to omitting the typeinfo attribute in that case;
+/// users who want typed catches on those types still have
+/// the manual `#[rustc_cxx_throws_typeinfos = "..."]` escape
+/// hatch.
+///
+/// Examples:
+/// - `"DomainError"` → `Some("_ZTI11DomainError")`
+/// - `"std::runtime_error"` → `Some("_ZTISt13runtime_error")`
+/// - `"my_ns::Error"` → `None` (un-supported nesting)
+pub fn itanium_typeinfo_symbol_for(type_name: &str) -> Option<String> {
+    let trimmed = type_name.trim();
+    if let Some(rest) = trimmed.strip_prefix("std::") {
+        // No further `::` allowed in this MVP — defer nested
+        // std types to a future patch.
+        if rest.contains("::") || rest.contains('<') || rest.contains('&') {
+            return None;
+        }
+        return Some(format!("_ZTISt{}{}", rest.len(), rest));
+    }
+    if trimmed.contains("::")
+        || trimmed.contains('<')
+        || trimmed.contains('&')
+        || trimmed.is_empty()
+    {
+        return None;
+    }
+    Some(format!("_ZTI{}{}", trimmed.len(), trimmed))
+}
+
+/// P09.70 / 1.13 throws Phase 2E: mangle a C++ type name to
+/// its MSVC TypeDescriptor name (the form `.?AV<name>@@` for
+/// global-namespace classes, with namespace components
+/// reversed and double-`@` terminator for nested types).
+///
+/// Returns `None` for unsupported shapes (same as
+/// `itanium_typeinfo_symbol_for`).
+///
+/// Examples:
+/// - `"DomainError"` → `Some(".?AVDomainError@@")`
+/// - `"std::runtime_error"` → `Some(".?AVruntime_error@std@@")`
+pub fn msvc_typedesc_name_for(type_name: &str) -> Option<String> {
+    let trimmed = type_name.trim();
+    if trimmed.is_empty() || trimmed.contains('<') || trimmed.contains('&') {
+        return None;
+    }
+    // Reverse namespace components and join with `@`. The
+    // final `@@` closes the qualified name.
+    let parts: Vec<&str> = trimmed.split("::").collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let mut out = String::from(".?AV");
+    // MSVC encodes from innermost type out: the LAST `::`
+    // segment goes first, then walk back. We use `@` between
+    // segments and `@@` to terminate.
+    let mut rev: Vec<&str> = parts.into_iter().collect();
+    rev.reverse();
+    for (i, p) in rev.iter().enumerate() {
+        out.push_str(p);
+        if i + 1 < rev.len() {
+            out.push('@');
+        }
+    }
+    out.push_str("@@");
+    Some(out)
+}
+
+/// P09.70: given a list of caught C++ type names, produce
+/// the comma-separated strings for the
+/// `#[rustc_cxx_throws_typeinfos]` and
+/// `#[rustc_cxx_throws_msvc_typedescs]` attributes. Returns
+/// `None` if any type in the list can't be mangled by the
+/// helpers above (so we don't ship a partial list — better
+/// to skip the attributes entirely than to mismatch
+/// indices).
+pub fn manglings_for_typed_catches(
+    type_names: &[String],
+) -> Option<(String, String)> {
+    let mut itanium = Vec::with_capacity(type_names.len());
+    let mut msvc = Vec::with_capacity(type_names.len());
+    for ty in type_names {
+        let i = itanium_typeinfo_symbol_for(ty)?;
+        let m = msvc_typedesc_name_for(ty)?;
+        itanium.push(i);
+        msvc.push(m);
+    }
+    Some((itanium.join(","), msvc.join(",")))
+}
+
 /// Build the canonical FQN string from a `NestedName`'s
 /// segments. Matches the form
 /// `crate::rust_bindings::parent_path_to_fqn` produces, but
@@ -580,6 +678,87 @@ struct CxxRawError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn itanium_typeinfo_for_global_class() {
+        assert_eq!(
+            itanium_typeinfo_symbol_for("DomainError"),
+            Some("_ZTI11DomainError".to_string())
+        );
+        assert_eq!(
+            itanium_typeinfo_symbol_for("RangeError"),
+            Some("_ZTI10RangeError".to_string())
+        );
+    }
+
+    #[test]
+    fn itanium_typeinfo_for_std_class() {
+        assert_eq!(
+            itanium_typeinfo_symbol_for("std::runtime_error"),
+            Some("_ZTISt13runtime_error".to_string())
+        );
+        assert_eq!(
+            itanium_typeinfo_symbol_for("std::logic_error"),
+            Some("_ZTISt11logic_error".to_string())
+        );
+    }
+
+    #[test]
+    fn itanium_typeinfo_rejects_unsupported_shapes() {
+        assert_eq!(itanium_typeinfo_symbol_for(""), None);
+        assert_eq!(itanium_typeinfo_symbol_for("a::b::C"), None);
+        assert_eq!(itanium_typeinfo_symbol_for("std::vector<int>"), None);
+        assert_eq!(itanium_typeinfo_symbol_for("Foo&"), None);
+    }
+
+    #[test]
+    fn msvc_typedesc_for_global_class() {
+        assert_eq!(
+            msvc_typedesc_name_for("DomainError"),
+            Some(".?AVDomainError@@".to_string())
+        );
+    }
+
+    #[test]
+    fn msvc_typedesc_for_std_class() {
+        // MSVC: ".?AV" + reversed-namespace-components-with-@-sep
+        // + "@@" terminator. For `std::runtime_error`, the
+        // segments reversed give ["runtime_error", "std"], so the
+        // result is ".?AVruntime_error@std@@".
+        assert_eq!(
+            msvc_typedesc_name_for("std::runtime_error"),
+            Some(".?AVruntime_error@std@@".to_string())
+        );
+    }
+
+    #[test]
+    fn msvc_typedesc_for_nested_namespace() {
+        // `my::lib::Error` segments reversed = [Error, lib, my].
+        assert_eq!(
+            msvc_typedesc_name_for("my::lib::Error"),
+            Some(".?AVError@lib@my@@".to_string())
+        );
+    }
+
+    #[test]
+    fn manglings_for_typed_catches_pairs_lists() {
+        let (itanium, msvc) = manglings_for_typed_catches(&[
+            "DomainError".to_string(),
+            "RangeError".to_string(),
+        ])
+        .expect("simple global types should mangle");
+        assert_eq!(itanium, "_ZTI11DomainError,_ZTI10RangeError");
+        assert_eq!(msvc, ".?AVDomainError@@,.?AVRangeError@@");
+    }
+
+    #[test]
+    fn manglings_returns_none_on_any_unsupported() {
+        let result = manglings_for_typed_catches(&[
+            "DomainError".to_string(),
+            "std::vector<int>".to_string(),
+        ]);
+        assert_eq!(result, None);
+    }
 
     #[test]
     fn render_void_returning_shim() {
