@@ -336,6 +336,89 @@ pub fn render_all_throws_shims_cpp(
     out
 }
 
+/// v1.12.11: collect the typed-catches list for every throwing
+/// class method whose annotation is
+/// `Annotation::CxxThrowsTyped(_)`. Returns a `BTreeMap` keyed
+/// by `"<ClassFQN>::<method_name>"` — the same FQN form
+/// `crate::rust_bindings`'s class-method emitter uses for
+/// annotation lookups.
+///
+/// Walks each `ClassId` in `classes`, builds the C++ class FQN
+/// from the class's `NestedName`, and then for each method
+/// (excluding ctors and special members) looks up
+/// `"<ClassFQN>::<method_name>"` in the annotation set. Methods
+/// with plain `CxxThrows` (no type list) are NOT included —
+/// they're handled by `render_throws_shim_cpp`.
+///
+/// Note on ctors: ctors are named after the class
+/// (`"Class::Class"` in the annotation FQN form). Typed ctor
+/// catches are recognized by this helper too — they land in
+/// the result map under that doubled-name key.
+pub fn collect_class_method_throws_catches(
+    ctx: &rustc_abi_cxx::CxxTypeCtx,
+    annotations: &crate::annotations::AnnotationSet,
+    classes: &[rustc_abi_cxx::ClassId],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    use crate::annotations::Annotation;
+    use rustc_abi_cxx::{MethodName, SpecialMember};
+
+    let mut out: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+
+    for &class_id in classes {
+        let class = ctx.class(class_id);
+        let class_fqn = nested_name_to_fqn(&class.name.0);
+
+        // Compute the class's last segment for the ctor
+        // annotation key — libclang names ctor cursors after
+        // the class, so the FQN is `Class::Class` (or
+        // `ns::sub::Class::Class` for namespaced classes).
+        let class_short = class_fqn.rsplit("::").next().unwrap_or("").to_string();
+
+        for method in &class.methods {
+            let method_name_src: Option<String> = match (&method.special, &method.name) {
+                (
+                    Some(SpecialMember::DefaultCtor | SpecialMember::OtherCtor),
+                    _,
+                ) => Some(class_short.clone()),
+                (None, MethodName::Ident(id)) => Some(id.0.clone()),
+                _ => None, // operators / conversion / dtor / move-special
+            };
+            let Some(src) = method_name_src else {
+                continue;
+            };
+            let fqn = format!("{class_fqn}::{src}");
+            for ann in annotations.effective(&fqn) {
+                if let Annotation::CxxThrowsTyped(types) = ann {
+                    out.insert(fqn.clone(), types);
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Build the canonical FQN string from a `NestedName`'s
+/// segments. Matches the form
+/// `crate::rust_bindings::parent_path_to_fqn` produces, but
+/// re-implemented here to keep the helper self-contained
+/// (avoids exposing rust_bindings internals).
+fn nested_name_to_fqn(segments: &[rustc_abi_cxx::NameSegment]) -> String {
+    use rustc_abi_cxx::NameSegment;
+    let mut parts = Vec::with_capacity(segments.len());
+    for seg in segments {
+        match seg {
+            NameSegment::Namespace(id)
+            | NameSegment::Class(id)
+            | NameSegment::Enum(id) => parts.push(id.0.clone()),
+            NameSegment::TemplateSpec { name, .. } => parts.push(name.0.clone()),
+            NameSegment::AnonymousNamespace => parts.push("__anon".into()),
+        }
+    }
+    parts.join("::")
+}
+
 /// v1.12.9: collect the typed-catches list for every throwing
 /// free function in `free_fns` whose annotation is
 /// `Annotation::CxxThrowsTyped(_)`. Returns a `BTreeMap` keyed
