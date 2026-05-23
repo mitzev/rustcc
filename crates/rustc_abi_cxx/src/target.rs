@@ -180,11 +180,21 @@ impl Target {
         {
             Self::aarch64_apple_darwin()
         }
+        #[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+        {
+            Self::x86_64_pc_windows_msvc()
+        }
+        #[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "aarch64"))]
+        {
+            Self::aarch64_pc_windows_msvc()
+        }
         #[cfg(not(any(
             all(target_os = "linux", target_arch = "x86_64"),
             all(target_os = "linux", target_arch = "aarch64"),
             all(target_os = "macos", target_arch = "x86_64"),
             all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"),
+            all(target_os = "windows", target_env = "msvc", target_arch = "aarch64"),
         )))]
         {
             compile_error!(
