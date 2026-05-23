@@ -65,6 +65,13 @@ pub enum Annotation {
     /// Skip this entity entirely when lowering. Useful for silencing
     /// decls that mis-parse or can't safely be exposed to Rust.
     Skip,
+    /// v1.12.2: mark a free function or class method as throwing.
+    /// The bindings emitter wraps the C++ side via the Phase 0
+    /// catch shim (`render_throws_shim_cpp`) and emits a
+    /// `Result<T, ::cxx::CxxException>`-returning safe wrapper on
+    /// the Rust side. Spelled `[[clang::annotate("rustcc::cxx_throws")]]`
+    /// in the source.
+    CxxThrows,
 }
 
 impl Annotation {
@@ -85,6 +92,7 @@ impl Annotation {
             Annotation::InteriorMutable => AnnotationKind::InteriorMutable,
             Annotation::Instantiate(_) => AnnotationKind::Instantiate,
             Annotation::Skip => AnnotationKind::Skip,
+            Annotation::CxxThrows => AnnotationKind::CxxThrows,
         }
     }
 }
@@ -100,6 +108,7 @@ enum AnnotationKind {
     InteriorMutable,
     Instantiate,
     Skip,
+    CxxThrows,
 }
 
 /// Parsed sidecar YAML body. Schema mirrors `docs/cxx_importer.md §5.2`.
@@ -162,6 +171,11 @@ pub struct MethodEntry {
     pub noexcept: Option<bool>,
     #[serde(default)]
     pub nullable: Option<bool>,
+    /// v1.12.2: mark this method as throwing. Emitter wraps the
+    /// C++ call in the Phase 0 catch shim and returns
+    /// `Result<T, ::cxx::CxxException>` on the Rust side.
+    #[serde(default)]
+    pub throws: Option<bool>,
 }
 
 impl SidecarSchema {
@@ -259,6 +273,9 @@ fn annotations_from_method(entry: &MethodEntry) -> Vec<Annotation> {
     }
     if entry.nullable == Some(true) {
         out.push(Annotation::Nullable);
+    }
+    if entry.throws == Some(true) {
+        out.push(Annotation::CxxThrows);
     }
     out
 }
