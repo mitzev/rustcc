@@ -1028,12 +1028,31 @@ fn collect_throws_specs_for_class_methods(
     class_ids: &[rustc_abi_cxx::ClassId],
 ) -> Vec<crate::cxx_exception::ThrowsShimSpec> {
     use crate::cxx_exception::ThrowsShimSpec;
+    use crate::name_mapping::{disambiguate_overloads, OverloadEntry};
     use rustc_abi_cxx::{MethodName, NameSegment, Virtuality};
 
-    let mut specs: Vec<ThrowsShimSpec> = Vec::new();
-    // Per-class dedup against duplicate method names (overload skip).
-    let mut seen_per_class: std::collections::HashSet<(rustc_abi_cxx::ClassId, String)> =
-        std::collections::HashSet::new();
+    // Pre-rendered per-overload slot. We collect everything we
+    // need for emission in a first pass, then v1.12.18 feeds
+    // base names + param-type disambiguator strings through
+    // `disambiguate_overloads` so each overload gets a unique
+    // wrapper symbol (e.g. `divide` / `divide_int` /
+    // `divide_double` for `int divide(int)`, `int divide(double)`).
+    struct PreSpec {
+        class_short: String,
+        method_name: String,
+        return_type_cpp: String,
+        param_decls: Vec<String>,
+        forward_args: Vec<String>,
+        typed_catches: Vec<String>,
+        // The C++-side callsite expression. Kept as a separate
+        // field rather than re-derived during the second pass
+        // because callers may want to override this in future
+        // (e.g. for explicit-this static-style calls).
+        callsite: String,
+        // Param-type signature used as the disambiguator string.
+        disambiguator: String,
+    }
+    let mut pre_specs: Vec<PreSpec> = Vec::new();
 
     for &class_id in class_ids {
         let class = ctx.class(class_id);
@@ -1053,8 +1072,6 @@ fn collect_throws_specs_for_class_methods(
             .collect::<Vec<_>>()
             .join("::");
 
-        // Last segment of the class FQN — used to build the
-        // `__rustcc_throws_<Class>_<method>` shim symbol.
         let class_short = class_fqn
             .rsplit("::")
             .next()
@@ -1065,8 +1082,6 @@ fn collect_throws_specs_for_class_methods(
         }
 
         for method in &class.methods {
-            // Today's scope filter: only plain identifier-named
-            // non-virtual non-special methods.
             if method.special.is_some() {
                 continue;
             }
@@ -1075,7 +1090,7 @@ fn collect_throws_specs_for_class_methods(
             }
             let method_name = match &method.name {
                 MethodName::Ident(id) => id.0.clone(),
-                _ => continue, // operators / conversions
+                _ => continue,
             };
 
             let fqn = format!("{class_fqn}::{method_name}");
@@ -1084,13 +1099,6 @@ fn collect_throws_specs_for_class_methods(
                 continue;
             };
 
-            // Overload dedup.
-            let key = (class_id, method_name.clone());
-            if !seen_per_class.insert(key) {
-                continue;
-            }
-
-            // Render return type + params.
             let return_type_cpp = match crate::shims::render_cxx_type(
                 ctx,
                 method.sig.ret,
@@ -1100,9 +1108,6 @@ fn collect_throws_specs_for_class_methods(
                 Err(_) => continue,
             };
 
-            // First param: `<ClassFQN>* __this` (or `const <ClassFQN>* __this`
-            // for cv-const methods so the `this->method(args)` call
-            // type-checks).
             let this_decl = if method.sig.cv.is_const {
                 format!("const {class_fqn}* __this")
             } else {
@@ -1110,6 +1115,7 @@ fn collect_throws_specs_for_class_methods(
             };
             let mut param_decls: Vec<String> = vec![this_decl];
             let mut forward_args: Vec<String> = Vec::with_capacity(method.sig.params.len());
+            let mut rendered_params: Vec<String> = Vec::with_capacity(method.sig.params.len());
             let mut params_ok = true;
             for (i, &p_ty) in method.sig.params.iter().enumerate() {
                 match crate::shims::render_cxx_type(
@@ -1120,6 +1126,7 @@ fn collect_throws_specs_for_class_methods(
                     Ok(ty_src) => {
                         param_decls.push(format!("{ty_src} __a{i}"));
                         forward_args.push(format!("__a{i}"));
+                        rendered_params.push(ty_src);
                     }
                     Err(_) => {
                         params_ok = false;
@@ -1131,22 +1138,55 @@ fn collect_throws_specs_for_class_methods(
                 continue;
             }
 
-            specs.push(ThrowsShimSpec {
-                wrapper_name: format!("__rustcc_throws_{class_short}_{method_name}"),
+            // Build the disambiguator from the C++ param-type
+            // list (e.g. `int_double` for `(int, double)`).
+            // Empty for no-arg methods — `disambiguate_overloads`
+            // handles the empty-disambiguator case by leaving
+            // the base name unsuffixed when there's no
+            // collision, and producing a suffix derived from
+            // the position otherwise.
+            let disamb = rendered_params.join("_");
+
+            pre_specs.push(PreSpec {
+                class_short: class_short.clone(),
+                method_name: method_name.clone(),
                 return_type_cpp,
                 param_decls,
                 forward_args,
-                // C++-side callsite: `__this->method`. The
-                // typed renderer wraps this in `__this->method(args)`
-                // (or `*__out = __this->method(args)` for non-void
-                // returns).
-                original_callsite: format!("__this->{method_name}"),
                 typed_catches,
-                is_ctor: false,
+                callsite: format!("__this->{method_name}"),
+                disambiguator: disamb,
             });
         }
     }
-    specs
+
+    // Second pass: feed (base_name, disambiguator) pairs through
+    // the workspace's `disambiguate_overloads` so each overload
+    // gets a unique suffix. Same machinery the Rust-side bindings
+    // emitter uses for safe-wrapper names — keeps the shim
+    // symbols + the Rust wrapper symbols in lock-step.
+    let entries: Vec<OverloadEntry<&str>> = pre_specs
+        .iter()
+        .map(|p| OverloadEntry {
+            base_name: p.method_name.as_str(),
+            disambiguator: p.disambiguator.as_str(),
+        })
+        .collect();
+    let resolved = disambiguate_overloads(entries);
+
+    pre_specs
+        .into_iter()
+        .zip(resolved)
+        .map(|(pre, resolved_ident)| ThrowsShimSpec {
+            wrapper_name: format!("__rustcc_throws_{}_{}", pre.class_short, resolved_ident.0),
+            return_type_cpp: pre.return_type_cpp,
+            param_decls: pre.param_decls,
+            forward_args: pre.forward_args,
+            original_callsite: pre.callsite,
+            typed_catches: pre.typed_catches,
+            is_ctor: false,
+        })
+        .collect()
 }
 
 /// v1.12.17: build `ThrowsShimSpec` entries for class

@@ -425,6 +425,71 @@ class MyErrorA {};
     );
 }
 
+/// v1.12.18: throws annotations on overloaded class methods
+/// produce per-overload-unique shim symbols via the workspace's
+/// existing `disambiguate_overloads` machinery. Before this PR
+/// `int divide(int)` + `int divide(double)` collapsed to a
+/// single `__rustcc_throws_Calc_divide` shim.
+#[test]
+fn compile_disambiguates_overloaded_class_method_throws_shims() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let header = tmp.path().join("ovl.hpp");
+    std::fs::write(
+        &header,
+        r#"#pragma once
+class Calc {
+public:
+    [[clang::annotate("rustcc::cxx_throws")]]
+    int divide(int a, int b);
+
+    [[clang::annotate("rustcc::cxx_throws")]]
+    double divide(double a, double b);
+};
+"#,
+    )
+    .unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let outputs = Build::new()
+        .header(&header)
+        .out_dir(&out_dir)
+        .invoke_cc(false)
+        .compile("ovl_bindings")
+        .expect("compile");
+
+    let shims = std::fs::read_to_string(&outputs.shims_path)
+        .expect("read shims");
+    eprintln!("=== shims ===\n{shims}");
+
+    // Two distinct shim wrapper symbols should appear — one per
+    // overload. The exact disambiguator the workspace's
+    // `disambiguate_overloads` picks is implementation-defined,
+    // but we know `divide` is the base name + each overload
+    // adds a suffix derived from its C++ param types.
+    let int_int = shims
+        .matches("__rustcc_throws_Calc_divide_int_int")
+        .count();
+    let dbl_dbl = shims
+        .matches("__rustcc_throws_Calc_divide_double_double")
+        .count();
+    // At least one of each disambiguated symbol must appear in
+    // the extern fn declaration. (The exact match count depends
+    // on whether disambiguate_overloads suffixes both overloads
+    // or only the colliding ones — we accept either, just want
+    // both overloads to land as distinct symbols.)
+    assert!(
+        int_int >= 1 || shims.contains("__rustcc_throws_Calc_divide(") && dbl_dbl >= 1,
+        "expected int-int overload's shim symbol; shims:\n{shims}"
+    );
+    assert!(
+        dbl_dbl >= 1,
+        "expected double-double overload's shim symbol; shims:\n{shims}"
+    );
+}
+
 /// v1.12.17: ctor throws annotations emit a placement-new shim.
 /// The Rust ctor wrapper returns `Result<Self, CxxException>`
 /// and calls `__rustcc_throws_<Class>_new(__slot.as_mut_ptr(), args)`;
