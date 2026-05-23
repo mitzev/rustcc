@@ -250,7 +250,14 @@ fn walk_for_annotations(
         | EntityKind::Method
         | EntityKind::Constructor
         | EntityKind::Destructor
-        | EntityKind::ConversionFunction => {
+        | EntityKind::ConversionFunction
+        | EntityKind::FunctionDecl => {
+            // FunctionDecl picks up free functions at TU /
+            // namespace scope (v1.12.2 — for the
+            // `rustcc::cxx_throws` annotation). Class-scope
+            // methods are not `FunctionDecl` in libclang's
+            // schema; they go through the `Method` /
+            // `Constructor` / etc. arms above.
             let anns = read_annotations(entity);
             if !anns.is_empty() {
                 out.insert(entity_fqn(entity), anns);
@@ -961,6 +968,14 @@ impl<'a> Importer<'a> {
             cur = e.get_semantic_parent();
         }
         parent_segments.reverse();
+
+        // v1.12.2: free-fn annotation capture happens via
+        // `walk_for_annotations` (which now recognizes
+        // `EntityKind::FunctionDecl`) — the per-importer
+        // `self.annotations` HashMap is currently discarded by
+        // the surrounding `import_header_full` path, so we don't
+        // duplicate the work here. Tracking unification of the
+        // two annotation paths as a v1.12.3 cleanup.
 
         self.free_fns.push(FreeFnDef {
             parent: parent_segments,
@@ -2332,6 +2347,7 @@ fn parse_rustcc_annotation(text: &str) -> Option<Annotation> {
         "nullable" => Some(Annotation::Nullable),
         "nonnull" => Some(Annotation::NonNull),
         "skip" => Some(Annotation::Skip),
+        "cxx_throws" => Some(Annotation::CxxThrows),
         _ => None,
     }
 }

@@ -942,6 +942,7 @@ fn render_namespace_tree(
             ctx,
             &tree.free_fns,
             &config.cxx_throws_functions,
+            annotations,
             out,
             indent,
         )?;
@@ -4198,10 +4199,43 @@ fn render_free_fns(
     ctx: &CxxTypeCtx,
     fns: &[crate::free_fns::FreeFnDef],
     throws_set: &std::collections::BTreeSet<String>,
+    annotations: &AnnotationSet,
     out: &mut String,
     indent: &str,
 ) -> Result<(), BindingsError> {
     use rustc_abi_cxx::{NestedName, Symbol};
+
+    // Helper: a function is throws-tagged if either the config
+    // knob lists it by bare name (v1.12.1), or its imported
+    // annotations include `Annotation::CxxThrows` (v1.12.2).
+    // Annotations are keyed by FQN — for a TU-scope free fn the
+    // FQN is just the bare name, but namespaced fns spell out
+    // their path (`ns::sub::fname`).
+    let is_throws = |ff: &crate::free_fns::FreeFnDef| -> bool {
+        if throws_set.contains(&ff.name.0) {
+            return true;
+        }
+        let fqn = if ff.parent.is_empty() {
+            ff.name.0.clone()
+        } else {
+            let mut parts: Vec<String> = ff
+                .parent
+                .iter()
+                .map(|seg| match seg {
+                    rustc_abi_cxx::NameSegment::Namespace(id) => id.0.clone(),
+                    rustc_abi_cxx::NameSegment::AnonymousNamespace => String::new(),
+                    _ => String::new(),
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+            parts.push(ff.name.0.clone());
+            parts.join("::")
+        };
+        annotations
+            .effective(&fqn)
+            .iter()
+            .any(|a| matches!(a, Annotation::CxxThrows))
+    };
 
     // Pre-render each function's signature into wrapper-safe
     // strings so the `extern { ... }` block and the wrapper
@@ -4260,7 +4294,7 @@ fn render_free_fns(
             }
         };
         let ret_is_void = ret_ty == "()";
-        let throws = throws_set.contains(&ff.name.0);
+        let throws = is_throws(ff);
         // Link name: for throwing fns we point at the C++ shim
         // wrapper symbol (`__rustcc_throws_<name>`), which is
         // `extern "C"` — no mangling involved. For normal fns,
