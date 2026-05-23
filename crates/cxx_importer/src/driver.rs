@@ -33,6 +33,18 @@ pub struct HeaderGraph {
     /// Empty by default. Populate this field (or use the
     /// `Driver::with_instantiations(...)` helper) to opt in.
     pub template_instantiations: Vec<String>,
+    /// v1.11 stretch 3: when `true`, the driver runs a pre-scan
+    /// pass over each root header to discover class template
+    /// specializations that appear by reference in field /
+    /// parameter / return positions, and adds them to
+    /// [`Self::template_instantiations`] before the main import
+    /// pass. Useful for STL-heavy headers where listing every
+    /// instantiation by hand is impractical.
+    ///
+    /// Off by default to preserve existing semantics; users opt
+    /// in by setting `auto_discover_template_specs = true` on
+    /// the graph before passing to `Driver::new`.
+    pub auto_discover_template_specs: bool,
 }
 
 impl Default for HeaderGraph {
@@ -42,6 +54,7 @@ impl Default for HeaderGraph {
             include_paths: Vec::new(),
             clang_flags: Vec::new(),
             template_instantiations: Vec::new(),
+            auto_discover_template_specs: false,
         }
     }
 }
@@ -135,8 +148,59 @@ impl Driver {
         let mut usr_cache: std::collections::HashMap<String, ClassId> =
             std::collections::HashMap::new();
 
-        // If the graph requests explicit template instantiations,
-        // synthesize a single root that `#include`s every user
+        // v1.11 stretch 3: if auto-discovery is enabled, pre-scan
+        // every root header for class template specializations
+        // that appear by reference (field / parameter / return
+        // types). Merge the discovered names into a local copy of
+        // the graph's `template_instantiations` list so the synth
+        // root force-instantiates them too. The local copy avoids
+        // mutating `self.graph` which `parse_all` takes by &-ref.
+        let mut effective_graph = HeaderGraph {
+            roots: self.graph.roots.clone(),
+            include_paths: self.graph.include_paths.clone(),
+            clang_flags: self.graph.clang_flags.clone(),
+            template_instantiations: self.graph.template_instantiations.clone(),
+            auto_discover_template_specs: self.graph.auto_discover_template_specs,
+        };
+        if self.graph.auto_discover_template_specs {
+            // Use a temporary Clang for the discovery pass; reuse
+            // is fine since it's read-only AST walks.
+            let disco_clang = clang::Clang::new().map_err(|e| ImportError::ClangDiagnostic {
+                file: self.graph.roots.first().map(|p| p.display().to_string()).unwrap_or_default(),
+                line: 0,
+                message: format!("discovery libclang init failed: {e}"),
+            })?;
+            let mut discovered: std::collections::HashSet<String> = self
+                .graph
+                .template_instantiations
+                .iter()
+                .cloned()
+                .collect();
+            for root in &self.graph.roots {
+                let found = crate::import::discover_template_instantiations(
+                    &disco_clang,
+                    root,
+                    &argv_refs,
+                )?;
+                for inst in found {
+                    discovered.insert(inst);
+                }
+            }
+            // Keep entries from the explicit list at the front to
+            // preserve the user-specified ordering for the synth.
+            let mut combined: Vec<String> =
+                self.graph.template_instantiations.clone();
+            let explicit_set: std::collections::HashSet<&String> =
+                self.graph.template_instantiations.iter().collect();
+            let mut new_entries: Vec<String> = discovered
+                .into_iter()
+                .filter(|s| !explicit_set.contains(s))
+                .collect();
+            new_entries.sort();
+            combined.extend(new_entries);
+            effective_graph.template_instantiations = combined;
+        }
+        // Synthesize a single root that `#include`s every user
         // header and force-instantiates each template via
         // `template class <name>;`. libclang then surfaces the
         // resulting `ClassTemplateSpecialization` cursors as
@@ -145,7 +209,7 @@ impl Driver {
         // (not instead of) the user roots to keep namespace
         // ordering / first-import semantics consistent across
         // configurations.
-        let synth = synthesize_instantiation_root(&self.graph)?;
+        let synth = synthesize_instantiation_root(&effective_graph)?;
         let mut roots: Vec<PathBuf> = self.graph.roots.clone();
         if let Some((path, _guard)) = synth.as_ref() {
             roots.push(path.clone());

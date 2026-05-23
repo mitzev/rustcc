@@ -1709,6 +1709,7 @@ fn driver_force_instantiates_class_template_via_synthetic_root() {
         include_paths: vec![],
         clang_flags: vec!["-std=c++17".into()],
         template_instantiations: vec!["Box<int>".into()],
+        ..HeaderGraph::default()
     });
     let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
     let class_ids = driver.parse_all(&mut ctx).expect("parse_all");

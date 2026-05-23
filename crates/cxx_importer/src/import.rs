@@ -2448,3 +2448,153 @@ fn cv_from_type(ty: Type<'_>) -> CvQual {
 fn int(signed: bool, width: IntWidth) -> CxxType {
     CxxType::Int { signed, width }
 }
+
+// -------- v1.11 stretch 3: STL container auto-discovery (M24 follow-up) --
+
+/// Parse `source` headers via libclang and discover every class
+/// template specialization referenced in field / parameter /
+/// return-type positions. Returns the deduplicated set of
+/// canonical instantiation strings (e.g. `"std::vector<int>"`,
+/// `"std::optional<MyClass>"`) suitable for inserting into a
+/// [`crate::driver::HeaderGraph::template_instantiations`] list.
+///
+/// Why this exists: libclang only surfaces methods for a
+/// `ClassTemplateSpecialization` when the spec has been *forced*
+/// to instantiate (via `template class T<int>;` in a synthetic
+/// root). For specs that only appear by reference (e.g. a header
+/// declares `void foo(std::vector<int>);` but never explicitly
+/// instantiates `vector<int>`), the methods on `vector<int>`
+/// don't make it into the imported `ClassDef`. Pre-scanning the
+/// AST for such references lets the driver auto-populate the
+/// `template_instantiations` list and re-parse with the
+/// synthesized force-instantiations, yielding full method
+/// coverage for STL containers and similar template-heavy types.
+///
+/// **Scope (v1)**: top-level spec references in fields /
+/// parameters / returns. The walker recurses into pointer /
+/// reference / array element types to find inner spec
+/// references (e.g. `std::vector<int>*` finds `std::vector<int>`).
+/// Nested specs (`std::vector<std::optional<int>>`) ARE captured
+/// — both the outer and inner specs land in the result set.
+///
+/// **Limits**: 
+/// - Iterator types (`std::vector<int>::iterator`) are NOT
+///   auto-discovered — they're nested types inside a spec and
+///   need their own walker pass to lift them. Track as a v2
+///   follow-up.
+/// - Allocator-defaulted specs (`std::vector<int>` vs
+///   `std::vector<int, std::allocator<int>>`) are captured by
+///   the canonical-display-name they happen to surface; libclang
+///   typically reports the short form. The forced-instantiation
+///   synth then re-parses libstdc++'s template with the default
+///   allocator, which is the desired behavior.
+#[cfg(feature = "libclang")]
+pub fn discover_template_instantiations(
+    clang: &Clang,
+    source: &Path,
+    args: &[&str],
+) -> Result<std::collections::HashSet<String>, ImportError> {
+    let index = Index::new(clang, false, false);
+    let tu = index
+        .parser(source)
+        .arguments(args)
+        .parse()
+        .map_err(|e| ImportError::ClangDiagnostic {
+            file: source.display().to_string(),
+            line: 0,
+            message: format!("discovery parse failed: {e:?}"),
+        })?;
+
+    let mut found: std::collections::HashSet<String> = std::collections::HashSet::new();
+    walk_entity_for_specs(&tu.get_entity(), &mut found);
+    Ok(found)
+}
+
+#[cfg(feature = "libclang")]
+fn walk_entity_for_specs(
+    entity: &Entity<'_>,
+    found: &mut std::collections::HashSet<String>,
+) {
+    // For this entity itself: examine its type (if any) and the
+    // type-result for functions / methods. Then recurse into
+    // children.
+    if let Some(ty) = entity.get_type() {
+        collect_specs_in_type(ty, found);
+    }
+    if let Some(rt) = entity.get_result_type() {
+        collect_specs_in_type(rt, found);
+    }
+    for child in entity.get_children() {
+        walk_entity_for_specs(&child, found);
+    }
+}
+
+#[cfg(feature = "libclang")]
+fn collect_specs_in_type(
+    ty: Type<'_>,
+    found: &mut std::collections::HashSet<String>,
+) {
+    // Unwrap pointer / reference / array layers to find the
+    // pointee. `vector<int>*` has TypeKind::Pointer with a
+    // pointee TypeKind::Record (or Elaborated) that's the spec.
+    let mut cur = ty;
+    let mut depth = 0;
+    while depth < 16 {
+        depth += 1;
+        match cur.get_kind() {
+            TypeKind::Pointer | TypeKind::LValueReference | TypeKind::RValueReference => {
+                if let Some(p) = cur.get_pointee_type() {
+                    cur = p;
+                    continue;
+                }
+            }
+            TypeKind::ConstantArray
+            | TypeKind::IncompleteArray
+            | TypeKind::VariableArray => {
+                if let Some(elem) = cur.get_element_type() {
+                    cur = elem;
+                    continue;
+                }
+            }
+            TypeKind::Elaborated | TypeKind::Typedef => {
+                cur = cur.get_canonical_type();
+                continue;
+            }
+            _ => {}
+        }
+        break;
+    }
+
+    // Now check if `cur` is a class template specialization. The
+    // signal libclang gives us: `get_template_argument_types()`
+    // returns Some(_) with non-empty inner vector.
+    let targs = cur.get_template_argument_types();
+    let is_spec = matches!(targs, Some(ref v) if !v.is_empty());
+    if !is_spec {
+        return;
+    }
+
+    // Capture the canonical instantiation string. The
+    // display-name format is exactly what the synth-root
+    // `template class <name>;` line wants — `"std::vector<int>"`.
+    let display = cur.get_display_name();
+    if display.is_empty() {
+        return;
+    }
+    // Filter heuristic: only capture types that look like
+    // "namespace::Name<args>" — exclude bare template names
+    // and anything containing local-only types we can't
+    // re-instantiate.
+    if !display.contains('<') || !display.contains('>') {
+        return;
+    }
+    // Recurse into the template arguments to capture nested
+    // specs (e.g. `vector<optional<int>>` should add both
+    // `vector<optional<int>>` and `optional<int>`).
+    if let Some(arg_tys) = targs {
+        for arg in arg_tys.iter().flatten() {
+            collect_specs_in_type(*arg, found);
+        }
+    }
+    found.insert(display);
+}
