@@ -212,6 +212,25 @@ pub struct RustBindingsConfig {
     /// until the user opts a specific function in. Class methods
     /// are not yet supported through this knob; track v1.12.2.
     pub cxx_throws_functions: std::collections::BTreeSet<String>,
+
+    /// v1.13.0 P09.71: when `true`, throws-tagged functions are
+    /// emitted as v1.13.0 native-invoke `extern "C++"` decls
+    /// (`#[rustc_cxx_throws]` + typeinfo attribute lists) instead
+    /// of the v1.12.x shim path. Native invoke needs the fork
+    /// rustc + `#![feature(rustc_attrs)]` in the consuming crate,
+    /// so this is opt-in. When `false` (default), the existing
+    /// shim emission stays intact so stable-rustc users keep
+    /// working.
+    ///
+    /// The typed-catch lists (`#[rustc_cxx_throws_typeinfos]` +
+    /// `#[rustc_cxx_throws_msvc_typedescs]`) are auto-emitted
+    /// from the `[[clang::annotate("rustcc::cxx_throws(T1, T2)")]]`
+    /// payload via the [`cxx_exception::manglings_for_typed_catches`]
+    /// helper. Unsupported type shapes (templates, references)
+    /// fall back to bare `#[rustc_cxx_throws]` — catch-all
+    /// behavior, no typed dispatch — rather than mis-aligning the
+    /// Itanium and MSVC lists.
+    pub cxx_throws_use_native_invoke: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -943,6 +962,7 @@ fn render_namespace_tree(
             &tree.free_fns,
             &config.cxx_throws_functions,
             annotations,
+            config.cxx_throws_use_native_invoke,
             out,
             indent,
         )?;
@@ -4536,6 +4556,7 @@ fn render_free_fns(
     fns: &[crate::free_fns::FreeFnDef],
     throws_set: &std::collections::BTreeSet<String>,
     annotations: &AnnotationSet,
+    use_native_invoke: bool,
     out: &mut String,
     indent: &str,
 ) -> Result<(), BindingsError> {
@@ -4661,13 +4682,16 @@ fn render_free_fns(
         };
         let ret_is_void = ret_ty == "()";
         let throws = is_throws(ff);
-        // Link name: for throwing fns we point at the C++ shim
-        // wrapper symbol (`__rustcc_throws_<name>`), which is
-        // `extern "C"` — no mangling involved. For normal fns,
-        // we use the Itanium-mangled symbol. The mangler handles
-        // empty-scope (TU-root) by emitting the bare
-        // `_Z<len><name>` form.
-        let link_name = if throws {
+        // Link name routing:
+        // - Throws + shim path (v1.12.x, the default): point at
+        //   the C++ shim wrapper `__rustcc_throws_<name>` which
+        //   has `extern "C"` linkage so no mangling.
+        // - Throws + native invoke (v1.13.0 P09.71, opt-in via
+        //   `cxx_throws_use_native_invoke`): point at the C++
+        //   side's regular Itanium-mangled symbol — the fork
+        //   rustc emits an LLVM invoke directly against it.
+        // - Non-throws: regular Itanium mangling.
+        let link_name = if throws && !use_native_invoke {
             format!("__rustcc_throws_{}", ff.name.0)
         } else {
             let scope = NestedName(ff.def_scope().to_vec());
@@ -4718,14 +4742,29 @@ fn render_free_fns(
         return Ok(());
     }
 
-    // Throwing fns can't share the same `extern "C++"` block —
-    // their shim wrappers are `extern "C" noexcept` (no name
-    // mangling, no unwinding across the boundary). Emit two
-    // blocks when both flavors are present.
+    // Throwing fns can't share the same `extern "C++"` block as
+    // plain ones on the v1.12.x shim path — their shim wrappers
+    // are `extern "C" noexcept` (no name mangling, no unwinding
+    // across the boundary). Emit two blocks when both flavors
+    // are present.
+    //
+    // P09.71 / 1.13 throws Phase 2F: when `use_native_invoke` is
+    // true, throws fns instead live in the SAME `extern "C++"`
+    // block as plain fns, with `#[rustc_cxx_throws]` + typeinfo
+    // attributes above each decl and a `Result<T, CxxException>`
+    // return type. The fork rustc lowers calls to LLVM invoke +
+    // landingpad and the runtime helper conjures the Err side
+    // from the caught C++ exception.
     let (throwing, plain): (Vec<&Rendered<'_>>, Vec<&Rendered<'_>>) =
         rendered.iter().partition(|r| r.throws);
 
-    if !plain.is_empty() {
+    // For native invoke, the throws fns go into the `extern "C++"`
+    // block alongside plain fns — partition collapses to one
+    // block.
+    let plain_block_throws: &[&Rendered<'_>] =
+        if use_native_invoke { &throwing } else { &[] };
+
+    if !plain.is_empty() || !plain_block_throws.is_empty() {
         let _ = writeln!(out, "{indent}unsafe extern \"C++\" {{");
         for r in &plain {
             let _ = writeln!(out, "{indent}    #[link_name = \"{}\"]", r.link_name);
@@ -4750,11 +4789,63 @@ fn render_free_fns(
                 );
             }
         }
+        // Throws decls in the same block (native-invoke only).
+        for r in plain_block_throws {
+            // Resolve the function's annotation FQN so we can
+            // look up the typed-catches list (if any).
+            let fqn = if r.def.parent.is_empty() {
+                r.def.name.0.clone()
+            } else {
+                let mut parts: Vec<String> = r
+                    .def
+                    .parent
+                    .iter()
+                    .filter_map(|seg| match seg {
+                        rustc_abi_cxx::NameSegment::Namespace(id) => Some(id.0.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                parts.push(r.def.name.0.clone());
+                parts.join("::")
+            };
+            let typed_catches: Vec<String> = annotations
+                .effective(&fqn)
+                .into_iter()
+                .find_map(|a| match a {
+                    Annotation::CxxThrowsTyped(types) => Some(types),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let attr_indent = format!("{indent}    ");
+            let attrs = crate::cxx_exception::render_native_invoke_attr_block(
+                &typed_catches,
+                &attr_indent,
+            );
+            out.push_str(&attrs);
+            let _ = writeln!(out, "{indent}    #[link_name = \"{}\"]", r.link_name);
+            let decl_params = r
+                .params
+                .iter()
+                .map(|(d, _)| d.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ok_ty = if r.ret_is_void {
+                "()".to_string()
+            } else {
+                r.ret_ty.clone()
+            };
+            let _ = writeln!(
+                out,
+                "{indent}    fn {ext}({decl_params}) \
+                 -> ::core::result::Result<{ok_ty}, ::cxx::CxxException>;",
+                ext = r.extern_ident,
+            );
+        }
         let _ = writeln!(out, "{indent}}}");
         let _ = writeln!(out);
     }
 
-    if !throwing.is_empty() {
+    if !use_native_invoke && !throwing.is_empty() {
         // Throws extern block: `extern "C"` (the shim is
         // `extern "C" noexcept`, returning CxxRawError by value).
         // Out-param for non-void returns; nothing for void.
@@ -4803,7 +4894,19 @@ fn render_free_fns(
                 "{indent}pub fn {safe_name}({wrap_params}) \
                  -> ::core::result::Result<{ok_ty}, ::cxx::CxxException> {{",
             );
-            if r.ret_is_void {
+            if use_native_invoke {
+                // P09.71: the extern fn ALREADY returns
+                // Result<T, CxxException> directly (the fork
+                // rustc rewrote the destination to that shape
+                // at MIR level + the catch BB conjures the
+                // Err side). The safe wrapper is just an
+                // `unsafe { ext(args) }` invocation.
+                let _ = writeln!(
+                    out,
+                    "{indent}    unsafe {{ {ext}({fwd}) }}",
+                    ext = r.extern_ident,
+                );
+            } else if r.ret_is_void {
                 let call_args = if fwd.is_empty() {
                     String::new()
                 } else {

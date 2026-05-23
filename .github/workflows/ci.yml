@@ -58,3 +58,59 @@ jobs:
 
       - name: Run fork/build.sh --apply-only
         run: ./fork/build.sh --apply-only
+
+  # v1.13.0 P09.71: gate the native-invoke smoke tests behind a
+  # workflow_dispatch trigger. Both jobs need either a built fork
+  # rustc (~30 min on a clean runner) or a pre-built artifact, so
+  # we don't run them on every PR — they're for release-cycle
+  # validation. The job recipes are kept here so they can't
+  # bit-rot, and a maintainer can trigger them on demand.
+  cxx-throws-native-itanium:
+    name: fork rustc + cxx_throws native invoke (linux Itanium)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: System deps (clang + C++ runtime)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev libc++-dev libc++abi-dev
+
+      - name: Build fork rustc stage-1
+        run: ./fork/build.sh
+
+      - name: Build the cxx_throws_native example
+        working-directory: examples/cxx_throws_native
+        env:
+          RUSTC: ${{ github.workspace }}/../rust-lang-rust-fork/build/host/stage1/bin/rustc
+        run: |
+          cargo build --release --locked
+
+      - name: Run the cxx_throws_native example
+        working-directory: examples/cxx_throws_native
+        run: |
+          ./target/release/cxx_throws_native
+
+  cxx-throws-native-msvc-wine:
+    name: fork rustc + cxx_throws native invoke (x86_64-pc-windows-msvc under Wine)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: System deps (wine + clang + xwin)
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y wine wine64 clang lld
+          cargo install xwin --locked
+          xwin --accept-license splat --output ~/.xwin
+
+      - name: Build fork rustc stage-1
+        run: ./fork/build.sh
+
+      - name: Run the MSVC runtime smoke suite under Wine
+        env:
+          RUSTCC_STAGE1: ${{ github.workspace }}/../rust-lang-rust-fork/build/host/stage1
+        run: ./fork/tests/run_msvc_runtime.sh

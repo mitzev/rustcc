@@ -1,11 +1,22 @@
 # `cxx_throws` — catching C++ exceptions from Rust
 
-**Status**: Phase 0 (C++-side catch shim) is feature-complete and
-production-ready as of v1.12.18. Phase 1 (Itanium native `invoke`)
-ships runtime scaffolding in v1.12.5; codegen lowering still
-aspirational pending a fork rustc bootstrap. Phase 2 (MSVC funclet)
-ships cross-platform runtime in v1.12.6; codegen likewise pending.
-See `fork/CXX-THROW-PLAN.md` for the full phasing.
+**Status (v1.13.0)**: feature-complete on both the v1.12.x
+shim path (stable rustc, no fork required) and the v1.13.0
+native-invoke path (fork rustc + `#[rustc_cxx_throws]`).
+Both paths are runtime-validated:
+
+| Path | Toolchain | Itanium catch-all | Itanium typed | MSVC catch-all | MSVC typed |
+|---|---|---|---|---|---|
+| v1.12.x shim | stable rustc | ✅ | ✅ | ✅ | ✅ |
+| v1.13.0 native invoke | fork rustc | ✅ | ✅ | ✅ | ✅ |
+
+The shim path uses C++ `try`/`catch` wrappers compiled into
+the C++ side; the native-invoke path uses LLVM `invoke` +
+catch landingpads (Itanium) or `catch_switch`/`catch_pad`
+funclets (MSVC) emitted by the fork rustc directly. The
+v1.12.x section below covers the shim path; the
+[v1.13.0 native invoke](#v1130-native-invoke) section
+covers the fork path.
 
 ## What it does
 
@@ -235,17 +246,134 @@ Constants:
 | Operators / conversions | ❌ silently skipped | — | — |
 | Overloaded methods | ✅ disambiguated via param-type suffix since v1.12.18 | `__rustcc_throws_<Class>_<method>_<sig>` | `Result<T, _>` |
 
+## v1.13.0 native invoke
+
+The fork rustc (built via `fork/build.sh`, patches 21–35)
+recognizes `#[rustc_cxx_throws]` and lowers each call to an
+LLVM `invoke` instruction. On Itanium the personality is
+`__gxx_personality_v0` and the landingpad carries one
+`catch ptr @<typeinfo>` clause per typed catch plus a
+final catch-all; on MSVC it's `__CxxFrameHandler3` plus a
+`catch_switch` over one `catch_pad` per Microsoft
+TypeDescriptor.
+
+Three runtime helpers from `crates/cxx` are linked in:
+
+- `__rustcc_cxx_catch_unknown` — Itanium catch-all returns
+  `CxxRawError { kind: CXX_EXC_UNKNOWN, message: ... }`.
+- `__rustcc_cxx_catch_typed` — Itanium typed catch hands the
+  catch-clause index back as `CxxRawError.kind`.
+- (MSVC catches synthesize the `CxxRawError` inline — no
+  helper call.)
+
+The MIR pass `cxx_throws_wrap` then converts the call's
+`Result<T, CxxException>` destination into an Ok-wrap on
+success and an Err-wrap (via `From<CxxRawError>`) on the
+catch path, so the user-visible signature is the same as
+on the shim path.
+
+### Using the fork directly
+
+For hand-written bindings, emit the attributes directly:
+
+```rust
+#![feature(rustc_attrs)]   // required — rustc-internal attrs
+
+unsafe extern "C++" {
+    #[rustc_cxx_throws]
+    fn maybe_throws(x: i32) -> Result<i32, ::cxx::CxxException>;
+}
+
+let r = unsafe { maybe_throws(-1) };
+// r: Result<i32, CxxException>
+```
+
+For typed catches, add both Itanium and MSVC type-info lists:
+
+```rust
+unsafe extern "C++" {
+    #[rustc_cxx_throws]
+    #[rustc_cxx_throws_typeinfos     = "_ZTI11DomainError,_ZTI10RangeError"]
+    #[rustc_cxx_throws_msvc_typedescs = ".?AVDomainError@@,.?AVRangeError@@"]
+    fn parse(s: *const c_char) -> Result<Value, MyError>;
+}
+
+impl From<::cxx::CxxRawError> for MyError {
+    fn from(raw: ::cxx::CxxRawError) -> Self {
+        match raw.kind {
+            cxx::CXX_EXC_TYPED_BASE      => MyError::Domain,
+            cxx::CXX_EXC_TYPED_BASE + 1  => MyError::Range,
+            _                            => MyError::Other,
+        }
+    }
+}
+```
+
+The two lists must be in the same order so the
+`CXX_EXC_TYPED_BASE + N` indexing matches across both
+platforms.
+
+### Using cxx_importer (v1.13.0 P09.71)
+
+`Build::compile` can emit the v1.13.0 attributes
+automatically from `[[clang::annotate("rustcc::cxx_throws(T1, T2)")]]`
+annotations. Set the new flag on `RustBindingsConfig`:
+
+```rust
+cxx_importer::build::Build::new()
+    .header("my_lib.hpp")
+    .rust_bindings_config(RustBindingsConfig {
+        cxx_throws_use_native_invoke: true,
+        ..Default::default()
+    })
+    .compile("my_lib_bindings")
+    .unwrap();
+```
+
+When `cxx_throws_use_native_invoke` is true, throws-tagged
+functions are emitted as `extern "C++"` decls with
+`#[rustc_cxx_throws]` + typeinfos attributes instead of
+calling through `__rustcc_throws_<name>` shim wrappers. The
+v1.12.x C++ shims aren't emitted, so the C++ side compiles
+to the original symbol names directly.
+
+`cxx::CxxRawError` must be visible to the fork rustc's MIR
+pass — enable the `rustcc-fork` cargo feature on the
+`cxx` dep so its `CxxRawError` carries
+`#[rustc_diagnostic_item = "CxxRawError"]`:
+
+```toml
+[dependencies]
+cxx = { version = "...", features = ["rustcc-fork"] }
+```
+
+The feature is opt-in; stable-rustc users leave it off and
+keep using the v1.12.x shim path.
+
+### Picking a path
+
+| Constraint | Use |
+|---|---|
+| Stable rustc, no fork | v1.12.x shim path |
+| Fork rustc + nightly | either; native invoke is lower-overhead |
+| Mix of stable + nightly consumers | shim path (still works on both) |
+| Want to drop C++ shim TUs | native invoke |
+| Want zero-overhead happy path | native invoke (no shim sret) |
+
+The native-invoke path requires:
+- fork rustc (`fork/build.sh`)
+- nightly toolchain
+- `#![feature(rustc_attrs)]` in the consuming crate
+- `cxx = { features = ["rustcc-fork"] }`
+
+The shim path requires none of these.
+
 ## What's deferred
 
-- **Phase 1 codegen** (native `invoke` + Itanium landingpad):
-  runtime helpers + the `#[rustc_cxx_throws]` attribute
-  scaffolding patch are shipped
-  (`cxx::native_invoke`,
-  `fork/patches/21-rustc-cxx-throws-attr.patch`).
-  The codegen patch that rewrites `call` to `invoke` is a
-  separate 3-4 week fork rustc effort tracked separately.
-- **Phase 2 codegen** (MSVC funclet): cross-platform runtime
-  shipped in v1.12.6; same codegen story as Phase 1.
+- **GCC backend** — `cxx_throws` codegen is LLVM-backend
+  only; the GCC backend has stubs that panic with a clear
+  message if a `#[rustc_cxx_throws]` call reaches codegen.
+  Tracked as P09.64-gcc / P09.68-gcc.
 - **Typed-catch enum synthesis**: today users get
   `Result<T, ::cxx::CxxException>` and `match` on
   `e.is_typed_at(N)`. A future release can auto-generate
