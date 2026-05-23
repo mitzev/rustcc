@@ -1138,15 +1138,31 @@ fn render_direct_extern_class(
         // (`Class::method`) carries the `CxxThrows` annotation
         // either inline or via sidecar. Free fns flow through the
         // free-fn emitter; class methods through here.
-        let method_throws = method_source_name_for_fqn(method)
-            .map(|src_name| {
-                let fqn = format!("{class_fqn}::{src_name}");
-                annotations
-                    .effective(&fqn)
-                    .iter()
-                    .any(|a| matches!(a, Annotation::CxxThrows))
-            })
-            .unwrap_or(false);
+        //
+        // v1.12.4: extend lookup to cover ctors. libclang names
+        // ctor cursors after the class itself, so the
+        // entity-FQN key is `Class::Class` (the last segment of
+        // class_fqn duplicated as the method name). We compute
+        // that segment lazily and try it for the ctor arms.
+        let method_throws = {
+            let lookup_name: Option<String> = match (&method.special, &method.name) {
+                (Some(SpecialMember::DefaultCtor | SpecialMember::OtherCtor), _) => {
+                    // Last segment of the C++ class FQN.
+                    class_fqn.rsplit("::").next().map(|s| s.to_string())
+                }
+                (None, MethodName::Ident(id)) => Some(id.0.clone()),
+                _ => None,
+            };
+            lookup_name
+                .map(|src_name| {
+                    let fqn = format!("{class_fqn}::{src_name}");
+                    annotations
+                        .effective(&fqn)
+                        .iter()
+                        .any(|a| matches!(a, Annotation::CxxThrows))
+                })
+                .unwrap_or(false)
+        };
         let emission = match classify_for_direct_extern(
             ctx,
             class_id,
@@ -2174,28 +2190,48 @@ fn classify_for_direct_extern(
         Some(SpecialMember::DefaultCtor | SpecialMember::OtherCtor) => {
             let mut decl = vec![format!("this: *mut {class_name}")];
             decl.extend(user_arg_decls.clone());
-            let link = ctx.mangle(&Symbol::Ctor {
-                class: class_id,
-                variant: CtorVariant::C1,
-                sig: method.sig.clone(),
-            });
+            // v1.12.4: throwing ctors. The C++ shim's body is
+            // `try { new (__this) Class(args); ... }` which placement-
+            // constructs into the Rust-owned slot. The extern decl
+            // shape is identical to the non-throws ctor (no
+            // extra out-param — `this` IS the slot), except the
+            // return clause swaps to `-> ::cxx::CxxRawError` and
+            // the link_name targets the shim. The safe wrapper
+            // returns `Result<Self, ::cxx::CxxException>`.
+            let (link, extern_ret_clause, wrapper_ret) = if throws {
+                (
+                    format!("__rustcc_throws_{class_name}_{resolved_rust_name}"),
+                    " -> ::cxx::CxxRawError".to_string(),
+                    "::core::result::Result<Self, ::cxx::CxxException>".to_string(),
+                )
+            } else {
+                (
+                    ctx.mangle(&Symbol::Ctor {
+                        class: class_id,
+                        variant: CtorVariant::C1,
+                        sig: method.sig.clone(),
+                    }),
+                    String::new(),
+                    "Self".to_string(),
+                )
+            };
             return Ok(MethodEmission {
                 kind: EmissionKind::Ctor,
                 rust_name: resolved_rust_name.to_string(),
                 extern_ident: format!("__cxx_{class_name}_{resolved_rust_name}"),
                 link_name: link,
                 extern_decl_params: decl.join(", "),
-                extern_return_clause: String::new(),
+                extern_return_clause: extern_ret_clause,
                 wrapper_receiver: WrapperReceiver::Ctor,
                 wrapper_params: user_arg_decls.join(", "),
-                wrapper_return: "Self".into(),
+                wrapper_return: wrapper_ret,
                 forward_args: user_forward.join(", "),
                 default_arg_count: ctx.default_arg_count(class_id, method_idx),
                 wrapper_user_params: user_param_pairs.clone(),
                 wrapper_forward_arg_names: user_forward_names.clone(),
                 synthesized_default_literals: synthesized_defaults.clone(),
                 cstr_param_indices: cstr_param_indices.clone(),
-                throws: false,
+                throws,
                 raw_ret_ty: String::new(),
             });
         }
@@ -2322,27 +2358,24 @@ fn classify_for_direct_extern(
         receiver
     };
 
-    // v1.12.3: throws emission shape — supported on Instance +
-    // Static methods only (not Ctor / Dtor / Virtual yet). For
-    // throws methods we route through the Phase 0 C++ catch
-    // shim:
-    //  - link_name is the shim symbol (extern "C", no mangling)
-    //  - extern decl appends `__out: *mut RetTy` for non-void
-    //  - extern return clause becomes `-> ::cxx::CxxRawError`
-    //  - wrapper return becomes `Result<T, ::cxx::CxxException>`
-    // Throws on virtual methods is rejected here so callers see
-    // a clean per-method skip diagnostic.
-    if throws && matches!(kind, EmissionKind::Virtual { .. }) {
-        return Err(BindingsError::UnsupportedMethod {
-            where_: format!("{class_name}::{method_name}"),
-            why: "cxx_throws on virtual methods is v1.12.4+ work \
-                  (Phase 0 shim emission for vtable-dispatched \
-                  methods needs the vtable-lookup wrapper to thread \
-                  the out-param + Result-decode through the \
-                  transmute path)"
-                .into(),
-        });
-    }
+    // v1.12.3: throws emission shape on Instance + Static methods.
+    // v1.12.4 extension: virtual methods participate too — when a
+    // virtual is throws-tagged, we **downgrade** the emission kind
+    // from Virtual to Instance. The C++ shim
+    // (`__rustcc_throws_<Class>_<method>`) is itself an `extern "C"`
+    // free function (NOT a vtable entry) whose body does
+    // `this->method(args)` — which IS the virtual dispatch on the
+    // C++ side. So from Rust's perspective the call sequence is
+    // identical to a non-virtual: load the shim symbol, call it,
+    // decode. The vtable-lookup-and-transmute wrapper code is
+    // bypassed entirely. Pure virtuals work the same way —
+    // calling them via the shim dispatches into `__cxa_pure_virtual`
+    // and terminates, which is the correct C++ semantic.
+    let kind = if throws && matches!(kind, EmissionKind::Virtual { .. }) {
+        EmissionKind::Instance
+    } else {
+        kind
+    };
 
     // Mangle using the *original* C++ method name (operator code or
     // identifier) so the symbol matches what Clang produced for the
@@ -2464,39 +2497,90 @@ fn render_direct_extern_wrapper(
         EmissionKind::Ctor => {
             // Wrapper for ctors: allocate a stack temp, call the
             // C++ ctor, materialize the value via assume_init.
+            //
+            // v1.12.4: throwing ctors return Result<Self, _>. The
+            // C++ shim placement-constructs into the slot only if
+            // no exception escapes — otherwise the slot is left
+            // uninitialized and the shim returns the error tag.
+            // The wrapper checks `__raw.kind` BEFORE
+            // `assume_init`, so we never observe a half-constructed
+            // value.
+            let wrapper_ret = if emission.throws {
+                emission.wrapper_return.clone()
+            } else {
+                "Self".to_string()
+            };
             let _ = writeln!(
                 out,
-                "{indent}pub fn {name}({params}) -> Self {{",
+                "{indent}pub fn {name}({params}) -> {ret} {{",
                 name = display_name,
                 params = emission.wrapper_params,
+                ret = wrapper_ret,
             );
-            let _ = writeln!(
-                out,
-                "{indent}    unsafe {{",
-            );
-            let _ = writeln!(
-                out,
-                "{indent}        let mut __slot = ::core::mem::MaybeUninit::<Self>::uninit();",
-            );
-            if emission.forward_args.is_empty() {
+            if emission.throws {
                 let _ = writeln!(
                     out,
-                    "{indent}        {ext}(__slot.as_mut_ptr());",
-                    ext = emission.extern_ident,
+                    "{indent}    let mut __slot = ::core::mem::MaybeUninit::<Self>::uninit();",
                 );
+                if emission.forward_args.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "{indent}    let __raw = unsafe {{ {ext}(__slot.as_mut_ptr()) }};",
+                        ext = emission.extern_ident,
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{indent}    let __raw = unsafe {{ {ext}(__slot.as_mut_ptr(), {fwd}) }};",
+                        ext = emission.extern_ident,
+                        fwd = emission.forward_args,
+                    );
+                }
+                let _ = writeln!(
+                    out,
+                    "{indent}    if __raw.kind == ::cxx::CXX_EXC_OK {{",
+                );
+                let _ = writeln!(
+                    out,
+                    "{indent}        ::core::result::Result::Ok(unsafe \
+                     {{ __slot.assume_init() }})",
+                );
+                let _ = writeln!(out, "{indent}    }} else {{");
+                let _ = writeln!(
+                    out,
+                    "{indent}        ::core::result::Result::Err(unsafe {{ \
+                     ::cxx::CxxException::from_raw(__raw.kind, __raw.message) }})",
+                );
+                let _ = writeln!(out, "{indent}    }}");
             } else {
                 let _ = writeln!(
                     out,
-                    "{indent}        {ext}(__slot.as_mut_ptr(), {fwd});",
-                    ext = emission.extern_ident,
-                    fwd = emission.forward_args,
+                    "{indent}    unsafe {{",
                 );
+                let _ = writeln!(
+                    out,
+                    "{indent}        let mut __slot = ::core::mem::MaybeUninit::<Self>::uninit();",
+                );
+                if emission.forward_args.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "{indent}        {ext}(__slot.as_mut_ptr());",
+                        ext = emission.extern_ident,
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{indent}        {ext}(__slot.as_mut_ptr(), {fwd});",
+                        ext = emission.extern_ident,
+                        fwd = emission.forward_args,
+                    );
+                }
+                let _ = writeln!(
+                    out,
+                    "{indent}        __slot.assume_init()",
+                );
+                let _ = writeln!(out, "{indent}    }}");
             }
-            let _ = writeln!(
-                out,
-                "{indent}        __slot.assume_init()",
-            );
-            let _ = writeln!(out, "{indent}    }}");
             let _ = writeln!(out, "{indent}}}");
         }
         EmissionKind::Instance => {

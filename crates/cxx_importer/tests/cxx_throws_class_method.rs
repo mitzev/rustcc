@@ -175,7 +175,13 @@ public:
 }
 
 #[test]
-fn throws_on_virtual_method_is_skipped_with_clear_diagnostic() {
+fn virtual_throws_method_routes_through_shim_not_vtable() {
+    // v1.12.4: virtual + throws is supported. The C++ shim does
+    // the virtual dispatch on the C++ side (`this->method(args)`
+    // inside the catch block), so from Rust's perspective the
+    // call goes through the shim symbol — no vtable lookup,
+    // no transmute. The emission kind is downgraded from
+    // Virtual to Instance internally.
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
 
     let dir = tmpdir("virt");
@@ -221,19 +227,34 @@ public:
 
     eprintln!("=== generated bindings ===\n{src}\n");
 
-    // The virtual throws method must NOT appear as an emitted
-    // safe wrapper — classify rejected it.
+    // Safe wrapper IS emitted — virtual + throws is supported.
     assert!(
-        !src.contains("pub fn fail_me("),
-        "virtual throws method shouldn't emit a safe wrapper; src:\n{src}"
+        src.contains("pub fn fail_me(&mut self)"),
+        "expected safe wrapper for virtual throws method; src:\n{src}"
     );
-    // The skipped-method comment block should mention it.
+    // Wrapper returns Result.
     assert!(
-        src.contains("fail_me"),
-        "expected skipped-method note to mention fail_me; src:\n{src}"
+        src.contains("::core::result::Result<i32, ::cxx::CxxException>"),
+        "expected Result-returning wrapper for fail_me; src:\n{src}"
     );
+    // Extern decl points at the shim, not the Itanium-mangled
+    // symbol. We don't go through the vtable.
     assert!(
-        src.contains("v1.12.4"),
-        "expected the diagnostic to point at the v1.12.4 follow-up; src:\n{src}"
+        src.contains("__rustcc_throws_Base_fail_me"),
+        "expected shim symbol for virtual throws; src:\n{src}"
+    );
+    // No vtable-lookup machinery in the wrapper body — those
+    // are markers of the non-throws virtual path.
+    let body_start = src.find("pub fn fail_me").unwrap();
+    let body_end = src[body_start..].find("\n    }").map(|i| body_start + i).unwrap_or(src.len());
+    let body = &src[body_start..body_end];
+    assert!(
+        !body.contains("__vtable") && !body.contains("transmute"),
+        "throws virtual should bypass vtable lookup; body:\n{body}"
+    );
+    // MaybeUninit slot + decode shape, same as instance throws.
+    assert!(
+        body.contains("MaybeUninit::<i32>::uninit()"),
+        "expected MaybeUninit slot in wrapper body; body:\n{body}"
     );
 }
