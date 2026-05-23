@@ -1,0 +1,740 @@
+From f0518e199e4f32c1050049c57aa8b22b4c863d3d Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 12:55:37 +0300
+Subject: [PATCH] P09.68: typed C++ catches at codegen (1.13 throws Phase 2B)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Runtime-validated end-to-end. Typed catches dispatch to the
+right Rust variant based on the C++ exception's typeinfo.
+
+User-facing shape:
+
+    extern "C++" {
+        #[rustc_cxx_throws]
+        #[rustc_cxx_throws_typeinfos = "_ZTI11DomainError,_ZTI10RangeError"]
+        fn foo(x: i32) -> Result<i32, MyError>;
+    }
+
+with `MyError: From<CxxRawError>` (P09.69). The From impl
+dispatches on `CxxRawError.kind`:
+- `CXX_EXC_TYPED_BASE + 0` → first typeinfo (DomainError)
+- `CXX_EXC_TYPED_BASE + 1` → second typeinfo (RangeError)
+- `CXX_EXC_UNKNOWN` → caught via catch-all fallback
+
+Smoke output:
+
+    ok: 10        ← happy path (P09.66 ABI bridge)
+    err: Domain   ← _ZTI11DomainError matched
+    err: Range    ← _ZTI10RangeError matched
+
+Implementation:
+
+1. New attribute `#[rustc_cxx_throws_typeinfos = "_ZTI...,_ZTI..."]`
+   parsed in codegen_attrs.rs as a NameValueStr; stored in
+   CodegenFnAttrs.cxx_throws_typeinfos as a comma-separated
+   Symbol. Cross-crate encoded as Yes so the metadata
+   survives across crate boundaries.
+
+2. Codegen (block.rs do_call): reads the typeinfos string
+   from the callee's CodegenFnAttrs, parses to Vec<&str>,
+   passes to cxx_throws_catch_pad.
+
+3. Trait BuilderMethods::cxx_catch_landing_pad now takes
+   `typeinfos: &[Value]`. LLVM impl:
+   - Emits one `catch ptr <ti>` clause per entry + a final
+     `catch ptr null` catch-all
+   - Translates the landingpad's opaque type-id selector
+     into a small 1-based index via
+     `llvm.eh.typeid.for(@ti)` + icmp + select chain
+   - Returns (exn_ptr, small_idx) where small_idx is 1..=N
+     for typed clauses or 0 for catch-all
+
+4. New trait method MiscCodegenMethods::cxx_typeinfo_global:
+   declares an external opaque-ptr global by symbol name.
+   The C++ side defines `_ZTI<name>`, the linker resolves
+   the typeinfo object.
+
+5. New trait method MiscCodegenMethods::cxx_typeinfo_personality:
+   declares `__gxx_personality_v0` — the standard Itanium
+   C++ personality. **Required for typed catches** —
+   `rust_eh_personality` doesn't perform typeinfo matching
+   against C++ thrown types, so typed clauses would always
+   fall through to the catch-all. With `__gxx_personality_v0`,
+   the personality fn properly inspects the thrown
+   exception's typeinfo against each catch clause's typeinfo
+   and the landingpad fires the matched clause's i32 selector.
+
+6. New trait method MiscCodegenMethods::cxx_throws_catch_typed_fn:
+   declares the typed-catch runtime helper
+   `__rustcc_cxx_catch_typed(*mut c_void, u32) -> CxxRawError`.
+   Called instead of __rustcc_cxx_catch_unknown when
+   typeinfos is non-empty. The u32 is the small_idx (1-based
+   clause index or 0 for catch-all).
+
+7. cxx_throws_catch_pad in block.rs:
+   - When typeinfo_names is empty → Phase 1 behavior (Rust
+     personality + catch-all + __rustcc_cxx_catch_unknown).
+   - When non-empty → C++ personality, multi-clause landingpad,
+     small-idx translation, __rustcc_cxx_catch_typed call.
+
+GCC backend: stubbed via unimplemented!() — typed catches
+are LLVM-only for v1.13.0.
+
+The personality switch is function-global (LLVM constraint).
+Mixed Rust panic + cxx_throws in the same function uses
+__gxx_personality_v0 — which still handles Rust cleanup
+actions (drop chains) but can't catch Rust panics. Users
+who need to catch Rust panics shouldn't put them in the
+same function as typed cxx_throws calls.
+---
+ .../src/attributes/codegen_attrs.rs           |  35 ++++++
+ compiler/rustc_attr_parsing/src/context.rs    |   1 +
+ compiler/rustc_codegen_gcc/src/builder.rs     |   9 +-
+ compiler/rustc_codegen_gcc/src/context.rs     |  21 ++++
+ compiler/rustc_codegen_llvm/src/builder.rs    |  70 ++++++++---
+ compiler/rustc_codegen_llvm/src/context.rs    |  68 ++++++++++
+ .../rustc_codegen_ssa/src/codegen_attrs.rs    |   3 +
+ compiler/rustc_codegen_ssa/src/mir/block.rs   | 116 +++++++++++++-----
+ .../rustc_codegen_ssa/src/traits/builder.rs   |  17 ++-
+ compiler/rustc_codegen_ssa/src/traits/misc.rs |  22 ++++
+ compiler/rustc_feature/src/builtin_attrs.rs   |   6 +
+ .../rustc_hir/src/attrs/data_structures.rs    |  13 ++
+ .../rustc_hir/src/attrs/encode_cross_crate.rs |   1 +
+ .../src/middle/codegen_fn_attrs.rs            |   9 ++
+ compiler/rustc_passes/src/check_attr.rs       |   1 +
+ compiler/rustc_span/src/symbol.rs             |   1 +
+ 16 files changed, 345 insertions(+), 48 deletions(-)
+
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+index 468e9a547f4..f759d9abbe7 100644
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -813,6 +813,41 @@ impl<S: Stage> NoArgsAttributeParser<S> for $parser {
+     [Target::ForeignFn]
+ );
+ 
++/// P09.68 / 1.13 throws Phase 2B:
++/// `#[rustc_cxx_throws_typeinfos = "_ZTISt13runtime_error,_ZTI8MyError"]`
++/// — comma-separated list of Itanium typeinfo symbol names
++/// for typed catches. Codegen emits one `catch ptr @<symbol>`
++/// clause in the landingpad per entry, plus a final
++/// `catch ptr null` catch-all. The landingpad selector value
++/// becomes the matched clause's 1-based index (or 0 if the
++/// catch-all matched), packed into `CxxRawError.kind`.
++pub(crate) struct RustcCxxThrowsTypeinfosParser;
++
++impl<S: Stage> SingleAttributeParser<S> for RustcCxxThrowsTypeinfosParser {
++    const PATH: &[Symbol] = &[sym::rustc_cxx_throws_typeinfos];
++    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
++    const ALLOWED_TARGETS: AllowedTargets =
++        AllowedTargets::AllowList(&[Allow(Target::ForeignFn)]);
++    const TEMPLATE: AttributeTemplate =
++        template!(NameValueStr: "_ZTIxxx,_ZTIyyy");
++
++    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
++        let Some(nv) = args.name_value() else {
++            let attr_span = cx.attr_span;
++            cx.adcx().expected_name_value(attr_span, None);
++            return None;
++        };
++        let Some(typeinfos) = nv.value_as_str() else {
++            cx.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
++            return None;
++        };
++        Some(AttributeKind::RustcCxxThrowsTypeinfos {
++            typeinfos,
++            span: cx.attr_span,
++        })
++    }
++}
++
+ /// P09.20: `#[rustc_cxx_operator = "Plus"]` — marks a method on
+ /// a `#[repr(cpp)]` impl as a C++ operator overload. The string
+ /// value names the operator kind (matches the variants of
+diff --git a/compiler/rustc_attr_parsing/src/context.rs b/compiler/rustc_attr_parsing/src/context.rs
+index 3fe50346d24..6c61b7884f1 100644
+--- a/compiler/rustc_attr_parsing/src/context.rs
++++ b/compiler/rustc_attr_parsing/src/context.rs
+@@ -336,6 +336,7 @@ mod late {
+         Single<RustcSwiftLabelsParser>,
+         Single<WithoutArgs<RustcSwiftThrowsParser>>,
+         Single<WithoutArgs<RustcCxxThrowsParser>>,
++        Single<RustcCxxThrowsTypeinfosParser>,
+         Single<WithoutArgs<RustcPreserveUbChecksParser>>,
+         Single<WithoutArgs<RustcProcMacroDeclsParser>>,
+         Single<WithoutArgs<RustcPubTransparentParser>>,
+diff --git a/compiler/rustc_codegen_gcc/src/builder.rs b/compiler/rustc_codegen_gcc/src/builder.rs
+index 8cbceab058d..4fb718e1edd 100644
+--- a/compiler/rustc_codegen_gcc/src/builder.rs
++++ b/compiler/rustc_codegen_gcc/src/builder.rs
+@@ -1628,11 +1628,16 @@ fn cleanup_landing_pad(&mut self, _pers_fn: Function<'gcc>) -> (RValue<'gcc>, RV
+     // Real users of `#[rustc_cxx_throws]` will be on the LLVM
+     // backend; the GCC backend stub exists only so the trait
+     // compiles.
+-    fn cxx_catch_landing_pad(&mut self, pers_fn: Function<'gcc>) -> (RValue<'gcc>, RValue<'gcc>) {
++    fn cxx_catch_landing_pad(
++        &mut self,
++        pers_fn: Function<'gcc>,
++        _typeinfos: &[RValue<'gcc>],
++    ) -> (RValue<'gcc>, RValue<'gcc>) {
+         // Delegate to cleanup_landing_pad — it's not a real
+         // catch, but the trait must be satisfied. P09.62-gcc
+         // tracks a proper impl when libgccjit's try-catch
+-        // surface lands.
++        // surface lands. Typed catches (P09.68) are also
++        // stubbed here.
+         self.cleanup_landing_pad(pers_fn)
+     }
+ 
+diff --git a/compiler/rustc_codegen_gcc/src/context.rs b/compiler/rustc_codegen_gcc/src/context.rs
+index 1ce660ba198..a80b9233626 100644
+--- a/compiler/rustc_codegen_gcc/src/context.rs
++++ b/compiler/rustc_codegen_gcc/src/context.rs
+@@ -491,6 +491,27 @@ fn cxx_throws_catch_fn(&self) -> (Self::Value, Self::FunctionSignature) {
+         );
+     }
+ 
++    fn cxx_throws_catch_typed_fn(&self) -> (Self::Value, Self::FunctionSignature) {
++        unimplemented!(
++            "cxx_throws typed catches are LLVM-only for v1.13.0; \
++             GCC backend support is queued as P09.68-gcc"
++        );
++    }
++
++    fn cxx_typeinfo_global(&self, _name: &str) -> Self::Value {
++        unimplemented!(
++            "cxx_throws typed catches are LLVM-only for v1.13.0; \
++             GCC backend support is queued as P09.68-gcc"
++        );
++    }
++
++    fn cxx_typeinfo_personality(&self) -> Self::Function {
++        unimplemented!(
++            "cxx_throws typed catches are LLVM-only for v1.13.0; \
++             GCC backend support is queued as P09.68-gcc"
++        );
++    }
++
+     fn sess(&self) -> &Session {
+         self.tcx.sess
+     }
+diff --git a/compiler/rustc_codegen_llvm/src/builder.rs b/compiler/rustc_codegen_llvm/src/builder.rs
+index 71453e3e547..504d2f3e1c1 100644
+--- a/compiler/rustc_codegen_llvm/src/builder.rs
++++ b/compiler/rustc_codegen_llvm/src/builder.rs
+@@ -1227,26 +1227,66 @@ fn cleanup_landing_pad(&mut self, pers_fn: &'ll Value) -> (&'ll Value, &'ll Valu
+         (self.extract_value(landing_pad, 0), self.extract_value(landing_pad, 1))
+     }
+ 
+-    fn cxx_catch_landing_pad(&mut self, pers_fn: &'ll Value) -> (&'ll Value, &'ll Value) {
++    fn cxx_catch_landing_pad(
++        &mut self,
++        pers_fn: &'ll Value,
++        typeinfos: &[&'ll Value],
++    ) -> (&'ll Value, &'ll Value) {
+         // P09.62 / 1.13 throws Phase 1B: Itanium catch-all
+-        // landing pad. The 1-clause shape is what `catch (...)`
+-        // compiles to in C++ — a single `catch ptr null`
+-        // clause whose null type-info matches every thrown
+-        // type. The personality fn (`rust_eh_personality` on
+-        // Itanium) examines the clause; on match, control flows
+-        // straight into the catch handler block — no resume,
+-        // no further unwind.
++        // landing pad. The personality fn
++        // (`rust_eh_personality` on Itanium) examines clauses
++        // in order; on match, control flows straight into the
++        // catch handler block — no resume, no further unwind.
++        //
++        // Phase 1: single `catch ptr null` clause (catch-all).
+         //
+-        // Returns `(exception_ptr, type_info_index)`. The
+-        // `exception_ptr` is what the catch handler passes to
+-        // `cxx::native_invoke::__rustcc_cxx_catch_unknown`
+-        // (via `__cxa_begin_catch` internally) to materialize
+-        // the `CxxRawError`.
++        // P09.68 / 1.13 throws Phase 2B: when `typeinfos` is
++        // non-empty, emit one `catch ptr @<typeinfo>` clause
++        // per entry, then a final `catch ptr null` catch-all.
++        //
++        // Returns `(exception_ptr, small_index)`. The
++        // landingpad's raw `i32` selector is an opaque
++        // personality-assigned type-id; we translate it via
++        // `llvm.eh.typeid.for(@<typeinfo>)` into a
++        // **small 1-based index**:
++        //
++        //   - 1..=N for each typed clause (matching the
++        //     `typeinfos` slice order)
++        //   - 0 for the catch-all (no typed match)
++        //
++        // This makes the downstream catch BB / runtime helper
++        // logic trivial: just dispatch on the small index. The
++        // raw type-id is implementation-defined and not
++        // portable; the small index is.
+         let ty = self.type_struct(&[self.type_ptr(), self.type_i32()], false);
+-        let landing_pad = self.landing_pad(ty, pers_fn, 1);
++        let num_clauses = typeinfos.len() + 1;
++        let landing_pad = self.landing_pad(ty, pers_fn, num_clauses);
++        for &ti in typeinfos {
++            self.add_clause(landing_pad, ti);
++        }
+         let null_ty_info = self.const_null(self.type_ptr());
+         self.add_clause(landing_pad, null_ty_info);
+-        (self.extract_value(landing_pad, 0), self.extract_value(landing_pad, 1))
++
++        let exn_ptr = self.extract_value(landing_pad, 0);
++        let raw_selector = self.extract_value(landing_pad, 1);
++
++        // Phase 1: no typed clauses, no translation needed.
++        if typeinfos.is_empty() {
++            return (exn_ptr, raw_selector);
++        }
++
++        // Translate raw_selector → small 1-based index.
++        // Start with 0 (catch-all) and overlay typed matches
++        // via a chain of `select`s.
++        let i32_ty = self.type_i32();
++        let mut small_idx = self.const_uint(i32_ty, 0);
++        for (i, &ti) in typeinfos.iter().enumerate() {
++            let tid = self.call_intrinsic("llvm.eh.typeid.for", &[self.val_ty(ti)], &[ti]);
++            let is_match = self.icmp(IntPredicate::IntEQ, raw_selector, tid);
++            let small = self.const_uint(i32_ty, (i + 1) as u64);
++            small_idx = self.select(is_match, small, small_idx);
++        }
++        (exn_ptr, small_idx)
+     }
+ 
+     fn filter_landing_pad(&mut self, pers_fn: &'ll Value) {
+diff --git a/compiler/rustc_codegen_llvm/src/context.rs b/compiler/rustc_codegen_llvm/src/context.rs
+index dbdfac6ae65..e94611a4f4c 100644
+--- a/compiler/rustc_codegen_llvm/src/context.rs
++++ b/compiler/rustc_codegen_llvm/src/context.rs
+@@ -951,6 +951,74 @@ fn cxx_throws_catch_fn(&self) -> (&'ll Value, &'ll Type) {
+         (llfn, fty)
+     }
+ 
++    fn cxx_throws_catch_typed_fn(&self) -> (&'ll Value, &'ll Type) {
++        // P09.68 / 1.13 throws Phase 2B: declare (or look up) the
++        // `__rustcc_cxx_catch_typed` runtime helper. Same as
++        // `cxx_throws_catch_fn` but takes an extra `u32`
++        // selector argument so the runtime can pack the matched
++        // typeinfo index into the returned `CxxRawError.kind`.
++        //
++        // LLVM signature: `fn(ptr, u32) -> { i32, ptr }`.
++        let cxx_raw_error_ty = self.type_struct(
++            &[self.type_i32(), self.type_ptr()],
++            /* packed: */ false,
++        );
++        let fty = self.type_func(
++            &[self.type_ptr(), self.type_i32()],
++            cxx_raw_error_ty,
++        );
++        let name = "__rustcc_cxx_catch_typed";
++        let llfn = if let Some(llfn) = self.get_declared_value(name) {
++            llfn
++        } else {
++            let llfn = self.declare_cfn(name, llvm::UnnamedAddr::Global, fty);
++            let target_cpu = attributes::target_cpu_attr(self, self.sess());
++            attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &[target_cpu]);
++            llfn
++        };
++        (llfn, fty)
++    }
++
++    fn cxx_typeinfo_personality(&self) -> &'ll Value {
++        // P09.68 / 1.13 throws Phase 2B: declare (or look up)
++        // `__gxx_personality_v0` — the standard Itanium C++
++        // personality function. Required for typed-catch
++        // landingpads because the Rust personality
++        // (`rust_eh_personality`) doesn't perform typeinfo
++        // matching against arbitrary C++ thrown types.
++        //
++        // The personality has signature
++        // `i32(i32, i32, u64, ptr, ptr)` but LLVM allows
++        // declaring it with a variadic stub since the
++        // personality call is opaque to user code.
++        let name = "__gxx_personality_v0";
++        if let Some(existing) = self.get_declared_value(name) {
++            return existing;
++        }
++        // Match the shape used for the rust personality:
++        // variadic-args returning i32.
++        let fty = self.type_variadic_func(&[], self.type_i32());
++        self.declare_cfn(name, llvm::UnnamedAddr::Global, fty)
++    }
++
++    fn cxx_typeinfo_global(&self, name: &str) -> &'ll Value {
++        // P09.68 / 1.13 throws Phase 2B: declare a Itanium
++        // typeinfo extern global. The C++ side defines these
++        // (linker resolves them to the typeinfo objects in
++        // libstdc++/libc++/etc.). We declare them as
++        // opaque-pointer globals (the typeinfo object is an
++        // opaque struct from Rust's perspective; only its
++        // address matters to the personality fn).
++        if let Some(existing) = self.get_declared_value(name) {
++            return existing;
++        }
++        // Use type_ptr() for the global's type — opaque pointers
++        // make the concrete element type irrelevant. The
++        // landingpad treats this as a `ptr` value, no
++        // dereferencing happens on the Rust side.
++        self.declare_global(name, self.type_ptr())
++    }
++
+     fn sess(&self) -> &Session {
+         self.tcx.sess
+     }
+diff --git a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+index 75701f343f0..2d9b5e11dd0 100644
+--- a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
++++ b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+@@ -192,6 +192,9 @@ fn process_builtin_attrs(
+             AttributeKind::RustcCxxThrows(_) => {
+                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::CXX_THROWS
+             }
++            AttributeKind::RustcCxxThrowsTypeinfos { typeinfos, .. } => {
++                codegen_fn_attrs.cxx_throws_typeinfos = Some(*typeinfos)
++            }
+             AttributeKind::RustcStdInternalSymbol(_) => {
+                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
+             }
+diff --git a/compiler/rustc_codegen_ssa/src/mir/block.rs b/compiler/rustc_codegen_ssa/src/mir/block.rs
+index dcc5ac82ed5..5929d113458 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/block.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/block.rs
+@@ -224,14 +224,32 @@ fn do_call<Bx: BuilderMethods<'a, 'tcx>>(
+         // We detect CXX_THROWS off the callee `Instance` (when
+         // present — indirect calls through fn pointers skip this
+         // path because they don't carry per-callee attrs).
+-        let callee_cxx_throws = instance
++        let (callee_cxx_throws, callee_typeinfos_str) = instance
+             .map(|inst| {
+-                bx.tcx()
+-                    .codegen_fn_attrs(inst.def_id())
+-                    .flags
+-                    .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::CXX_THROWS)
++                let attrs = bx.tcx().codegen_fn_attrs(inst.def_id());
++                (
++                    attrs.flags.contains(
++                        rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::CXX_THROWS,
++                    ),
++                    attrs.cxx_throws_typeinfos,
++                )
+             })
+-            .unwrap_or(false);
++            .unwrap_or((false, None));
++
++        // P09.68 / 1.13 throws Phase 2B: parse the typeinfos
++        // attribute into a Vec of trimmed symbol names. The
++        // attribute is a comma-separated string. Empty list
++        // means the callee uses Phase 1 catch-all semantics.
++        let callee_typeinfos: Vec<&str> = callee_typeinfos_str
++            .as_ref()
++            .map(|s| {
++                s.as_str()
++                    .split(',')
++                    .map(str::trim)
++                    .filter(|s| !s.is_empty())
++                    .collect()
++            })
++            .unwrap_or_default();
+ 
+         let unwind_block = if let mir::UnwindAction::CxxThrowsCleanup { bb, raw_err_local } =
+             unwind
+@@ -241,14 +259,14 @@ fn do_call<Bx: BuilderMethods<'a, 'tcx>>(
+             // err_wrap_bb (which constructs Result::Err) and
+             // the raw_err_local that codegen's catch BB must
+             // populate with the runtime helper's return value.
+-            Some(fx.cxx_throws_catch_pad(bx, Some((bb, raw_err_local))))
++            Some(fx.cxx_throws_catch_pad(bx, Some((bb, raw_err_local)), &callee_typeinfos))
+         } else if callee_cxx_throws {
+             // Fallback: callee is CXX_THROWS but the MIR pass
+             // didn't (or couldn't) rewrite this call. Use the
+             // legacy abort-after-catch path; the continuation
+             // target is wherever the call would have normally
+             // returned.
+-            Some(fx.cxx_throws_catch_pad(bx, None))
++            Some(fx.cxx_throws_catch_pad(bx, None, &callee_typeinfos))
+         } else { match unwind {
+             mir::UnwindAction::Cleanup(cleanup) => Some(self.llbb_with_cleanup(fx, cleanup)),
+             mir::UnwindAction::CxxThrowsCleanup { .. } => {
+@@ -1993,6 +2011,7 @@ fn cxx_throws_catch_pad(
+         &mut self,
+         _outer_bx: &mut Bx,
+         dest: Option<(mir::BasicBlock, mir::Local)>,
++        typeinfo_names: &[&str],
+     ) -> Bx::BasicBlock {
+         let catch_llbb = Bx::append_block(self.cx, self.llfn, "cxx_throws_catch");
+         let mut catch_bx = Bx::build(self.cx, catch_llbb);
+@@ -2001,7 +2020,7 @@ fn cxx_throws_catch_pad(
+             // MSVC funclet path — synthesize a catch_switch /
+             // catch_pad pair. For P09.63 we just emit a
+             // cleanup_pad (no real catch semantics) and abort;
+-            // P09.64-msvc adds the real catch_pad + helper call.
++            // P09.67-msvc adds the real catch_pad + helper call.
+             let funclet = catch_bx.cleanup_pad(None, &[]);
+             let _ = funclet;
+             catch_bx.abort();
+@@ -2009,32 +2028,69 @@ fn cxx_throws_catch_pad(
+             return catch_llbb;
+         }
+ 
+-        // Itanium landingpad path: emit catch-all landingpad,
+-        // store exception ptr + type-info index into the
+-        // function's personality slot (so debuggers can recover
+-        // them), then call the runtime helper.
+-        let llpersonality = self.cx.eh_personality();
+-        let (exn0, exn1) = catch_bx.cxx_catch_landing_pad(llpersonality);
++        // P09.68 / 1.13 throws Phase 2B: declare each typeinfo
++        // global so we can pass them as catch clauses. Empty
++        // slice → Phase 1 catch-all behavior.
++        let typeinfo_globals: Vec<_> = typeinfo_names
++            .iter()
++            .map(|name| self.cx.cxx_typeinfo_global(name))
++            .collect();
++
++        // Choose the personality fn. For Phase 1 (no typed
++        // catches), use the Rust personality — the catch-all
++        // clause matches anything, no typeinfo dispatch is
++        // needed. For Phase 2B (typed catches), use
++        // `__gxx_personality_v0` so the personality fn
++        // actually performs typeinfo matching against the
++        // multi-clause list. Without this, the Rust
++        // personality would just match the catch-all clause
++        // and selector translation would return 0 for every
++        // catch.
++        //
++        // The personality is set function-globally inside
++        // `landing_pad()` — if the same function has both
++        // Rust panic landingpads and a typed cxx_throws
++        // landingpad, the C++ personality wins (it also
++        // handles cleanup actions, so Rust drop chains still
++        // work; it just can't match Rust panic types).
++        let llpersonality = if typeinfo_globals.is_empty() {
++            self.cx.eh_personality()
++        } else {
++            self.cx.cxx_typeinfo_personality()
++        };
++        let (exn0, exn1) =
++            catch_bx.cxx_catch_landing_pad(llpersonality, &typeinfo_globals);
+ 
+         let slot = self.get_personality_slot(&mut catch_bx);
+         slot.storage_live(&mut catch_bx);
+         Pair(exn0, exn1).store(&mut catch_bx, slot);
+ 
+-        // P09.64 / 1.13 throws Phase 1D: call the runtime
+-        // helper `cxx::native_invoke::__rustcc_cxx_catch_unknown`
+-        // with the caught exception pointer. The helper handles
+-        // `__cxa_begin_catch` / `__cxa_end_catch` internally and
+-        // returns a `CxxRawError` tagged union ({ i32, ptr }).
+-        let (helper_fn, helper_ty) = self.cx.cxx_throws_catch_fn();
+-        let raw_err = catch_bx.call(
+-            helper_ty,
+-            /* fn_attrs: */ None,
+-            /* fn_abi: */ None,
+-            helper_fn,
+-            &[exn0],
+-            /* funclet: */ None,
+-            /* instance: */ None,
+-        );
++        // Call the runtime helper. Phase 1 path: untyped
++        // catch-all → `__rustcc_cxx_catch_unknown(exn_ptr)`.
++        // Phase 2B path: typed catches → `__rustcc_cxx_catch_typed(exn_ptr, selector)`.
++        let raw_err = if typeinfo_globals.is_empty() {
++            let (helper_fn, helper_ty) = self.cx.cxx_throws_catch_fn();
++            catch_bx.call(
++                helper_ty,
++                /* fn_attrs: */ None,
++                /* fn_abi: */ None,
++                helper_fn,
++                &[exn0],
++                /* funclet: */ None,
++                /* instance: */ None,
++            )
++        } else {
++            let (helper_fn, helper_ty) = self.cx.cxx_throws_catch_typed_fn();
++            catch_bx.call(
++                helper_ty,
++                /* fn_attrs: */ None,
++                /* fn_abi: */ None,
++                helper_fn,
++                &[exn0, exn1],
++                /* funclet: */ None,
++                /* instance: */ None,
++            )
++        };
+ 
+         match dest {
+             None => {
+diff --git a/compiler/rustc_codegen_ssa/src/traits/builder.rs b/compiler/rustc_codegen_ssa/src/traits/builder.rs
+index c4200b7daed..feae8dbd976 100644
+--- a/compiler/rustc_codegen_ssa/src/traits/builder.rs
++++ b/compiler/rustc_codegen_ssa/src/traits/builder.rs
+@@ -587,10 +587,25 @@ fn select(
+     /// `cxx::native_invoke::__rustcc_cxx_catch_unknown` to
+     /// convert the caught exception into a `CxxRawError`.
+     ///
++    /// `typeinfos` is an optional list of Itanium typeinfo
++    /// pointer values (one per typed-catch clause from
++    /// `#[rustc_cxx_throws_typeinfos = "..."]`). When empty,
++    /// emits a single `catch ptr null` clause (catch-all,
++    /// Phase 1 behavior). When non-empty, emits
++    /// `catch ptr @<typeinfo>` for each entry plus a final
++    /// `catch ptr null` catch-all. The returned i32 is the
++    /// landingpad selector: 1..=N for the typed clauses,
++    /// N+1 (or 0 depending on type_id resolution) for the
++    /// catch-all.
++    ///
+     /// MSVC funclets take a separate path via `catch_pad` /
+     /// `catch_switch` and don't use this method (the call-site
+     /// codegen dispatches per-platform).
+-    fn cxx_catch_landing_pad(&mut self, pers_fn: Self::Function) -> (Self::Value, Self::Value);
++    fn cxx_catch_landing_pad(
++        &mut self,
++        pers_fn: Self::Function,
++        typeinfos: &[Self::Value],
++    ) -> (Self::Value, Self::Value);
+ 
+     // These are used only by msvc
+     fn cleanup_pad(&mut self, parent: Option<Self::Value>, args: &[Self::Value]) -> Self::Funclet;
+diff --git a/compiler/rustc_codegen_ssa/src/traits/misc.rs b/compiler/rustc_codegen_ssa/src/traits/misc.rs
+index 2c02a594182..f5bcb07876a 100644
+--- a/compiler/rustc_codegen_ssa/src/traits/misc.rs
++++ b/compiler/rustc_codegen_ssa/src/traits/misc.rs
+@@ -33,6 +33,28 @@ fn apply_vcall_visibility_metadata(
+     /// synthesized by `cxx_throws_catch_pad` (P09.63) passes
+     /// both to `bx.call`.
+     fn cxx_throws_catch_fn(&self) -> (Self::Value, Self::FunctionSignature);
++    /// P09.68 / 1.13 throws Phase 2B: function reference + type
++    /// for the typed-catch helper
++    /// `__rustcc_cxx_catch_typed(*mut c_void, u32) -> CxxRawError`.
++    /// Like `cxx_throws_catch_fn` but takes an extra `selector`
++    /// argument (the landingpad's i32 result) and produces a
++    /// `CxxRawError` whose `kind` field encodes which typeinfo
++    /// matched.
++    fn cxx_throws_catch_typed_fn(&self) -> (Self::Value, Self::FunctionSignature);
++    /// P09.68 / 1.13 throws Phase 2B: declare (or look up) an
++    /// external symbol referencing a C++ Itanium typeinfo
++    /// pointer. The symbol name is the mangled Itanium typeinfo
++    /// (e.g., `_ZTISt13runtime_error`). Returns the pointer
++    /// value usable in landingpad catch clauses.
++    fn cxx_typeinfo_global(&self, name: &str) -> Self::Value;
++    /// P09.68 / 1.13 throws Phase 2B: declare (or look up) the
++    /// C++ Itanium personality function `__gxx_personality_v0`.
++    /// Used as the personality for functions with typed-catch
++    /// landingpads so the personality fn actually performs
++    /// typeinfo matching against the multi-clause list (the
++    /// Rust personality doesn't do typeinfo matching for C++
++    /// throws).
++    fn cxx_typeinfo_personality(&self) -> Self::Function;
+     fn sess(&self) -> &Session;
+     fn set_frame_pointer_type(&self, llfn: Self::Function);
+     fn apply_target_cpu_attr(&self, llfn: Self::Function);
+diff --git a/compiler/rustc_feature/src/builtin_attrs.rs b/compiler/rustc_feature/src/builtin_attrs.rs
+index 5e6a1e9a31b..78bbd439a67 100644
+--- a/compiler/rustc_feature/src/builtin_attrs.rs
++++ b/compiler/rustc_feature/src/builtin_attrs.rs
+@@ -373,6 +373,12 @@ pub struct BuiltinAttribute {
+     // ships in P09.61 (Itanium) + P09.62 (MSVC funclet).
+     rustc_attr!(rustc_cxx_throws, "marks an `extern \"C++\"` foreign fn as a C++ throwing function; call sites lower to LLVM `invoke` with a catch landingpad and the return type becomes `Result<T, ::cxx::CxxException>`"),
+ 
++    // P09.68 / 1.13 throws Phase 2B — typed catches at codegen.
++    // Comma-separated list of Itanium typeinfo symbol names;
++    // codegen emits a multi-clause landingpad with one
++    // `catch ptr @<symbol>` per entry plus a final catch-all.
++    rustc_attr!(rustc_cxx_throws_typeinfos, "comma-separated list of C++ Itanium typeinfo symbols for typed catches on a `#[rustc_cxx_throws]` foreign fn"),
++
+     // Limits:
+     ungated!(recursion_limit),
+     ungated!(type_length_limit),
+diff --git a/compiler/rustc_hir/src/attrs/data_structures.rs b/compiler/rustc_hir/src/attrs/data_structures.rs
+index eed8b661056..da753ffa041 100644
+--- a/compiler/rustc_hir/src/attrs/data_structures.rs
++++ b/compiler/rustc_hir/src/attrs/data_structures.rs
+@@ -1612,6 +1612,19 @@ pub enum AttributeKind {
+     /// patches land.
+     RustcCxxThrows(Span),
+ 
++    /// Represents `#[rustc_cxx_throws_typeinfos = "_ZTI...,_ZTI..."]`
++    /// (P09.68 / 1.13 throws Phase 2B) — comma-separated list of
++    /// C++ Itanium typeinfo symbol names for typed catches. When
++    /// present, codegen emits a multi-clause landingpad with
++    /// `catch ptr @<symbol>` for each entry plus a final
++    /// `catch ptr null` catch-all. The landingpad's `i32`
++    /// selector becomes the index of the matched clause (1-based)
++    /// or 0 if the catch-all matched. The runtime helper packs
++    /// the selector into `CxxRawError.kind` so the user's
++    /// `From<CxxRawError>` impl can dispatch to the right
++    /// variant.
++    RustcCxxThrowsTypeinfos { typeinfos: Symbol, span: Span },
++
+     /// Represents `#[rustc_swift_symbol = "ModuleName"]` — names
+     /// the Swift module hosting an `extern "Swift"` function so
+     /// the Swift mangler can produce `$s<module><name>...F`.
+diff --git a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+index 195fc9619dd..b663460237c 100644
+--- a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
++++ b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+@@ -191,6 +191,7 @@ pub fn encode_cross_crate(&self) -> EncodeCrossCrate {
+             RustcSwiftLabels { .. } => Yes,
+             RustcSwiftThrows(..) => Yes,
+             RustcCxxThrows(..) => Yes,
++            RustcCxxThrowsTypeinfos { .. } => Yes,
+             RustcPreserveUbChecks => No,
+             RustcProcMacroDecls => No,
+             RustcPubTransparent(..) => Yes,
+diff --git a/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs b/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
+index a6cb7588d91..8767786e0d3 100644
+--- a/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
++++ b/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
+@@ -109,6 +109,14 @@ pub struct CodegenFnAttrs {
+     pub objc_class: Option<Symbol>,
+     /// The `#[rustc_objc_selector = "..."]` attribute.
+     pub objc_selector: Option<Symbol>,
++    /// The `#[rustc_cxx_throws_typeinfos = "_ZTI...,_ZTI..."]`
++    /// attribute (P09.68 / 1.13 throws Phase 2B). A
++    /// comma-separated list of C++ Itanium typeinfo symbol
++    /// names. When `Some` and `CXX_THROWS` is also set on the
++    /// callee, codegen emits a multi-clause landingpad with
++    /// one `catch ptr @<symbol>` per entry and a final
++    /// `catch ptr null` catch-all.
++    pub cxx_throws_typeinfos: Option<Symbol>,
+ }
+ 
+ #[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, HashStable, PartialEq, Eq)]
+@@ -255,6 +263,7 @@ pub const fn new() -> CodegenFnAttrs {
+             patchable_function_entry: None,
+             objc_class: None,
+             objc_selector: None,
++            cxx_throws_typeinfos: None,
+         }
+     }
+ 
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+index a7f236d963f..bf11448f6e4 100644
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -371,6 +371,7 @@ fn check_attributes(
+                     | AttributeKind::RustcSwiftLabels { .. }
+                     | AttributeKind::RustcSwiftThrows(..)
+                     | AttributeKind::RustcCxxThrows(..)
++                    | AttributeKind::RustcCxxThrowsTypeinfos { .. }
+                     | AttributeKind::RustcPreserveUbChecks
+                     | AttributeKind::RustcProcMacroDecls
+                     | AttributeKind::RustcReallocator
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 20750b95cd1..0fdb0bf26b8 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -1740,6 +1740,7 @@
+         rustc_cxx_base,
+         rustc_cxx_drop_wrapper,
+         rustc_cxx_throws,
++        rustc_cxx_throws_typeinfos,
+         rustc_cxx_wrapper,
+         rustc_deallocator,
+         rustc_default_body_unstable,
+-- 
+2.50.1 (Apple Git-155)
+
