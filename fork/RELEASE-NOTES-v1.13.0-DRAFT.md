@@ -34,7 +34,7 @@ No shim. No extra C++ object file. The catch handler is synthesized at LLVM IR l
 
 ## What ships
 
-Eleven fork rustc patches (numbered 21–31 in `fork/patches/`):
+Thirteen fork rustc patches (numbered 21–33 in `fork/patches/`):
 
 | Patch | Phase | Component | Description |
 |---|---|---|---|
@@ -49,6 +49,8 @@ Eleven fork rustc patches (numbered 21–31 in `fork/patches/`):
 | 29 | 1G' | follow-up wiring | 6 bug fixes that close the end-to-end loop (successors(), validator, visitor, pretty-print, is_cleanup, ...) |
 | 30 | 1H | `rustc_codegen_ssa::mir::block` | ABI bridging on the happy path — rebuild fn_abi with the post-MIR destination type as return, preserve can_unwind |
 | 31 | 2A | `rustc_mir_transform::cxx_throws_wrap` + `rustc_span` | `From<CxxRawError>` auto-conversion. Adds `rustc_diagnostic_item = "CxxRawError"` symbol; MIR pass injects a conversion call when the user's Err type differs from CxxRawError |
+| 32 | 2B | `rustc_codegen_*` + attribute parser | Typed catches via multi-clause landingpad. New `#[rustc_cxx_throws_typeinfos = "_ZTI...,_ZTI..."]` attribute. Selector translation via `llvm.eh.typeid.for` chain. Switches function personality to `__gxx_personality_v0` so the C++ ABI personality matches typeinfos. |
+| 33 | 2C | `rustc_codegen_*` | MSVC funclet codegen — replaces cleanup_pad+abort with real catch_switch+catch_pad for the catch-all path. Typed catches on MSVC deferred. New `BuilderMethods::catch_ret` trait method. |
 
 The MIR pass `cxx_throws_wrap` runs in `run_runtime_lowering_passes`. For each `Call` to a `CXX_THROWS` callee with a destination shaped like `Result<T, E>`, it:
 
@@ -81,6 +83,65 @@ A standalone end-to-end test (extern `int32_t maybe_throws(int32_t)` in C++ thro
 | Process exit | ✅ exit=0 | clean shutdown, no abort, no leaked exception |
 
 **Phase 1 is closed.** Both arms of the Result work end-to-end on the Itanium codegen path.
+
+## Phase 2B: typed catches via multi-clause landingpad
+
+```rust
+extern "C++" {
+    #[rustc_cxx_throws]
+    #[rustc_cxx_throws_typeinfos = "_ZTI11DomainError,_ZTI10RangeError"]
+    fn parse(input: &CxxString) -> Result<Value, MyError>;
+}
+```
+
+The fork rustc emits a multi-clause Itanium landingpad
+(`catch ptr @_ZTI11DomainError catch ptr @_ZTI10RangeError catch ptr null`),
+translates the opaque selector via `llvm.eh.typeid.for(@<ti>)`
+into a small 1-based index, and packs it into
+`CxxRawError.kind` via the runtime helper
+`__rustcc_cxx_catch_typed`. The user's `From<CxxRawError>`
+impl dispatches on the kind:
+
+```rust
+impl From<CxxRawError> for MyError {
+    fn from(raw: CxxRawError) -> Self {
+        match raw.kind {
+            cxx::CXX_EXC_TYPED_BASE      => MyError::Domain,
+            cxx::CXX_EXC_TYPED_BASE + 1  => MyError::Range,
+            _                            => MyError::Other,
+        }
+    }
+}
+```
+
+The function's personality is switched to
+`__gxx_personality_v0` so the C++ Itanium ABI personality
+fn actually performs typeinfo matching (Rust's personality
+matches only the catch-all). Runtime cleanup actions (Rust
+drop chains) still work — `__gxx_personality_v0` handles
+cleanup actions alongside typed catches.
+
+Smoke test confirms:
+
+```
+maybe_throws_typed(5)   →  ok: 10
+maybe_throws_typed(-1)  →  err: Domain   ← _ZTI11DomainError matched
+maybe_throws_typed(-2)  →  err: Range    ← _ZTI10RangeError matched
+```
+
+## Phase 2C: MSVC funclet codegen (untested)
+
+Replaces the cleanup_pad+abort placeholder on MSVC with a
+real `catch_switch` + `catch_pad` funclet that catches all
+C++ exceptions and routes to the err_wrap_bb. Typed catches
+on MSVC are deferred — MSVC uses Microsoft TypeDescriptors
+(`?AVMyClass@@` + RTTI vtable), incompatible with the
+Itanium `_ZTI<name>` symbols the
+`#[rustc_cxx_throws_typeinfos]` attribute carries.
+
+The MSVC code path is **not runtime-validated** on this
+release — no Windows toolchain on the dev machine. Builds
+cleanly; needs a Windows or Wine run to confirm.
 
 ## Phase 2A: ergonomic Result&lt;T, CxxException&gt;
 
@@ -117,9 +178,9 @@ isn't, a `span_delayed_bug` surfaces as a compile error.
 
 ## Known gaps / next steps
 
-1. **P09.67**: MSVC funclet codegen — needs `catch_pad` / `catch_switch` instead of `cleanup_pad`. Currently the MSVC path emits a `cleanup_pad + abort` placeholder.
-2. **P09.68**: Typed catches at codegen level (vs. swallow-all catch_throws_unknown). Currently every exception becomes `CxxRawError`; typed `Result<T, MyError>` works at the *wrap* level via the From conversion (P09.69) but not at the *catch* level — the runtime helper still catches everything as a single CxxRawError.
-3. **Real integration test** linking against the actual `cxx` runtime crate (not the inline stub the smoke test uses).
+1. **MSVC runtime validation** — the catch_switch/catch_pad code path (P09.67) needs an actual Windows or Wine run to confirm. Built cleanly but untested.
+2. **Typed catches on MSVC** — currently falls back to catch-all on MSVC regardless of the `#[rustc_cxx_throws_typeinfos]` attribute (Microsoft TypeDescriptor format work pending).
+3. **cxx_importer integration** — the bindings emitter doesn't yet add `#[rustc_cxx_throws_typeinfos]` based on the C++ `cxx_throws(T1, T2)` annotation. Users must hand-write the typeinfo list today. A follow-up patch routes the v1.12.x typed-catch metadata into the v1.13.0 attribute.
 
 ## Compatibility
 
