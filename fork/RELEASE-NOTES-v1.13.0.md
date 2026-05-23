@@ -1,8 +1,8 @@
-# rustcc v1.13.0 — Native `invoke` + landingpad for `#[rustc_cxx_throws]` (DRAFT)
+# rustcc v1.13.0 — Native `invoke` + landingpad for `#[rustc_cxx_throws]`
 
-**The "first time rustc itself catches a C++ exception" release.** Phase 1 of v1.13.0 ships nine fork rustc patches that lower `extern "C++" fn` declarations marked `#[rustc_cxx_throws]` to a native LLVM `invoke` instruction with a custom catch-all landingpad — replacing the v1.12.x shim-based approach for the cases where the fork rustc is available.
+**The "first time rustc itself catches a C++ exception" release.** v1.13.0 ships fifteen fork rustc patches that lower `extern "C++" fn` declarations marked `#[rustc_cxx_throws]` to a native LLVM `invoke` with a custom catch landingpad (Itanium) or `catch_switch`/`catch_pad` funclet (MSVC). The v1.12.x shim path stays alongside — stable-rustc users keep working unchanged; fork-rustc users opt into the lower-overhead native path via the cxx crate's `rustcc-fork` feature + `RustBindingsConfig::cxx_throws_use_native_invoke`.
 
-This is a draft of the release notes for the eventual v1.13.0 tag. It captures Phase 1 as runtime-validated. Phase 2 (MSVC funclet path, typed catches at codegen level, deeper integration) is still pending.
+Both paths are runtime-validated on both Itanium (macOS aarch64) and MSVC (x86_64 under Wine), for both untyped catch-all and typed-catch dispatch.
 
 ## Headline: zero-shim catches
 
