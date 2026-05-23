@@ -34,7 +34,7 @@ No shim. No extra C++ object file. The catch handler is synthesized at LLVM IR l
 
 ## What ships
 
-Thirteen fork rustc patches (numbered 21–33 in `fork/patches/`):
+Fifteen fork rustc patches (numbered 21–35 in `fork/patches/`):
 
 | Patch | Phase | Component | Description |
 |---|---|---|---|
@@ -50,7 +50,9 @@ Thirteen fork rustc patches (numbered 21–33 in `fork/patches/`):
 | 30 | 1H | `rustc_codegen_ssa::mir::block` | ABI bridging on the happy path — rebuild fn_abi with the post-MIR destination type as return, preserve can_unwind |
 | 31 | 2A | `rustc_mir_transform::cxx_throws_wrap` + `rustc_span` | `From<CxxRawError>` auto-conversion. Adds `rustc_diagnostic_item = "CxxRawError"` symbol; MIR pass injects a conversion call when the user's Err type differs from CxxRawError |
 | 32 | 2B | `rustc_codegen_*` + attribute parser | Typed catches via multi-clause landingpad. New `#[rustc_cxx_throws_typeinfos = "_ZTI...,_ZTI..."]` attribute. Selector translation via `llvm.eh.typeid.for` chain. Switches function personality to `__gxx_personality_v0` so the C++ ABI personality matches typeinfos. |
-| 33 | 2C | `rustc_codegen_*` | MSVC funclet codegen — replaces cleanup_pad+abort with real catch_switch+catch_pad for the catch-all path. Typed catches on MSVC deferred. New `BuilderMethods::catch_ret` trait method. |
+| 33 | 2C | `rustc_codegen_*` | MSVC funclet codegen — replaces cleanup_pad+abort with real catch_switch+catch_pad for the catch-all path. New `BuilderMethods::catch_ret` trait method. |
+| 34 | 2C' | `rustc_codegen_ssa::mir::block` | MSVC funclet bug fixes (Wine-validated): set personality fn, pass catch_switch token to catch_pad parent, synthesize CxxRawError inline (avoiding sret-attribute mismatch). |
+| 35 | 2D | `rustc_codegen_*` + attribute parser | Typed catches on MSVC via Microsoft TypeDescriptor synthesis. New `#[rustc_cxx_throws_msvc_typedescs]` attribute + new `cxx_typedesc_global_msvc` trait method. Multi-catchpad in catch_switch dispatches by C++ RTTI string identity. |
 
 The MIR pass `cxx_throws_wrap` runs in `run_runtime_lowering_passes`. For each `Call` to a `CXX_THROWS` callee with a destination shaped like `Result<T, E>`, it:
 
@@ -176,11 +178,52 @@ falls back to trusting the user's declared type — Phase 1
 behavior. If the diagnostic item is present but the impl
 isn't, a `span_delayed_bug` surfaces as a compile error.
 
+## cxx_importer manglers (P09.70)
+
+`crates/cxx_importer/src/cxx_exception.rs` now exposes three
+public helpers for translating C++ type names from a
+`[[clang::annotate("rustcc::cxx_throws(T1, T2)")]]`
+annotation into the attribute strings the fork rustc
+patches expect:
+
+```rust
+itanium_typeinfo_symbol_for("DomainError")
+    // -> "_ZTI11DomainError"
+msvc_typedesc_name_for("DomainError")
+    // -> ".?AVDomainError@@"
+manglings_for_typed_catches(&["DomainError".into(), "RangeError".into()])
+    // -> Some(("_ZTI11DomainError,_ZTI10RangeError",
+    //         ".?AVDomainError@@,.?AVRangeError@@"))
+```
+
+The manglers handle global-namespace classes and single
+`std::` segments; nested namespaces work for MSVC. Templates,
+references, and qualifiers return `None` — callers fall
+back to omitting the typeinfo attributes when one of the
+types can't be mangled (so the indexing across both attrs
+stays consistent).
+
+The full automatic emission inside `rust_bindings.rs` (so
+`Build::compile` adds the attributes alongside the existing
+v1.12.x shims) is the natural next step. The helpers ship
+now so downstream code can use them in isolation; the
+rust_bindings.rs threading is a larger refactor tracked as
+P09.71.
+
 ## Known gaps / next steps
 
-1. **MSVC runtime validation** — the catch_switch/catch_pad code path (P09.67) needs an actual Windows or Wine run to confirm. Built cleanly but untested.
-2. **Typed catches on MSVC** — currently falls back to catch-all on MSVC regardless of the `#[rustc_cxx_throws_typeinfos]` attribute (Microsoft TypeDescriptor format work pending).
-3. **cxx_importer integration** — the bindings emitter doesn't yet add `#[rustc_cxx_throws_typeinfos]` based on the C++ `cxx_throws(T1, T2)` annotation. Users must hand-write the typeinfo list today. A follow-up patch routes the v1.12.x typed-catch metadata into the v1.13.0 attribute.
+1. **P09.71**: thread the P09.70 manglers through
+   `rust_bindings.rs` so `Build::compile` emits the
+   `#[rustc_cxx_throws_typeinfos]` +
+   `#[rustc_cxx_throws_msvc_typedescs]` attributes
+   automatically based on the C++ `cxx_throws(T1, T2)`
+   annotations. Today users must write the lists by hand or
+   call the helpers themselves.
+2. **GCC backend support** — currently MSVC typed catches +
+   the helper synthesis path are stubbed via `unimplemented!()`
+   in the GCC backend. The Itanium-on-GCC path also needs
+   real `cxx_catch_landing_pad` semantics (currently stubbed
+   to `cleanup_landing_pad`).
 
 ## Compatibility
 
