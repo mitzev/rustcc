@@ -16,6 +16,7 @@ mod callback;
 mod exception;
 mod heap;
 mod move_;
+pub mod native_invoke;
 mod owned;
 mod shared;
 mod stack;
