@@ -194,6 +194,7 @@ pub const CXX_EXC_TYPED_BASE: u32 = 16;
 /// };
 /// ```
 #[repr(C)]
+#[cfg_attr(feature = "rustcc-fork", rustc_diagnostic_item = "CxxRawError")]
 pub struct CxxRawError {
     pub kind: u32,
     pub message: *const std::os::raw::c_char,

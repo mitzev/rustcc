@@ -7,6 +7,7 @@
 //!
 //! See `docs/ownership_and_safety.md`.
 
+#![cfg_attr(feature = "rustcc-fork", feature(rustc_attrs))]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
 

@@ -34,7 +34,7 @@ No shim. No extra C++ object file. The catch handler is synthesized at LLVM IR l
 
 ## What ships
 
-Ten fork rustc patches (numbered 21–30 in `fork/patches/`):
+Eleven fork rustc patches (numbered 21–31 in `fork/patches/`):
 
 | Patch | Phase | Component | Description |
 |---|---|---|---|
@@ -48,6 +48,7 @@ Ten fork rustc patches (numbered 21–30 in `fork/patches/`):
 | 28 | 1G | `rustc_middle::mir::syntax` + 14 visitor sites | New `UnwindAction::CxxThrowsCleanup { bb, raw_err_local }` variant + codegen plumbing |
 | 29 | 1G' | follow-up wiring | 6 bug fixes that close the end-to-end loop (successors(), validator, visitor, pretty-print, is_cleanup, ...) |
 | 30 | 1H | `rustc_codegen_ssa::mir::block` | ABI bridging on the happy path — rebuild fn_abi with the post-MIR destination type as return, preserve can_unwind |
+| 31 | 2A | `rustc_mir_transform::cxx_throws_wrap` + `rustc_span` | `From<CxxRawError>` auto-conversion. Adds `rustc_diagnostic_item = "CxxRawError"` symbol; MIR pass injects a conversion call when the user's Err type differs from CxxRawError |
 
 The MIR pass `cxx_throws_wrap` runs in `run_runtime_lowering_passes`. For each `Call` to a `CXX_THROWS` callee with a destination shaped like `Result<T, E>`, it:
 
@@ -81,12 +82,44 @@ A standalone end-to-end test (extern `int32_t maybe_throws(int32_t)` in C++ thro
 
 **Phase 1 is closed.** Both arms of the Result work end-to-end on the Itanium codegen path.
 
-## Known gaps / next steps (Phase 2)
+## Phase 2A: ergonomic Result&lt;T, CxxException&gt;
+
+With P09.69 (patch 31), the user's `Result<T, E>` Err type
+no longer has to be `CxxRawError` exactly. Any type that
+implements `From<CxxRawError>` works:
+
+```rust
+extern "C++" {
+    #[rustc_cxx_throws]
+    fn maybe_throws(x: i32) -> Result<i32, CxxException>;
+}
+```
+
+The MIR pass detects that `CxxException != CxxRawError`,
+resolves `<CxxException as From<CxxRawError>>::from`, and
+injects a conversion call between the runtime helper's
+result and the final `Result::Err` wrap. The cxx runtime
+crate marks `CxxRawError` with
+`#[rustc_diagnostic_item = "CxxRawError"]` so the MIR pass
+can find it.
+
+Smoke test confirms:
+
+| Err type | Result |
+|---|---|
+| `CxxRawError` | `Err(kind=42)` (raw helper return, no conversion) |
+| `CxxException` | `Err(kind=Runtime)` (typed kind via From impl) |
+
+If the diagnostic item is missing (no `cxx` dep), the pass
+falls back to trusting the user's declared type — Phase 1
+behavior. If the diagnostic item is present but the impl
+isn't, a `span_delayed_bug` surfaces as a compile error.
+
+## Known gaps / next steps
 
 1. **P09.67**: MSVC funclet codegen — needs `catch_pad` / `catch_switch` instead of `cleanup_pad`. Currently the MSVC path emits a `cleanup_pad + abort` placeholder.
-2. **P09.68**: Typed catches at codegen level (vs. swallow-all catch_throws_unknown). Currently every exception becomes `CxxRawError`; typed `Result<T, MyError>` only works via v1.12.x sidecar shims.
-3. **P09.69**: `CxxException` ergonomic conversion. Today the Err payload is the raw `{ i32, ptr }` from the helper; users typically want a `From<CxxRawError> for CxxException` conversion at the wrap site.
-4. **Real integration test** linking against the actual `cxx` runtime crate (not the inline stub the smoke test uses).
+2. **P09.68**: Typed catches at codegen level (vs. swallow-all catch_throws_unknown). Currently every exception becomes `CxxRawError`; typed `Result<T, MyError>` works at the *wrap* level via the From conversion (P09.69) but not at the *catch* level — the runtime helper still catches everything as a single CxxRawError.
+3. **Real integration test** linking against the actual `cxx` runtime crate (not the inline stub the smoke test uses).
 
 ## Compatibility
 

@@ -6,4 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 description = "Runtime types for Rust <-> C++ interop in rustcc."
 
+[features]
+default = []
+# Opt-in feature for the rustcc fork rustc — enables the
+# `rustc_diagnostic_item` attribute on CxxRawError so the
+# fork's MIR pass (P09.69) can find the type for automatic
+# Result<T, E> conversions. Requires nightly + the fork
+# rustc. Stable users should leave this off.
+rustcc-fork = []
+
 [dependencies]
