@@ -27,7 +27,7 @@ pub use boxed::CxxBox;
 pub use callback::CxxCallback;
 pub use exception::{
     decode as decode_cxx_raw_error, CxxException, CxxExceptionKind, CxxRawError,
-    CXX_EXC_OK, CXX_EXC_STD, CXX_EXC_UNKNOWN,
+    CXX_EXC_OK, CXX_EXC_STD, CXX_EXC_TYPED_BASE, CXX_EXC_UNKNOWN,
 };
 pub use heap::{CxxDeletable, CxxHeap};
 pub use move_::CxxMove;

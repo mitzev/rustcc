@@ -32,6 +32,19 @@ pub enum CxxExceptionKind {
     /// Caught via `catch (...)` — `message` is the
     /// synthetic `"non-std::exception C++ exception"`.
     Unknown,
+    /// v1.12.7 (Phase 3): a typed catch matched a specific
+    /// exception type listed in
+    /// `[[clang::annotate("rustcc::cxx_throws(Type1, Type2, …)")]]`.
+    /// The `u32` is the zero-based index into the annotation's
+    /// type list (`0` = first type, `1` = second, …), so the
+    /// Rust-side caller can dispatch into a typed enum variant
+    /// once the multi-variant emission lands (tracked as the
+    /// follow-on to v1.12.7).
+    ///
+    /// `message` is still the result of `what()` on the caught
+    /// exception — Phase 3 typed catches are constrained to
+    /// `std::exception` subclasses so this is always safe.
+    Typed(u32),
 }
 
 impl CxxException {
@@ -56,8 +69,17 @@ impl CxxException {
             let cstr = unsafe { std::ffi::CStr::from_ptr(message_ptr) };
             Cow::Owned(cstr.to_string_lossy().into_owned())
         };
+        // v1.12.7: typed catches use kind tags in the
+        // `CXX_EXC_TYPED_BASE`-and-up range. `Typed(N)` where N
+        // is `kind_tag - CXX_EXC_TYPED_BASE`. Tags 0, 1, 2 stay
+        // reserved for OK / Std / Unknown.
         let kind = match kind_tag {
+            CXX_EXC_OK => CxxExceptionKind::Unknown, // OK shouldn't reach here
             CXX_EXC_STD => CxxExceptionKind::Std,
+            CXX_EXC_UNKNOWN => CxxExceptionKind::Unknown,
+            n if n >= CXX_EXC_TYPED_BASE => {
+                CxxExceptionKind::Typed(n - CXX_EXC_TYPED_BASE)
+            }
             _ => CxxExceptionKind::Unknown,
         };
         CxxException { kind, message }
@@ -87,6 +109,9 @@ impl fmt::Display for CxxException {
         match self.kind {
             CxxExceptionKind::Std => write!(f, "C++ exception: {}", self.message),
             CxxExceptionKind::Unknown => write!(f, "non-std C++ exception"),
+            CxxExceptionKind::Typed(idx) => {
+                write!(f, "C++ exception (typed slot {idx}): {}", self.message)
+            }
         }
     }
 }
@@ -100,6 +125,12 @@ pub const CXX_EXC_OK: u32 = 0;
 pub const CXX_EXC_STD: u32 = 1;
 /// Caught via `catch (...)` — non-std exception.
 pub const CXX_EXC_UNKNOWN: u32 = 2;
+/// v1.12.7 (Phase 3): typed catch tags occupy the range
+/// `[CXX_EXC_TYPED_BASE, u32::MAX)`. The C++ shim emits
+/// `CXX_EXC_TYPED_BASE + index` where `index` is the 0-based
+/// position of the matched type in the annotation's
+/// `cxx_throws(T1, T2, …)` list.
+pub const CXX_EXC_TYPED_BASE: u32 = 16;
 
 /// C++-side tagged-union layout. The generated shim wraps the
 /// original function and returns this struct by value. Layout
