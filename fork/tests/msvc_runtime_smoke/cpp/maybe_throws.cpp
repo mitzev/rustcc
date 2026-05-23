@@ -21,3 +21,26 @@ extern "C" __declspec(dllexport) int32_t maybe_throws(int32_t x) noexcept(false)
     }
     return x * 2;
 }
+
+// P09.68-msvc: typed-catch smoke fixture. Throws different
+// types based on input so Rust-side typed catches can be
+// validated against the MSVC RTTI dispatch.
+class DomainError {
+public:
+    DomainError() {}
+};
+
+class RangeError {
+public:
+    RangeError() {}
+};
+
+extern "C" __declspec(dllexport) int32_t maybe_throws_typed(int32_t x) noexcept(false) {
+    if (x == -1) {
+        throw DomainError{};
+    }
+    if (x == -2) {
+        throw RangeError{};
+    }
+    return x * 2;
+}

@@ -37,6 +37,11 @@ path = "src/override.rs"
 name = "msvc_cxx_throws"
 path = "src/cxx_throws.rs"
 
+# v1.13.0 P09.68-msvc: typed catches via MSVC TypeDescriptor.
+[[bin]]
+name = "msvc_cxx_throws_typed"
+path = "src/cxx_throws_typed.rs"
+
 [workspace]
 
 [profile.dev]

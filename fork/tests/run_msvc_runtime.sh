@@ -108,6 +108,7 @@ declare -a TESTS=(
     "msvc_virtual_dtor:100"  # patch 18: scalar deleting dtor side-effect
     "msvc_override:14"       # patch 17: derived class vtable override
     "msvc_cxx_throws:3"      # P09.67b: catch_switch funclet catches C++ throw
+    "msvc_cxx_throws_typed:3"  # P09.68-msvc: typed catches via TypeDescriptor
 )
 
 ALL_PASS=1
