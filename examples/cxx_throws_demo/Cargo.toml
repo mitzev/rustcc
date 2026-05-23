@@ -1,0 +1,44 @@
+# End-to-end demo of the rustcc cxx_throws system (Phase 0).
+#
+# Shows the full pipeline a real downstream crate uses:
+#   - C++ header in cpp/library.hpp with rustcc::cxx_throws
+#     annotations
+#   - build.rs drives cxx_importer::build::Build to emit Rust
+#     bindings + matching C++ shims
+#   - cc::Build compiles the library implementation
+#   - cargo links both archives + the rustcc bindings against
+#     main.rs
+#
+# This crate intentionally lives OUTSIDE the rustcc workspace
+# (not a workspace member) because it has a build-time
+# dependency on cxx_importer with the `build` feature, which
+# pulls in libclang + cc — both heavier than the workspace
+# wants on every `cargo test` invocation.
+#
+# Run with:
+#   cd examples/cxx_throws_demo
+#   cargo run --release
+
+[workspace]
+# Explicitly opt out of the parent workspace — same pattern the
+# other examples/ crates use. We pull in cxx + cxx_importer via
+# explicit path = "../../crates/..." entries so we don't need
+# workspace membership.
+
+[package]
+name = "cxx_throws_demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Runtime types — CxxException + the FFI mirror.
+cxx = { path = "../../crates/cxx" }
+
+[build-dependencies]
+# Bindings generator + shim emitter. The `build` feature opts
+# into the `Build::compile` orchestrator API.
+cxx_importer = { path = "../../crates/cxx_importer", features = ["build"] }
+# Used directly by build.rs to compile the user library
+# implementation (library.cpp) into a static archive alongside
+# the orchestrator-emitted shims.
+cc = "1.2"

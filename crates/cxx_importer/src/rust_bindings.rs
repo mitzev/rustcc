@@ -1089,10 +1089,16 @@ fn render_direct_extern_class(
     // separately during the per-method loop below and emit
     // them in a second `extern "C"` block (and class-scope
     // statics still flow into the `extern "C++"` block).
-    let _ = writeln!(block, "{indent}unsafe extern \"C++\" {{");
-    // Side-buffer for throws-tagged extern decls. Flushed
-    // immediately after the "C++" block closes, before the
-    // impl block opens.
+    // v1.12.21: buffer non-throws extern decls + statics until
+    // we know the block has content. When every method on the
+    // class is throws-tagged AND there are no class-scope
+    // statics, the `extern "C++"` block would otherwise emit
+    // empty, which stock rustc rejects (only fork rustc accepts
+    // empty extern "C++" blocks). Buffering lets us elide the
+    // block header + closing brace entirely when it would be
+    // empty.
+    let mut cxx_extern_lines: Vec<String> = Vec::new();
+    // Side-buffer for throws-tagged extern decls.
     let mut throws_extern_lines: Vec<String> = Vec::new();
 
     // Pre-compute the disambiguated Rust name for each method.
@@ -1226,19 +1232,18 @@ fn render_direct_extern_class(
                     ret = emission.extern_return_clause,
                 ));
             } else {
-                // Emit the extern decl line.
-                let _ = writeln!(
-                    block,
+                // Emit the extern decl line into the cxx_extern
+                // buffer; flushed below only if non-empty.
+                cxx_extern_lines.push(format!(
                     "{indent}    #[link_name = \"{}\"]",
                     emission.link_name,
-                );
-                let _ = writeln!(
-                    block,
+                ));
+                cxx_extern_lines.push(format!(
                     "{indent}    fn {ext}({decl}){ret};",
                     ext = emission.extern_ident,
                     decl = emission.extern_decl_params,
                     ret = emission.extern_return_clause,
-                );
+                ));
             }
         }
         method_blocks.push(emission);
@@ -1269,12 +1274,11 @@ fn render_direct_extern_class(
         let extern_ident =
             format!("__cxx_static_{}_{}", class_name, sd.name.0);
         let mut_kw = if sd.cv.is_const { "" } else { "mut " };
-        let _ = writeln!(block, "{indent}    #[link_name = \"{link_name}\"]");
-        let _ = writeln!(
-            block,
+        cxx_extern_lines.push(format!("{indent}    #[link_name = \"{link_name}\"]"));
+        cxx_extern_lines.push(format!(
             "{indent}    pub(super) static {mut_kw}{ext}: {rendered_ty};",
             ext = extern_ident,
-        );
+        ));
         emitted_statics.push((
             rust_safe_ident(&sd.name.0),
             extern_ident,
@@ -1282,8 +1286,20 @@ fn render_direct_extern_class(
             rendered_ty,
         ));
     }
-    let _ = writeln!(block, "{indent}}}");
-    let _ = writeln!(block);
+    // v1.12.21: flush the cxx_extern buffer only if it has
+    // content. An empty `extern "C++" {}` block is rejected by
+    // stock rustc (fork rustc accepts it), so when every
+    // method on the class is throws-tagged AND there are no
+    // class-scope statics, we skip the block header + close
+    // brace entirely.
+    if !cxx_extern_lines.is_empty() {
+        let _ = writeln!(block, "{indent}unsafe extern \"C++\" {{");
+        for line in &cxx_extern_lines {
+            let _ = writeln!(block, "{line}");
+        }
+        let _ = writeln!(block, "{indent}}}");
+        let _ = writeln!(block);
+    }
 
     // v1.12.3: emit the separate `extern "C"` block for any
     // throws-tagged method shims collected during the loop above.
