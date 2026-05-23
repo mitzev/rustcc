@@ -2,9 +2,9 @@
 
 **Status**:
 - **Phase 0** (C++-side catch shim): **shipped** in v1.12.0–v1.12.4. See `crates/cxx/src/exception.rs` + `crates/cxx_importer/src/cxx_exception.rs`.
-- **Phase 1** (Itanium native `invoke` + landingpad): **scaffolding shipped** in v1.12.5 (`crates/cxx/src/native_invoke.rs` + `fork/patches/21-rustc-cxx-throws-attr.patch`); codegen lowering is v1.12.6.
-- **Phase 2** (MSVC `catchpad`/`catchswitch` funclet EH): v1.12.7.
-- **Phase 3** (typed catches + `what()` extraction): v1.12.8.
+- **Phase 1** (Itanium native `invoke` + landingpad): **runtime shipped** in v1.12.5 (`crates/cxx/src/native_invoke.rs` + `fork/patches/21-rustc-cxx-throws-attr.patch`); Itanium codegen lowering still aspirational.
+- **Phase 2** (MSVC `catchpad`/`catchswitch` funclet EH): **runtime shipped cross-platform** in v1.12.6 (same `cxx::native_invoke` module, MSVC-specific cfg arm added); MSVC codegen lowering still aspirational.
+- **Phase 3** (typed catches + `what()` extraction): v1.12.7.
 
 ## What we want
 
@@ -62,9 +62,15 @@ Fork rustc lowers a `#[rustc_cxx_throws]`-marked `extern "C++"` call from LLVM `
 - `fork/patches/22-rustc-cxx-throws-itanium-invoke.patch` — codegen rewrite from `call` → `invoke` for marked decls. Emits the catch landingpad block + the call to `__rustcc_cxx_catch_unknown`. Wraps the visible return type as `Result<T, ::cxx::CxxException>` at the MIR / signature level so callers see the rewritten shape.
 - Integration test: `crates/cxx/tests/native_invoke_phase1_runtime.rs` — links a C++ throwing function, calls it via `#[rustc_cxx_throws]` extern decl, asserts `Result::Err(_)` round-trips.
 
-### Phase 2 — MSVC funclet EH (v1.12.7)
+### Phase 2 — MSVC funclet EH (v1.12.6 runtime, codegen TBD)
 
-Same Rust API surface as Phase 1; different LLVM IR shape inside fork codegen:
+Same Rust API surface as Phase 1; different LLVM IR shape inside fork codegen.
+
+**v1.12.6 shipped**:
+- `cxx::native_invoke` now compiles on both Itanium and MSVC targets. The MSVC arm of `__rustcc_cxx_catch_unknown` skips the `__cxa_begin_catch` / `__cxa_end_catch` calls — the funclet's `catchret` handles lifetime — but exposes the same `extern "C"` symbol so fork rustc codegen emits identical call IR regardless of target. Only the surrounding catchpad-vs-landingpad IR differs.
+- The cross-target `#[cfg]` arms gate Itanium-only externs (`__cxa_begin_catch` / `__cxa_end_catch`) without breaking the MSVC build.
+
+**v1.12.6 codegen patch (still aspirational)**:
 
 ```text
    %cs = catchswitch within none [label %catchpad] unwind to caller
@@ -79,7 +85,7 @@ catchpad:
 
 **Status**: stub in `cxx::native_invoke` (Itanium-only `#[cfg]` today); MSVC-side TBD in v1.12.7.
 
-### Phase 3 — Typed catches (v1.12.8)
+### Phase 3 — Typed catches (v1.12.7)
 
 `[[rustcc::cxx_throws(std::runtime_error)]]` — catch only `std::runtime_error` and subclasses; let other exception types propagate. Itanium emits a non-null type-info in the catch clause:
 
@@ -98,7 +104,7 @@ Multi-catch via `[[rustcc::cxx_throws(A, B, C)]]` maps to multiple clauses on th
 | Codegen: `call` → `invoke` for marked calls (Itanium) | ~300 | 4 days | 1 (v1.12.6) |
 | Return-type rewriting MIR pass | ~150 | 3 days | 1 (v1.12.6) |
 | MSVC funclet catch + runtime helper | ~400 | 6 days | 2 (v1.12.7) |
-| Phase 3 typed catches + dispatch | ~400 | 5 days | 3 (v1.12.8) |
+| Phase 3 typed catches + dispatch | ~400 | 5 days | 3 (v1.12.7) |
 
 ## What's done (cumulative)
 

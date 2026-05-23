@@ -42,16 +42,30 @@
 //! C++ exception type). Phase 3 (#34) extends this to typed
 //! catches via per-type RTTI pointers.
 //!
-//! ## What's intentionally absent in v1.12.5
+//! ## What's intentionally absent in v1.12.5 + v1.12.6
 //!
 //! - **`what()` extraction.** The catch-all path doesn't know the
 //!   dynamic type of the thrown exception, so it can't safely call
-//!   `what()`. Phase 3 wires up `dynamic_cast<std::exception*>` via
-//!   a separate (`-lstdc++`-linking) helper TU.
-//! - **MSVC funclet EH.** The `catchpad`/`catchswitch` shape is
-//!   different from Itanium's landingpad; v1.12.7 handles that
-//!   target. The runtime helpers below are Itanium-only — guarded
-//!   by `#[cfg(not(all(windows, target_env = "msvc")))]`.
+//!   `what()`. Phase 3 (v1.12.8) wires up `dynamic_cast<std::exception*>`
+//!   via a separate (`-lstdc++` or `-llibcxx_msvc`-linking) helper TU.
+//!
+//! ## Per-target shape (v1.12.6 cross-platform)
+//!
+//! - **Itanium** (`linux`, `macos`, non-msvc `windows`): the
+//!   helper calls `__cxa_begin_catch` / `__cxa_end_catch` to take
+//!   ownership of the exception inside the landingpad before
+//!   returning the `CxxRawError`. libc++abi / libsupc++ are
+//!   already in the user's link line because the personality fn
+//!   needs them.
+//!
+//! - **MSVC C++ EH** (`target_env = "msvc"`): no `__cxa_*` calls.
+//!   The funclet's `catchret` instruction automatically releases
+//!   the exception object when the funclet returns, so the
+//!   helper just builds the `CxxRawError` and lets the funclet
+//!   machinery handle cleanup. The same C symbol name is
+//!   exported on both targets so fork rustc codegen emits the
+//!   same `call` instruction regardless of target — only the
+//!   surrounding catchpad-vs-landingpad IR differs.
 //!
 //! ## Coexistence with Phase 0
 //!
@@ -61,11 +75,13 @@
 //! plumbing). Without that flag, the Phase 0 shim path stays the
 //! default — no behavior change for existing users.
 
-#![cfg(not(all(windows, target_env = "msvc")))]
-
 use crate::exception::{CxxException, CxxRawError, CXX_EXC_UNKNOWN};
 use std::os::raw::c_void;
 
+// Itanium-only externs. MSVC's funclet machinery handles
+// exception lifetime through `catchret`, so we don't call the
+// Itanium `__cxa_*` runtime there.
+#[cfg(not(all(windows, target_env = "msvc")))]
 unsafe extern "C" {
     /// Itanium C++ ABI personality-output handler. Takes the
     /// "exception object pointer" the personality function
@@ -90,41 +106,63 @@ unsafe extern "C" {
 /// valid for the lifetime of the program. Null-terminated.
 static UNKNOWN_MESSAGE_CSTR: &[u8] = b"non-std::exception C++ exception\0";
 
-/// Convert a raw Itanium exception pointer into a
-/// [`CxxRawError`] carrying the `Unknown` kind tag and a fixed
+/// Convert a raw exception pointer into a [`CxxRawError`]
+/// carrying the `Unknown` kind tag and a fixed
 /// `"non-std::exception C++ exception"` message.
 ///
-/// **This is the v1.12.5 minimum** — the catch-all path that
-/// loses the dynamic exception type. v1.12.8 (Phase 3) adds a
-/// parallel `catch_std_exception` helper that does
+/// **This is the v1.12.5 + v1.12.6 minimum** — the catch-all
+/// path that loses the dynamic exception type. v1.12.8 (Phase 3)
+/// adds a parallel `catch_std_exception` helper that does
 /// `dynamic_cast<std::exception*>` and extracts `what()`.
+///
+/// # Per-target behavior
+///
+/// - **Itanium**: calls `__cxa_begin_catch` / `__cxa_end_catch`
+///   to take + release ownership of the exception.
+/// - **MSVC**: no `__cxa_*` calls — the funclet's `catchret`
+///   instruction handles release. The helper just builds the
+///   `CxxRawError`.
 ///
 /// # Safety
 ///
 /// `exc_ptr` must be the value of the personality function's
-/// exception-object output (i.e., `extractvalue { ptr, i32 }
-/// %landingpad_result, 0` in LLVM IR). Passing any other pointer
-/// — including null, an already-caught pointer, or a pointer
-/// from a different throw — is undefined behavior; the runtime
-/// will likely abort via `std::terminate`.
+/// exception-object output:
+///
+/// - Itanium: `extractvalue { ptr, i32 } %landingpad_result, 0`
+/// - MSVC: result of `llvm.eh.exceptionpointer.i8` on the
+///   surrounding `catchpad` token
+///
+/// Passing any other pointer — null, already-caught, from a
+/// different throw — is undefined behavior; the runtime will
+/// likely abort via `std::terminate`.
 ///
 /// The fork rustc codegen layer emits a `call` to this function
-/// inside the catch landingpad, so user code never invokes it
-/// directly.
+/// inside the catch landingpad / funclet, so user code never
+/// invokes it directly.
 #[no_mangle]
 pub unsafe extern "C" fn __rustcc_cxx_catch_unknown(
     exc_ptr: *mut c_void,
 ) -> CxxRawError {
     // SAFETY: caller's contract — `exc_ptr` is the personality
-    // output. `__cxa_begin_catch` is the canonical Itanium API
-    // for taking ownership of the exception inside a catch
-    // handler. We immediately end_catch without inspecting the
-    // object because Phase 1 only ships the catch-all path.
+    // output. On Itanium we round-trip through
+    // `__cxa_begin_catch` / `__cxa_end_catch` to acquire +
+    // release the exception. On MSVC the funclet handles
+    // lifetime; we just consume `exc_ptr` (it stays live for
+    // the duration of the funclet, which is our caller).
     //
     // The static `UNKNOWN_MESSAGE_CSTR` outlives the program, so
     // the returned `*const c_char` is always valid.
-    let _obj = unsafe { __cxa_begin_catch(exc_ptr) };
-    unsafe { __cxa_end_catch() };
+    #[cfg(not(all(windows, target_env = "msvc")))]
+    {
+        let _obj = unsafe { __cxa_begin_catch(exc_ptr) };
+        unsafe { __cxa_end_catch() };
+    }
+    #[cfg(all(windows, target_env = "msvc"))]
+    {
+        // Consume to suppress unused-variable lint without
+        // dropping the safety obligation on the caller side.
+        let _ = exc_ptr;
+    }
     CxxRawError {
         kind: CXX_EXC_UNKNOWN,
         message: UNKNOWN_MESSAGE_CSTR.as_ptr() as *const std::os::raw::c_char,
