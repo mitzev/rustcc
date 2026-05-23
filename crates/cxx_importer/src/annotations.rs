@@ -118,6 +118,29 @@ pub struct SidecarSchema {
     pub schema: u32,
     #[serde(default)]
     pub types: BTreeMap<String, TypeEntry>,
+    /// v1.12.4: per-free-function overrides, keyed by the
+    /// fully-qualified C++ name (e.g. `do_divide`,
+    /// `ns::sub::compute`). Lets users mark a free fn as throwing
+    /// (or rename / skip it) without inline `[[clang::annotate]]`
+    /// markup in the source.
+    #[serde(default)]
+    pub free_functions: BTreeMap<String, FreeFunctionEntry>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FreeFunctionEntry {
+    /// Override the emitted Rust-side function name.
+    #[serde(default)]
+    pub rust_name: Option<String>,
+    /// Skip emission entirely.
+    #[serde(default)]
+    pub skip: Option<bool>,
+    /// v1.12.4: mark as throwing. Emitter wraps via the Phase 0
+    /// catch shim — same shape as
+    /// `[[clang::annotate("rustcc::cxx_throws")]]`.
+    #[serde(default)]
+    pub throws: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -204,11 +227,18 @@ impl SidecarSchema {
     }
 
     /// Return annotations that apply to `entity`, whether that's a
-    /// type-level entity (`"std::vector"`) or a method-level entity
-    /// (`"std::vector::push_back(T&&)"`).
+    /// type-level entity (`"std::vector"`), a method-level entity
+    /// (`"std::vector::push_back(T&&)"`), or a free-function entity
+    /// (`"do_divide"` / `"ns::sub::compute"`).
     pub fn annotations_for(&self, entity: &str) -> Option<Vec<Annotation>> {
         if let Some(t) = self.types.get(entity) {
             return Some(annotations_from_type(t));
+        }
+        // v1.12.4: free-function lookup. Top-level `free_functions:`
+        // entries don't have method-style signatures, so try this
+        // before the method-split path.
+        if let Some(ff) = self.free_functions.get(entity) {
+            return Some(annotations_from_free_function(ff));
         }
         // Method lookup: split on the last `::` and look up the type.
         if let Some((type_name, method_sig)) = split_method_entity(entity) {
@@ -220,6 +250,20 @@ impl SidecarSchema {
         }
         None
     }
+}
+
+fn annotations_from_free_function(entry: &FreeFunctionEntry) -> Vec<Annotation> {
+    let mut out = Vec::new();
+    if let Some(name) = &entry.rust_name {
+        out.push(Annotation::Name(name.clone()));
+    }
+    if entry.skip == Some(true) {
+        out.push(Annotation::Skip);
+    }
+    if entry.throws == Some(true) {
+        out.push(Annotation::CxxThrows);
+    }
+    out
 }
 
 fn split_method_entity(entity: &str) -> Option<(&str, &str)> {
