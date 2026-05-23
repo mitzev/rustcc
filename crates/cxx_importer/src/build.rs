@@ -390,7 +390,12 @@ impl Build {
         // Use the same Target we used to build the argv so the
         // Rust-side ctx and the libclang TU agree on ABI flavor.
         let mut ctx = CxxTypeCtx::new(target_for_argv);
-        let annotations = AnnotationSet::default();
+        // v1.12.14: harvest inline `[[clang::annotate("rustcc::…")]]`
+        // markup. The annotation walker re-parses each header (a
+        // tracked perf gap, see `import::collect_annotations`'s
+        // doc comment) but the cost is negligible next to the
+        // downstream `cc::Build::compile` step.
+        let mut annotations = AnnotationSet::default();
         let mut aliases = AliasSet::default();
         let mut enums = EnumSet::default();
         let mut free_fns = FreeFnSet::default();
@@ -435,6 +440,21 @@ impl Build {
             enums.entries.extend(captured_enums);
             free_fns.entries.extend(captured_free_fns);
             static_data.entries.extend(captured_static_data);
+
+            // v1.12.14: harvest annotations from this header
+            // using the same Clang instance the main import
+            // pass uses — re-initing libclang per parse has
+            // been observed to segfault on libclang 17+ when
+            // ASTs from earlier parses are still in scope.
+            let collected = crate::import::collect_annotations_with_clang(
+                &clang,
+                header,
+                &argv,
+            )
+            .map_err(BuildError::Import)?;
+            for (key, anns) in collected {
+                annotations.inline.entry(key).or_default().extend(anns);
+            }
         }
 
         // ----- 3. Emit Rust bindings. ------

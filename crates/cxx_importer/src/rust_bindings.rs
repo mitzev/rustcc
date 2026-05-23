@@ -4592,6 +4592,32 @@ fn render_free_fns(
         std::collections::HashSet::new();
 
     for ff in fns {
+        // v1.12.14: honor `[[clang::annotate("rustcc::skip")]]`
+        // (or sidecar `skip: true`) on free fns by dropping them
+        // before any rendering work — same precedence rule the
+        // class emitter uses at the top of `render_direct_extern_class`.
+        let ff_fqn = if ff.parent.is_empty() {
+            ff.name.0.clone()
+        } else {
+            let mut parts: Vec<String> = ff
+                .parent
+                .iter()
+                .filter_map(|seg| match seg {
+                    rustc_abi_cxx::NameSegment::Namespace(id) => Some(id.0.clone()),
+                    _ => None,
+                })
+                .collect();
+            parts.push(ff.name.0.clone());
+            parts.join("::")
+        };
+        if annotations
+            .effective(&ff_fqn)
+            .iter()
+            .any(|a| matches!(a, Annotation::Skip))
+        {
+            continue;
+        }
+
         let where_ = format!("free fn `{}`", ff.name.0);
         let mut params_ok = true;
         let mut params: Vec<(String, String)> = Vec::with_capacity(ff.sig.params.len());
