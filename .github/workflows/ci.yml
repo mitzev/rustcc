@@ -37,6 +37,19 @@ jobs:
       - name: cargo test --workspace
         run: cargo test --workspace --locked
 
+      # v1.12.22: gate the cxx_throws_demo example. The demo
+      # lives outside the workspace (separate Cargo.toml) so
+      # `cargo test --workspace` doesn't reach it. Build + run
+      # it here so the throws-system end-to-end pipeline can't
+      # bit-rot between releases — if a future refactor breaks
+      # the orchestrator's annotation harvest or shim emission,
+      # this step catches it on PR.
+      - name: cargo run -p cxx_throws_demo
+        working-directory: examples/cxx_throws_demo
+        run: |
+          cargo build --locked
+          cargo run --locked
+
   patches-apply:
     name: fork/patches apply cleanly on pinned nightly
     runs-on: ubuntu-latest
