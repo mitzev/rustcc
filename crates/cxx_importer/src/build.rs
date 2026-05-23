@@ -540,6 +540,12 @@ impl Build {
             &annotations,
             &all_class_ids,
         ));
+        // v1.12.17: also emit shims for throws-annotated ctors.
+        combined_specs.extend(collect_throws_specs_for_ctors(
+            &ctx,
+            &annotations,
+            &all_class_ids,
+        ));
         if !combined_specs.is_empty() {
             let header_refs: Vec<&str> = self
                 .headers
@@ -981,6 +987,7 @@ fn collect_throws_specs_for_free_fns(
             forward_args,
             original_callsite: fqn,
             typed_catches,
+            is_ctor: false,
         });
     }
     specs
@@ -1135,7 +1142,123 @@ fn collect_throws_specs_for_class_methods(
                 // returns).
                 original_callsite: format!("__this->{method_name}"),
                 typed_catches,
+                is_ctor: false,
             });
+        }
+    }
+    specs
+}
+
+/// v1.12.17: build `ThrowsShimSpec` entries for class
+/// constructors carrying `cxx_throws` / `cxx_throws(T1, T2)`
+/// annotations. Today's scope: `DefaultCtor` + `OtherCtor`
+/// (copy/move ctors are not yet wired to the throws path).
+///
+/// Annotation key form: `Class::Class` — libclang names ctor
+/// cursors after the class itself, so the FQN doubles the
+/// last segment (matches the v1.12.4 emitter convention).
+///
+/// Overloads: first ctor with the throws annotation wins;
+/// subsequent ctors with the same wrapper name (always
+/// `__rustcc_throws_<Class>_new` in v1.12.17) are skipped.
+/// Per-overload disambiguation tracks as a follow-on.
+fn collect_throws_specs_for_ctors(
+    ctx: &CxxTypeCtx,
+    annotations: &AnnotationSet,
+    class_ids: &[rustc_abi_cxx::ClassId],
+) -> Vec<crate::cxx_exception::ThrowsShimSpec> {
+    use crate::cxx_exception::ThrowsShimSpec;
+    use rustc_abi_cxx::{NameSegment, SpecialMember};
+
+    let mut specs: Vec<ThrowsShimSpec> = Vec::new();
+    let mut seen_classes: std::collections::HashSet<rustc_abi_cxx::ClassId> =
+        std::collections::HashSet::new();
+
+    for &class_id in class_ids {
+        let class = ctx.class(class_id);
+        let class_fqn: String = class
+            .name
+            .0
+            .iter()
+            .map(|seg| match seg {
+                NameSegment::Namespace(id) | NameSegment::Class(id) => id.0.clone(),
+                NameSegment::TemplateSpec { name, .. } => name.0.clone(),
+                NameSegment::AnonymousNamespace => String::new(),
+                NameSegment::Enum(id) => id.0.clone(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("::");
+        let class_short = class_fqn
+            .rsplit("::")
+            .next()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if class_short.is_empty() {
+            continue;
+        }
+
+        // libclang ctor annotation key: `Class::Class`
+        // (matches the `method_source_name_for_fqn` path in
+        // `render_direct_extern_class`).
+        let fqn = format!("{class_fqn}::{class_short}");
+        let anns = annotations.effective(&fqn);
+        let Some(typed_catches) = extract_throws_types(&anns) else {
+            continue;
+        };
+
+        // Find the first DefaultCtor / OtherCtor with throws.
+        for method in &class.methods {
+            if !matches!(
+                method.special,
+                Some(SpecialMember::DefaultCtor | SpecialMember::OtherCtor),
+            ) {
+                continue;
+            }
+            if !seen_classes.insert(class_id) {
+                break;
+            }
+
+            // Render params (no return type — ctor doesn't
+            // produce one; the `*__out` slot IS the result).
+            let mut param_decls: Vec<String> = Vec::with_capacity(method.sig.params.len());
+            let mut forward_args: Vec<String> = Vec::with_capacity(method.sig.params.len());
+            let mut params_ok = true;
+            for (i, &p_ty) in method.sig.params.iter().enumerate() {
+                match crate::shims::render_cxx_type(
+                    ctx,
+                    p_ty,
+                    &format!("throws ctor shim param {i} for {fqn}"),
+                ) {
+                    Ok(ty_src) => {
+                        param_decls.push(format!("{ty_src} __a{i}"));
+                        forward_args.push(format!("__a{i}"));
+                    }
+                    Err(_) => {
+                        params_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !params_ok {
+                continue;
+            }
+
+            specs.push(ThrowsShimSpec {
+                wrapper_name: format!("__rustcc_throws_{class_short}_new"),
+                // Return type isn't used in the ctor renderer
+                // path; the shim is fixed to `CxxRawError`.
+                return_type_cpp: String::new(),
+                param_decls,
+                forward_args,
+                // For ctor specs, `original_callsite` is the
+                // class FQN to placement-construct (the
+                // renderer reads `is_ctor` and switches modes).
+                original_callsite: class_fqn.clone(),
+                typed_catches,
+                is_ctor: true,
+            });
+            break;
         }
     }
     specs

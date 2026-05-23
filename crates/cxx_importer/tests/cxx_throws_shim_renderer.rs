@@ -104,6 +104,7 @@ int do_typed(int selector) {
             forward_args: vec!["__a".into(), "__b".into()],
             original_callsite: "do_divide".into(),
             typed_catches: vec![],
+            is_ctor: false,
         },
         ThrowsShimSpec {
             wrapper_name: "__rustcc_throws_do_typed".into(),
@@ -112,6 +113,7 @@ int do_typed(int selector) {
             forward_args: vec!["__selector".into()],
             original_callsite: "do_typed".into(),
             typed_catches: vec!["MyErrorA".into()],
+            is_ctor: false,
         },
     ];
 
@@ -249,6 +251,7 @@ fn render_all_throws_shims_emits_expected_preamble() {
         forward_args: vec![],
         original_callsite: "foo".into(),
         typed_catches: vec![],
+        is_ctor: false,
     }];
     let src = render_all_throws_shims_cpp(&["my_header.hpp"], &specs);
 
@@ -281,6 +284,7 @@ fn render_all_throws_shims_routes_per_spec_to_typed_or_plain() {
             forward_args: vec!["x".into()],
             original_callsite: "plain".into(),
             typed_catches: vec![],
+            is_ctor: false,
         },
         ThrowsShimSpec {
             wrapper_name: "__rustcc_throws_typed".into(),
@@ -289,6 +293,7 @@ fn render_all_throws_shims_routes_per_spec_to_typed_or_plain() {
             forward_args: vec!["x".into()],
             original_callsite: "typed".into(),
             typed_catches: vec!["MyError".into()],
+            is_ctor: false,
         },
     ];
     let src = render_all_throws_shims_cpp(&["h.hpp"], &specs);

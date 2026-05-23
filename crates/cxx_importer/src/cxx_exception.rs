@@ -257,6 +257,19 @@ pub struct ThrowsShimSpec {
     /// `render_throws_shim_cpp_typed` with these C++ type names
     /// as the matched-catch clauses.
     pub typed_catches: Vec<String>,
+    /// v1.12.17: when `true`, the renderer emits a ctor shim:
+    /// the first param is `<Class>* __out` (no extra trailing
+    /// out-param), the body is
+    /// `new (__out) <Class>(<args>...)` instead of
+    /// `*__out = <callsite>(<args>...)`, and the
+    /// `original_callsite` field is treated as the
+    /// **fully-qualified C++ class name** to placement-construct
+    /// (e.g., `"ns::Foo"`).
+    ///
+    /// Set automatically by build.rs's
+    /// `collect_throws_specs_for_ctors`; callers building specs
+    /// by hand for ctor cases set this manually.
+    pub is_ctor: bool,
 }
 
 /// v1.12.10: emit a full C++ shim source file for a batch of
@@ -313,7 +326,18 @@ pub fn render_all_throws_shims_cpp(
     out.push('\n');
 
     for spec in shims {
-        if spec.typed_catches.is_empty() {
+        if spec.is_ctor {
+            // v1.12.17: ctor shims use placement-new into the
+            // Rust-owned out-slot. `original_callsite` is the
+            // class FQN to construct.
+            out.push_str(&render_throws_ctor_shim_cpp(
+                &spec.wrapper_name,
+                &spec.original_callsite,
+                &spec.param_decls,
+                &spec.forward_args,
+                &spec.typed_catches,
+            ));
+        } else if spec.typed_catches.is_empty() {
             out.push_str(&render_throws_shim_cpp(
                 &spec.wrapper_name,
                 &spec.return_type_cpp,
@@ -334,6 +358,77 @@ pub fn render_all_throws_shims_cpp(
         out.push('\n');
     }
     out
+}
+
+/// v1.12.17: emit a throwing-ctor shim wrapper. Unlike the
+/// non-ctor variants, the first parameter is `<Class>* __out`
+/// (the Rust caller's `MaybeUninit::as_mut_ptr()`) and the body
+/// placement-constructs into that slot rather than assigning
+/// through it:
+///
+/// ```cpp
+/// extern "C" CxxRawError __rustcc_throws_<Class>_new(
+///     <Class>* __out,
+///     <args>...
+/// ) noexcept {
+///     try {
+///         new (__out) <Class>(<args>...);
+///         return { 0, nullptr };
+///     } catch (...) { ... }
+/// }
+/// ```
+///
+/// `class_fqn` is the C++ name to placement-construct
+/// (e.g., `"ns::Foo"`). `param_decls` and `forward_args`
+/// describe the ctor's user-facing parameters — the `__out`
+/// slot is prepended by this function, not in the spec.
+///
+/// Pass an empty `typed_catches` slice for catch-all behavior.
+fn render_throws_ctor_shim_cpp(
+    wrapper_name: &str,
+    class_fqn: &str,
+    param_decls: &[String],
+    forward_args: &[String],
+    typed_catches: &[String],
+) -> String {
+    let mut src = String::new();
+    src.push_str(&format!("extern \"C\" CxxRawError {wrapper_name}(\n"));
+    src.push_str(&format!("    {class_fqn}* __out,\n"));
+    for p in param_decls {
+        src.push_str(&format!("    {p},\n"));
+    }
+    // Drop trailing comma.
+    if src.ends_with(",\n") {
+        src.truncate(src.len() - 2);
+        src.push('\n');
+    }
+    src.push_str(") noexcept {\n");
+    src.push_str("    try {\n");
+    src.push_str(&format!(
+        "        new (__out) {class_fqn}({});\n",
+        forward_args.join(", ")
+    ));
+    src.push_str("        return { 0, nullptr };\n");
+
+    for (i, ty) in typed_catches.iter().enumerate() {
+        let tag = CXX_EXC_TYPED_BASE + i as u32;
+        src.push_str(&format!("    }} catch (const {ty}& __e) {{\n"));
+        src.push_str("        thread_local static std::string __buf;\n");
+        src.push_str("        __buf = __e.what();\n");
+        src.push_str(&format!("        return {{ {tag}, __buf.c_str() }};\n"));
+    }
+
+    src.push_str("    } catch (const std::exception& __e) {\n");
+    src.push_str("        thread_local static std::string __buf;\n");
+    src.push_str("        __buf = __e.what();\n");
+    src.push_str("        return { 1, __buf.c_str() };\n");
+    src.push_str("    } catch (...) {\n");
+    src.push_str(
+        "        return { 2, \"non-std::exception C++ exception\" };\n",
+    );
+    src.push_str("    }\n");
+    src.push_str("}\n");
+    src
 }
 
 /// v1.12.11: collect the typed-catches list for every throwing
