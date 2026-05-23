@@ -8,6 +8,12 @@ description = "libclang-driven C++ header importer for rustcc."
 
 [dependencies]
 rustc_abi_cxx = { path = "../rustc_abi_cxx" }
+# Runtime types shared with the generated bindings + downstream
+# user crates: CxxException + CxxRawError + decode helper live in
+# `cxx` so users only depend on the runtime crate at link time;
+# `cxx_importer` re-exports them at the codegen surface for
+# convenience.
+cxx = { path = "../cxx" }
 # The `runtime` feature makes clang-sys dlopen libclang at runtime via
 # libloading, so the binary doesn't need libclang on its rpath at build
 # time. LIBCLANG_PATH env var, xcrun, and standard paths are searched.

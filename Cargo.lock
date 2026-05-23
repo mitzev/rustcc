@@ -192,6 +192,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "clang",
+ "cxx",
  "rustc_abi_cxx",
  "serde",
  "serde_json",

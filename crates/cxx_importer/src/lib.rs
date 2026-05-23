@@ -32,8 +32,8 @@ pub mod shims;
 pub use aliases::{AliasSet, TypeAlias};
 pub use annotations::{load_sidecar, Annotation, AnnotationSet, SidecarSchema};
 pub use cxx_exception::{
-    decode as decode_cxx_raw_error, render_throws_shim_cpp, CxxException, CxxExceptionKind,
-    CxxRawError, CXX_EXC_OK, CXX_EXC_STD, CXX_EXC_UNKNOWN, CXX_RAW_ERROR_HEADER,
+    decode_cxx_raw_error, render_throws_shim_cpp, CxxException, CxxExceptionKind, CxxRawError,
+    CXX_EXC_OK, CXX_EXC_STD, CXX_EXC_UNKNOWN, CXX_RAW_ERROR_HEADER,
 };
 pub use enums::{CxxEnumDef, CxxEnumVariant, EnumSet};
 pub use free_fns::{FreeFnDef, FreeFnSet};

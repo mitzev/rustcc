@@ -196,6 +196,22 @@ pub struct RustBindingsConfig {
     /// every flattened method is reachable via the explicit
     /// upcast path even without this flag.
     pub flatten_inherited_methods: bool,
+    /// v1.12.1: list of free-function names (the bare C++
+    /// identifier as it appears in source, e.g. `"do_divide"`) that
+    /// should be wrapped via the [`cxx_exception`] Phase 0 catch
+    /// shim. For each entry, the free-fn emitter changes shape:
+    /// the extern decl targets `__rustcc_throws_<name>` instead
+    /// of the regular Itanium symbol, signature gains an
+    /// out-param + `CxxRawError` return, and the safe wrapper
+    /// returns `Result<T, ::cxx::CxxException>` instead
+    /// of `T`. Callers must compile + link the corresponding C++
+    /// shim — see [`render_cxx_throws_shim_for_free_fn`] which
+    /// produces the matching `.cpp` source.
+    ///
+    /// Empty by default: the bindings emitter is throws-naive
+    /// until the user opts a specific function in. Class methods
+    /// are not yet supported through this knob; track v1.12.2.
+    pub cxx_throws_functions: std::collections::BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -922,7 +938,13 @@ fn render_namespace_tree(
     // by a per-fn safe wrapper, so the `#[link_name]` attributes
     // sit together and the API surface is just the wrappers.
     if !tree.free_fns.is_empty() {
-        render_free_fns(ctx, &tree.free_fns, out, indent)?;
+        render_free_fns(
+            ctx,
+            &tree.free_fns,
+            &config.cxx_throws_functions,
+            out,
+            indent,
+        )?;
         out.push('\n');
     }
     for &class_id in &tree.classes {
@@ -4175,6 +4197,7 @@ fn render_rust_type_with_opts(
 fn render_free_fns(
     ctx: &CxxTypeCtx,
     fns: &[crate::free_fns::FreeFnDef],
+    throws_set: &std::collections::BTreeSet<String>,
     out: &mut String,
     indent: &str,
 ) -> Result<(), BindingsError> {
@@ -4184,6 +4207,14 @@ fn render_free_fns(
     // strings so the `extern { ... }` block and the wrapper
     // bodies see the same forms. Drop functions whose params
     // or return type the renderer rejects.
+    //
+    // `throws` flips the emission shape:
+    //   - extern decl targets `__rustcc_throws_<name>` (the C++
+    //     shim wrapper symbol), takes an `out: *mut T` if non-void,
+    //     and returns `::cxx::CxxRawError`;
+    //   - safe wrapper body calls the extern + `decode` and
+    //     returns `Result<T, ::cxx::CxxException>` instead
+    //     of `T`.
     struct Rendered<'a> {
         def: &'a crate::free_fns::FreeFnDef,
         link_name: String,
@@ -4191,6 +4222,7 @@ fn render_free_fns(
         params: Vec<(String, String)>, // (decl, forward) per arg
         ret_ty: String,
         ret_is_void: bool,
+        throws: bool,
     }
     let mut rendered: Vec<Rendered<'_>> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
@@ -4228,16 +4260,23 @@ fn render_free_fns(
             }
         };
         let ret_is_void = ret_ty == "()";
-        // Itanium-mangled link name. Build the scope from the
-        // free fn's parent namespace path; the mangler handles
-        // empty-scope (TU-root) by emitting the bare `_Z<len><name>`
-        // form.
-        let scope = NestedName(ff.def_scope().to_vec());
-        let link_name = ctx.mangle(&Symbol::Function {
-            scope,
-            name: ff.name.clone(),
-            sig: ff.sig.clone(),
-        });
+        let throws = throws_set.contains(&ff.name.0);
+        // Link name: for throwing fns we point at the C++ shim
+        // wrapper symbol (`__rustcc_throws_<name>`), which is
+        // `extern "C"` — no mangling involved. For normal fns,
+        // we use the Itanium-mangled symbol. The mangler handles
+        // empty-scope (TU-root) by emitting the bare
+        // `_Z<len><name>` form.
+        let link_name = if throws {
+            format!("__rustcc_throws_{}", ff.name.0)
+        } else {
+            let scope = NestedName(ff.def_scope().to_vec());
+            ctx.mangle(&Symbol::Function {
+                scope,
+                name: ff.name.clone(),
+                sig: ff.sig.clone(),
+            })
+        };
         // Pick a Rust-safe identifier for the extern_ident +
         // wrapper. Free functions don't have a class prefix so
         // collisions are more likely; prefix with `__cxx_` to
@@ -4254,6 +4293,7 @@ fn render_free_fns(
             params,
             ret_ty,
             ret_is_void,
+            throws,
         });
         let _ = safe;
     }
@@ -4278,33 +4318,64 @@ fn render_free_fns(
         return Ok(());
     }
 
-    // Shared extern block.
-    let _ = writeln!(out, "{indent}unsafe extern \"C++\" {{");
-    for r in &rendered {
-        let _ = writeln!(out, "{indent}    #[link_name = \"{}\"]", r.link_name);
-        let decl_params = r
-            .params
-            .iter()
-            .map(|(d, _)| d.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        if r.ret_is_void {
+    // Throwing fns can't share the same `extern "C++"` block —
+    // their shim wrappers are `extern "C" noexcept` (no name
+    // mangling, no unwinding across the boundary). Emit two
+    // blocks when both flavors are present.
+    let (throwing, plain): (Vec<&Rendered<'_>>, Vec<&Rendered<'_>>) =
+        rendered.iter().partition(|r| r.throws);
+
+    if !plain.is_empty() {
+        let _ = writeln!(out, "{indent}unsafe extern \"C++\" {{");
+        for r in &plain {
+            let _ = writeln!(out, "{indent}    #[link_name = \"{}\"]", r.link_name);
+            let decl_params = r
+                .params
+                .iter()
+                .map(|(d, _)| d.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if r.ret_is_void {
+                let _ = writeln!(
+                    out,
+                    "{indent}    fn {ext}({decl_params});",
+                    ext = r.extern_ident,
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{indent}    fn {ext}({decl_params}) -> {ret};",
+                    ext = r.extern_ident,
+                    ret = r.ret_ty,
+                );
+            }
+        }
+        let _ = writeln!(out, "{indent}}}");
+        let _ = writeln!(out);
+    }
+
+    if !throwing.is_empty() {
+        // Throws extern block: `extern "C"` (the shim is
+        // `extern "C" noexcept`, returning CxxRawError by value).
+        // Out-param for non-void returns; nothing for void.
+        let _ = writeln!(out, "{indent}unsafe extern \"C\" {{");
+        for r in &throwing {
+            let _ = writeln!(out, "{indent}    #[link_name = \"{}\"]", r.link_name);
+            let mut decl_parts: Vec<String> =
+                r.params.iter().map(|(d, _)| d.clone()).collect();
+            if !r.ret_is_void {
+                decl_parts.push(format!("__out: *mut {}", r.ret_ty));
+            }
             let _ = writeln!(
                 out,
-                "{indent}    fn {ext}({decl_params});",
+                "{indent}    fn {ext}({decls}) -> ::cxx::CxxRawError;",
                 ext = r.extern_ident,
-            );
-        } else {
-            let _ = writeln!(
-                out,
-                "{indent}    fn {ext}({decl_params}) -> {ret};",
-                ext = r.extern_ident,
-                ret = r.ret_ty,
+                decls = decl_parts.join(", "),
             );
         }
+        let _ = writeln!(out, "{indent}}}");
+        let _ = writeln!(out);
     }
-    let _ = writeln!(out, "{indent}}}");
-    let _ = writeln!(out);
 
     // Safe wrappers — one `pub fn` per imported free fn.
     for r in &rendered {
@@ -4321,21 +4392,87 @@ fn render_free_fns(
             .map(|(_, f)| f.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let ret_clause = if r.ret_is_void {
-            String::new()
+        if r.throws {
+            let ok_ty = if r.ret_is_void {
+                "()".to_string()
+            } else {
+                r.ret_ty.clone()
+            };
+            let _ = writeln!(
+                out,
+                "{indent}pub fn {safe_name}({wrap_params}) \
+                 -> ::core::result::Result<{ok_ty}, ::cxx::CxxException> {{",
+            );
+            if r.ret_is_void {
+                let call_args = if fwd.is_empty() {
+                    String::new()
+                } else {
+                    fwd.clone()
+                };
+                let _ = writeln!(
+                    out,
+                    "{indent}    let __raw = unsafe {{ {ext}({args}) }};",
+                    ext = r.extern_ident,
+                    args = call_args,
+                );
+                let _ = writeln!(
+                    out,
+                    "{indent}    unsafe {{ ::cxx::decode_cxx_raw_error(__raw, ()) }}",
+                );
+            } else {
+                // Need a `MaybeUninit` slot for the out-param so
+                // we don't require `T: Default`. Phase 0 only
+                // populates it on the success path.
+                let _ = writeln!(
+                    out,
+                    "{indent}    let mut __out = ::core::mem::MaybeUninit::<{ret}>::uninit();",
+                    ret = r.ret_ty,
+                );
+                let extern_args = if fwd.is_empty() {
+                    "__out.as_mut_ptr()".to_string()
+                } else {
+                    format!("{fwd}, __out.as_mut_ptr()")
+                };
+                let _ = writeln!(
+                    out,
+                    "{indent}    let __raw = unsafe {{ {ext}({args}) }};",
+                    ext = r.extern_ident,
+                    args = extern_args,
+                );
+                let _ = writeln!(
+                    out,
+                    "{indent}    if __raw.kind == ::cxx::CXX_EXC_OK {{",
+                );
+                let _ = writeln!(
+                    out,
+                    "{indent}        ::core::result::Result::Ok(unsafe {{ __out.assume_init() }})",
+                );
+                let _ = writeln!(out, "{indent}    }} else {{");
+                let _ = writeln!(
+                    out,
+                    "{indent}        ::core::result::Result::Err(unsafe {{ \
+                     ::cxx::CxxException::from_raw(__raw.kind, __raw.message) }})",
+                );
+                let _ = writeln!(out, "{indent}    }}");
+            }
+            let _ = writeln!(out, "{indent}}}");
         } else {
-            format!(" -> {}", r.ret_ty)
-        };
-        let _ = writeln!(
-            out,
-            "{indent}pub fn {safe_name}({wrap_params}){ret_clause} {{",
-        );
-        let _ = writeln!(
-            out,
-            "{indent}    unsafe {{ {ext}({fwd}) }}",
-            ext = r.extern_ident,
-        );
-        let _ = writeln!(out, "{indent}}}");
+            let ret_clause = if r.ret_is_void {
+                String::new()
+            } else {
+                format!(" -> {}", r.ret_ty)
+            };
+            let _ = writeln!(
+                out,
+                "{indent}pub fn {safe_name}({wrap_params}){ret_clause} {{",
+            );
+            let _ = writeln!(
+                out,
+                "{indent}    unsafe {{ {ext}({fwd}) }}",
+                ext = r.extern_ident,
+            );
+            let _ = writeln!(out, "{indent}}}");
+        }
     }
 
     Ok(())
