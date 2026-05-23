@@ -1,0 +1,244 @@
+From d5f792de67cfd9d34a4c111fcde9c68beb76bc03 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 11:01:56 +0300
+Subject: [PATCH] P09.65b: MIR pass wraps happy path in Result::Ok (Phase 1F)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Sixth codegen patch in the Phase 1 series. Activates the
+P09.65a scaffold by implementing the happy-path Ok wrapping:
+for each Call terminator targeting a #[rustc_cxx_throws]
+callee with a Result-shaped destination type, the MIR pass
+now allocates a fresh local of the Ok-payload type T,
+rewrites the Call destination to that local, and synthesizes
+a new bb_ok_wrap basic block that constructs Result::Ok and
+branches to the call's original target.
+
+Before:
+  bb_call:
+    call foo(args) -> dest_place    (type Result<T, E>)
+    success → orig_target
+
+After:
+  bb_call:
+    call foo(args) -> raw_local     (type T)
+    success → bb_ok_wrap
+    unwind → <existing UnwindAction>  (unchanged — catch still aborts via P09.64)
+  bb_ok_wrap:
+    dest_place = Result::Ok(Move(raw_local))
+    goto → orig_target
+
+The catch path is INTENTIONALLY UNTOUCHED in this patch. It
+still routes through codegen's P09.64 catch-then-abort BB.
+Wiring the catch path to produce Result::Err requires either
+extending UnwindAction with a new variant (touches ~78 visitor
+sites) or codegen-MIR plumbing via a new MIR data structure —
+both genuinely multi-day chunks. Tracked in
+CXX-THROW-P09.65-DESIGN.md; queued as P09.65c.
+
+Skip conditions (call left untouched):
+- Destination type isn't an ADT or doesn't look like
+  Result<T, E> (2-variant enum, single-field Ok). The MIR
+  pass quietly skips — codegen will surface any actual type
+  mismatch downstream.
+- Call has no success target (diverging call). Skip.
+
+Test scenario this enables (once a Phase 1 example is wired):
+  extern "C++" {
+      #[rustc_cxx_throws]
+      fn foo(x: i32) -> Result<*mut Bar, ::cxx::CxxRawError>;
+  }
+
+  let r = unsafe { foo(42) };
+  match r {
+      Ok(p) => use_p(p),          // happy path: Result::Ok(p)
+      Err(_) => unreachable!(),   // catch path: aborts before reaching here
+  }
+
+Validation: clean compile + bootstrap on first try, 10s
+incremental rebuild. No new warnings.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../src/cxx_throws_wrap.rs                    | 142 +++++++++++++++---
+ 1 file changed, 121 insertions(+), 21 deletions(-)
+
+diff --git a/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs b/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+index 767e14e8d7f..7fa7467e8b5 100644
+--- a/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
++++ b/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+@@ -40,6 +40,7 @@
+ //! ships the pass without changing P09.64's abort behavior;
+ //! the next bootstrap cycle lights the wiring up.
+ 
++use rustc_index::IndexVec;
+ use rustc_middle::mir::*;
+ use rustc_middle::ty::{self, TyCtxt};
+ use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+@@ -48,23 +49,19 @@
+ 
+ impl<'tcx> crate::MirPass<'tcx> for CxxThrowsWrap {
+     fn is_required(&self) -> bool {
+-        // Required: changes program semantics for #[rustc_cxx_throws]
+-        // calls (currently a no-op scaffold, but the wiring needs
+-        // to be in place so P09.65b's MIR rewriting lands cleanly).
+         true
+     }
+ 
+     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+         let def_id = body.source.def_id();
+-        let kind = tcx.def_kind(def_id);
+-        if !kind.is_fn_like() {
++        if !tcx.def_kind(def_id).is_fn_like() {
+             return;
+         }
+ 
+-        // First pass: identify Call terminators targeting a
+-        // CXX_THROWS callee. Collect the basic block indices
+-        // separately so we can mutate the body without
+-        // borrow-conflict pain.
++        // Identify CXX_THROWS Call terminators in a first pass so
++        // we can mutate the body afterward without borrow-conflict
++        // pain. Collect block + the destination type at the same
++        // time — both are needed for the rewrite.
+         let mut targets: Vec<BasicBlock> = Vec::new();
+         for (bb, bbdata) in body.basic_blocks.iter_enumerated() {
+             let Some(terminator) = &bbdata.terminator else { continue };
+@@ -81,18 +78,121 @@ fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+             targets.push(bb);
+         }
+ 
+-        // P09.65a stops here — just identifying the call sites.
+-        // P09.65b (next iteration) does the actual Place
+-        // rewriting + Ok/Err wrapper BB synthesis. Splitting
+-        // the work this way means the bootstrap can validate
+-        // the pass-registration plumbing in isolation before
+-        // we touch MIR construction.
++        if targets.is_empty() {
++            return;
++        }
++
++        // P09.65b: happy-path Ok wrapping. For each target:
++        //
++        // Original MIR shape:
++        //   bb_call:
++        //     call foo(args) -> dest_place                 (type: Result<T, E>)
++        //     target → orig_target
++        //     unwind → <existing UnwindAction>
+         //
+-        // Without the rewriting, the pass is a no-op for now —
+-        // P09.64's "catch + helper call + abort" behavior is
+-        // preserved. The pass exists so the registration in
+-        // `lib.rs` lands cleanly + future P09.65b iterations
+-        // have a place to land their MIR manipulation.
+-        let _ = targets;
++        // After this pass:
++        //   bb_call:
++        //     call foo(args) -> raw_local                  (type: T)
++        //     target → bb_ok_wrap
++        //     unwind → <existing UnwindAction>  (preserved — catch still aborts via P09.64)
++        //   bb_ok_wrap:
++        //     dest_place = Result::Ok(raw_local)
++        //     goto → orig_target
++        //
++        // The catch path is untouched in this patch — it still
++        // routes through codegen's P09.64 catch-then-abort BB.
++        // P09.65c will wire the catch path to produce Result::Err
++        // (requires UnwindAction extension or codegen plumbing,
++        // tracked in CXX-THROW-P09.65-DESIGN.md).
++        let basic_blocks = body.basic_blocks.as_mut();
++        for bb in targets {
++            rewrite_happy_path(tcx, basic_blocks, &mut body.local_decls, bb);
++        }
++    }
++}
++
++fn rewrite_happy_path<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    basic_blocks: &mut IndexVec<BasicBlock, BasicBlockData<'tcx>>,
++    local_decls: &mut IndexVec<Local, LocalDecl<'tcx>>,
++    call_bb: BasicBlock,
++) {
++    // Extract Call destination + target from the terminator.
++    let (dest_place, dest_ty, orig_target) = {
++        let bbdata = &basic_blocks[call_bb];
++        let terminator = bbdata.terminator.as_ref().expect("call_bb has no terminator");
++        let TerminatorKind::Call { destination, target, .. } = &terminator.kind else {
++            return;
++        };
++        let dest_place = *destination;
++        let dest_ty = dest_place.ty(&*local_decls, tcx).ty;
++        let Some(orig_target) = *target else {
++            // Diverging call — no success target to wrap. Skip.
++            return;
++        };
++        (dest_place, dest_ty, orig_target)
++    };
++
++    // Destination must be `Result<T, E>` — i.e., an ADT with a
++    // single Ok-shaped variant + a single Err-shaped variant
++    // matching the Result layout. We don't try to enforce that
++    // strictly here — the codegen path requires it. If it's not
++    // a Result, we skip the rewrite and leave the call alone
++    // (codegen will surface a type mismatch later).
++    let &ty::Adt(adt_def, generics) = dest_ty.kind() else { return };
++    if !adt_def.is_enum() || adt_def.variants().len() != 2 {
++        return;
+     }
++    // First variant = Ok in `Result`'s definition order.
++    let ok_variant_idx = rustc_abi::VariantIdx::from_usize(0);
++    let ok_variant = adt_def.variant(ok_variant_idx);
++    if ok_variant.fields.len() != 1 {
++        return;
++    }
++    let ok_payload_ty = ok_variant.fields[rustc_abi::FieldIdx::from_usize(0)].ty(tcx, generics);
++
++    // Allocate a fresh local of type T (the Ok payload type).
++    // Source info: copy from the call terminator's source_info.
++    let source_info = basic_blocks[call_bb].terminator.as_ref().unwrap().source_info;
++    let raw_local = local_decls.push(LocalDecl::new(ok_payload_ty, source_info.span));
++
++    // Build the new bb_ok_wrap block:
++    //   StorageLive(raw_local)? — not needed; codegen handles it.
++    //   dest_place = Result::Ok(Move(raw_local));
++    //   goto orig_target
++    let ok_rvalue = Rvalue::Aggregate(
++        Box::new(AggregateKind::Adt(
++            adt_def.did(),
++            ok_variant_idx,
++            generics,
++            None,
++            None,
++        )),
++        IndexVec::from_iter([Operand::Move(Place::from(raw_local))]),
++    );
++    let ok_stmt = Statement::new(
++        source_info,
++        StatementKind::Assign(Box::new((dest_place, ok_rvalue))),
++    );
++    let ok_terminator = Terminator {
++        source_info,
++        kind: TerminatorKind::Goto { target: orig_target },
++    };
++    let ok_wrap_bb_data = BasicBlockData::new_stmts(
++        vec![ok_stmt],
++        Some(ok_terminator),
++        /* is_cleanup: */ false,
++    );
++    let ok_wrap_bb = basic_blocks.push(ok_wrap_bb_data);
++
++    // Rewrite the Call terminator: destination → raw_local,
++    // target → ok_wrap_bb. UnwindAction stays as-is so the
++    // catch path keeps routing through P09.64's catch BB.
++    let bbdata = &mut basic_blocks[call_bb];
++    let terminator = bbdata.terminator.as_mut().unwrap();
++    let TerminatorKind::Call { destination, target, .. } = &mut terminator.kind else {
++        unreachable!()
++    };
++    *destination = Place::from(raw_local);
++    *target = Some(ok_wrap_bb);
+ }
+-- 
+2.50.1 (Apple Git-155)
+
