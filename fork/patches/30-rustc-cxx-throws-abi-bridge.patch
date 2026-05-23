@@ -1,0 +1,144 @@
+From 3933beacee4c26b804a69e26661a11c16ab5f9da Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 11:58:24 +0300
+Subject: [PATCH] P09.66: ABI bridging on cxx_throws happy path (1.13 throws
+ Phase 1H)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the loop on Phase 1 — the happy path now returns the
+right value instead of garbage. Smoke test confirms:
+
+  maybe_throws(5)   →  ok(10)        (was: ok(<garbage>))
+  maybe_throws(-1)  →  err(kind=42)  (unchanged: still works)
+
+Root cause was a calling-convention mismatch: rustc computed
+the call's FnAbi from the user-declared
+`fn maybe_throws(i32) -> Result<i32, CxxRawError>` signature.
+On most targets, a 24-byte Result is passed via sret pointer.
+But the actual C++ symbol `int32_t maybe_throws(int32_t)`
+returns by value in a register. The sret slot was never
+populated, so the Ok variant carried random bytes.
+
+The MIR pass (cxx_throws_wrap) already rewrites the Call
+terminator's destination to `raw_ok_local: T` (i32 in this
+case). So at codegen time, `destination.ty(...)` is T, not
+`Result<T, E>` — i.e., the post-MIR-rewrite destination's
+type matches the C++ ABI's actual return type.
+
+Fix: in `codegen_call_terminator`, after computing the
+default fn_abi via `fn_abi_of_instance`, if the callee is
+CXX_THROWS, synthesize a new FnSig with the destination's
+type as the return and re-derive fn_abi via
+`fn_abi_of_fn_ptr`. This goes through the full ABI-adjust
+pipeline so target-specific decisions (Cast/Direct/etc.)
+apply correctly.
+
+Subtlety: `fn_abi_of_fn_ptr` has no callee def_id, so the
+P09.61 `fn_can_unwind` patch (which forces `can_unwind=true`
+for CXX_THROWS callees) doesn't trigger on the bridged
+signature. After the rebuild, copy `can_unwind` from the
+original fn_abi via clone + arena re-allocation. Without
+this, do_call's `if !fn_abi.can_unwind { unwind = Unreachable }`
+guard would defeat the catch BB and the unwind path would
+trap instead of running the runtime helper.
+
+LLVM IR confirms the bridged shape:
+
+  %ret = invoke i32 @maybe_throws(i32 5)
+           to label %ok_wrap unwind label %cxx_throws_catch
+
+(direct i32 return — no sret arg!)
+
+vs. the pre-bridge shape:
+
+  invoke void @maybe_throws(ptr sret([24 x i8]) %_5, i32 %x)
+           to label %ok_wrap unwind label %cxx_throws_catch
+
+End-to-end smoke test under
+`fork/examples/cxx_throws_smoke*` passes both arms now.
+---
+ compiler/rustc_codegen_ssa/src/mir/block.rs | 66 +++++++++++++++++++++
+ 1 file changed, 66 insertions(+)
+
+diff --git a/compiler/rustc_codegen_ssa/src/mir/block.rs b/compiler/rustc_codegen_ssa/src/mir/block.rs
+index ed50f9498a6..dcc5ac82ed5 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/block.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/block.rs
+@@ -1173,6 +1173,72 @@ fn codegen_call_terminator(
+             None => bx.fn_abi_of_fn_ptr(sig, extra_args),
+         };
+ 
++        // P09.66 / 1.13 throws Phase 1H: ABI bridging on the
++        // happy path of `#[rustc_cxx_throws]` calls.
++        //
++        // The user declared the extern fn as
++        //   fn maybe_throws(x: i32) -> Result<i32, CxxRawError>
++        // so rustc computed `fn_abi.ret` for `Result<T, E>` —
++        // which on most targets means `PassMode::Indirect`
++        // (sret pointer). But the actual C++ symbol returns
++        // `int32_t` directly. The MIR pass (cxx_throws_wrap)
++        // already rewrote the Call's destination to a
++        // freshly-allocated `raw_ok_local: T`, so the
++        // destination Place's monomorphized type is `T`, not
++        // `Result<T, E>`.
++        //
++        // Rebuild fn_abi from a synthesized fn signature with
++        // `T` as the return type. This goes through the full
++        // `fn_abi_of_fn_ptr` pipeline so target-specific
++        // adjustments (Cast/Direct/etc.) apply correctly.
++        let callee_cxx_throws = instance
++            .map(|inst| {
++                bx.tcx()
++                    .codegen_fn_attrs(inst.def_id())
++                    .flags
++                    .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::CXX_THROWS)
++            })
++            .unwrap_or(false);
++        let fn_abi = if callee_cxx_throws {
++            let bridged_ret_ty =
++                self.monomorphize(destination.ty(self.mir, bx.tcx()).ty);
++            // Sanity: only rebuild if the bridged type
++            // differs from the declared one. If the user
++            // declared the extern as `-> T` directly (no
++            // Result wrap), the MIR pass leaves the
++            // destination alone and the original fn_abi is
++            // already correct.
++            let original_ret_ty = self.monomorphize(sig.output().skip_binder());
++            if bridged_ret_ty != original_ret_ty {
++                let sig_inner = sig.skip_binder();
++                let new_sig_inner = bx.tcx().mk_fn_sig(
++                    sig_inner.inputs().iter().copied(),
++                    bridged_ret_ty,
++                    sig_inner.fn_sig_kind,
++                );
++                let bridged_sig = sig.rebind(new_sig_inner);
++                let bridged = bx.fn_abi_of_fn_ptr(bridged_sig, extra_args);
++                // Preserve can_unwind from the original — the
++                // bridged signature has no CXX_THROWS attr on
++                // its (synthetic) def_id, so its can_unwind
++                // would default to false for extern "C". The
++                // P09.61 logic on the original instance's
++                // FnAbi already accounts for CXX_THROWS, so
++                // we copy that decision through.
++                if bridged.can_unwind != fn_abi.can_unwind {
++                    let mut patched = bridged.clone();
++                    patched.can_unwind = fn_abi.can_unwind;
++                    bx.tcx().arena.alloc(patched)
++                } else {
++                    bridged
++                }
++            } else {
++                fn_abi
++            }
++        } else {
++            fn_abi
++        };
++
+         // The arguments we'll be passing. Plus one to account for outptr, if used.
+         let arg_count = fn_abi.args.len() + fn_abi.ret.is_indirect() as usize;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

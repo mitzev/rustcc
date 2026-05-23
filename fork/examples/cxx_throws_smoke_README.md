@@ -25,12 +25,14 @@ ar rcs libmaybe_throws.a maybe_throws.o
 ./smoke
 ```
 
-Expected output (current state, as of v1.13.0 Phase 1):
+Expected output (current state, as of v1.13.0 Phase 1 close):
 
 ```
-ok(<garbage>)       # ⚠ known ABI gap — see release notes
-err(kind=42)        # ✅ catch path works
+ok(10)              # ✅ happy path: 5 * 2 = 10
+err(kind=42)        # ✅ catch path: helper's stub returns kind=42
 ```
+
+Both lines confirm Phase 1 is closed.
 
 The second line confirms:
 1. The C++ exception was caught via the Itanium landingpad
@@ -42,12 +44,11 @@ The second line confirms:
 5. Normal control flow resumed and the match printed the
    error kind
 
-The first line's garbage is the result of the happy-path
-ABI mismatch (see "Known gaps" in
-`RELEASE-NOTES-v1.13.0-DRAFT.md`). The C++ function returns
-`int32_t` in a register, but rustc lowers the call with an
-sret pointer based on the Rust-declared `Result<T, E>`
-return type. The sret slot is never written.
+The first line now returns the correct value thanks to the
+P09.66 ABI bridge: rustc rebuilds the call's fn_abi using
+the MIR-rewritten destination's type (`i32`), so the call
+uses a direct register return matching the C++ side instead
+of an sret pointer.
 
 ## Why the inline `__rustcc_cxx_catch_unknown` stub?
 

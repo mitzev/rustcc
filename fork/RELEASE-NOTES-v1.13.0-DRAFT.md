@@ -34,7 +34,7 @@ No shim. No extra C++ object file. The catch handler is synthesized at LLVM IR l
 
 ## What ships
 
-Nine fork rustc patches (numbered 21–29 in `fork/patches/`):
+Ten fork rustc patches (numbered 21–30 in `fork/patches/`):
 
 | Patch | Phase | Component | Description |
 |---|---|---|---|
@@ -47,6 +47,7 @@ Nine fork rustc patches (numbered 21–29 in `fork/patches/`):
 | 27 | 1F | `rustc_mir_transform::cxx_throws_wrap` | MIR pass actually wraps the happy path in `Result::Ok` via `AggregateKind::Adt` |
 | 28 | 1G | `rustc_middle::mir::syntax` + 14 visitor sites | New `UnwindAction::CxxThrowsCleanup { bb, raw_err_local }` variant + codegen plumbing |
 | 29 | 1G' | follow-up wiring | 6 bug fixes that close the end-to-end loop (successors(), validator, visitor, pretty-print, is_cleanup, ...) |
+| 30 | 1H | `rustc_codegen_ssa::mir::block` | ABI bridging on the happy path — rebuild fn_abi with the post-MIR destination type as return, preserve can_unwind |
 
 The MIR pass `cxx_throws_wrap` runs in `run_runtime_lowering_passes`. For each `Call` to a `CXX_THROWS` callee with a destination shaped like `Result<T, E>`, it:
 
@@ -74,21 +75,18 @@ A standalone end-to-end test (extern `int32_t maybe_throws(int32_t)` in C++ thro
 
 | Path | Result | Notes |
 |---|---|---|
-| Throwing call (negative input) | ✅ `Err(kind=42)` | landingpad fires, `__rustcc_cxx_catch_unknown` returns, Result::Err constructed correctly, normal flow resumes |
-| Happy-path call (positive input) | ⚠ `Ok(garbage)` | the call ABI uses sret based on the declared `Result<T, E>` return type, but the C++ side returns by value — sret slot is never written |
+| Happy-path call `maybe_throws(5)` | ✅ `Ok(10)` | direct register return, no sret; Ok wrap fires, match dispatches correctly |
+| Throwing call `maybe_throws(-1)` | ✅ `Err(kind=42)` | landingpad fires, `__rustcc_cxx_catch_unknown` returns, Result::Err constructed, normal flow resumes |
+| Process exit | ✅ exit=0 | clean shutdown, no abort, no leaked exception |
 
-The catch path is **fully functional**. The happy path has a known ABI mismatch documented as gap #1 below.
+**Phase 1 is closed.** Both arms of the Result work end-to-end on the Itanium codegen path.
 
-## Known gaps / next steps
+## Known gaps / next steps (Phase 2)
 
-1. **ABI bridging on happy path** (the visible Ok-side returns garbage today). The Rust-declared `fn -> Result<T, E>` makes codegen pass an sret pointer, but the actual C++ symbol returns T directly. Fix options:
-   - **A**: MIR pass synthesizes a fn-pointer cast that re-types the Call's `func` operand to `fn -> T` before codegen runs. Codegen's `fn_abi_of_fn_ptr` then computes ABI from the bridged signature.
-   - **B**: Codegen patches `fn_abi.ret` post-hoc when it sees a `CxxThrowsCleanup` unwind action, replacing it with an ArgAbi for the destination's actual type. Simpler, more intrusive.
-   - Tracked as **P09.66** in the v1.13 plan.
-
-2. **P09.67**: MSVC funclet codegen — needs `catch_pad` / `catch_switch` instead of `cleanup_pad`.
-3. **P09.68**: Typed catches at codegen level (vs. swallow-all catch_throws_unknown). Currently every exception becomes `CxxRawError`; typed `Result<T, MyError>` only works via v1.12.x sidecar shims.
-4. **P09.69**: `CxxException` ergonomic conversion. Today the Err payload is the raw `{ i32, ptr }` from the helper; users typically want a `From<CxxRawError> for CxxException` conversion at the wrap site.
+1. **P09.67**: MSVC funclet codegen — needs `catch_pad` / `catch_switch` instead of `cleanup_pad`. Currently the MSVC path emits a `cleanup_pad + abort` placeholder.
+2. **P09.68**: Typed catches at codegen level (vs. swallow-all catch_throws_unknown). Currently every exception becomes `CxxRawError`; typed `Result<T, MyError>` only works via v1.12.x sidecar shims.
+3. **P09.69**: `CxxException` ergonomic conversion. Today the Err payload is the raw `{ i32, ptr }` from the helper; users typically want a `From<CxxRawError> for CxxException` conversion at the wrap site.
+4. **Real integration test** linking against the actual `cxx` runtime crate (not the inline stub the smoke test uses).
 
 ## Compatibility
 
