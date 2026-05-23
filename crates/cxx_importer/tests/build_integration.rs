@@ -424,3 +424,65 @@ class MyErrorA {};
         "non-throws method shouldn't emit a throws shim; shims:\n{shims}"
     );
 }
+
+/// v1.12.17: ctor throws annotations emit a placement-new shim.
+/// The Rust ctor wrapper returns `Result<Self, CxxException>`
+/// and calls `__rustcc_throws_<Class>_new(__slot.as_mut_ptr(), args)`;
+/// the C++ shim does `new (__out) Class(args)` inside the try.
+#[test]
+fn compile_emits_ctor_throws_shim_with_placement_new() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let header = tmp.path().join("resource.hpp");
+    std::fs::write(
+        &header,
+        r#"#pragma once
+class Resource {
+public:
+    [[clang::annotate("rustcc::cxx_throws")]]
+    Resource(int initial);
+
+    int value() const;
+};
+"#,
+    )
+    .unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let outputs = Build::new()
+        .header(&header)
+        .out_dir(&out_dir)
+        .invoke_cc(false)
+        .compile("resource_bindings")
+        .expect("compile");
+
+    let shims = std::fs::read_to_string(&outputs.shims_path)
+        .expect("read shims");
+
+    // Ctor shim is named `__rustcc_throws_Resource_new`.
+    assert!(
+        shims.contains("extern \"C\" CxxRawError __rustcc_throws_Resource_new"),
+        "expected Resource ctor shim; shims:\n{shims}"
+    );
+    // First param is the out-slot pointer (no extra trailing
+    // out-param since the slot IS the result).
+    assert!(
+        shims.contains("Resource* __out"),
+        "expected Resource* __out first param; shims:\n{shims}"
+    );
+    // Body uses placement-new into the out-slot.
+    assert!(
+        shims.contains("new (__out) Resource(__a0)"),
+        "expected placement-new in ctor shim body; shims:\n{shims}"
+    );
+    // Bindings should also have the Result<Self, _> wrapper
+    // pointing at this shim.
+    let bindings = std::fs::read_to_string(&outputs.bindings_path)
+        .expect("read bindings");
+    assert!(
+        bindings.contains("pub fn new(arg0: i32) -> ::core::result::Result<Self, ::cxx::CxxException>"),
+        "expected Result<Self, _> ctor wrapper; bindings:\n{bindings}"
+    );
+}
