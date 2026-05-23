@@ -1,0 +1,147 @@
+From 4a4496087064be5b05920f3403c5dbdc2fa7b6ea Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 10:08:32 +0300
+Subject: [PATCH] P09.62: BuilderMethods::cxx_catch_landing_pad (1.13 throws
+ Phase 1B)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the LLVM-backend catch-all landing-pad emitter that
+P09.63's call-site rewrite (next patch) will use to materialize
+a Result::Err(CxxException) when a #[rustc_cxx_throws] callee
+unwinds. Mirrors `cleanup_landing_pad`'s shape but with a
+`catch ptr null` clause instead of `LLVMSetCleanup`:
+
+  landingpad { ptr, i32 } catch ptr null
+
+The null type-info matches every C++ exception type — the
+personality fn (`rust_eh_personality` on Itanium) flows control
+into the handler block instead of resuming the unwind.
+
+Trait surface lives in `rustc_codegen_ssa::traits::BuilderMethods`
+under the existing Itanium-only block (alongside
+`cleanup_landing_pad` / `filter_landing_pad` / `resume`). MSVC
+funclets take a different path via `catch_pad` / `catch_switch`
+and won't call this method.
+
+GCC backend: stub that delegates to `cleanup_landing_pad`. A
+real impl needs libgccjit's try/catch surface which is master-
+branch territory; tracked separately.
+
+This patch is plumbing-only — nothing calls
+`cxx_catch_landing_pad` yet. P09.63 wires it into
+`rustc_codegen_ssa::mir::block::do_call`: when the callee has
+CodegenFnAttrFlags::CXX_THROWS, the existing default cleanup
+landing pad gets replaced with this catch landing pad +
+follow-on basic block that calls
+`cxx::native_invoke::__rustcc_cxx_catch_unknown(exc_ptr)` to
+build the CxxRawError, then routes into a Result::Err
+construction.
+
+Validation: trait + LLVM impl + GCC stub mirror the existing
+landingpad methods exactly. Bootstrap validation lands when
+P09.63 wires it in + the patch series rebuilds.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ compiler/rustc_codegen_gcc/src/builder.rs     | 20 +++++++++++++++++
+ compiler/rustc_codegen_llvm/src/builder.rs    | 22 +++++++++++++++++++
+ .../rustc_codegen_ssa/src/traits/builder.rs   | 17 ++++++++++++++
+ 3 files changed, 59 insertions(+)
+
+diff --git a/compiler/rustc_codegen_gcc/src/builder.rs b/compiler/rustc_codegen_gcc/src/builder.rs
+index 3cffd862b9b..8cbceab058d 100644
+--- a/compiler/rustc_codegen_gcc/src/builder.rs
++++ b/compiler/rustc_codegen_gcc/src/builder.rs
+@@ -1616,6 +1616,26 @@ fn cleanup_landing_pad(&mut self, _pers_fn: Function<'gcc>) -> (RValue<'gcc>, RV
+         (value1, value2)
+     }
+ 
++    // P09.62: GCC backend stub for cxx_catch_landing_pad. The
++    // LLVM backend's catch-all landingpad (1 clause, null
++    // type-info) doesn't map cleanly to libgccjit's
++    // try/catch shape — that path is the libgccjit master
++    // branch's job and is out of scope for this patch. The
++    // implementation here mirrors `cleanup_landing_pad`'s
++    // GCC stub for consistency: same shape, no real catch
++    // semantics until libgccjit grows the matching API.
++    //
++    // Real users of `#[rustc_cxx_throws]` will be on the LLVM
++    // backend; the GCC backend stub exists only so the trait
++    // compiles.
++    fn cxx_catch_landing_pad(&mut self, pers_fn: Function<'gcc>) -> (RValue<'gcc>, RValue<'gcc>) {
++        // Delegate to cleanup_landing_pad — it's not a real
++        // catch, but the trait must be satisfied. P09.62-gcc
++        // tracks a proper impl when libgccjit's try-catch
++        // surface lands.
++        self.cleanup_landing_pad(pers_fn)
++    }
++
+     fn filter_landing_pad(&mut self, pers_fn: Function<'gcc>) {
+         // FIXME(antoyo): generate the correct landing pad
+         self.cleanup_landing_pad(pers_fn);
+diff --git a/compiler/rustc_codegen_llvm/src/builder.rs b/compiler/rustc_codegen_llvm/src/builder.rs
+index 828c978294d..71453e3e547 100644
+--- a/compiler/rustc_codegen_llvm/src/builder.rs
++++ b/compiler/rustc_codegen_llvm/src/builder.rs
+@@ -1227,6 +1227,28 @@ fn cleanup_landing_pad(&mut self, pers_fn: &'ll Value) -> (&'ll Value, &'ll Valu
+         (self.extract_value(landing_pad, 0), self.extract_value(landing_pad, 1))
+     }
+ 
++    fn cxx_catch_landing_pad(&mut self, pers_fn: &'ll Value) -> (&'ll Value, &'ll Value) {
++        // P09.62 / 1.13 throws Phase 1B: Itanium catch-all
++        // landing pad. The 1-clause shape is what `catch (...)`
++        // compiles to in C++ — a single `catch ptr null`
++        // clause whose null type-info matches every thrown
++        // type. The personality fn (`rust_eh_personality` on
++        // Itanium) examines the clause; on match, control flows
++        // straight into the catch handler block — no resume,
++        // no further unwind.
++        //
++        // Returns `(exception_ptr, type_info_index)`. The
++        // `exception_ptr` is what the catch handler passes to
++        // `cxx::native_invoke::__rustcc_cxx_catch_unknown`
++        // (via `__cxa_begin_catch` internally) to materialize
++        // the `CxxRawError`.
++        let ty = self.type_struct(&[self.type_ptr(), self.type_i32()], false);
++        let landing_pad = self.landing_pad(ty, pers_fn, 1);
++        let null_ty_info = self.const_null(self.type_ptr());
++        self.add_clause(landing_pad, null_ty_info);
++        (self.extract_value(landing_pad, 0), self.extract_value(landing_pad, 1))
++    }
++
+     fn filter_landing_pad(&mut self, pers_fn: &'ll Value) {
+         let ty = self.type_struct(&[self.type_ptr(), self.type_i32()], false);
+         let landing_pad = self.landing_pad(ty, pers_fn, 1);
+diff --git a/compiler/rustc_codegen_ssa/src/traits/builder.rs b/compiler/rustc_codegen_ssa/src/traits/builder.rs
+index 11e0e93d45f..c4200b7daed 100644
+--- a/compiler/rustc_codegen_ssa/src/traits/builder.rs
++++ b/compiler/rustc_codegen_ssa/src/traits/builder.rs
+@@ -574,6 +574,23 @@ fn select(
+     fn cleanup_landing_pad(&mut self, pers_fn: Self::Function) -> (Self::Value, Self::Value);
+     fn filter_landing_pad(&mut self, pers_fn: Self::Function);
+     fn resume(&mut self, exn0: Self::Value, exn1: Self::Value);
++    /// P09.62 / 1.13 throws Phase 1B: emit an Itanium catch-all
++    /// landing pad. Unlike `cleanup_landing_pad`, which marks
++    /// the slot with `LLVMSetCleanup` and re-raises through the
++    /// personality fn, this emits `landingpad { ptr, i32 } catch ptr null`
++    /// — the null type-info clause matches every C++ exception
++    /// type, so control flows to the catch handler instead of
++    /// resuming the unwind.
++    ///
++    /// Returns `(exception_ptr, type_info_index)`; the catch
++    /// block typically passes `exception_ptr` straight into
++    /// `cxx::native_invoke::__rustcc_cxx_catch_unknown` to
++    /// convert the caught exception into a `CxxRawError`.
++    ///
++    /// MSVC funclets take a separate path via `catch_pad` /
++    /// `catch_switch` and don't use this method (the call-site
++    /// codegen dispatches per-platform).
++    fn cxx_catch_landing_pad(&mut self, pers_fn: Self::Function) -> (Self::Value, Self::Value);
+ 
+     // These are used only by msvc
+     fn cleanup_pad(&mut self, parent: Option<Self::Value>, args: &[Self::Value]) -> Self::Funclet;
+-- 
+2.50.1 (Apple Git-155)
+
