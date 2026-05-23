@@ -68,12 +68,27 @@ Codegen's `do_call` recognizes `CxxThrowsCleanup` and synthesizes a catch BB tha
 | `*-pc-windows-gnu` Itanium | likely works — not yet smoke-tested |
 | `*-pc-windows-msvc` SEH funclet | ❌ falls back to `cleanup_pad + abort` (P09.66 pending) |
 
+## Linker smoke test results
+
+A standalone end-to-end test (extern `int32_t maybe_throws(int32_t)` in C++ throwing `std::runtime_error` on negative input, called from Rust with `#[rustc_cxx_throws]`) confirms:
+
+| Path | Result | Notes |
+|---|---|---|
+| Throwing call (negative input) | ✅ `Err(kind=42)` | landingpad fires, `__rustcc_cxx_catch_unknown` returns, Result::Err constructed correctly, normal flow resumes |
+| Happy-path call (positive input) | ⚠ `Ok(garbage)` | the call ABI uses sret based on the declared `Result<T, E>` return type, but the C++ side returns by value — sret slot is never written |
+
+The catch path is **fully functional**. The happy path has a known ABI mismatch documented as gap #1 below.
+
 ## Known gaps / next steps
 
-- **P09.66**: MSVC funclet codegen — needs `catch_pad` / `catch_switch` instead of `cleanup_pad`.
-- **P09.67**: Typed catches at codegen level (vs. swallow-all catch_throws_unknown). Currently every exception becomes `CxxRawError`; typed `Result<T, MyError>` only works via v1.12.x sidecar shims.
-- **P09.68**: `CxxException` ergonomic conversion. Today the Err payload is the raw `{ i32, ptr }` from the helper; users typically want a `From<CxxRawError> for CxxException` conversion at the wrap site.
-- **Real linker smoke test**: link against the `cxx` runtime crate end-to-end and run a throwing C++ function under `lldb`/`gdb`. Validates the `__rustcc_cxx_catch_unknown` symbol resolution.
+1. **ABI bridging on happy path** (the visible Ok-side returns garbage today). The Rust-declared `fn -> Result<T, E>` makes codegen pass an sret pointer, but the actual C++ symbol returns T directly. Fix options:
+   - **A**: MIR pass synthesizes a fn-pointer cast that re-types the Call's `func` operand to `fn -> T` before codegen runs. Codegen's `fn_abi_of_fn_ptr` then computes ABI from the bridged signature.
+   - **B**: Codegen patches `fn_abi.ret` post-hoc when it sees a `CxxThrowsCleanup` unwind action, replacing it with an ArgAbi for the destination's actual type. Simpler, more intrusive.
+   - Tracked as **P09.66** in the v1.13 plan.
+
+2. **P09.67**: MSVC funclet codegen — needs `catch_pad` / `catch_switch` instead of `cleanup_pad`.
+3. **P09.68**: Typed catches at codegen level (vs. swallow-all catch_throws_unknown). Currently every exception becomes `CxxRawError`; typed `Result<T, MyError>` only works via v1.12.x sidecar shims.
+4. **P09.69**: `CxxException` ergonomic conversion. Today the Err payload is the raw `{ i32, ptr }` from the helper; users typically want a `From<CxxRawError> for CxxException` conversion at the wrap site.
 
 ## Compatibility
 
