@@ -43,9 +43,15 @@ The cxx_importer emits a C++ `extern "C" noexcept` wrapper around every throwing
 - Sidecar YAML: `free_functions: { name: { throws: true } }` or per-method `throws: true` under a type entry.
 - Config knob: `RustBindingsConfig::cxx_throws_functions` (still supported for callers that don't use annotations).
 
-### Phase 1 — Itanium native `invoke` + landingpad (v1.12.5 scaffolding, v1.12.6 codegen)
+### Phase 1 — Itanium native `invoke` + landingpad (split across v1.12.5 + v1.13.0+)
 
 Fork rustc lowers a `#[rustc_cxx_throws]`-marked `extern "C++"` call from LLVM `call` to LLVM `invoke` with an Itanium catch landingpad. The landingpad calls `cxx::native_invoke::__rustcc_cxx_catch_unknown` to convert the raw exception ptr into a `CxxRawError`, which the catch block then turns into `Result::Err(CxxException)`.
+
+The codegen patches split into three focused increments:
+
+- **P09.61** (v1.13.0, shipped as `fork/patches/22-rustc-cxx-throws-fn-can-unwind.patch`): `fn_can_unwind` returns true for CXX_THROWS callees regardless of the declared ABI's `unwind` field. This forces call sites into the `invoke`-with-landingpad path in `rustc_codegen_ssa::mir::block::do_call`. Without P09.62 + P09.63 yet, calls land on the default *cleanup* landingpad and re-raise through `rust_eh_personality` — usable as a stepping stone but not yet "catch + return Err".
+- **P09.62** (next bootstrap cycle): replace the default cleanup landingpad with a *custom catch landingpad* (`landingpad { ptr, i32 } catch ptr null` — Itanium catch-all clause). The handler basic block calls `cxx::native_invoke::__rustcc_cxx_catch_unknown(exc_ptr) -> CxxRawError`. New trait method on `BuilderMethods`: `cxx_throws_landing_pad(&mut self, runtime_helper: Self::Function) -> (CatchBlock, ExceptionPtr)`.
+- **P09.63** (next bootstrap cycle): MIR-level return-type rewriting. The visible Rust signature for a `#[rustc_cxx_throws]` `extern "C++"` decl becomes `fn foo(args) -> Result<T, CxxException>`. The MIR pass takes the user's `fn foo() -> T` extern decl, synthesizes a Rust-side wrapper `fn foo_wrapper(args) -> Result<T, _> { let r = foo(args); Ok(r) }` (the `Err` arm gets injected from the catch landingpad). Estimated 150 LoC across `rustc_mir_transform/src/cxx_throws_wrap.rs`.
 
 **Properties** (vs Phase 0):
 - ✅ No C++ shim TU — bindings are pure Rust + fork rustc codegen.
