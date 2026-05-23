@@ -47,9 +47,54 @@ fi
 
 cd "$SMOKE_DIR"
 
+# v1.13.0 P09.67b: pre-compile the throwing C++ stub for the
+# cxx_throws MSVC smoke test. Can't use a build.rs because
+# the rustcc-stage1 toolchain doesn't ship host std (stage-1
+# is target-only); a build.rs would fail compiling natively.
+# Instead we run clang-cl + llvm-lib here and inject the .lib
+# search path / link directive via RUSTFLAGS.
+XWIN="$HOME/.xwin"
+CPP_OBJ="$SMOKE_DIR/target/cxx_throws_stub/maybe_throws.obj"
+CPP_LIB="$SMOKE_DIR/target/cxx_throws_stub/maybe_throws.lib"
+mkdir -p "$(dirname "$CPP_OBJ")"
+
+# Locate clang-cl / llvm-lib — Homebrew puts them under
+# /opt/homebrew/opt/llvm/bin on Apple Silicon and they're not
+# on the default PATH. Allow either PATH-resolution or that
+# known-good fallback.
+CLANG_CL="$(command -v clang-cl || true)"
+LLVM_LIB="$(command -v llvm-lib || true)"
+HOMEBREW_LLVM_BIN="/opt/homebrew/opt/llvm/bin"
+if [ -z "$CLANG_CL" ] && [ -x "$HOMEBREW_LLVM_BIN/clang-cl" ]; then
+    CLANG_CL="$HOMEBREW_LLVM_BIN/clang-cl"
+fi
+if [ -z "$LLVM_LIB" ] && [ -x "$HOMEBREW_LLVM_BIN/llvm-lib" ]; then
+    LLVM_LIB="$HOMEBREW_LLVM_BIN/llvm-lib"
+fi
+
+if [ -f "cpp/maybe_throws.cpp" ] && [ -n "$CLANG_CL" ]; then
+    echo "=> Pre-compiling cpp/maybe_throws.cpp for x86_64-pc-windows-msvc"
+    "$CLANG_CL" /c /EHsc /std:c++17 /MT \
+        "/imsvc${XWIN}/crt/include" \
+        "/imsvc${XWIN}/sdk/include/ucrt" \
+        "/imsvc${XWIN}/sdk/include/um" \
+        "/imsvc${XWIN}/sdk/include/shared" \
+        "--target=x86_64-pc-windows-msvc" \
+        "/Fo:${CPP_OBJ}" cpp/maybe_throws.cpp
+    if [ -n "$LLVM_LIB" ]; then
+        "$LLVM_LIB" "/OUT:${CPP_LIB}" "$CPP_OBJ"
+    else
+        lld-link /lib "/OUT:${CPP_LIB}" "$CPP_OBJ"
+    fi
+    EXTRA_RUSTFLAGS="-Lnative=$(dirname "$CPP_LIB") -lstatic=maybe_throws"
+else
+    EXTRA_RUSTFLAGS=""
+fi
+
 echo "=> Building msvc_runtime_smoke for x86_64-pc-windows-msvc"
 echo "   via fork rustc + -Zbuild-std=core,panic_abort"
 
+CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="$EXTRA_RUSTFLAGS" \
 cargo +rustcc-stage1 -Zbuild-std=core,panic_abort \
     build --target x86_64-pc-windows-msvc --release 2>&1
 
@@ -62,6 +107,7 @@ declare -a TESTS=(
     "msvc_polymorphic:17"    # class with #[cpp_virtual] method
     "msvc_virtual_dtor:100"  # patch 18: scalar deleting dtor side-effect
     "msvc_override:14"       # patch 17: derived class vtable override
+    "msvc_cxx_throws:3"      # P09.67b: catch_switch funclet catches C++ throw
 )
 
 ALL_PASS=1

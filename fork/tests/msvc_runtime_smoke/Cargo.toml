@@ -29,6 +29,14 @@ path = "src/virtual_dtor.rs"
 name = "msvc_override"
 path = "src/override.rs"
 
+# v1.13.0 P09.67b: cxx_throws MSVC funclet smoke test.
+# Calls a throwing C++ extern fn through #[rustc_cxx_throws];
+# verifies the catch_switch + catch_pad funclet path under
+# Wine. C++ side is compiled by build.rs into a static .lib.
+[[bin]]
+name = "msvc_cxx_throws"
+path = "src/cxx_throws.rs"
+
 [workspace]
 
 [profile.dev]

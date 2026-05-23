@@ -1,0 +1,182 @@
+From 84409a0a787b634e78a233292090cfd6ba67f9ec Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 13:54:52 +0300
+Subject: [PATCH] P09.67c: MSVC catch funclet runtime-validated (Wine)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three fixes to make the catch_switch + catch_pad path
+actually work under Wine + MSVC SEH:
+
+1. Set `__CxxFrameHandler3` as the personality. The Itanium
+   path implicitly calls set_personality_fn from inside
+   landing_pad(); the funclet path doesn't, so without an
+   explicit call the function has no personality and the
+   SEH unwinder can't match clauses.
+
+2. Pass the catch_switch token to catch_pad as its parent
+   (was incorrectly passing null, which caused
+   getUnwindDestToken to crash inside LLVM's inliner).
+
+3. Don't call __rustcc_cxx_catch_unknown via the external
+   helper signature `(ptr) -> { i32, ptr }`. On Win64 ABI,
+   a 16-byte struct return requires an implicit sret pointer
+   in RCX — but the external declaration doesn't carry the
+   sret attribute, so LLVM lowers the call without sret and
+   passes null in RCX. The helper's body (compiled by Rust
+   with proper Win64 ABI lowering) interprets RCX as the
+   sret pointer and AVs on the first store.
+
+   For the MSVC catch-all path (flags=64, no slot — there's
+   no way to pass a real exception pointer to a helper
+   anyway), synthesize the CxxRawError inline:
+
+     raw_err_local.kind    = CXX_EXC_UNKNOWN (2)
+     raw_err_local.message = null
+
+   The user-visible Result::Err(CxxRawError { .. }) is
+   unchanged; only the runtime helper call is elided on this
+   one platform.
+
+Wine smoke test under fork/tests/msvc_runtime_smoke/
+(bin "msvc_cxx_throws") confirms:
+
+  maybe_throws(5)   →  Ok(10)        ← happy path (P09.66)
+  maybe_throws(-1)  →  Err(kind=2)   ← catch funclet fires
+
+exit code 3 = both arms behaved correctly.
+---
+ compiler/rustc_codegen_ssa/src/mir/block.rs | 100 ++++++++++++++------
+ 1 file changed, 70 insertions(+), 30 deletions(-)
+
+diff --git a/compiler/rustc_codegen_ssa/src/mir/block.rs b/compiler/rustc_codegen_ssa/src/mir/block.rs
+index e56ba3253d8..b97e2f2771f 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/block.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/block.rs
+@@ -2042,44 +2042,66 @@ fn cxx_throws_catch_pad(
+             //     %raw = call __rustcc_cxx_catch_unknown(%exn_ptr) [funclet=%fnlet]
+             //     store %raw, raw_err_local
+             //     catchret from %fnlet to err_wrap_bb
+-            let exn_slot_align = self.cx.tcx().data_layout.pointer_align().abi;
+-            let exn_slot_size = self.cx.tcx().data_layout.pointer_size();
+-            let exn_slot = catch_bx.alloca(exn_slot_size, exn_slot_align);
++            // Set the function's personality fn. On MSVC,
++            // `eh_personality()` resolves to `__CxxFrameHandler3`
++            // (the standard C++ SEH personality), which performs
++            // the SEH dispatch needed by catch_switch / catch_pad.
++            // The landing_pad path (Itanium) calls this implicitly
++            // inside its LLVMBuildLandingPad wrapper; the funclet
++            // path doesn't, so we must set it ourselves.
++            catch_bx.set_personality_fn(self.cx.eh_personality());
+ 
+             // catch_switch — single successor (the catch_pad).
++            // Its returned token is the parent of the catch_pad
++            // funclet — passing null here is a bug LLVM detects
++            // late (getUnwindDestToken crash during inlining).
+             let catchpad_bb = Bx::append_block(self.cx, self.llfn, "cxx_throws_catchpad");
+             let cs = catch_bx.catch_switch(None, None, &[catchpad_bb]);
+-            let _ = cs;
+ 
+             // Switch builders to emit into the catch_pad block.
+             let mut pad_bx = Bx::build(self.cx, catchpad_bb);
+-            // typedesc=null + flags=64 (catch-all) + slot=our alloca
++            // typedesc=null + flags=64 (catch-all) + slot=null.
++            //
++            // The slot can't be a real alloca because for
++            // catch-all (flags=64) the runtime doesn't bind
++            // anything to it — passing an alloca causes the
++            // inliner / SROA to confuse the slot with the
++            // helper's sret return slot and ends up storing the
++            // helper's result through the (uninitialized) slot
++            // pointer instead of into raw_err_local. NULL slot
++            // matches what libstd's foreign-panic catch BB
++            // does. The cost is that we can't pass a real
++            // exception pointer to the helper — pass null and
++            // let the helper just synthesize a
++            // `CxxRawError { kind: CXX_EXC_UNKNOWN, ... }`.
+             let null = pad_bx.cx().const_null(pad_bx.cx().type_ptr());
+             let flags_catch_all = pad_bx.cx().const_i32(64);
+-            let funclet = pad_bx.catch_pad(
+-                pad_bx.cx().const_null(pad_bx.cx().type_ptr()),
+-                &[null, flags_catch_all, exn_slot],
+-            );
+-
+-            // Load the captured exception pointer.
+-            let ptr_ty = pad_bx.cx().type_ptr();
+-            let exn_ptr = pad_bx.load(ptr_ty, exn_slot, exn_slot_align);
+-
+-            // Call the runtime helper (catch-all only on MSVC
+-            // for v1.13.0). Helper signature: `(ptr) -> { i32, ptr }`.
+-            let (helper_fn, helper_ty) = pad_bx.cx().cxx_throws_catch_fn();
+-            let raw_err = pad_bx.call(
+-                helper_ty,
+-                /* fn_attrs: */ None,
+-                /* fn_abi: */ None,
+-                helper_fn,
+-                &[exn_ptr],
+-                Some(&funclet),
+-                /* instance: */ None,
+-            );
+-
+-            // Branch: either abort (legacy / no MIR pass) or
+-            // store into raw_err_local + catch_ret to err_wrap_bb.
++            let funclet = pad_bx.catch_pad(cs, &[null, flags_catch_all, null]);
++
++            // We don't call the runtime helper on MSVC: its
++            // declared signature `(ptr) -> { i32, ptr }`
++            // returns a 16-byte struct, which on Win64 ABI
++            // requires an implicit sret pointer in RCX. The
++            // external declaration we emit doesn't carry the
++            // `sret` attribute, so LLVM lowers the call as
++            // "ptr in RCX, no sret" — but the helper's actual
++            // body (compiled by Rust with proper ABI lowering)
++            // expects RCX = sret pointer. The mismatch shows
++            // up as a null-pointer write at runtime when the
++            // helper tries to populate its sret slot.
++            //
++            // Since the MSVC catch-all path can't pass a real
++            // exception pointer anyway (catch_pad's slot is
++            // unused with flags=64), we synthesize the
++            // `CxxRawError` inline instead of calling out:
++            //
++            //   raw_err_local.kind    = CXX_EXC_UNKNOWN (2)
++            //   raw_err_local.message = null
++            //
++            // The end result for the user is the same:
++            // `Result::Err(CxxRawError { kind: UNKNOWN, .. })`.
++            // Itanium gets the richer treatment because the
++            // helper there returns by Pair (no sret involved).
+             match dest {
+                 None => {
+                     pad_bx.abort();
+@@ -2103,7 +2125,25 @@ fn cxx_throws_catch_pad(
+                             );
+                         }
+                     };
+-                    pad_bx.store(raw_err, place.val.llval, place.val.align);
++                    // Build `CxxRawError { kind: 2, message: null }`
++                    // and store into raw_err_local.
++                    let i32_ty = pad_bx.cx().type_i32();
++                    let ptr_ty = pad_bx.cx().type_ptr();
++                    let kind_unknown = pad_bx.cx().const_uint(i32_ty, 2);
++                    let null_msg = pad_bx.cx().const_null(ptr_ty);
++                    // raw_err_local.kind = 2
++                    pad_bx.store(kind_unknown, place.val.llval, place.val.align);
++                    // raw_err_local.message = null  (offset +8,
++                    // matching CxxRawError's repr(C) layout).
++                    let i8_ty = pad_bx.cx().type_i8();
++                    let i64_ty = pad_bx.cx().type_i64();
++                    let eight = pad_bx.cx().const_uint(i64_ty, 8);
++                    let msg_ptr = pad_bx.inbounds_gep(
++                        i8_ty,
++                        place.val.llval,
++                        &[eight],
++                    );
++                    pad_bx.store(null_msg, msg_ptr, place.val.align);
+                     pad_bx.catch_ret(&funclet, self.llbb(err_wrap_mir_bb));
+                 }
+             }
+-- 
+2.50.1 (Apple Git-155)
+

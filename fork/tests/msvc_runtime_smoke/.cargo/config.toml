@@ -12,5 +12,10 @@ rustflags = [
   "-Lnative=/Users/ogi/.xwin/crt/lib/x86_64",
   "-Lnative=/Users/ogi/.xwin/sdk/lib/um/x86_64",
   "-Lnative=/Users/ogi/.xwin/sdk/lib/ucrt/x86_64",
+  # v1.13.0 P09.67b: build.rs would need host std (not in
+  # stage-1 sysroot), so we pre-compile maybe_throws.lib via
+  # the runner script (run_msvc_runtime.sh) and pass its
+  # directory + name via additional -L / -l args. The script
+  # appends them as link-arg flags at cargo invocation time.
   "-Clink-arg=/subsystem:console",
 ]
