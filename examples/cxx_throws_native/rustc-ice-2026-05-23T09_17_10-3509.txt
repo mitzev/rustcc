@@ -1,0 +1,8 @@
+delayed bug: `#[rustc_cxx_throws]` requires `CxxException: From<CxxRawError>` (cxx::CxxRawError); add the impl or change the Result's Err type
+disabled backtrace
+delayed bug: `#[rustc_cxx_throws]` requires `CxxException: From<CxxRawError>` (cxx::CxxRawError); add the impl or change the Result's Err type
+disabled backtrace
+
+
+rustc version: 1.97.0-dev
+platform: aarch64-apple-darwin

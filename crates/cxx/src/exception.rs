@@ -155,6 +155,33 @@ impl CxxException {
     }
 }
 
+/// Convert from the FFI-mirror `CxxRawError` to the
+/// ergonomic `CxxException`. Used by the rustcc fork rustc's
+/// `cxx_throws_wrap` MIR pass (P09.69) to lift the runtime
+/// helper's return into the user's declared
+/// `Result<T, CxxException>` shape.
+///
+/// Wraps the unsafe `CxxException::from_raw` with the trust
+/// assumption that the `CxxRawError` was produced by
+/// `__rustcc_cxx_catch_unknown` — which always returns a
+/// valid (possibly-null) message pointer pointing to a
+/// statically-allocated `c_char` string. The conversion is
+/// safe to use in the From impl because that's the only path
+/// that actually produces a `CxxRawError` in real use; any
+/// hand-constructed instance is the caller's responsibility
+/// to set up correctly.
+impl From<CxxRawError> for CxxException {
+    fn from(raw: CxxRawError) -> Self {
+        // SAFETY: `__rustcc_cxx_catch_unknown` either returns
+        // a null pointer or a pointer to a string with
+        // 'static lifetime. The Phase 0 shim's path uses a
+        // `thread_local std::string` whose buffer lives
+        // through the call; from_raw copies out of it
+        // immediately, so the lifetime constraint holds.
+        unsafe { CxxException::from_raw(raw.kind, raw.message) }
+    }
+}
+
 impl fmt::Display for CxxException {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {

@@ -1,0 +1,40 @@
+# Phase 2 native invoke smoke test — proves the full v1.13.0
+# stack composes against the real cxx runtime crate.
+#
+# Unlike cxx_throws_demo (which uses the v1.12.x shim path),
+# this example exercises the fork rustc patches directly:
+#
+#   - extern "C++" fn marked `#[rustc_cxx_throws]`
+#   - lowered to LLVM invoke + landingpad by the fork rustc
+#   - catch BB calls cxx::native_invoke::__rustcc_cxx_catch_unknown
+#   - MIR pass auto-converts CxxRawError → CxxException via
+#     <CxxException as From<CxxRawError>>::from
+#
+# Requires the fork rustc (build/host/stage1/bin/rustc) and
+# the `rustcc-fork` feature on the cxx dep. Run with:
+#
+#   RUSTC=../../../rust-lang-rust-fork/build/host/stage1/bin/rustc \
+#     cargo run --release
+#
+# Or use a rustup toolchain link.
+
+[workspace]
+# Opt out of the parent rustcc workspace — same pattern as
+# the other examples/ crates.
+
+[package]
+name = "cxx_throws_native"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+
+[dependencies]
+# Enable the rustcc-fork feature so CxxRawError carries
+# the `rustc_diagnostic_item = "CxxRawError"` attribute the
+# MIR pass uses for auto-conversion.
+cxx = { path = "../../crates/cxx", features = ["rustcc-fork"] }
+
+[build-dependencies]
+cc = "1.2"
