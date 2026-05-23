@@ -2814,17 +2814,20 @@ fn render_m20d_one_variant(
 /// before this. So flattening adds zero new offset arithmetic;
 /// it's pure ergonomics.
 ///
-/// v0 limitations:
-/// - Only directly-declared methods on a direct base get
-///   flattened. Multi-level chains (Fl_Window inherits from
-///   Fl_Group inherits from Fl_Widget) need a recursive walk
-///   to surface Fl_Widget's methods on Fl_Window directly.
-///   For v0 we walk one level; users get the second hop via
-///   `window.as_fl_group().handle()` which still works.
+/// v1.10 stretch 2 update: now walks **multi-level**. Methods
+/// from grandparent bases flatten as `c.gp_method()` instead of
+/// requiring `c.as_parent().as_grandparent().gp_method()`. The
+/// walker visits ancestor classes in C++ name-lookup order:
+/// depth-first through bases in declaration order, with closer
+/// ancestors winning over deeper ones on name collisions.
+///
+/// Limitations carried forward:
 /// - Static methods are skipped — they don't carry through
 ///   inheritance the same way at the binding level.
 /// - Operators / conversions / virtuals / ctors / dtors are
 ///   skipped (they have separate dispatch shapes).
+/// - Virtual bases are skipped — they need vbase-offset
+///   arithmetic that v0's accessor pattern doesn't yet model.
 fn render_flattened_inherited_methods(
     ctx: &CxxTypeCtx,
     class_id: ClassId,
@@ -2834,8 +2837,6 @@ fn render_flattened_inherited_methods(
     derived_emissions: &[MethodEmission],
     block: &mut String,
 ) {
-    use rustc_abi_cxx::{MethodName, Virtuality};
-
     // Names already taken by the derived class's own emissions or
     // by the M22 cross-base accessors emitted above. Cross-base
     // accessor names follow the `as_<base_lowercase>` /
@@ -2860,11 +2861,83 @@ fn render_flattened_inherited_methods(
 
     let mut emitted_any = false;
     let mut header_written = false;
-    for base_spec in &class.bases {
+
+    // v1.10 stretch 2: walk multi-level. The recursive walker
+    // visits each ancestor class in C++ name-lookup order — depth-
+    // first through bases in declaration order, with closer
+    // ancestors winning on name collision. `visited` prevents
+    // cycles (defensive: single non-virtual inheritance can't
+    // cycle, but defensive against pathological importer output).
+    //
+    // The accessor chain is built up as we recurse — at depth N
+    // we know we need to chain through `self.as_a().as_b()…` to
+    // reach the current ancestor.
+    let mut visited: std::collections::HashSet<ClassId> =
+        std::collections::HashSet::new();
+    visited.insert(class_id);
+    walk_ancestor_chain(
+        ctx,
+        class,
+        class_name,
+        inner_indent,
+        &mut taken,
+        &mut visited,
+        &[], // accessor chain: empty at top level
+        &mut emitted_any,
+        &mut header_written,
+        block,
+    );
+    let _ = emitted_any;
+}
+
+/// v1.10 stretch 2 walker. For each ancestor reachable through
+/// non-virtual non-poisoned bases (starting from `class`):
+///
+/// - Walk its bases recursively first (depth-first, declaration
+///   order). This makes deeper ancestors visible BEFORE we shadow
+///   their names with closer ones.
+/// - Then emit forwarders for each plain-identifier non-virtual
+///   instance method on the current ancestor that doesn't collide
+///   with `taken`. Each forwarder chains through the supplied
+///   `accessor_chain` and produces a body of the form
+///   `self.as_a().as_b().method(...)`.
+///
+/// Name-shadowing follows C++ name-lookup: a method declared
+/// closer to the derived class wins over a same-named method on
+/// a deeper ancestor. We achieve this by emitting CLOSER
+/// ancestors LAST — they call `taken.insert` last, but the closer
+/// emission also wins display because we already iterated the
+/// deeper ones earlier and inserted them into `taken`.
+///
+/// Wait, that's backwards — we want CLOSER methods to be emitted,
+/// and farther shadowed. So the walker actually:
+///   1. Emits this class's methods FIRST at the current chain
+///      depth (these are the "closer to derived" methods at this
+///      branch).
+///   2. THEN recurses into bases.
+fn walk_ancestor_chain(
+    ctx: &CxxTypeCtx,
+    current: &rustc_abi_cxx::ClassDef,
+    class_name: &str,
+    inner_indent: &str,
+    taken: &mut std::collections::HashSet<String>,
+    visited: &mut std::collections::HashSet<ClassId>,
+    accessor_chain: &[(String, String)], // (const_accessor, mut_accessor)
+    emitted_any: &mut bool,
+    header_written: &mut bool,
+    block: &mut String,
+) {
+    use rustc_abi_cxx::{MethodName, Virtuality};
+
+    for base_spec in &current.bases {
         if base_spec.virtual_ {
             continue;
         }
         if ctx.is_poisoned(base_spec.class) {
+            continue;
+        }
+        if !visited.insert(base_spec.class) {
+            // Diamond / cycle defense.
             continue;
         }
         let base = ctx.class(base_spec.class);
@@ -2875,6 +2948,14 @@ fn render_flattened_inherited_methods(
         let accessor_const = format!("as_{}", base_ident.to_lowercase());
         let accessor_mut = format!("{accessor_const}_mut");
 
+        // Build the accessor chain to reach `base` from `self`.
+        let mut new_chain: Vec<(String, String)> = accessor_chain.to_vec();
+        new_chain.push((accessor_const.clone(), accessor_mut.clone()));
+
+        // 1. Emit forwarders for THIS base's own methods at the
+        //    current chain depth. Closer-to-derived methods win
+        //    on name collision because we iterate direct bases
+        //    BEFORE recursing into grandparents.
         for (m_idx, method) in base.methods.iter().enumerate() {
             if method.virtuality != Virtuality::NonVirtual {
                 continue;
@@ -2882,26 +2963,20 @@ fn render_flattened_inherited_methods(
             if method.special.is_some() {
                 continue;
             }
-            // Only methods named with a plain identifier — skip
-            // operators / conversion functions for v0.
             let name = match &method.name {
                 MethodName::Ident(i) => i.0.clone(),
                 _ => continue,
             };
-            // Skip static methods — at the binding level they
-            // don't carry through inheritance the way instance
-            // methods do.
-            if ctx.is_method_static(class_id, m_idx)
-                || ctx.is_method_static(base_spec.class, m_idx)
-            {
+            if ctx.is_method_static(base_spec.class, m_idx) {
                 continue;
             }
-            if !taken.insert(rust_safe_ident(&name)) {
+            let safe_name = rust_safe_ident(&name);
+            if !taken.insert(safe_name.clone()) {
                 continue;
             }
-            // Render parameter and return types. Failures (e.g.
-            // unsupported parameter type) silently skip — same
-            // policy as the regular method walk.
+
+            // Render param + return types — same policy as the
+            // single-level walker. Failures silently skip.
             let where_ =
                 format!("{class_name}::{name} (flattened from {base_ident})");
             let mut param_decls: Vec<String> = Vec::new();
@@ -2922,54 +2997,78 @@ fn render_flattened_inherited_methods(
             if !params_ok {
                 continue;
             }
-            let ret_ty =
-                match render_rust_type(ctx, method.sig.ret, &where_) {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
+            let ret_ty = match render_rust_type(ctx, method.sig.ret, &where_) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
             let ret_clause = if ret_ty == "()" {
                 String::new()
             } else {
                 format!(" -> {ret_ty}")
             };
-            let receiver = if method.sig.cv.is_const {
-                ("&self", &accessor_const)
-            } else {
-                ("&mut self", &accessor_mut)
-            };
-            let display_name = rust_safe_ident(&name);
-            if !header_written {
+            let is_const = method.sig.cv.is_const;
+            let receiver_str = if is_const { "&self" } else { "&mut self" };
+            // Build accessor chain expression:
+            // `self.as_a().as_b()…` — last segment uses `_mut`
+            // variant when the method is non-const, else const.
+            let mut accessor_expr = String::from("self");
+            for (i, (cst, mt)) in new_chain.iter().enumerate() {
+                let pick = if i + 1 == new_chain.len() && !is_const {
+                    mt.as_str()
+                } else {
+                    cst.as_str()
+                };
+                accessor_expr.push_str(&format!(".{pick}()"));
+            }
+            if !*header_written {
                 let _ = writeln!(block);
                 let _ = writeln!(
                     block,
                     "{inner_indent}// M22 follow-up: flattened methods inherited from non-virtual bases.",
                 );
-                header_written = true;
+                *header_written = true;
             }
+            let chain_pretty = new_chain
+                .iter()
+                .map(|(c, _)| format!(".{c}()"))
+                .collect::<Vec<_>>()
+                .join("");
             let _ = writeln!(
                 block,
                 "{inner_indent}/// Flattened from `{base_ident}`. Equivalent to \
-                 `self.{accessor}().{name}(...)`.",
-                accessor = receiver.1,
+                 `self{chain_pretty}.{name}(...)`.",
             );
             let _ = writeln!(
                 block,
-                "{inner_indent}pub fn {display_name}({receiver_str}{maybe_comma}{params}){ret_clause} {{",
-                receiver_str = receiver.0,
+                "{inner_indent}pub fn {safe_name}({receiver_str}{maybe_comma}{params}){ret_clause} {{",
                 maybe_comma = if param_decls.is_empty() { "" } else { ", " },
                 params = param_decls.join(", "),
             );
             let _ = writeln!(
                 block,
-                "{inner_indent}    self.{accessor}().{name}({fwd})",
-                accessor = receiver.1,
+                "{inner_indent}    {accessor_expr}.{name}({fwd})",
                 fwd = forward_args.join(", "),
             );
             let _ = writeln!(block, "{inner_indent}}}");
-            emitted_any = true;
+            *emitted_any = true;
         }
+
+        // 2. Recurse into this base's own bases (grandparents
+        //    of the original class). Pass the extended chain so
+        //    the next level's emit knows to chain twice.
+        walk_ancestor_chain(
+            ctx,
+            base,
+            class_name,
+            inner_indent,
+            taken,
+            visited,
+            &new_chain,
+            emitted_any,
+            header_written,
+            block,
+        );
     }
-    let _ = emitted_any;
 }
 
 fn render_m21c_bitfield_accessors(
