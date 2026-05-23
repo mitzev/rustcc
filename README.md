@@ -269,6 +269,7 @@ More examples in [`examples/`](examples/). Full walkthrough:
 | [`docs/codegen.md`](docs/codegen.md) | LLVM IR generation for cross-language calls, vtables, ctors/dtors |
 | [`docs/ownership_and_safety.md`](docs/ownership_and_safety.md) | `CxxOwned<T>`, pinning, move/copy surface, borrow-checker contract |
 | [`docs/exception_boundary.md`](docs/exception_boundary.md) | Terminate-on-throw barrier between Rust and C++ |
+| [`docs/cxx_throws.md`](docs/cxx_throws.md) | `[[rustcc::cxx_throws]]` — catching C++ exceptions from Rust (Phase 0 ergonomic story + Phase 1/2/3 design) |
 | [`docs/repr_cpp.md`](docs/repr_cpp.md) | Rust types exposed to C++ with matching layout |
 | [`docs/build_integration.md`](docs/build_integration.md) | Driver, cargo manifest extensions, linking, toolchain detection |
 
