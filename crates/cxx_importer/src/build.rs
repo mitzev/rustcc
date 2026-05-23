@@ -524,13 +524,32 @@ impl Build {
         // annotations. Without this step the generated bindings
         // reference `__rustcc_throws_*` symbols that don't
         // exist in the final static lib, producing link errors.
-        let throws_shim_src = build_throws_shims_for_free_fns(
+        // v1.12.16: same now for class methods — collect both
+        // free-fn + class-method ThrowsShimSpec entries into a
+        // single render pass so `CxxRawError` + `#include`s
+        // stay deduplicated.
+        let mut combined_specs: Vec<crate::cxx_exception::ThrowsShimSpec> =
+            Vec::new();
+        combined_specs.extend(collect_throws_specs_for_free_fns(
             &ctx,
             &annotations,
             &free_fns,
-            &self.headers,
-        );
-        if !throws_shim_src.is_empty() {
+        ));
+        combined_specs.extend(collect_throws_specs_for_class_methods(
+            &ctx,
+            &annotations,
+            &all_class_ids,
+        ));
+        if !combined_specs.is_empty() {
+            let header_refs: Vec<&str> = self
+                .headers
+                .iter()
+                .filter_map(|h| h.to_str())
+                .collect();
+            let throws_shim_src = crate::cxx_exception::render_all_throws_shims_cpp(
+                &header_refs,
+                &combined_specs,
+            );
             shims_src.push('\n');
             shims_src.push_str(&throws_shim_src);
         }
@@ -863,34 +882,47 @@ fn build_argv(
     argv
 }
 
-/// v1.12.15: walk the imported free fns + the annotation set,
-/// build a `ThrowsShimSpec` for every fn carrying
-/// `Annotation::CxxThrows` / `CxxThrowsTyped`, and render the
-/// combined C++ shim source via
-/// `cxx_importer::render_all_throws_shims_cpp`. Returns an empty
-/// string when no fn is throws-tagged, so the caller can no-op
-/// concatenate without a conditional.
-///
-/// Class methods are NOT included yet — v1.12.16 will extend
-/// this to class-method throws emission (needs the
-/// `__rustcc_throws_<Class>_<method>` shim shape, the
-/// `this->method(args)` callsite form, and per-method param
-/// rendering through `shims::render_cxx_type`).
-fn build_throws_shims_for_free_fns(
+/// Inspect an effective annotation list for a throws marker.
+/// Returns `Some(typed_list)` for the typed form (possibly
+/// empty for plain `cxx_throws`) and `None` when the entity
+/// is not throws-tagged. Helper for the
+/// `collect_throws_specs_for_*` walkers.
+fn extract_throws_types(anns: &[crate::annotations::Annotation]) -> Option<Vec<String>> {
+    use crate::annotations::Annotation;
+    let mut is_throws = false;
+    for ann in anns {
+        match ann {
+            Annotation::CxxThrowsTyped(types) => {
+                return Some(types.clone());
+            }
+            Annotation::CxxThrows => {
+                is_throws = true;
+            }
+            _ => {}
+        }
+    }
+    if is_throws {
+        Some(Vec::new())
+    } else {
+        None
+    }
+}
+
+/// v1.12.15: build `ThrowsShimSpec` entries for every
+/// throws-annotated free fn in `free_fns`. Returns an empty
+/// vec when no fn is throws-tagged. Unsupported return / param
+/// types drop the offending fn (the resulting link error then
+/// surfaces the gap loudly).
+fn collect_throws_specs_for_free_fns(
     ctx: &CxxTypeCtx,
     annotations: &AnnotationSet,
     free_fns: &FreeFnSet,
-    headers: &[PathBuf],
-) -> String {
-    use crate::annotations::Annotation;
-    use crate::cxx_exception::{render_all_throws_shims_cpp, ThrowsShimSpec};
+) -> Vec<crate::cxx_exception::ThrowsShimSpec> {
+    use crate::cxx_exception::ThrowsShimSpec;
     use rustc_abi_cxx::NameSegment;
 
     let mut specs: Vec<ThrowsShimSpec> = Vec::new();
     for ff in &free_fns.entries {
-        // Build the FQN matching the annotation lookup key
-        // (same convention `crate::rust_bindings::render_free_fns`
-        // uses).
         let fqn = if ff.parent.is_empty() {
             ff.name.0.clone()
         } else {
@@ -906,43 +938,17 @@ fn build_throws_shims_for_free_fns(
             parts.join("::")
         };
 
-        // Pick out the throws annotation (typed or plain). Skip
-        // fns that aren't throws-tagged.
-        let mut typed_catches: Vec<String> = Vec::new();
-        let mut is_throws = false;
-        for ann in annotations.effective(&fqn) {
-            match ann {
-                Annotation::CxxThrowsTyped(types) => {
-                    typed_catches = types;
-                    is_throws = true;
-                    break;
-                }
-                Annotation::CxxThrows => {
-                    is_throws = true;
-                    // Don't break — a later CxxThrowsTyped in
-                    // the same effective list (from sidecar
-                    // layering) should still win.
-                }
-                _ => {}
-            }
-        }
-        if !is_throws {
+        let anns = annotations.effective(&fqn);
+        let Some(typed_catches) = extract_throws_types(&anns) else {
             continue;
-        }
+        };
 
-        // Render C++ return type + per-param decl + forward
-        // arg list via the shims module's renderer.
         let return_type_cpp = match crate::shims::render_cxx_type(
             ctx,
             ff.sig.ret,
             &format!("throws shim return for {fqn}"),
         ) {
             Ok(s) => s,
-            // Unsupported type — drop this fn from the throws
-            // shim emission. The generated bindings will
-            // produce a link error referencing the missing
-            // shim symbol, which surfaces the gap loudly
-            // rather than silently miscompiling.
             Err(_) => continue,
         };
         let mut param_decls: Vec<String> = Vec::with_capacity(ff.sig.params.len());
@@ -973,22 +979,166 @@ fn build_throws_shims_for_free_fns(
             return_type_cpp,
             param_decls,
             forward_args,
-            // For namespaced free fns the callsite needs the
-            // namespace prefix so the call resolves.
-            original_callsite: fqn.clone(),
+            original_callsite: fqn,
             typed_catches,
         });
     }
+    specs
+}
 
-    if specs.is_empty() {
-        return String::new();
+/// v1.12.16: build `ThrowsShimSpec` entries for class methods
+/// carrying `cxx_throws` / `cxx_throws(T1, T2)` annotations.
+/// Today's scope: plain identifier-named **non-virtual,
+/// non-static, non-special** instance methods. (Static, virtual,
+/// ctor / dtor, operator, and conversion functions are all
+/// silently skipped — the generated bindings will produce a
+/// link error if they reference a `__rustcc_throws_*` symbol
+/// we didn't emit, which is the desired "surface the gap"
+/// behavior.)
+///
+/// The C++ shim body for an instance method is:
+///
+/// ```cpp
+/// extern "C" CxxRawError __rustcc_throws_<Class>_<method>(
+///     <ClassFQN>* __this,
+///     <args>...,
+///     <RetTy>* __out
+/// ) noexcept {
+///     try {
+///         *__out = __this-><method>(<args>...);
+///         return { 0, nullptr };
+///     } catch (…) { … }
+/// }
+/// ```
+///
+/// Overloads: the v1.12.16 minimum drops every overload after
+/// the first method of a given name (the second emission would
+/// produce a duplicate symbol). Per-overload disambiguation is
+/// tracked for a follow-on.
+fn collect_throws_specs_for_class_methods(
+    ctx: &CxxTypeCtx,
+    annotations: &AnnotationSet,
+    class_ids: &[rustc_abi_cxx::ClassId],
+) -> Vec<crate::cxx_exception::ThrowsShimSpec> {
+    use crate::cxx_exception::ThrowsShimSpec;
+    use rustc_abi_cxx::{MethodName, NameSegment, Virtuality};
+
+    let mut specs: Vec<ThrowsShimSpec> = Vec::new();
+    // Per-class dedup against duplicate method names (overload skip).
+    let mut seen_per_class: std::collections::HashSet<(rustc_abi_cxx::ClassId, String)> =
+        std::collections::HashSet::new();
+
+    for &class_id in class_ids {
+        let class = ctx.class(class_id);
+
+        // Build the class's C++ FQN (namespaces + class name).
+        let class_fqn: String = class
+            .name
+            .0
+            .iter()
+            .map(|seg| match seg {
+                NameSegment::Namespace(id) | NameSegment::Class(id) => id.0.clone(),
+                NameSegment::TemplateSpec { name, .. } => name.0.clone(),
+                NameSegment::AnonymousNamespace => String::new(),
+                NameSegment::Enum(id) => id.0.clone(),
+            })
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("::");
+
+        // Last segment of the class FQN — used to build the
+        // `__rustcc_throws_<Class>_<method>` shim symbol.
+        let class_short = class_fqn
+            .rsplit("::")
+            .next()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if class_short.is_empty() {
+            continue;
+        }
+
+        for method in &class.methods {
+            // Today's scope filter: only plain identifier-named
+            // non-virtual non-special methods.
+            if method.special.is_some() {
+                continue;
+            }
+            if !matches!(method.virtuality, Virtuality::NonVirtual) {
+                continue;
+            }
+            let method_name = match &method.name {
+                MethodName::Ident(id) => id.0.clone(),
+                _ => continue, // operators / conversions
+            };
+
+            let fqn = format!("{class_fqn}::{method_name}");
+            let anns = annotations.effective(&fqn);
+            let Some(typed_catches) = extract_throws_types(&anns) else {
+                continue;
+            };
+
+            // Overload dedup.
+            let key = (class_id, method_name.clone());
+            if !seen_per_class.insert(key) {
+                continue;
+            }
+
+            // Render return type + params.
+            let return_type_cpp = match crate::shims::render_cxx_type(
+                ctx,
+                method.sig.ret,
+                &format!("throws shim return for {fqn}"),
+            ) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // First param: `<ClassFQN>* __this` (or `const <ClassFQN>* __this`
+            // for cv-const methods so the `this->method(args)` call
+            // type-checks).
+            let this_decl = if method.sig.cv.is_const {
+                format!("const {class_fqn}* __this")
+            } else {
+                format!("{class_fqn}* __this")
+            };
+            let mut param_decls: Vec<String> = vec![this_decl];
+            let mut forward_args: Vec<String> = Vec::with_capacity(method.sig.params.len());
+            let mut params_ok = true;
+            for (i, &p_ty) in method.sig.params.iter().enumerate() {
+                match crate::shims::render_cxx_type(
+                    ctx,
+                    p_ty,
+                    &format!("throws shim param {i} for {fqn}"),
+                ) {
+                    Ok(ty_src) => {
+                        param_decls.push(format!("{ty_src} __a{i}"));
+                        forward_args.push(format!("__a{i}"));
+                    }
+                    Err(_) => {
+                        params_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !params_ok {
+                continue;
+            }
+
+            specs.push(ThrowsShimSpec {
+                wrapper_name: format!("__rustcc_throws_{class_short}_{method_name}"),
+                return_type_cpp,
+                param_decls,
+                forward_args,
+                // C++-side callsite: `__this->method`. The
+                // typed renderer wraps this in `__this->method(args)`
+                // (or `*__out = __this->method(args)` for non-void
+                // returns).
+                original_callsite: format!("__this->{method_name}"),
+                typed_catches,
+            });
+        }
     }
-
-    let header_refs: Vec<&str> = headers
-        .iter()
-        .filter_map(|h| h.to_str())
-        .collect();
-    render_all_throws_shims_cpp(&header_refs, &specs)
+    specs
 }
 
 #[cfg(test)]
