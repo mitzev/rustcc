@@ -1081,7 +1081,19 @@ fn render_direct_extern_class(
     //    overlay routes records and ADTs through the right
     //    indirect-result register; pointer/scalar args are
     //    register-passed identically to C.
+    //
+    // v1.12.3: throws-tagged methods can't share the same
+    // `extern "C++"` block — their shim wrappers are
+    // `extern "C" noexcept`, no name mangling, no unwinding
+    // across the boundary. We collect the throws emissions
+    // separately during the per-method loop below and emit
+    // them in a second `extern "C"` block (and class-scope
+    // statics still flow into the `extern "C++"` block).
     let _ = writeln!(block, "{indent}unsafe extern \"C++\" {{");
+    // Side-buffer for throws-tagged extern decls. Flushed
+    // immediately after the "C++" block closes, before the
+    // impl block opens.
+    let mut throws_extern_lines: Vec<String> = Vec::new();
 
     // Pre-compute the disambiguated Rust name for each method.
     // Ctors and dtors are special-cased to `new` / `drop`; operators
@@ -1121,6 +1133,20 @@ fn render_direct_extern_class(
         // methods. We also surface skipped methods as `///` doc
         // comments at the top of the impl block so the user can
         // see what's missing without the class becoming a black box.
+        //
+        // v1.12.3: a method is throws-tagged when its FQN
+        // (`Class::method`) carries the `CxxThrows` annotation
+        // either inline or via sidecar. Free fns flow through the
+        // free-fn emitter; class methods through here.
+        let method_throws = method_source_name_for_fqn(method)
+            .map(|src_name| {
+                let fqn = format!("{class_fqn}::{src_name}");
+                annotations
+                    .effective(&fqn)
+                    .iter()
+                    .any(|a| matches!(a, Annotation::CxxThrows))
+            })
+            .unwrap_or(false);
         let emission = match classify_for_direct_extern(
             ctx,
             class_id,
@@ -1129,6 +1155,7 @@ fn render_direct_extern_class(
             method_idx,
             resolved_name,
             config,
+            method_throws,
         ) {
             Ok(e) => e,
             Err(BindingsError::UnsupportedMethod { why, .. })
@@ -1167,20 +1194,37 @@ fn render_direct_extern_class(
         // they're dispatched via the vtable at the call site, not
         // by linker resolution. The wrapper does its own vptr load
         // and transmute.
+        //
+        // v1.12.3: throws-tagged methods route into the separate
+        // `extern "C"` block (Phase 0 catch shim — see top of
+        // function), not the in-progress `extern "C++"` block.
         if !matches!(emission.kind, EmissionKind::Virtual { .. }) {
-            // Emit the extern decl line.
-            let _ = writeln!(
-                block,
-                "{indent}    #[link_name = \"{}\"]",
-                emission.link_name,
-            );
-            let _ = writeln!(
-                block,
-                "{indent}    fn {ext}({decl}){ret};",
-                ext = emission.extern_ident,
-                decl = emission.extern_decl_params,
-                ret = emission.extern_return_clause,
-            );
+            if emission.throws {
+                throws_extern_lines.push(format!(
+                    "{indent}    #[link_name = \"{}\"]",
+                    emission.link_name,
+                ));
+                throws_extern_lines.push(format!(
+                    "{indent}    fn {ext}({decl}){ret};",
+                    ext = emission.extern_ident,
+                    decl = emission.extern_decl_params,
+                    ret = emission.extern_return_clause,
+                ));
+            } else {
+                // Emit the extern decl line.
+                let _ = writeln!(
+                    block,
+                    "{indent}    #[link_name = \"{}\"]",
+                    emission.link_name,
+                );
+                let _ = writeln!(
+                    block,
+                    "{indent}    fn {ext}({decl}){ret};",
+                    ext = emission.extern_ident,
+                    decl = emission.extern_decl_params,
+                    ret = emission.extern_return_clause,
+                );
+            }
         }
         method_blocks.push(emission);
     }
@@ -1225,6 +1269,21 @@ fn render_direct_extern_class(
     }
     let _ = writeln!(block, "{indent}}}");
     let _ = writeln!(block);
+
+    // v1.12.3: emit the separate `extern "C"` block for any
+    // throws-tagged method shims collected during the loop above.
+    // The two extern blocks never share contents (throws methods
+    // skip the `extern "C++"` block; everything else skips this
+    // one), so this is the only place that emits the throws
+    // extern decls.
+    if !throws_extern_lines.is_empty() {
+        let _ = writeln!(block, "{indent}unsafe extern \"C\" {{");
+        for line in &throws_extern_lines {
+            let _ = writeln!(block, "{line}");
+        }
+        let _ = writeln!(block, "{indent}}}");
+        let _ = writeln!(block);
+    }
 
     // 3. Inherent `impl` block with safe wrappers. Each method
     //    forwards to its extern decl with the appropriate `unsafe`
@@ -1818,6 +1877,22 @@ struct MethodEmission {
     /// that takes `&::core::ffi::CStr` for each listed slot
     /// and forwards via `as_ptr()`.
     cstr_param_indices: Vec<usize>,
+    /// v1.12.3: when set, the method is tagged
+    /// `[[clang::annotate("rustcc::cxx_throws")]]` (or sidecar
+    /// `throws: true`). The extern decl is routed through the
+    /// Phase 0 C++ catch shim (`extern "C"`, takes a `*mut RetTy`
+    /// out-param, returns `::cxx::CxxRawError`), and the safe
+    /// wrapper returns `Result<T, ::cxx::CxxException>`.
+    /// Today only Instance + Static method kinds participate —
+    /// Ctor / Dtor / Virtual throws are tracked for a follow-up.
+    throws: bool,
+    /// v1.12.3: the rendered Rust type of the method's return,
+    /// kept separately so the wrapper-body emitter can put it
+    /// behind a `MaybeUninit` slot without re-parsing the
+    /// `wrapper_return` string (which becomes
+    /// `Result<T, ...>` when `throws`). Empty string for void
+    /// returns. Populated for every non-special method.
+    raw_ret_ty: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1975,6 +2050,7 @@ fn classify_for_direct_extern(
     method_idx: usize,
     resolved_rust_name: &str,
     config: &RustBindingsConfig,
+    throws: bool,
 ) -> Result<MethodEmission, BindingsError> {
     // Per-method gate: virtual methods (regular or pure) without
     // a populated `vtable_index` can't be dispatched through the
@@ -2119,6 +2195,8 @@ fn classify_for_direct_extern(
                 wrapper_forward_arg_names: user_forward_names.clone(),
                 synthesized_default_literals: synthesized_defaults.clone(),
                 cstr_param_indices: cstr_param_indices.clone(),
+                throws: false,
+                raw_ret_ty: String::new(),
             });
         }
         Some(SpecialMember::Dtor) => {
@@ -2142,6 +2220,8 @@ fn classify_for_direct_extern(
                 wrapper_forward_arg_names: Vec::new(),
                 synthesized_default_literals: None,
                 cstr_param_indices: Vec::new(),
+                throws: false,
+                raw_ret_ty: String::new(),
             });
         }
         Some(SpecialMember::CopyCtor | SpecialMember::MoveCtor)
@@ -2242,33 +2322,88 @@ fn classify_for_direct_extern(
         receiver
     };
 
+    // v1.12.3: throws emission shape — supported on Instance +
+    // Static methods only (not Ctor / Dtor / Virtual yet). For
+    // throws methods we route through the Phase 0 C++ catch
+    // shim:
+    //  - link_name is the shim symbol (extern "C", no mangling)
+    //  - extern decl appends `__out: *mut RetTy` for non-void
+    //  - extern return clause becomes `-> ::cxx::CxxRawError`
+    //  - wrapper return becomes `Result<T, ::cxx::CxxException>`
+    // Throws on virtual methods is rejected here so callers see
+    // a clean per-method skip diagnostic.
+    if throws && matches!(kind, EmissionKind::Virtual { .. }) {
+        return Err(BindingsError::UnsupportedMethod {
+            where_: format!("{class_name}::{method_name}"),
+            why: "cxx_throws on virtual methods is v1.12.4+ work \
+                  (Phase 0 shim emission for vtable-dispatched \
+                  methods needs the vtable-lookup wrapper to thread \
+                  the out-param + Result-decode through the \
+                  transmute path)"
+                .into(),
+        });
+    }
+
     // Mangle using the *original* C++ method name (operator code or
     // identifier) so the symbol matches what Clang produced for the
     // C++ object. The Rust-side identifier (`resolved_rust_name`)
     // is what the wrapper exposes to callers; the link_name is
     // separate and follows the C++ side verbatim.
-    let link = ctx.mangle(&Symbol::Method {
-        class: class_id,
-        name: mangler_method_name,
-        sig: method.sig.clone(),
-    });
+    let link = if throws {
+        format!("__rustcc_throws_{class_name}_{method_name}")
+    } else {
+        ctx.mangle(&Symbol::Method {
+            class: class_id,
+            name: mangler_method_name,
+            sig: method.sig.clone(),
+        })
+    };
+
+    // Effective extern decl + return clause for the emission.
+    // Plain path: extern_decl, extern_ret_clause as built above.
+    // Throws path: same `this` + user args, then `__out: *mut RetTy`
+    // tail (for non-void), and `-> ::cxx::CxxRawError`.
+    let (effective_extern_decl, effective_extern_ret_clause, effective_wrapper_return) =
+        if throws {
+            let mut decl = extern_decl.clone();
+            let ret_is_void = ret_rust == "()";
+            if !ret_is_void {
+                decl.push(format!("__out: *mut {ret_rust}"));
+            }
+            let wrapper_ret = if ret_is_void {
+                "::core::result::Result<(), ::cxx::CxxException>".to_string()
+            } else {
+                format!(
+                    "::core::result::Result<{ret_rust}, ::cxx::CxxException>"
+                )
+            };
+            (
+                decl.join(", "),
+                " -> ::cxx::CxxRawError".to_string(),
+                wrapper_ret,
+            )
+        } else {
+            (extern_decl.join(", "), extern_ret_clause, ret_rust.clone())
+        };
 
     Ok(MethodEmission {
         kind,
         rust_name: method_name.clone(),
         extern_ident: format!("__cxx_{class_name}_{method_name}"),
         link_name: link,
-        extern_decl_params: extern_decl.join(", "),
-        extern_return_clause: extern_ret_clause,
+        extern_decl_params: effective_extern_decl,
+        extern_return_clause: effective_extern_ret_clause,
         wrapper_receiver: final_receiver,
         wrapper_params: user_arg_decls.join(", "),
-        wrapper_return: ret_rust,
+        wrapper_return: effective_wrapper_return,
         forward_args: user_forward.join(", "),
         wrapper_user_params: user_param_pairs,
         wrapper_forward_arg_names: user_forward_names,
         synthesized_default_literals: synthesized_defaults,
         cstr_param_indices,
         default_arg_count: ctx.default_arg_count(class_id, method_idx),
+        throws,
+        raw_ret_ty: ret_rust,
     })
 }
 
@@ -2397,7 +2532,61 @@ fn render_direct_extern_wrapper(
                 )
             };
             let _ = writeln!(out, "{head}");
-            if emission.forward_args.is_empty() {
+            if emission.throws {
+                // v1.12.3 throws shape: call the extern through
+                // the C++ catch shim, get a CxxRawError back,
+                // decode into Result.
+                let ret_is_void = emission.raw_ret_ty == "()";
+                let fwd_clause = if emission.forward_args.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", emission.forward_args)
+                };
+                if ret_is_void {
+                    let _ = writeln!(
+                        out,
+                        "{indent}    let __raw = unsafe {{ {ext}({this}{fwd}) }};",
+                        ext = emission.extern_ident,
+                        this = self_cast,
+                        fwd = fwd_clause,
+                    );
+                    let _ = writeln!(
+                        out,
+                        "{indent}    unsafe {{ ::cxx::decode_cxx_raw_error(__raw, ()) }}",
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{indent}    let mut __out = \
+                         ::core::mem::MaybeUninit::<{ret}>::uninit();",
+                        ret = emission.raw_ret_ty,
+                    );
+                    let _ = writeln!(
+                        out,
+                        "{indent}    let __raw = unsafe {{ \
+                         {ext}({this}{fwd}, __out.as_mut_ptr()) }};",
+                        ext = emission.extern_ident,
+                        this = self_cast,
+                        fwd = fwd_clause,
+                    );
+                    let _ = writeln!(
+                        out,
+                        "{indent}    if __raw.kind == ::cxx::CXX_EXC_OK {{",
+                    );
+                    let _ = writeln!(
+                        out,
+                        "{indent}        ::core::result::Result::Ok(unsafe \
+                         {{ __out.assume_init() }})",
+                    );
+                    let _ = writeln!(out, "{indent}    }} else {{");
+                    let _ = writeln!(
+                        out,
+                        "{indent}        ::core::result::Result::Err(unsafe {{ \
+                         ::cxx::CxxException::from_raw(__raw.kind, __raw.message) }})",
+                    );
+                    let _ = writeln!(out, "{indent}    }}");
+                }
+            } else if emission.forward_args.is_empty() {
                 let _ = writeln!(
                     out,
                     "{indent}    unsafe {{ {ext}({this}) }}",
@@ -2532,7 +2721,55 @@ fn render_direct_extern_wrapper(
                 params = emission.wrapper_params,
                 ret = ret_clause,
             );
-            if emission.forward_args.is_empty() {
+            if emission.throws {
+                let ret_is_void = emission.raw_ret_ty == "()";
+                if ret_is_void {
+                    let _ = writeln!(
+                        out,
+                        "{indent}    let __raw = unsafe {{ {ext}({fwd}) }};",
+                        ext = emission.extern_ident,
+                        fwd = emission.forward_args,
+                    );
+                    let _ = writeln!(
+                        out,
+                        "{indent}    unsafe {{ ::cxx::decode_cxx_raw_error(__raw, ()) }}",
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{indent}    let mut __out = \
+                         ::core::mem::MaybeUninit::<{ret}>::uninit();",
+                        ret = emission.raw_ret_ty,
+                    );
+                    let out_arg = if emission.forward_args.is_empty() {
+                        "__out.as_mut_ptr()".to_string()
+                    } else {
+                        format!("{}, __out.as_mut_ptr()", emission.forward_args)
+                    };
+                    let _ = writeln!(
+                        out,
+                        "{indent}    let __raw = unsafe {{ {ext}({args}) }};",
+                        ext = emission.extern_ident,
+                        args = out_arg,
+                    );
+                    let _ = writeln!(
+                        out,
+                        "{indent}    if __raw.kind == ::cxx::CXX_EXC_OK {{",
+                    );
+                    let _ = writeln!(
+                        out,
+                        "{indent}        ::core::result::Result::Ok(unsafe \
+                         {{ __out.assume_init() }})",
+                    );
+                    let _ = writeln!(out, "{indent}    }} else {{");
+                    let _ = writeln!(
+                        out,
+                        "{indent}        ::core::result::Result::Err(unsafe {{ \
+                         ::cxx::CxxException::from_raw(__raw.kind, __raw.message) }})",
+                    );
+                    let _ = writeln!(out, "{indent}    }}");
+                }
+            } else if emission.forward_args.is_empty() {
                 let _ = writeln!(
                     out,
                     "{indent}    unsafe {{ {ext}() }}",
