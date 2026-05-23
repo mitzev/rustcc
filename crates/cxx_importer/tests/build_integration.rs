@@ -314,4 +314,36 @@ int internal_only();
         !bindings.contains("internal_only"),
         "skip-annotated fn shouldn't appear; bindings:\n{bindings}"
     );
+
+    // v1.12.15: the C++ shim source must include the matching
+    // `__rustcc_throws_*` shim bodies so the bindings actually
+    // link. Without this, the generated bindings reference
+    // unresolved symbols.
+    let shims = std::fs::read_to_string(&outputs.shims_path)
+        .expect("read shims");
+    assert!(
+        shims.contains("extern \"C\" CxxRawError __rustcc_throws_risky_op"),
+        "expected risky_op shim body in cxx_shims.cpp; shims:\n{shims}"
+    );
+    assert!(
+        shims.contains("extern \"C\" CxxRawError __rustcc_throws_risky_typed_op"),
+        "expected risky_typed_op shim body; shims:\n{shims}"
+    );
+    // Typed shim should have the per-type catch arms.
+    assert!(
+        shims.contains("catch (const MyErrorA& __e)"),
+        "expected MyErrorA catch arm; shims:\n{shims}"
+    );
+    assert!(
+        shims.contains("catch (const MyErrorB& __e)"),
+        "expected MyErrorB catch arm; shims:\n{shims}"
+    );
+    // The CxxRawError struct should appear exactly once even
+    // though both throws-shim emission and the legacy shim
+    // emission run.
+    assert_eq!(
+        shims.matches("struct CxxRawError {").count(),
+        1,
+        "CxxRawError struct should appear exactly once; shims:\n{shims}"
+    );
 }

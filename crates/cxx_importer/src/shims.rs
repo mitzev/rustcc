@@ -362,7 +362,7 @@ fn operator_source(op: OperatorKind) -> &'static str {
     }
 }
 
-fn render_cxx_type(
+pub(crate) fn render_cxx_type(
     ctx: &CxxTypeCtx,
     ty: TypeId,
     where_: &str,
