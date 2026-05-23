@@ -1156,10 +1156,9 @@ fn render_direct_extern_class(
             lookup_name
                 .map(|src_name| {
                     let fqn = format!("{class_fqn}::{src_name}");
-                    annotations
-                        .effective(&fqn)
-                        .iter()
-                        .any(|a| matches!(a, Annotation::CxxThrows))
+                    annotations.effective(&fqn).iter().any(|a| {
+                        matches!(a, Annotation::CxxThrows | Annotation::CxxThrowsTyped(_))
+                    })
                 })
                 .unwrap_or(false)
         };
@@ -4528,10 +4527,15 @@ fn render_free_fns(
 
     // Helper: a function is throws-tagged if either the config
     // knob lists it by bare name (v1.12.1), or its imported
-    // annotations include `Annotation::CxxThrows` (v1.12.2).
-    // Annotations are keyed by FQN — for a TU-scope free fn the
-    // FQN is just the bare name, but namespaced fns spell out
-    // their path (`ns::sub::fname`).
+    // annotations include `Annotation::CxxThrows` (v1.12.2) or
+    // `Annotation::CxxThrowsTyped(_)` (v1.12.9). Annotations are
+    // keyed by FQN — for a TU-scope free fn the FQN is just the
+    // bare name, but namespaced fns spell out their path
+    // (`ns::sub::fname`). The typed variant carries additional
+    // per-type catches that don't change the Rust-side codegen
+    // shape (still `Result<T, CxxException>`); consumers
+    // building the matching C++ shim retrieve the typed list
+    // via `collect_throws_catches` (also v1.12.9).
     let is_throws = |ff: &crate::free_fns::FreeFnDef| -> bool {
         if throws_set.contains(&ff.name.0) {
             return true;
@@ -4552,10 +4556,9 @@ fn render_free_fns(
             parts.push(ff.name.0.clone());
             parts.join("::")
         };
-        annotations
-            .effective(&fqn)
-            .iter()
-            .any(|a| matches!(a, Annotation::CxxThrows))
+        annotations.effective(&fqn).iter().any(|a| {
+            matches!(a, Annotation::CxxThrows | Annotation::CxxThrowsTyped(_))
+        })
     };
 
     // Pre-render each function's signature into wrapper-safe

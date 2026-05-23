@@ -217,6 +217,58 @@ pub fn render_throws_shim_cpp_typed(
     src
 }
 
+/// v1.12.9: collect the typed-catches list for every throwing
+/// free function in `free_fns` whose annotation is
+/// `Annotation::CxxThrowsTyped(_)`. Returns a `BTreeMap` keyed
+/// by the function's FQN (matching the lookup form
+/// `crate::rust_bindings`'s free-fn emitter uses). Consumers
+/// building the C++ shim feed the list straight to
+/// [`render_throws_shim_cpp_typed`].
+///
+/// Functions with the plain `Annotation::CxxThrows` (no type
+/// list) are NOT included — they're handled by
+/// [`render_throws_shim_cpp`] which doesn't take a type list.
+/// Likewise, throws-tagged functions reached only via the
+/// `RustBindingsConfig::cxx_throws_functions` config knob are
+/// untyped.
+///
+/// FQN format: `name` for TU-scope free fns, `ns::sub::name`
+/// for namespaced ones. This matches the key
+/// [`crate::AnnotationSet::effective`] uses.
+pub fn collect_throws_catches(
+    annotations: &crate::annotations::AnnotationSet,
+    free_fns: &crate::free_fns::FreeFnSet,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    use crate::annotations::Annotation;
+    use rustc_abi_cxx::NameSegment;
+
+    let mut out: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for ff in &free_fns.entries {
+        let fqn = if ff.parent.is_empty() {
+            ff.name.0.clone()
+        } else {
+            let mut parts: Vec<String> = ff
+                .parent
+                .iter()
+                .filter_map(|seg| match seg {
+                    NameSegment::Namespace(id) => Some(id.0.clone()),
+                    _ => None,
+                })
+                .collect();
+            parts.push(ff.name.0.clone());
+            parts.join("::")
+        };
+        for ann in annotations.effective(&fqn) {
+            if let Annotation::CxxThrowsTyped(types) = ann {
+                out.insert(fqn.clone(), types);
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// The C++ header definition for `CxxRawError`. Embedded in the
 /// generated shim source once per translation unit. Mirrors the
 /// `#[repr(C)]` layout of `cxx::CxxRawError`.
