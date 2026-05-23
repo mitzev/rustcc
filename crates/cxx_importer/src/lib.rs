@@ -52,5 +52,6 @@ pub use resolve::{EntityKey, ResolvedCursor};
 #[cfg(feature = "libclang")]
 pub use import::{
     discover_template_instantiations, import_header,
-    import_header_with_annotations, import_header_with_extras, ImportExtras,
+    import_header_with_annotations, import_header_with_extras, synthesize_stl_companions,
+    ImportExtras,
 };

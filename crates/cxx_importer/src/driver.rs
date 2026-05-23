@@ -186,6 +186,18 @@ impl Driver {
                     discovered.insert(inst);
                 }
             }
+            // v1.12.8: synthesize STL companion specs (allocator,
+            // pair, default_delete) for common containers in the
+            // discovered set. These are typically composed inside
+            // the container's template body and never appear
+            // directly in user code, so the discovery walker
+            // misses them — but the importer needs them
+            // force-instantiated to attach methods on the
+            // container's internal helpers.
+            let companions = crate::import::synthesize_stl_companions(&discovered);
+            for c in companions {
+                discovered.insert(c);
+            }
             // Keep entries from the explicit list at the front to
             // preserve the user-specified ordering for the synth.
             let mut combined: Vec<String> =

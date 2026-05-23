@@ -2614,3 +2614,253 @@ fn collect_specs_in_type(
     }
     found.insert(display);
 }
+
+/// v1.12.8: synthesize known "companion" template instantiations
+/// for STL containers + smart pointers that are typically
+/// composed inside other templates (and therefore never appear
+/// directly in user code, so `discover_template_instantiations`
+/// doesn't pick them up).
+///
+/// For every entry in `discovered`, the function inspects the
+/// template head + first type argument and adds any companion
+/// specs the container is known to internally instantiate:
+///
+/// - `std::vector<T, …>` → `std::allocator<T>`
+/// - `std::deque<T, …>` → `std::allocator<T>`
+/// - `std::list<T, …>` → `std::allocator<T>`
+/// - `std::map<K, V, …>` → `std::allocator<std::pair<const K, V>>`,
+///   `std::pair<const K, V>`
+/// - `std::unordered_map<K, V, …>` → same allocator + pair spec
+/// - `std::set<T, …>` → `std::allocator<T>`
+/// - `std::unique_ptr<T, …>` → `std::default_delete<T>`
+/// - `std::shared_ptr<T>` → `std::__shared_ptr<T>` (libstdc++ /
+///   libc++ both expose this as a base class)
+/// - `std::function<R(Args…)>` → companion deleter / control-block
+///   specs are libstdc++-internal and skipped for now (tracked
+///   for a v1.12.8.1 follow-up)
+///
+/// The function is pure — it inspects only the input set and
+/// returns the additional names to merge in. Companions that
+/// match the input format ("`std::allocator<int>`" with the
+/// `std::` namespace prefix) — caller can drop the prefix if
+/// the discovery walker happens to surface allocator-free names.
+///
+/// **Iterator typedefs** (`std::vector<int>::iterator`,
+/// `::const_iterator`) are NOT auto-synthesized here. The
+/// underlying iterator types are libstdc++-vs-libc++-specific
+/// (`__gnu_cxx::__normal_iterator<int*, std::vector<int>>` vs
+/// `std::__1::__wrap_iter<int*>`); users who need iterator
+/// methods exposed should list the implementation-specific
+/// type in the sidecar's `template_instantiations:` block.
+/// Iterator type-name synthesis is tracked as v1.12.8.1.
+pub fn synthesize_stl_companions(
+    discovered: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for spec in discovered {
+        // Parse `<template-head>` + first type arg out of the
+        // canonical-name form. For `"std::vector<int, std::allocator<int>>"`
+        // the head is `"std::vector"` and the first arg is `"int"`.
+        let Some((head, args)) = split_template_head(spec) else {
+            continue;
+        };
+        let arg_list = split_template_args(args);
+        let Some(first_arg) = arg_list.first().map(|s| s.trim()) else {
+            continue;
+        };
+
+        match head.trim() {
+            // Sequence containers — allocator per element type.
+            "std::vector" | "std::deque" | "std::list" | "std::forward_list" => {
+                out.insert(format!("std::allocator<{first_arg}>"));
+            }
+            // Sets — allocator per element type.
+            "std::set" | "std::multiset" | "std::unordered_set" | "std::unordered_multiset" => {
+                out.insert(format!("std::allocator<{first_arg}>"));
+            }
+            // Maps — pair<const K, V> + its allocator.
+            "std::map" | "std::multimap" | "std::unordered_map" | "std::unordered_multimap" => {
+                let Some(second_arg) = arg_list.get(1).map(|s| s.trim()) else {
+                    continue;
+                };
+                let pair_ty = format!("std::pair<const {first_arg}, {second_arg}>");
+                out.insert(format!("std::allocator<{pair_ty}>"));
+                out.insert(pair_ty);
+            }
+            "std::unique_ptr" => {
+                out.insert(format!("std::default_delete<{first_arg}>"));
+            }
+            "std::shared_ptr" | "std::weak_ptr" => {
+                // libstdc++ + libc++ both expose `__shared_ptr<T>`
+                // as the base; force-instantiating it picks up
+                // the control-block accessors users sometimes
+                // need.
+                out.insert(format!("std::__shared_ptr<{first_arg}>"));
+            }
+            _ => {}
+        }
+    }
+
+    // Don't return entries that were already in the input — the
+    // caller merges, so we only ship NEW synthesized specs.
+    out.retain(|s| !discovered.contains(s));
+    out
+}
+
+/// Split a template spec into `(head, args)` where `head` is
+/// the part before the first `<` and `args` is the contents
+/// between the outermost `<…>` pair. Returns `None` if the
+/// input doesn't have a top-level template-argument list.
+fn split_template_head(spec: &str) -> Option<(&str, &str)> {
+    let lt = spec.find('<')?;
+    // Find the matching `>` accounting for nested generics.
+    let bytes = spec.as_bytes();
+    let mut depth = 0i32;
+    let mut end = None;
+    for (i, &b) in bytes.iter().enumerate().skip(lt) {
+        match b {
+            b'<' => depth += 1,
+            b'>' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    Some((&spec[..lt], &spec[lt + 1..end]))
+}
+
+/// Split a template argument list into individual argument
+/// strings, respecting nested `<…>` so a single argument like
+/// `std::pair<const int, double>` doesn't get sliced on its
+/// internal comma.
+fn split_template_args(args: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let bytes = args.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&args[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if start < args.len() {
+        out.push(&args[start..]);
+    }
+    out
+}
+
+#[cfg(test)]
+mod stl_companion_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn set<I: IntoIterator<Item = &'static str>>(items: I) -> HashSet<String> {
+        items.into_iter().map(String::from).collect()
+    }
+
+    #[test]
+    fn vector_int_synthesizes_allocator_int() {
+        let input = set(["std::vector<int>"]);
+        let companions = synthesize_stl_companions(&input);
+        assert!(
+            companions.contains("std::allocator<int>"),
+            "expected std::allocator<int> companion; got {companions:?}"
+        );
+    }
+
+    #[test]
+    fn vector_with_explicit_allocator_still_emits_companion_if_distinct() {
+        // libclang sometimes reports the long form
+        // `std::vector<int, std::allocator<int>>` directly — in
+        // that case our synth still wants to emit
+        // `std::allocator<int>` (the underlying spec) so the
+        // importer can attach methods.
+        let input = set(["std::vector<int, std::allocator<int>>"]);
+        let companions = synthesize_stl_companions(&input);
+        assert!(
+            companions.contains("std::allocator<int>"),
+            "expected std::allocator<int> synthesized from the explicit form; got {companions:?}"
+        );
+    }
+
+    #[test]
+    fn map_synthesizes_pair_and_pair_allocator() {
+        let input = set(["std::map<int, double>"]);
+        let companions = synthesize_stl_companions(&input);
+        assert!(
+            companions.contains("std::pair<const int, double>"),
+            "expected pair companion; got {companions:?}"
+        );
+        assert!(
+            companions.contains("std::allocator<std::pair<const int, double>>"),
+            "expected pair-allocator companion; got {companions:?}"
+        );
+    }
+
+    #[test]
+    fn unique_ptr_synthesizes_default_delete() {
+        let input = set(["std::unique_ptr<MyType>"]);
+        let companions = synthesize_stl_companions(&input);
+        assert!(
+            companions.contains("std::default_delete<MyType>"),
+            "expected default_delete companion; got {companions:?}"
+        );
+    }
+
+    #[test]
+    fn shared_ptr_synthesizes_shared_ptr_base() {
+        let input = set(["std::shared_ptr<MyType>"]);
+        let companions = synthesize_stl_companions(&input);
+        assert!(
+            companions.contains("std::__shared_ptr<MyType>"),
+            "expected __shared_ptr base companion; got {companions:?}"
+        );
+    }
+
+    #[test]
+    fn non_stl_specs_get_no_companions() {
+        let input = set(["MyTemplate<int>", "Vec<double>"]);
+        let companions = synthesize_stl_companions(&input);
+        assert!(
+            companions.is_empty(),
+            "expected no companions for user templates; got {companions:?}"
+        );
+    }
+
+    #[test]
+    fn companions_already_in_input_are_not_duplicated() {
+        let input = set(["std::vector<int>", "std::allocator<int>"]);
+        let companions = synthesize_stl_companions(&input);
+        assert!(
+            !companions.contains("std::allocator<int>"),
+            "expected dedup against input; got {companions:?}"
+        );
+    }
+
+    #[test]
+    fn split_template_args_respects_nested_generics() {
+        let args = "int, std::pair<int, double>, std::allocator<int>";
+        let parts = split_template_args(args);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].trim(), "int");
+        assert_eq!(parts[1].trim(), "std::pair<int, double>");
+        assert_eq!(parts[2].trim(), "std::allocator<int>");
+    }
+
+    #[test]
+    fn split_template_head_returns_none_for_non_template_input() {
+        assert!(split_template_head("plain_type").is_none());
+    }
+}
