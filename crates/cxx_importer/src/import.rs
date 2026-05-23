@@ -211,7 +211,7 @@ pub(crate) fn import_header_full(
 /// a temporary measure — the next iteration should fold the
 /// annotation walk directly into [`import_header_with_cache`] so
 /// each header is parsed once.
-fn collect_annotations(
+pub(crate) fn collect_annotations(
     source: &Path,
     args: &[&str],
     ctx: &mut CxxTypeCtx,
@@ -223,7 +223,23 @@ fn collect_annotations(
         line: 0,
         message: format!("failed to initialize libclang: {e}"),
     })?;
-    let index = Index::new(&clang, false, false);
+    collect_annotations_with_clang(&clang, source, args)
+}
+
+/// v1.12.14: same as [`collect_annotations`] but reuses an
+/// existing `Clang` instance. Callers running multiple imports
+/// in the same process (e.g. `crate::build::Build::compile`)
+/// hoist `Clang::new()` to the top of their loop and pass the
+/// shared instance — re-initing libclang per parse has been
+/// observed to segfault on libclang 17+ when ASTs from earlier
+/// parses are still in scope. See
+/// `import_header_with_clang`'s doc-comment for the long form.
+pub(crate) fn collect_annotations_with_clang(
+    clang: &Clang,
+    source: &Path,
+    args: &[&str],
+) -> Result<HashMap<String, Vec<Annotation>>, ImportError> {
+    let index = Index::new(clang, false, false);
     let tu = index
         .parser(source)
         .arguments(args)

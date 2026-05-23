@@ -251,3 +251,67 @@ fn real_cc_invocation_produces_a_static_archive_when_opted_in() {
         "expected archive to exist after cc invocation",
     );
 }
+
+/// v1.12.14: annotations harvested from the header (notably
+/// `[[clang::annotate("rustcc::cxx_throws")]]` and
+/// `rustcc::skip`) must reach the bindings emitter through the
+/// `Build` orchestrator. Without this wiring, the orchestrator
+/// passed `AnnotationSet::default()` to
+/// `generate_rust_bindings_full`, dropping every inline
+/// annotation on the floor.
+#[test]
+fn compile_picks_up_inline_annotations_from_headers() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let header = tmp.path().join("anno.hpp");
+    std::fs::write(
+        &header,
+        r#"#pragma once
+[[clang::annotate("rustcc::cxx_throws")]]
+int risky_op(int x);
+
+[[clang::annotate("rustcc::cxx_throws(MyErrorA, MyErrorB)")]]
+int risky_typed_op(int x);
+
+[[clang::annotate("rustcc::skip")]]
+int internal_only();
+"#,
+    )
+    .unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let outputs = Build::new()
+        .header(&header)
+        .out_dir(&out_dir)
+        .invoke_cc(false)
+        .compile("anno_bindings")
+        .expect("compile orchestrator");
+
+    let bindings = std::fs::read_to_string(&outputs.bindings_path)
+        .expect("read bindings");
+
+    // The two throwing fns should land with the shim shape —
+    // extern "C" block + __rustcc_throws_<name> link symbol +
+    // Result<T, ::cxx::CxxException> wrapper return.
+    assert!(
+        bindings.contains("__rustcc_throws_risky_op"),
+        "expected risky_op shim symbol; bindings:\n{bindings}"
+    );
+    assert!(
+        bindings.contains("__rustcc_throws_risky_typed_op"),
+        "expected risky_typed_op shim symbol; bindings:\n{bindings}"
+    );
+    assert!(
+        bindings.contains("Result<i32, ::cxx::CxxException>"),
+        "expected Result-returning wrapper; bindings:\n{bindings}"
+    );
+
+    // skip annotation should be honored — internal_only must
+    // NOT appear in the generated bindings.
+    assert!(
+        !bindings.contains("internal_only"),
+        "skip-annotated fn shouldn't appear; bindings:\n{bindings}"
+    );
+}
