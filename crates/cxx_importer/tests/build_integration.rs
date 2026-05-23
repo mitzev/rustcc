@@ -347,3 +347,80 @@ int internal_only();
         "CxxRawError struct should appear exactly once; shims:\n{shims}"
     );
 }
+
+/// v1.12.16: class-method throws annotations should also reach
+/// `cxx_shims.cpp` — without this, the generated bindings'
+/// per-method Result wrappers reference unresolved
+/// `__rustcc_throws_<Class>_<method>` symbols.
+#[test]
+fn compile_emits_throws_shim_bodies_for_class_methods() {
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let header = tmp.path().join("calc.hpp");
+    std::fs::write(
+        &header,
+        r#"#pragma once
+class Calc {
+public:
+    Calc();
+    int read() const;
+
+    [[clang::annotate("rustcc::cxx_throws")]]
+    int divide(int a, int b);
+
+    [[clang::annotate("rustcc::cxx_throws(MyErrorA)")]]
+    int risky(int x);
+};
+
+class MyErrorA {};
+"#,
+    )
+    .unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let outputs = Build::new()
+        .header(&header)
+        .out_dir(&out_dir)
+        .invoke_cc(false)
+        .compile("calc_bindings")
+        .expect("compile");
+
+    let shims = std::fs::read_to_string(&outputs.shims_path)
+        .expect("read shims");
+
+    // Both annotated methods should have shim bodies pointing
+    // at __this->method(args).
+    assert!(
+        shims.contains("extern \"C\" CxxRawError __rustcc_throws_Calc_divide"),
+        "expected Calc::divide shim body; shims:\n{shims}"
+    );
+    assert!(
+        shims.contains("extern \"C\" CxxRawError __rustcc_throws_Calc_risky"),
+        "expected Calc::risky shim body; shims:\n{shims}"
+    );
+    // Const-method this-pointer is const-qualified so the
+    // call into a non-const `divide` from inside the shim
+    // type-checks (we used non-const `divide` here, so the
+    // this-pointer is plain).
+    assert!(
+        shims.contains("Calc* __this"),
+        "expected Calc* __this param for non-const method; shims:\n{shims}"
+    );
+    // Typed catch arm present for risky.
+    assert!(
+        shims.contains("catch (const MyErrorA& __e)"),
+        "expected MyErrorA catch arm; shims:\n{shims}"
+    );
+    // Callsite goes through __this->.
+    assert!(
+        shims.contains("__this->divide(__a0, __a1)"),
+        "expected __this->divide callsite; shims:\n{shims}"
+    );
+    // Non-throwing read() should NOT have a throws shim.
+    assert!(
+        !shims.contains("__rustcc_throws_Calc_read"),
+        "non-throws method shouldn't emit a throws shim; shims:\n{shims}"
+    );
+}

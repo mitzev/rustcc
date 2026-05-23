@@ -458,7 +458,7 @@ fn apply_cv_prefix(inner: &str, cv: CvQual) -> String {
     out
 }
 
-fn render_nested_name(
+pub(crate) fn render_nested_name(
     ctx: &CxxTypeCtx,
     name: &NestedName,
 ) -> Result<String, ShimError> {
