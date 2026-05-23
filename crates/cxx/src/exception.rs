@@ -102,6 +102,57 @@ impl CxxException {
     pub fn what(&self) -> &str {
         &self.message
     }
+
+    /// v1.12.13: true when the caught exception derived from
+    /// `std::exception` and was matched by the fallback arm of
+    /// the C++ shim (i.e., the caller's annotation was the
+    /// plain `cxx_throws` form, or the typed form's listed
+    /// types didn't match — `std::exception` won the fallback).
+    pub fn is_std(&self) -> bool {
+        matches!(self.kind, CxxExceptionKind::Std)
+    }
+
+    /// v1.12.13: true when the caught exception was matched by
+    /// the C++ shim's `catch (...)` arm — non-`std::exception`
+    /// type (bare `int`, custom class with no `std::exception`
+    /// base, etc.). Message is the synthetic
+    /// `"non-std::exception C++ exception"` string.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self.kind, CxxExceptionKind::Unknown)
+    }
+
+    /// v1.12.13: true when the caught exception matched a typed
+    /// `catch (const T&)` arm. Without an `idx` filter, returns
+    /// `true` for any typed match. See [`Self::is_typed_at`] for
+    /// a position-specific check.
+    pub fn is_typed(&self) -> bool {
+        matches!(self.kind, CxxExceptionKind::Typed(_))
+    }
+
+    /// v1.12.13: true when the caught exception matched the
+    /// typed arm at zero-based position `idx` in the
+    /// `cxx_throws(T0, T1, …)` annotation list.
+    pub fn is_typed_at(&self, idx: u32) -> bool {
+        matches!(self.kind, CxxExceptionKind::Typed(n) if n == idx)
+    }
+
+    /// v1.12.13: the zero-based index of the typed-catch arm
+    /// that matched, or `None` when the kind isn't `Typed(_)`.
+    /// Useful for routing into a typed handler:
+    ///
+    /// ```ignore
+    /// match e.typed_index() {
+    ///     Some(0) => handle_domain_error(e),
+    ///     Some(1) => handle_range_error(e),
+    ///     _ => handle_fallback(e),
+    /// }
+    /// ```
+    pub fn typed_index(&self) -> Option<u32> {
+        match self.kind {
+            CxxExceptionKind::Typed(n) => Some(n),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for CxxException {
@@ -209,5 +260,55 @@ mod tests {
         let err = r.unwrap_err();
         assert_eq!(err.kind, CxxExceptionKind::Std);
         assert_eq!(err.what(), "xs");
+    }
+
+    #[test]
+    fn is_std_only_true_for_std_kind() {
+        let std = CxxException::synthetic(CxxExceptionKind::Std, "x");
+        assert!(std.is_std());
+        assert!(!std.is_unknown());
+        assert!(!std.is_typed());
+        assert_eq!(std.typed_index(), None);
+
+        let unk = CxxException::synthetic(CxxExceptionKind::Unknown, "");
+        assert!(!unk.is_std());
+        assert!(unk.is_unknown());
+
+        let typed = CxxException::synthetic(CxxExceptionKind::Typed(2), "y");
+        assert!(!typed.is_std());
+        assert!(!typed.is_unknown());
+        assert!(typed.is_typed());
+        assert_eq!(typed.typed_index(), Some(2));
+    }
+
+    #[test]
+    fn is_typed_at_position_match() {
+        let typed = CxxException::synthetic(CxxExceptionKind::Typed(3), "");
+        assert!(typed.is_typed_at(3));
+        assert!(!typed.is_typed_at(0));
+        assert!(!typed.is_typed_at(2));
+        // Non-typed kinds match nothing.
+        let std = CxxException::synthetic(CxxExceptionKind::Std, "");
+        assert!(!std.is_typed_at(0));
+    }
+
+    #[test]
+    fn typed_index_returns_position_for_typed_kinds_only() {
+        assert_eq!(
+            CxxException::synthetic(CxxExceptionKind::Typed(0), "").typed_index(),
+            Some(0)
+        );
+        assert_eq!(
+            CxxException::synthetic(CxxExceptionKind::Typed(7), "").typed_index(),
+            Some(7)
+        );
+        assert_eq!(
+            CxxException::synthetic(CxxExceptionKind::Std, "").typed_index(),
+            None
+        );
+        assert_eq!(
+            CxxException::synthetic(CxxExceptionKind::Unknown, "").typed_index(),
+            None
+        );
     }
 }
