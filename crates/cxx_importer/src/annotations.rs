@@ -72,6 +72,18 @@ pub enum Annotation {
     /// the Rust side. Spelled `[[clang::annotate("rustcc::cxx_throws")]]`
     /// in the source.
     CxxThrows,
+    /// v1.12.9: typed-catch variant of `CxxThrows`. The carried
+    /// `Vec<String>` lists C++ exception types in source order;
+    /// the emitter passes them straight to
+    /// `render_throws_shim_cpp_typed` which generates one
+    /// `catch (const Ti&)` arm per entry before the
+    /// `std::exception` / `(...)` fallbacks. Spelled
+    /// `[[clang::annotate("rustcc::cxx_throws(TypeA, TypeB)")]]`
+    /// in the source, or via sidecar `throws_types: [TypeA, TypeB]`.
+    /// The plain `CxxThrows` and `CxxThrowsTyped` variants are
+    /// mutually exclusive — they share the same `AnnotationKind`
+    /// for the "inline wins over sidecar" merge rule.
+    CxxThrowsTyped(Vec<String>),
 }
 
 impl Annotation {
@@ -93,6 +105,7 @@ impl Annotation {
             Annotation::Instantiate(_) => AnnotationKind::Instantiate,
             Annotation::Skip => AnnotationKind::Skip,
             Annotation::CxxThrows => AnnotationKind::CxxThrows,
+            Annotation::CxxThrowsTyped(_) => AnnotationKind::CxxThrows,
         }
     }
 }
@@ -141,6 +154,10 @@ pub struct FreeFunctionEntry {
     /// `[[clang::annotate("rustcc::cxx_throws")]]`.
     #[serde(default)]
     pub throws: Option<bool>,
+    /// v1.12.9: typed-catch variant of `throws`. Same semantics
+    /// as the method-entry field — empty list = no typed dispatch.
+    #[serde(default)]
+    pub throws_types: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -199,6 +216,14 @@ pub struct MethodEntry {
     /// `Result<T, ::cxx::CxxException>` on the Rust side.
     #[serde(default)]
     pub throws: Option<bool>,
+    /// v1.12.9: typed-catch variant of `throws`. When present
+    /// (non-empty), the emitter routes through
+    /// `render_throws_shim_cpp_typed` with these types listed
+    /// before the `std::exception` / `(...)` fallbacks. Implies
+    /// `throws: true` — setting both is fine; only one
+    /// `CxxThrows*` annotation flows downstream.
+    #[serde(default)]
+    pub throws_types: Vec<String>,
 }
 
 impl SidecarSchema {
@@ -260,7 +285,10 @@ fn annotations_from_free_function(entry: &FreeFunctionEntry) -> Vec<Annotation> 
     if entry.skip == Some(true) {
         out.push(Annotation::Skip);
     }
-    if entry.throws == Some(true) {
+    // v1.12.9: typed form takes precedence over plain throws.
+    if !entry.throws_types.is_empty() {
+        out.push(Annotation::CxxThrowsTyped(entry.throws_types.clone()));
+    } else if entry.throws == Some(true) {
         out.push(Annotation::CxxThrows);
     }
     out
@@ -318,7 +346,13 @@ fn annotations_from_method(entry: &MethodEntry) -> Vec<Annotation> {
     if entry.nullable == Some(true) {
         out.push(Annotation::Nullable);
     }
-    if entry.throws == Some(true) {
+    // v1.12.9: throws_types takes precedence over plain throws —
+    // it carries strictly more information. If both are set,
+    // the typed form wins; the plain `throws: true` becomes
+    // implicit.
+    if !entry.throws_types.is_empty() {
+        out.push(Annotation::CxxThrowsTyped(entry.throws_types.clone()));
+    } else if entry.throws == Some(true) {
         out.push(Annotation::CxxThrows);
     }
     out

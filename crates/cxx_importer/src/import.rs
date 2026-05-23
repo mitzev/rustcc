@@ -2343,6 +2343,26 @@ fn parse_rustcc_annotation(text: &str) -> Option<Annotation> {
     if let Some(value) = rest.strip_prefix("name=") {
         return Some(Annotation::Name(value.trim().to_string()));
     }
+    // v1.12.9: typed-throws form `cxx_throws(T1, T2, …)`. Parse
+    // the parenthesized list into `Vec<String>` and produce
+    // `Annotation::CxxThrowsTyped`. We split on top-level commas
+    // (respecting nested generics) so a single type like
+    // `std::pair<int, double>` doesn't get sliced. Empty list
+    // `cxx_throws()` collapses to the bare `cxx_throws` form for
+    // forgiveness.
+    if let Some(args) = rest.strip_prefix("cxx_throws(") {
+        if let Some(inner) = args.strip_suffix(')') {
+            let types = split_top_level_args(inner);
+            if types.is_empty() {
+                return Some(Annotation::CxxThrows);
+            }
+            return Some(Annotation::CxxThrowsTyped(types));
+        }
+        // Mis-formatted (`cxx_throws(` with no closing paren).
+        // Silently ignore — matches the v0 unknown-annotation
+        // policy.
+        return None;
+    }
     match rest {
         "nullable" => Some(Annotation::Nullable),
         "nonnull" => Some(Annotation::NonNull),
@@ -2350,6 +2370,37 @@ fn parse_rustcc_annotation(text: &str) -> Option<Annotation> {
         "cxx_throws" => Some(Annotation::CxxThrows),
         _ => None,
     }
+}
+
+/// Split a comma-separated argument list, respecting nested
+/// `<…>` so generic types like `std::pair<int, double>` count
+/// as a single argument. Trims whitespace around each entry
+/// and drops empty entries (so `cxx_throws()` or
+/// `cxx_throws(, )` returns an empty vec).
+fn split_top_level_args(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b',' if depth == 0 => {
+                let part = s[start..i].trim();
+                if !part.is_empty() {
+                    out.push(part.to_string());
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
 }
 
 /// Recompute `is_polymorphic` for a class from its current state.
