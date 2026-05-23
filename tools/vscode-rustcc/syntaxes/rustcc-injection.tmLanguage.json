@@ -8,7 +8,8 @@
     { "include": "#extern-cpp-string" },
     { "include": "#extern-swift-string" },
     { "include": "#rustcc-attributes" },
-    { "include": "#rustcc-attr-args" }
+    { "include": "#rustcc-attr-args" },
+    { "include": "#rustcc-cxx-throws-typeinfos-attr" }
   ],
   "repository": {
     "class-keyword": {
@@ -36,8 +37,8 @@
       }
     },
     "rustcc-attributes": {
-      "comment": "Bare attribute names that the fork understands.",
-      "match": "(#\\[)(cpp_virtual|constructor|swift_throws|swift_value)(\\])",
+      "comment": "Bare attribute names that the fork understands. `rustc_cxx_throws` (P09.60+) marks a foreign fn as a C++ throwing function so the fork's codegen lowers it to LLVM invoke + landingpad.",
+      "match": "(#\\[)(cpp_virtual|constructor|swift_throws|swift_value|rustc_cxx_throws)(\\])",
       "captures": {
         "1": { "name": "punctuation.brackets.attribute.rust" },
         "2": { "name": "support.function.attribute.rustcc" },
@@ -54,6 +55,17 @@
         "5": { "name": "support.constant.attribute.rustcc" },
         "7": { "name": "punctuation.brackets.round.rust" },
         "8": { "name": "punctuation.brackets.attribute.rust" }
+      }
+    },
+    "rustcc-cxx-throws-typeinfos-attr": {
+      "comment": "v1.13.0 P09.68+: typed-catches lists for cxx_throws fns. Itanium (`_ZTI...`) + MSVC (`.?AV...`) variants. Usually auto-emitted by cxx_importer; power users can hand-write them.",
+      "match": "(#\\[)(rustc_cxx_throws_typeinfos|rustc_cxx_throws_msvc_typedescs)(\\s*=\\s*)(\"[^\"]*\")(\\])",
+      "captures": {
+        "1": { "name": "punctuation.brackets.attribute.rust" },
+        "2": { "name": "support.function.attribute.rustcc" },
+        "3": { "name": "keyword.operator.assignment.rust" },
+        "4": { "name": "string.quoted.double.rust" },
+        "5": { "name": "punctuation.brackets.attribute.rust" }
       }
     }
   }

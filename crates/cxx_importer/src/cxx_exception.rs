@@ -592,6 +592,56 @@ pub fn manglings_for_typed_catches(
     Some((itanium.join(","), msvc.join(",")))
 }
 
+/// P09.71 / 1.13 throws Phase 2F: render the v1.13.0
+/// native-invoke attribute block for a throwing C++ function.
+/// Emits the three rustc-fork-only attributes the fork's
+/// codegen patches react to:
+///
+/// ```text
+/// #[rustc_cxx_throws]
+/// #[rustc_cxx_throws_typeinfos = "_ZTI...,_ZTI..."]
+/// #[rustc_cxx_throws_msvc_typedescs = ".?AV...,.?AV..."]
+/// ```
+///
+/// Returned string has a trailing newline so callers can
+/// splice it directly above an `extern "C++" { fn ... }`
+/// declaration. Each attribute line is prefixed with
+/// `indent` to match the surrounding block.
+///
+/// When `typed_catches` is empty (untyped `cxx_throws`),
+/// only `#[rustc_cxx_throws]` is emitted — catch-all
+/// behavior is the Phase 1 default.
+///
+/// When any type in `typed_catches` can't be mangled by the
+/// helpers, the typeinfo attributes are omitted (and the
+/// caller falls back to the catch-all path). Use
+/// [`manglings_for_typed_catches`] directly if you want to
+/// detect this and fail-loud instead.
+pub fn render_native_invoke_attr_block(
+    typed_catches: &[String],
+    indent: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str(indent);
+    out.push_str("#[rustc_cxx_throws]\n");
+    if typed_catches.is_empty() {
+        return out;
+    }
+    let Some((itanium_list, msvc_list)) = manglings_for_typed_catches(typed_catches)
+    else {
+        return out;
+    };
+    out.push_str(indent);
+    out.push_str(&format!(
+        "#[rustc_cxx_throws_typeinfos = \"{itanium_list}\"]\n",
+    ));
+    out.push_str(indent);
+    out.push_str(&format!(
+        "#[rustc_cxx_throws_msvc_typedescs = \"{msvc_list}\"]\n",
+    ));
+    out
+}
+
 /// Build the canonical FQN string from a `NestedName`'s
 /// segments. Matches the form
 /// `crate::rust_bindings::parent_path_to_fqn` produces, but
@@ -758,6 +808,42 @@ mod tests {
             "std::vector<int>".to_string(),
         ]);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn render_native_invoke_attr_block_untyped() {
+        let s = render_native_invoke_attr_block(&[], "    ");
+        assert_eq!(s, "    #[rustc_cxx_throws]\n");
+    }
+
+    #[test]
+    fn render_native_invoke_attr_block_with_types() {
+        let s = render_native_invoke_attr_block(
+            &["DomainError".to_string(), "RangeError".to_string()],
+            "    ",
+        );
+        assert!(s.contains("#[rustc_cxx_throws]\n"));
+        assert!(s.contains(
+            "#[rustc_cxx_throws_typeinfos = \"_ZTI11DomainError,_ZTI10RangeError\"]\n"
+        ));
+        assert!(s.contains(
+            "#[rustc_cxx_throws_msvc_typedescs = \".?AVDomainError@@,.?AVRangeError@@\"]\n"
+        ));
+        // Indent prefix applied to every line.
+        for line in s.lines() {
+            assert!(line.starts_with("    "));
+        }
+    }
+
+    #[test]
+    fn render_native_invoke_attr_block_unsupported_falls_back_to_untyped() {
+        // std::vector<int> can't be mangled — fall back to
+        // emitting just `#[rustc_cxx_throws]` (catch-all).
+        let s = render_native_invoke_attr_block(
+            &["DomainError".to_string(), "std::vector<int>".to_string()],
+            "",
+        );
+        assert_eq!(s, "#[rustc_cxx_throws]\n");
     }
 
     #[test]

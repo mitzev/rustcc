@@ -96,5 +96,27 @@
       "include!(concat!(env!(\"OUT_DIR\"), \"/bindings.rs\"));"
     ],
     "description": "Pull in generated bindings from cxx_importer's M26 pipeline."
+  },
+  "rustc_cxx_throws extern fn (v1.13.0 native invoke)": {
+    "prefix": ["rustcc-cxx-throws", "rustcc-throws"],
+    "body": [
+      "unsafe extern \"C++\" {",
+      "    #[rustc_cxx_throws]",
+      "    fn ${1:throwing_fn}(${2:args}) -> Result<${3:i32}, ::cxx::CxxException>;",
+      "}"
+    ],
+    "description": "v1.13.0 native-invoke extern decl for a throwing C++ fn. The fork rustc lowers calls to LLVM invoke + landingpad; CxxException carries the runtime helper's CxxRawError after From conversion."
+  },
+  "rustc_cxx_throws extern fn with typed catches": {
+    "prefix": ["rustcc-cxx-throws-typed", "rustcc-throws-typed"],
+    "body": [
+      "unsafe extern \"C++\" {",
+      "    #[rustc_cxx_throws]",
+      "    #[rustc_cxx_throws_typeinfos     = \"_ZTI${1:11DomainError},_ZTI${2:10RangeError}\"]",
+      "    #[rustc_cxx_throws_msvc_typedescs = \".?AV${3:DomainError}@@,.?AV${4:RangeError}@@\"]",
+      "    fn ${5:throwing_fn}(${6:args}) -> Result<${7:i32}, ::cxx::CxxException>;",
+      "}"
+    ],
+    "description": "v1.13.0 native-invoke extern decl with typed catches. The Itanium + MSVC type-info lists must be in the same order so `From<CxxRawError>` indexing matches on both targets. Normally auto-emitted by cxx_importer; this snippet is for hand-written bindings."
   }
 }
