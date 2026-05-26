@@ -74,7 +74,12 @@ jobs:
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 240
+    # The x86_64-pc-windows-msvc job hit the 240-minute mark
+    # during the LLVM build (~stage 3263/3997 of 3997) on the
+    # v1.13.0 release. Bump to 360 (the GH-hosted-runner hard
+    # cap on the free tier) so the full LLVM + rustc bootstrap
+    # has headroom.
+    timeout-minutes: 360
     steps:
       - name: Checkout rustcc
         # v5 is the first Node 24 major; v4 ran Node 20 which
