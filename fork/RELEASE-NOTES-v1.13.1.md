@@ -60,12 +60,29 @@ already shipped and were mis-listed as gaps:
 - **Empty Base Optimization** — implemented for both Itanium and
   MSVC.
 - **MSVC bit-fields + `#pragma pack`** — already implemented.
+- **Cross-compilation (host ≠ target)** — implemented and
+  Wine-validated. The fork rustc derives the C++ ABI from the
+  session `--target` triple, not the build host
+  (`rustc_ty_utils/layout/cxx_bridge.rs` and the Itanium
+  mangler call `CxxTarget::from_rustc_triple(triple,
+  pointer_width)`; `Target::host()` is only a tooling/test
+  fallback). `cxx_importer::Build` likewise reads
+  `CARGO_CFG_TARGET_*` (or an explicit `.target()`) and injects
+  `-target <triple>` (+ MSVC compat flags) into libclang with a
+  matching Rust-side ABI ctx. The MSVC-under-Wine smoke suite
+  cross-compiles macOS/Linux host → `x86_64-pc-windows-msvc`
+  end-to-end, and the release pipeline itself cross-builds the
+  Windows toolchains. All 7 first-class triples are wired
+  (Linux/macOS × x86_64/aarch64, Windows MSVC ×2, Windows GNU);
+  unlisted triples fall through to a generic-Itanium default
+  (correct pointer width, Linux-style long-double/wchar quirks).
 
 The genuinely-remaining gaps after v1.13.1: move ctor +
 copy/move assignment, templates beyond explicit instantiation
 (NTTP / template-template / uninstantiated generics), member
 pointers (partial), covariant-return thunks, VTT/construction
-vtables, and GCC-backend cxx_throws codegen.
+vtables, exotic-triple ABI quirks (non-first-class targets use
+generic-Itanium defaults), and GCC-backend cxx_throws codegen.
 
 ## Test status
 

@@ -160,9 +160,16 @@ impl Target {
     }
 
     /// Pick a target matching the host the driver is running on.
-    /// Cross-compilation is out of scope for v1
-    /// (docs/build_integration.md §9), so host-based selection is the
-    /// right default for every invocation rustcc fields.
+    ///
+    /// NOTE: this is a **fallback** for tooling and tests only. The
+    /// cross-compilation paths do NOT go through here — the fork
+    /// rustc's middle-end ABI bridge + Itanium mangler select the
+    /// C++ target from the compilation session's `--target` triple
+    /// via `from_rustc_triple`, and `cxx_importer::Build` selects it
+    /// from `CARGO_CFG_TARGET_*` (or an explicit `.target()`). Both
+    /// support host ≠ target. (The earlier "cross-compilation out of
+    /// scope" note here was stale; cross is implemented and
+    /// Wine-validated for the MSVC targets.)
     pub fn host() -> Self {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
