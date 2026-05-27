@@ -1601,6 +1601,35 @@ fn render_direct_extern_class(
         let _ = writeln!(block, "{indent}}}");
     }
 
+    // 4.a.2: v1.13.1-C — `Clone` impl from a user-declared copy
+    // constructor. The clone calls the C++ copy ctor to
+    // placement-copy `self` into a fresh stack slot, then returns
+    // it by value. Correct for trivially-relocatable types (the
+    // common case); address-sensitive types need pinned storage
+    // (tracked separately).
+    if let Some(copy) = method_blocks
+        .iter()
+        .find(|e| matches!(e.kind, EmissionKind::CopyCtor))
+    {
+        let _ = writeln!(block);
+        let _ = writeln!(block, "{indent}impl ::core::clone::Clone for {class_name} {{");
+        let _ = writeln!(block, "{indent}    fn clone(&self) -> Self {{");
+        let _ = writeln!(block, "{indent}        unsafe {{");
+        let _ = writeln!(
+            block,
+            "{indent}            let mut __slot = ::core::mem::MaybeUninit::<Self>::uninit();",
+        );
+        let _ = writeln!(
+            block,
+            "{indent}            {ext}(__slot.as_mut_ptr(), self as *const Self);",
+            ext = copy.extern_ident,
+        );
+        let _ = writeln!(block, "{indent}            __slot.assume_init()");
+        let _ = writeln!(block, "{indent}        }}");
+        let _ = writeln!(block, "{indent}    }}");
+        let _ = writeln!(block, "{indent}}}");
+    }
+
     // 4.b: M19 — `CxxBase<Base>` upcast impls for every non-virtual
     // base. Virtual bases are deferred to M22 (their offset is
     // dynamic via the vtable; the emission shape is different).
@@ -1950,6 +1979,11 @@ struct MethodEmission {
 enum EmissionKind {
     Ctor,
     Dtor,
+    /// v1.13.1-C: a user-declared copy constructor `T(const T&)`.
+    /// Renders an extern decl `__cxx_<Class>_copy_ctor(dst, src)`
+    /// plus an `impl Clone for <Class>` (postamble, like Drop) —
+    /// not an inherent method.
+    CopyCtor,
     /// `&self` / `&mut self` instance method, dispatched directly
     /// to the Itanium-mangled symbol.
     Instance,
@@ -2295,12 +2329,56 @@ fn classify_for_direct_extern(
                 raw_ret_ty: String::new(),
             });
         }
-        Some(SpecialMember::CopyCtor | SpecialMember::MoveCtor)
+        Some(SpecialMember::CopyCtor) => {
+            // v1.13.1-C: copy ctor → `impl Clone`. The extern decl
+            // is `__cxx_<Class>_copy_ctor(dst: *mut Class, src:
+            // *const Class)` bound to the Itanium-mangled complete-
+            // object ctor (`_ZN..C1ERKS_`). The mangler derives the
+            // `const Class&` parameter from the ctor's own sig.
+            //
+            // The clone wrapper placement-copies the source into a
+            // fresh stack slot then returns it by value — the same
+            // construct-into-MaybeUninit pattern the regular ctor
+            // uses. This is correct for the (overwhelmingly common)
+            // trivially-relocatable case; address-sensitive types
+            // that can't be byte-moved after construction still need
+            // the pinned-storage path (tracked separately).
+            let link = ctx.mangle(&Symbol::Ctor {
+                class: class_id,
+                variant: CtorVariant::C1,
+                sig: method.sig.clone(),
+            });
+            return Ok(MethodEmission {
+                kind: EmissionKind::CopyCtor,
+                rust_name: "clone".into(),
+                extern_ident: format!("__cxx_{class_name}_copy_ctor"),
+                link_name: link,
+                extern_decl_params: format!(
+                    "dst: *mut {class_name}, src: *const {class_name}"
+                ),
+                extern_return_clause: String::new(),
+                // Rendered in the Clone postamble, not as an inherent
+                // method — receiver is nominal.
+                wrapper_receiver: WrapperReceiver::SelfConst,
+                wrapper_params: String::new(),
+                wrapper_return: "Self".into(),
+                forward_args: String::new(),
+                default_arg_count: 0,
+                wrapper_user_params: Vec::new(),
+                wrapper_forward_arg_names: Vec::new(),
+                synthesized_default_literals: None,
+                cstr_param_indices: Vec::new(),
+                throws: false,
+                raw_ret_ty: String::new(),
+            });
+        }
+        Some(SpecialMember::MoveCtor)
         | Some(SpecialMember::CopyAssign | SpecialMember::MoveAssign) => {
             return Err(BindingsError::UnsupportedMethod {
                 where_: format!("{class_name}::{:?}", method.name),
-                why: "copy/move special members not yet wired (v0 covers \
-                      DefaultCtor + OtherCtor + Dtor + plain methods + operators)"
+                why: "move ctor / copy-assign / move-assign not yet wired \
+                      (v1.13.1 covers copy ctor → Clone; DefaultCtor + \
+                      OtherCtor + Dtor + plain methods + operators)"
                     .into(),
             });
         }
@@ -2906,6 +2984,10 @@ fn render_direct_extern_wrapper(
         }
         EmissionKind::Dtor => {
             // Dtor goes into the Drop impl, not the inherent impl.
+        }
+        EmissionKind::CopyCtor => {
+            // Copy ctor goes into the Clone impl postamble, not the
+            // inherent impl.
         }
     }
 
@@ -5389,6 +5471,61 @@ mod tests {
             BindingsBackend::default(),
             BindingsBackend::DirectExternCpp,
         );
+    }
+
+    #[test]
+    fn copy_ctor_emits_clone_impl() {
+        // v1.13.1-C: a class with a user-declared copy constructor
+        // `Point(const Point&)` gets an `impl Clone` that calls the
+        // C++ copy ctor into a fresh slot. Mirrors point_ctx but
+        // appends a copy ctor.
+        let (mut ctx, id) = point_ctx();
+        let point_ty = ctx.intern_type(CxxType::Record(id));
+        let const_ref_point = ctx.intern_type(CxxType::Ref {
+            pointee: point_ty,
+            kind: rustc_abi_cxx::RefKind::Lvalue,
+            cv: CvQual { is_const: true, is_volatile: false },
+        });
+        let void_ = void_ty(&mut ctx);
+        ctx.class_mut(id).methods.push(MethodDef {
+            name: MethodName::Ident(Ident("Point".into())),
+            sig: FnSig {
+                params: vec![const_ref_point],
+                ret: void_,
+                cv: CvQual::default(),
+                ref_q: None,
+                variadic: false,
+                noexcept: true,
+            },
+            virtuality: Virtuality::NonVirtual,
+            vtable_index: None,
+            special: Some(SpecialMember::CopyCtor),
+        });
+        let src = generate_rust_bindings(&ctx, &[id], &RustBindingsConfig::default())
+            .expect("emit");
+        assert!(
+            src.contains("impl ::core::clone::Clone for Point"),
+            "expected Clone impl:\n{src}"
+        );
+        assert!(
+            src.contains("__cxx_Point_copy_ctor"),
+            "expected copy-ctor extern:\n{src}"
+        );
+        assert!(
+            src.contains("__slot.as_mut_ptr(), self as *const Self"),
+            "expected placement-copy call shape:\n{src}"
+        );
+        // The copy ctor must NOT also surface as an inherent method
+        // named `clone` in the `impl Point` block (it lives only in
+        // the trait impl).
+        assert!(
+            !src.contains("pub fn clone("),
+            "copy ctor should not emit an inherent clone method:\n{src}"
+        );
+    }
+
+    fn void_ty(ctx: &mut CxxTypeCtx) -> rustc_abi_cxx::TypeId {
+        ctx.intern_type(CxxType::Void)
     }
 
     #[test]
