@@ -129,9 +129,13 @@ fn try_parse_section(
             footer_buf.push(' ');
             continue;
         }
-        let offset: u64 = match lhs.parse() {
-            Ok(v) => v,
-            Err(_) => continue,
+        // Clang prints a plain byte offset (`4`) for ordinary fields
+        // and a `byte:startbit-endbit` form for bit-fields
+        // (`0:4-23` = byte 0, bits 4..=23). Parse both; the bit form
+        // yields a (byte, bit_offset, bit_width) triple.
+        let (offset, bits) = match parse_offset_lhs(lhs) {
+            Some(v) => v,
+            None => continue,
         };
         let indent = rhs.chars().take_while(|c| *c == ' ').count();
         // Clang uses 1-space indent for the record header and 3-space indent
@@ -141,7 +145,7 @@ fn try_parse_section(
         if indent != 3 {
             continue;
         }
-        parse_entry(&mut dump, offset, rhs.trim());
+        parse_entry(&mut dump, offset, bits, rhs.trim());
     }
 
     parse_footer(&footer_buf, &mut dump)?;
@@ -182,7 +186,26 @@ fn strip_trailing_parens(s: &str) -> &str {
     }
 }
 
-fn parse_entry(dump: &mut Dump, offset: u64, body: &str) {
+/// Parse the left-hand offset column of a clang record-layout line.
+/// Returns `(byte_offset, Option<(bit_offset, bit_width)>)`:
+/// - `"4"`        → `(4, None)`           — ordinary field
+/// - `"0:4-23"`   → `(0, Some((4, 20)))`  — bit-field at byte 0,
+///   bits 4..=23 inclusive (width = 23 - 4 + 1 = 20).
+fn parse_offset_lhs(lhs: &str) -> Option<(u64, Option<(u8, u64)>)> {
+    match lhs.split_once(':') {
+        None => lhs.parse::<u64>().ok().map(|b| (b, None)),
+        Some((byte, bitrange)) => {
+            let byte: u64 = byte.trim().parse().ok()?;
+            let (start, end) = bitrange.split_once('-')?;
+            let start: u64 = start.trim().parse().ok()?;
+            let end: u64 = end.trim().parse().ok()?;
+            let width = end.checked_sub(start)? + 1;
+            Some((byte, Some((start as u8, width))))
+        }
+    }
+}
+
+fn parse_entry(dump: &mut Dump, offset: u64, bits: Option<(u8, u64)>, body: &str) {
     if body.contains("vtable pointer") {
         dump.has_vptr = true;
         return;
@@ -209,7 +232,7 @@ fn parse_entry(dump: &mut Dump, offset: u64, body: &str) {
         .unwrap_or("")
         .to_string();
     if !name.is_empty() {
-        dump.fields.push(FieldDump { name, offset });
+        dump.fields.push(FieldDump { name, offset, bits });
     }
 }
 

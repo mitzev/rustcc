@@ -79,10 +79,25 @@ fn layout_to_dump(
     let fields = class
         .fields
         .iter()
+        .enumerate()
         .zip(layout.field_offsets.iter())
-        .map(|(fd, off)| FieldDump {
-            name: fd.name.0.clone(),
-            offset: *off,
+        .map(|((idx, fd), off)| {
+            // v1.13.1: emit bit-field info when the layout marked
+            // this field as a bit-field (non-zero width). Bit
+            // offset is within the byte at `field_offsets[idx]`.
+            let bits = if layout.field_bit_widths.get(idx).copied().unwrap_or(0) != 0 {
+                Some((
+                    layout.field_bit_offsets[idx],
+                    layout.field_bit_widths[idx],
+                ))
+            } else {
+                None
+            };
+            FieldDump {
+                name: fd.name.0.clone(),
+                offset: *off,
+                bits,
+            }
         })
         .collect();
     let bases = layout
@@ -127,6 +142,13 @@ fn char_ty(ctx: &mut CxxTypeCtx) -> TypeId {
     })
 }
 
+fn uint_ty(ctx: &mut CxxTypeCtx) -> TypeId {
+    ctx.intern_type(CxxType::Int {
+        signed: false,
+        width: IntWidth::I32,
+    })
+}
+
 fn void_ty(ctx: &mut CxxTypeCtx) -> TypeId {
     ctx.intern_type(CxxType::Void)
 }
@@ -138,6 +160,36 @@ fn nested(parts: &[&str]) -> NestedName {
             .map(|s| NameSegment::Class(Ident((*s).to_string())))
             .collect(),
     )
+}
+
+// v1.13.1-A: Itanium bit-field packing. Mirrors corpus/bitfield.cpp —
+// `unsigned int a:4, b:20, c:8` + `char tail`. After defining the
+// class we record each bit-field's declared width via
+// `record_bitfield_width` (the importer does this from libclang in
+// the real pipeline).
+fn build_bitfield(ctx: &mut CxxTypeCtx) -> ClassId {
+    let uint_ = uint_ty(ctx);
+    let char_ = char_ty(ctx);
+    let id = ctx.define_class(ClassDef {
+        name: nested(&["BF"]),
+        bases: Vec::new(),
+        fields: vec![
+            FieldDef { name: Ident(String::from("a")), ty: uint_, explicit_align: None },
+            FieldDef { name: Ident(String::from("b")), ty: uint_, explicit_align: None },
+            FieldDef { name: Ident(String::from("c")), ty: uint_, explicit_align: None },
+            FieldDef { name: Ident(String::from("tail")), ty: char_, explicit_align: None },
+        ],
+        methods: Vec::new(),
+        kind: RecordKind::Struct,
+        is_polymorphic: false,
+        is_final: false,
+        source_alignment: None,
+    });
+    ctx.record_bitfield_width(id, 0, 4); // a:4
+    ctx.record_bitfield_width(id, 1, 20); // b:20
+    ctx.record_bitfield_width(id, 2, 8); // c:8
+    // `tail` (idx 3) is a regular field — no bitfield width recorded.
+    id
 }
 
 fn build_pod_scalar(ctx: &mut CxxTypeCtx) -> ClassId {
@@ -671,6 +723,17 @@ fn corpus_builders_compile() {
 }
 
 // -------- Layout-diff tests (unignore when M2 lands) --------------------
+
+#[test]
+fn bitfield_layout_matches_clang() {
+    let expected = load_golden("bitfield");
+    let target = target_from_golden(&expected.target).expect("supported target");
+    let mut ctx = CxxTypeCtx::new(target);
+    let class_id = build_bitfield(&mut ctx);
+    let layout = ctx.layout(class_id).expect("layout should succeed");
+    let actual = layout_to_dump(&ctx, class_id, &layout, &expected.target);
+    assert_eq!(actual, expected);
+}
 
 #[test]
 fn pod_scalar_layout_matches_clang() {

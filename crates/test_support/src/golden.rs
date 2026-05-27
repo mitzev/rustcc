@@ -46,6 +46,12 @@ pub struct BaseDump {
 pub struct FieldDump {
     pub name: String,
     pub offset: u64,
+    /// v1.13.1: bit-field info. `None` for a regular byte-aligned
+    /// field; `Some((bit_offset_within_byte, bit_width))` for a
+    /// bit-field. Serialized as a `bits <off> <width>` suffix on
+    /// the `field` line so existing non-bitfield goldens are
+    /// byte-for-byte unchanged.
+    pub bits: Option<(u8, u64)>,
 }
 
 pub const HEADER: &str =
@@ -65,7 +71,18 @@ pub fn render(d: &Dump) -> String {
         let _ = writeln!(out, "base {} {}", b.class, b.offset);
     }
     for f in &d.fields {
-        let _ = writeln!(out, "field {} {}", f.name, f.offset);
+        match f.bits {
+            Some((bit_off, bit_width)) => {
+                let _ = writeln!(
+                    out,
+                    "field {} {} bits {} {}",
+                    f.name, f.offset, bit_off, bit_width
+                );
+            }
+            None => {
+                let _ = writeln!(out, "field {} {}", f.name, f.offset);
+            }
+        }
     }
     out
 }
@@ -109,9 +126,25 @@ pub fn parse(text: &str) -> Result<Dump, String> {
             "field" => {
                 let name = toks.next().ok_or_else(|| err(i, "missing field name"))?;
                 let offset = parse_u64(&mut toks, i, "field offset")?;
+                // Optional `bits <bit_offset> <bit_width>` suffix.
+                let bits = match toks.next() {
+                    Some("bits") => {
+                        let bit_off = parse_u64(&mut toks, i, "bit offset")? as u8;
+                        let bit_width = parse_u64(&mut toks, i, "bit width")?;
+                        Some((bit_off, bit_width))
+                    }
+                    Some(other) => {
+                        return Err(err(
+                            i,
+                            &format!("unexpected field token {other:?} (want `bits`)"),
+                        ));
+                    }
+                    None => None,
+                };
                 fields.push(FieldDump {
                     name: name.to_string(),
                     offset,
+                    bits,
                 });
             }
             other => return Err(err(i, &format!("unknown key {other:?}"))),
@@ -406,10 +439,12 @@ mod tests {
                 FieldDump {
                     name: "x".into(),
                     offset: 0,
+                    bits: None,
                 },
                 FieldDump {
                     name: "y".into(),
                     offset: 4,
+                    bits: None,
                 },
             ],
         }
@@ -420,6 +455,34 @@ mod tests {
         let text = render(&sample());
         let parsed = parse(&text).expect("parse");
         assert_eq!(parsed, sample());
+    }
+
+    #[test]
+    fn bitfield_dump_round_trips() {
+        // v1.13.1: a Dump carrying bit-field fields must survive
+        // render → parse unchanged, and the serialized form must
+        // use the `bits <off> <width>` suffix.
+        let d = Dump {
+            target: "x86_64-apple-darwin".into(),
+            class: "BF".into(),
+            sizeof: 8,
+            dsize: 8,
+            align: 4,
+            nvsize: 8,
+            nvalign: 4,
+            has_vptr: false,
+            bases: Vec::new(),
+            fields: vec![
+                FieldDump { name: "a".into(), offset: 0, bits: Some((0, 4)) },
+                FieldDump { name: "b".into(), offset: 0, bits: Some((4, 20)) },
+                FieldDump { name: "tail".into(), offset: 4, bits: None },
+            ],
+        };
+        let text = render(&d);
+        assert!(text.contains("field a 0 bits 0 4"), "serialized form:\n{text}");
+        assert!(text.contains("field tail 4\n"), "plain field unchanged:\n{text}");
+        let parsed = parse(&text).expect("parse");
+        assert_eq!(parsed, d);
     }
 
     #[test]

@@ -14,9 +14,16 @@
 //! - Tail-padding reuse — a derived class can place its own fields into
 //!   the tail padding of a non-POD base because `state.dsize < size`.
 //!
-//! Out of scope for v1: virtual bases, multiple inheritance, bit-fields,
-//! `__attribute__((packed))`. These surface as `LayoutError` today and
-//! are grown in later milestones.
+//! Implemented in later milestones: virtual bases + multiple
+//! inheritance (vbase offsets, secondary vtables, this-adjusting
+//! thunks), and **bit-fields** (M21.b `place_bitfield`, validated
+//! against clang by `tests/corpus/bitfield`).
+//!
+//! Out of scope today: `__attribute__((packed))` on Itanium
+//! (MSVC `#pragma pack` is honored by `layout_msvc.rs`); VTT +
+//! construction vtables for virtual-base construction ordering.
+//! `__attribute__((packed))` surfaces as a `LayoutError` until
+//! the packed flag is plumbed.
 
 use crate::ctx::CxxTypeCtx;
 use crate::diag::LayoutError;
