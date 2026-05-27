@@ -599,7 +599,17 @@ fn place_field(
             field: FieldId(idx as u32),
         }
     })?;
-    let align = field.explicit_align.unwrap_or(align).max(align).max(1);
+    // v1.13.1: `__attribute__((packed))` forces field alignment to
+    // 1 (no inter-field padding). A per-field `alignas(N)` still
+    // wins — GCC honors explicit field alignment even inside a
+    // packed struct. Without packing, the field takes the larger
+    // of its natural alignment and any explicit `alignas`.
+    let packed = ctx.is_packed(class_id);
+    let align = if packed {
+        field.explicit_align.unwrap_or(1).max(1)
+    } else {
+        field.explicit_align.unwrap_or(align).max(align).max(1)
+    };
 
     let offset = align_up(state.dsize, align);
     let end = offset + size;

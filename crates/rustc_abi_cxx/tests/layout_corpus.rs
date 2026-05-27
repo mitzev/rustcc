@@ -192,6 +192,31 @@ fn build_bitfield(ctx: &mut CxxTypeCtx) -> ClassId {
     id
 }
 
+// v1.13.1-B: Itanium `__attribute__((packed))`. Mirrors
+// corpus/packed.cpp — `char a; int b; char c;` with the packed
+// attribute, which forces 1-byte field alignment (no padding
+// before `int b`). We mark the class packed via `set_packed`.
+fn build_packed(ctx: &mut CxxTypeCtx) -> ClassId {
+    let int_ = int_ty(ctx);
+    let char_ = char_ty(ctx);
+    let id = ctx.define_class(ClassDef {
+        name: nested(&["P"]),
+        bases: Vec::new(),
+        fields: vec![
+            FieldDef { name: Ident(String::from("a")), ty: char_, explicit_align: None },
+            FieldDef { name: Ident(String::from("b")), ty: int_, explicit_align: None },
+            FieldDef { name: Ident(String::from("c")), ty: char_, explicit_align: None },
+        ],
+        methods: Vec::new(),
+        kind: RecordKind::Struct,
+        is_polymorphic: false,
+        is_final: false,
+        source_alignment: None,
+    });
+    ctx.set_packed(id);
+    id
+}
+
 fn build_pod_scalar(ctx: &mut CxxTypeCtx) -> ClassId {
     let int_ = int_ty(ctx);
     let char_ = char_ty(ctx);
@@ -723,6 +748,17 @@ fn corpus_builders_compile() {
 }
 
 // -------- Layout-diff tests (unignore when M2 lands) --------------------
+
+#[test]
+fn packed_layout_matches_clang() {
+    let expected = load_golden("packed");
+    let target = target_from_golden(&expected.target).expect("supported target");
+    let mut ctx = CxxTypeCtx::new(target);
+    let class_id = build_packed(&mut ctx);
+    let layout = ctx.layout(class_id).expect("layout should succeed");
+    let actual = layout_to_dump(&ctx, class_id, &layout, &expected.target);
+    assert_eq!(actual, expected);
+}
 
 #[test]
 fn bitfield_layout_matches_clang() {

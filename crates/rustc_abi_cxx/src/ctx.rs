@@ -58,6 +58,15 @@ pub struct CxxTypeCtx {
     /// behavior on Unix targets — `#pragma pack` is a Microsoft
     /// extension); the MSVC layout engine honors it.
     pragma_pack: HashMap<ClassId, u64>,
+    /// v1.13.1: per-class `__attribute__((packed))` flag. When set,
+    /// the **Itanium** layout engine forces every field's alignment
+    /// to 1 (removing inter-field padding) and does not bump the
+    /// record's alignment from its fields — the record's alignment
+    /// becomes 1 unless a larger `alignas` is also present. This is
+    /// the GCC/Clang `packed` attribute, distinct from MSVC's
+    /// `#pragma pack(N)` (which clamps to N rather than forcing 1).
+    /// A per-field `alignas` still wins over packing for that field.
+    packed: HashSet<ClassId>,
     /// Rust-origin enums exposed to C++ as scoped enums. No parallel
     /// for C++-origin enums yet — imported enums flow as anonymous
     /// `CxxType::Enum` instances with the variants living in the
@@ -77,6 +86,7 @@ impl CxxTypeCtx {
             default_arg_counts: HashMap::new(),
             bitfield_widths: HashMap::new(),
             pragma_pack: HashMap::new(),
+            packed: HashSet::new(),
             rust_enums: Vec::new(),
             types: Vec::new(),
         }
@@ -205,6 +215,20 @@ impl CxxTypeCtx {
     /// default packing (8 on MSVC for 64-bit targets).
     pub fn pragma_pack(&self, class: ClassId) -> Option<u64> {
         self.pragma_pack.get(&class).copied()
+    }
+
+    /// v1.13.1: mark `class` as `__attribute__((packed))`. Honored
+    /// by the Itanium layout engine (forces field alignment to 1,
+    /// removes inter-field padding, and caps the record's
+    /// field-derived alignment at 1). The importer sets this from
+    /// the `packed` attribute on a `StructDecl`/`ClassDecl` cursor.
+    pub fn set_packed(&mut self, class: ClassId) {
+        self.packed.insert(class);
+    }
+
+    /// True iff `class` carries `__attribute__((packed))`.
+    pub fn is_packed(&self, class: ClassId) -> bool {
+        self.packed.contains(&class)
     }
 
     /// Register a Rust-origin enum for C++ exposure. Returns the
