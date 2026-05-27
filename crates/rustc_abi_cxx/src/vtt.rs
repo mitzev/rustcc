@@ -88,7 +88,18 @@ impl CxxTypeCtx {
     /// Compute the VTT for `class_id`, or `None` when the class
     /// has no virtual bases (no VTT is emitted in that case — the
     /// plain vtable suffices).
+    ///
+    /// **Itanium-only.** The VTT is an Itanium C++ ABI construct.
+    /// MSVC has no VTT and no construction vtables — it drives
+    /// virtual-base construction through the **vbtable** (a
+    /// separate table reached via the vbptr, built by
+    /// `vtable_msvc` / `layout_msvc`) plus constructor
+    /// displacement (vtordisp). On an MSVC-flavored context this
+    /// returns `None`; consult the vbtable instead.
     pub fn vtt(&self, class_id: ClassId) -> Option<Vtt> {
+        if !matches!(self.target().abi_flavor, crate::target::AbiFlavor::Itanium) {
+            return None;
+        }
         if !self.class(class_id).is_polymorphic {
             return None;
         }
@@ -192,7 +203,12 @@ impl CxxTypeCtx {
     /// Construction vtables for `class_id` — one per direct
     /// non-virtual base that carries its own virtual base(s). The
     /// symbol form is `_ZTC<class><offset>_<base>`.
+    ///
+    /// **Itanium-only** (see [`Self::vtt`]); returns empty on MSVC.
     pub fn construction_vtables(&self, class_id: ClassId) -> Vec<ConstructionVtable> {
+        if !matches!(self.target().abi_flavor, crate::target::AbiFlavor::Itanium) {
+            return Vec::new();
+        }
         if !has_virtual_base_chain(self, class_id) {
             return Vec::new();
         }
@@ -362,6 +378,21 @@ mod tests {
         assert_eq!(cvts[1].base, c);
         assert_eq!(cvts[1].offset, 16);
         assert_eq!(cvts[1].symbol, "_ZTC1D16_1C");
+    }
+
+    #[test]
+    fn msvc_has_no_vtt_or_construction_vtables() {
+        // VTT + construction vtables are Itanium-only. On MSVC the
+        // diamond uses a vbtable (vtable_msvc/layout_msvc), so vtt()
+        // must return None and construction_vtables() empty — never
+        // garbage `_ZTT??_7..` symbols built from MSVC manglings.
+        let mut ctx = CxxTypeCtx::new(Target::x86_64_pc_windows_msvc());
+        let (_a, _b, _c, d) = build_diamond(&mut ctx);
+        assert!(ctx.vtt(d).is_none(), "MSVC has no VTT");
+        assert!(
+            ctx.construction_vtables(d).is_empty(),
+            "MSVC has no construction vtables"
+        );
     }
 
     #[test]
