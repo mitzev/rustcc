@@ -105,7 +105,8 @@ use std::fmt::Write as _;
 
 use rustc_abi_cxx::{
     ClassId, CtorVariant, CxxType, CxxTypeCtx, DtorVariant, FloatKind, IntWidth,
-    MethodDef, MethodName, NameSegment, SpecialMember, Symbol, TypeId, Virtuality,
+    MethodDef, MethodName, NameSegment, OperatorKind, SpecialMember, Symbol, TypeId,
+    Virtuality,
 };
 
 use crate::annotations::{Annotation, AnnotationSet};
@@ -1984,6 +1985,17 @@ enum EmissionKind {
     /// plus an `impl Clone for <Class>` (postamble, like Drop) —
     /// not an inherent method.
     CopyCtor,
+    /// v1.13.2: move constructor `T(T&&)`. Renders the associated
+    /// fn `pub fn move_from(src: &mut Self) -> Self`, which
+    /// placement-move-constructs into a fresh slot. Rust has no
+    /// move-ctor concept, so this is an explicit method.
+    MoveCtor,
+    /// v1.13.2: copy assignment `operator=(const T&)`. Renders
+    /// `pub fn copy_assign(&mut self, src: &Self)`.
+    CopyAssign,
+    /// v1.13.2: move assignment `operator=(T&&)`. Renders
+    /// `pub fn move_assign(&mut self, src: &mut Self)`.
+    MoveAssign,
     /// `&self` / `&mut self` instance method, dispatched directly
     /// to the Itanium-mangled symbol.
     Instance,
@@ -2372,14 +2384,84 @@ fn classify_for_direct_extern(
                 raw_ret_ty: String::new(),
             });
         }
-        Some(SpecialMember::MoveCtor)
-        | Some(SpecialMember::CopyAssign | SpecialMember::MoveAssign) => {
-            return Err(BindingsError::UnsupportedMethod {
-                where_: format!("{class_name}::{:?}", method.name),
-                why: "move ctor / copy-assign / move-assign not yet wired \
-                      (v1.13.1 covers copy ctor → Clone; DefaultCtor + \
-                      OtherCtor + Dtor + plain methods + operators)"
-                    .into(),
+        Some(SpecialMember::MoveCtor) => {
+            // v1.13.2: move ctor → `pub fn move_from(src) -> Self`.
+            // Mangles as the complete-object ctor with an rvalue-ref
+            // param (`_ZN..C1EOS_`); the mangler derives `OS_` from
+            // the move ctor's own sig. Placement-move-constructs the
+            // source into a fresh slot. The source is left in C++'s
+            // moved-from state (still valid + droppable) — the caller
+            // keeps ownership of it.
+            let link = ctx.mangle(&Symbol::Ctor {
+                class: class_id,
+                variant: CtorVariant::C1,
+                sig: method.sig.clone(),
+            });
+            return Ok(MethodEmission {
+                kind: EmissionKind::MoveCtor,
+                rust_name: "move_from".into(),
+                extern_ident: format!("__cxx_{class_name}_move_ctor"),
+                link_name: link,
+                extern_decl_params: format!(
+                    "dst: *mut {class_name}, src: *mut {class_name}"
+                ),
+                extern_return_clause: String::new(),
+                wrapper_receiver: WrapperReceiver::None,
+                wrapper_params: format!("src: &mut {class_name}"),
+                wrapper_return: "Self".into(),
+                forward_args: String::new(),
+                default_arg_count: 0,
+                wrapper_user_params: Vec::new(),
+                wrapper_forward_arg_names: Vec::new(),
+                synthesized_default_literals: None,
+                cstr_param_indices: Vec::new(),
+                throws: false,
+                raw_ret_ty: String::new(),
+            });
+        }
+        Some(SpecialMember::CopyAssign | SpecialMember::MoveAssign) => {
+            // v1.13.2: copy/move assignment → `copy_assign` /
+            // `move_assign` methods on `&mut self`. `operator=`
+            // mangles via Symbol::Method; the const-ref vs rvalue-ref
+            // param in `method.sig` drives `aSERKS_` vs `aSEOS_`.
+            let is_move = matches!(method.special, Some(SpecialMember::MoveAssign));
+            let (rust_name, ext_suffix, src_ty) = if is_move {
+                ("move_assign", "move_assign", format!("&mut {class_name}"))
+            } else {
+                ("copy_assign", "copy_assign", format!("&{class_name}"))
+            };
+            let src_decl = if is_move {
+                format!("src: *mut {class_name}")
+            } else {
+                format!("src: *const {class_name}")
+            };
+            let link = ctx.mangle(&Symbol::Method {
+                class: class_id,
+                name: MethodName::Operator(OperatorKind::Assign),
+                sig: method.sig.clone(),
+            });
+            return Ok(MethodEmission {
+                kind: if is_move {
+                    EmissionKind::MoveAssign
+                } else {
+                    EmissionKind::CopyAssign
+                },
+                rust_name: rust_name.into(),
+                extern_ident: format!("__cxx_{class_name}_{ext_suffix}"),
+                link_name: link,
+                extern_decl_params: format!("this: *mut {class_name}, {src_decl}"),
+                extern_return_clause: String::new(),
+                wrapper_receiver: WrapperReceiver::SelfMut,
+                wrapper_params: format!("src: {src_ty}"),
+                wrapper_return: "()".into(),
+                forward_args: String::new(),
+                default_arg_count: 0,
+                wrapper_user_params: Vec::new(),
+                wrapper_forward_arg_names: Vec::new(),
+                synthesized_default_literals: None,
+                cstr_param_indices: Vec::new(),
+                throws: false,
+                raw_ret_ty: String::new(),
             });
         }
         None => {}
@@ -2988,6 +3070,56 @@ fn render_direct_extern_wrapper(
         EmissionKind::CopyCtor => {
             // Copy ctor goes into the Clone impl postamble, not the
             // inherent impl.
+        }
+        EmissionKind::MoveCtor => {
+            // v1.13.2: `pub fn move_from(src: &mut Self) -> Self` —
+            // placement-move-constructs into a fresh slot.
+            let _ = writeln!(
+                out,
+                "{indent}pub fn move_from({params}) -> Self {{",
+                params = emission.wrapper_params,
+            );
+            let _ = writeln!(out, "{indent}    unsafe {{");
+            let _ = writeln!(
+                out,
+                "{indent}        let mut __slot = ::core::mem::MaybeUninit::<Self>::uninit();",
+            );
+            let _ = writeln!(
+                out,
+                "{indent}        {ext}(__slot.as_mut_ptr(), src as *mut Self);",
+                ext = emission.extern_ident,
+            );
+            let _ = writeln!(out, "{indent}        __slot.assume_init()");
+            let _ = writeln!(out, "{indent}    }}");
+            let _ = writeln!(out, "{indent}}}");
+        }
+        EmissionKind::CopyAssign => {
+            // v1.13.2: `pub fn copy_assign(&mut self, src: &Self)`.
+            let _ = writeln!(
+                out,
+                "{indent}pub fn copy_assign(&mut self, {params}) {{",
+                params = emission.wrapper_params,
+            );
+            let _ = writeln!(
+                out,
+                "{indent}    unsafe {{ {ext}(self as *mut Self, src as *const Self); }}",
+                ext = emission.extern_ident,
+            );
+            let _ = writeln!(out, "{indent}}}");
+        }
+        EmissionKind::MoveAssign => {
+            // v1.13.2: `pub fn move_assign(&mut self, src: &mut Self)`.
+            let _ = writeln!(
+                out,
+                "{indent}pub fn move_assign(&mut self, {params}) {{",
+                params = emission.wrapper_params,
+            );
+            let _ = writeln!(
+                out,
+                "{indent}    unsafe {{ {ext}(self as *mut Self, src as *mut Self); }}",
+                ext = emission.extern_ident,
+            );
+            let _ = writeln!(out, "{indent}}}");
         }
     }
 
@@ -5470,6 +5602,85 @@ mod tests {
         assert_eq!(
             BindingsBackend::default(),
             BindingsBackend::DirectExternCpp,
+        );
+    }
+
+    #[test]
+    fn move_ctor_and_assignment_ops_emit_methods() {
+        // v1.13.2: move ctor + copy/move assignment. A class with
+        // all three (plus a copy ctor) emits `move_from`,
+        // `copy_assign`, `move_assign` methods + the Clone impl.
+        let (mut ctx, id) = point_ctx();
+        let point_ty = ctx.intern_type(CxxType::Record(id));
+        let const_ref = ctx.intern_type(CxxType::Ref {
+            pointee: point_ty,
+            kind: rustc_abi_cxx::RefKind::Lvalue,
+            cv: CvQual { is_const: true, is_volatile: false },
+        });
+        let rvalue_ref = ctx.intern_type(CxxType::Ref {
+            pointee: point_ty,
+            kind: rustc_abi_cxx::RefKind::Rvalue,
+            cv: CvQual::default(),
+        });
+        let void_ = void_ty(&mut ctx);
+        // copy ctor Point(const Point&)
+        ctx.class_mut(id).methods.push(MethodDef {
+            name: MethodName::Ident(Ident("Point".into())),
+            sig: FnSig { params: vec![const_ref], ret: void_, cv: CvQual::default(), ref_q: None, variadic: false, noexcept: true },
+            virtuality: Virtuality::NonVirtual, vtable_index: None,
+            special: Some(SpecialMember::CopyCtor),
+        });
+        // move ctor Point(Point&&)
+        ctx.class_mut(id).methods.push(MethodDef {
+            name: MethodName::Ident(Ident("Point".into())),
+            sig: FnSig { params: vec![rvalue_ref], ret: void_, cv: CvQual::default(), ref_q: None, variadic: false, noexcept: true },
+            virtuality: Virtuality::NonVirtual, vtable_index: None,
+            special: Some(SpecialMember::MoveCtor),
+        });
+        // copy assign operator=(const Point&)
+        ctx.class_mut(id).methods.push(MethodDef {
+            name: MethodName::Operator(OperatorKind::Assign),
+            sig: FnSig { params: vec![const_ref], ret: rvalue_ref, cv: CvQual::default(), ref_q: None, variadic: false, noexcept: true },
+            virtuality: Virtuality::NonVirtual, vtable_index: None,
+            special: Some(SpecialMember::CopyAssign),
+        });
+        // move assign operator=(Point&&)
+        ctx.class_mut(id).methods.push(MethodDef {
+            name: MethodName::Operator(OperatorKind::Assign),
+            sig: FnSig { params: vec![rvalue_ref], ret: rvalue_ref, cv: CvQual::default(), ref_q: None, variadic: false, noexcept: true },
+            virtuality: Virtuality::NonVirtual, vtable_index: None,
+            special: Some(SpecialMember::MoveAssign),
+        });
+        let src = generate_rust_bindings(&ctx, &[id], &RustBindingsConfig::default())
+            .expect("emit");
+        // move ctor → associated fn
+        assert!(
+            src.contains("pub fn move_from(src: &mut Point) -> Self"),
+            "expected move_from:\n{src}"
+        );
+        assert!(src.contains("__cxx_Point_move_ctor"), "move-ctor extern:\n{src}");
+        // copy assign → &mut self method taking &Point
+        assert!(
+            src.contains("pub fn copy_assign(&mut self, src: &Point)"),
+            "expected copy_assign:\n{src}"
+        );
+        assert!(src.contains("__cxx_Point_copy_assign"), "copy-assign extern:\n{src}");
+        // move assign → &mut self method taking &mut Point
+        assert!(
+            src.contains("pub fn move_assign(&mut self, src: &mut Point)"),
+            "expected move_assign:\n{src}"
+        );
+        assert!(src.contains("__cxx_Point_move_assign"), "move-assign extern:\n{src}");
+        // copy ctor still produces the Clone impl
+        assert!(
+            src.contains("impl ::core::clone::Clone for Point"),
+            "expected Clone impl alongside:\n{src}"
+        );
+        // the two operator= externs must have distinct mangled link
+        // names (copy = aSERKS_, move = aSEOS_) — no symbol clash.
+        assert!(
+            src.contains("aSERKS_") && src.contains("aSEOS_"),
+            "expected distinct copy/move operator= mangled symbols:\n{src}"
         );
     }
 
