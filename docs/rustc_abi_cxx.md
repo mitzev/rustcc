@@ -44,15 +44,27 @@ deterministic, and tested against Clang as ground truth on every build.
 - Conformance harness that diffs crate output against Clang record-layout and
   symbol dumps.
 
-### Not in scope for v1 (deferred, listed so the IR doesn't preclude them)
+### Implemented since v1 (this list was the original v1 scope cut)
 
-- Virtual inheritance, virtual bases, vbase offsets, construction vtables.
-- Multiple inheritance.
-- Bit-fields. *(v1.1)*
-- `__attribute__((packed))`, `#pragma pack`. *(v1.1)*
-- Covariant-return thunks. *(v1.1; single-inheritance version is small.)*
-- Templates beyond what the caller hands us already-instantiated.
-- MSVC ABI. *(Separate crate when the time comes.)*
+- **Multiple inheritance** — secondary vtables, `this`-adjusting
+  thunks, per-base layout. *(shipped, clang-validated)*
+- **Virtual / diamond inheritance** — vbase layout + vbase-offset
+  vtable slots. *(shipped; VTT + construction vtables still TODO)*
+- **Bit-fields** — Itanium `place_bitfield` + MSVC packing.
+  *(shipped v1.13.1, clang-validated)*
+- **`__attribute__((packed))`** (Itanium) + **`#pragma pack`**
+  (MSVC). *(shipped v1.13.1 / v1.09.x)*
+- **MSVC ABI** — full layout + vtable + mangling. *(shipped v1.09.x)*
+- **Empty Base Optimization** — both ABIs. *(shipped)*
+
+### Still not in scope
+
+- VTT / construction vtables (construction-order vptr fixup for
+  virtual-base hierarchies rustcc itself constructs).
+- Covariant-return thunks. *(single-inheritance version is small.)*
+- Templates beyond what the caller hands us already-instantiated
+  (non-type template params, template-template params).
+- Member pointers (partial: type exists, mangling/layout incomplete).
 - `thread_local` storage mangling (`TH`, `TW`).
 - Exception handling tables (not part of layout/mangling anyway).
 
