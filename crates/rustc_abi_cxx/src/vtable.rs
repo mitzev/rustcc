@@ -145,6 +145,35 @@ impl CxxTypeCtx {
                 });
                 running_offset += secondary_len * ptr_bytes;
             }
+
+            // v1.13.2: virtual-base sub-tables. A class with virtual
+            // bases gets one further sub-table per virtual base,
+            // after the non-virtual secondaries, matching clang's
+            // `_ZTV` struct shape (e.g. the diamond's
+            // `{ [primary], [secondary], [vbase] }`). Each vbase
+            // sub-table is shaped like a secondary one: offset-to-top
+            // = -(vbase offset), RTTI, then the vbase's virtuals.
+            // These are also the address points the VTT's
+            // "secondary virtual pointer" entries reference.
+            for &(vbase_id, vbase_offset) in &layout.virtual_base_offsets {
+                if !self.class(vbase_id).is_polymorphic {
+                    continue;
+                }
+                let entries = build_secondary_entries(
+                    self,
+                    class_id,
+                    vbase_id,
+                    vbase_offset,
+                );
+                let len = entries.len() as u64;
+                sub_tables.push(VTableSubTable {
+                    for_subobject: vbase_id,
+                    subobject_offset: vbase_offset,
+                    entries,
+                    address_point_offset: running_offset + 2 * ptr_bytes,
+                });
+                running_offset += len * ptr_bytes;
+            }
         }
 
         let symbol = self.mangle(&Symbol::VTable(class_id));

@@ -19,6 +19,7 @@ mod target;
 mod ty;
 mod vtable;
 mod vtable_msvc;
+mod vtt;
 
 pub use ctx::CxxTypeCtx;
 pub use diag::LayoutError;
@@ -33,3 +34,4 @@ pub use ty::{
     TypeOrigin, Virtuality,
 };
 pub use vtable::{VTable, VTableEntry, VTableSubTable};
+pub use vtt::{ConstructionVtable, Vtt, VttEntry, VttVtableRef};

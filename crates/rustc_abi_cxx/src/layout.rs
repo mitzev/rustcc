@@ -454,7 +454,7 @@ impl HfaProbe {
 /// declare a virtual base? Such a class needs a vptr at offset 0 to
 /// store vbase offsets, regardless of whether it declares virtual
 /// methods directly.
-fn has_virtual_base_chain(ctx: &CxxTypeCtx, class_id: ClassId) -> bool {
+pub(crate) fn has_virtual_base_chain(ctx: &CxxTypeCtx, class_id: ClassId) -> bool {
     let class = ctx.class(class_id);
     for base in &class.bases {
         if base.virtual_ {
@@ -472,7 +472,7 @@ fn has_virtual_base_chain(ctx: &CxxTypeCtx, class_id: ClassId) -> bool {
 /// post-order over the inheritance graph. For the common single-
 /// diamond case (`D : D1, D2`, both virtually inheriting `A`) this
 /// yields `[A]`.
-fn collect_virtual_bases(
+pub(crate) fn collect_virtual_bases(
     ctx: &CxxTypeCtx,
     class_id: ClassId,
 ) -> Vec<ClassId> {
