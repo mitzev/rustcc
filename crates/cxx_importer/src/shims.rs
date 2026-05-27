@@ -489,6 +489,12 @@ fn render_segment(
                             "template argument",
                         )?);
                     }
+                    TemplateArg::Integral { value, .. } => {
+                        arg_srcs.push(value.to_string());
+                    }
+                    TemplateArg::Template(nested) => {
+                        arg_srcs.push(render_nested_name(ctx, nested)?);
+                    }
                 }
             }
             Ok(format!("{}<{}>", name.0, arg_srcs.join(", ")))

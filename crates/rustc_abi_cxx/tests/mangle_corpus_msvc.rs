@@ -1026,6 +1026,137 @@ fn msvc_templates_matches_clang() {
     }
 }
 
+// -------- mangle_templates_nttp (non-type + template-template) -------
+
+const TEMPLATES_NTTP_EXPECTED: &[(&str, &str)] = &[
+    ("take_arr4(Arr<int,4>)", "?take_arr4@@YAXU?$Arr@H$03@@@Z"),
+    ("take_arrneg(Arr<int,-1>)", "?take_arrneg@@YAXU?$Arr@H$0?0@@@Z"),
+    (
+        "take_sizearr(SizeArr<int,4ul>)",
+        "?take_sizearr@@YAXU?$SizeArr@H$03@@@Z",
+    ),
+    ("take_flag(Flag<true>)", "?take_flag@@YAXU?$Flag@$00@@@Z"),
+    ("take_charbox(CharBox<'A'>)", "?take_charbox@@YAXU?$CharBox@$0EB@@@@Z"),
+    ("take_stack(Stack<int,Box>)", "?take_stack@@YAXU?$Stack@HUBox@@@@@Z"),
+];
+
+#[test]
+fn msvc_templates_nttp_golden_has_expected_symbols() {
+    let d = load("mangle_templates_nttp");
+    assert_all_msvc(&d, TEMPLATES_NTTP_EXPECTED);
+}
+
+#[test]
+fn msvc_templates_nttp_matches_clang() {
+    fn intern_spec(
+        c: &mut CxxTypeCtx,
+        name: &str,
+        args: Vec<TemplateArg>,
+    ) -> TypeId {
+        let cid = c.define_class(ClassDef {
+            name: NestedName(vec![NameSegment::TemplateSpec {
+                name: Ident(name.into()),
+                args,
+            }]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![],
+            kind: RecordKind::Struct,
+            is_polymorphic: false,
+            is_final: false,
+            source_alignment: None,
+        });
+        c.intern_type(CxxType::Record(cid))
+    }
+
+    fn free_fn(c: &CxxTypeCtx, name: &str, param: TypeId, v: TypeId) -> String {
+        c.mangle_msvc(&Symbol::Function {
+            scope: NestedName(vec![]),
+            name: Ident(name.into()),
+            sig: FnSig {
+                params: vec![param],
+                ret: v,
+                cv: CvQual::default(),
+                ref_q: None,
+                variadic: false,
+                noexcept: false,
+            },
+        })
+    }
+
+    let mut c = ctx();
+    let v = intern_void(&mut c);
+    let i = intern_int(&mut c, true, IntWidth::I32);
+    let ul = intern_int(&mut c, false, IntWidth::I64);
+    let b = c.intern_type(CxxType::Bool);
+    let ch = intern_int(&mut c, true, IntWidth::I8);
+
+    let arr4 = intern_spec(
+        &mut c,
+        "Arr",
+        vec![TemplateArg::Type(i), TemplateArg::Integral { value: 4, ty: i }],
+    );
+    assert_eq!(
+        free_fn(&c, "take_arr4", arr4, v),
+        "?take_arr4@@YAXU?$Arr@H$03@@@Z"
+    );
+
+    let arrneg = intern_spec(
+        &mut c,
+        "Arr",
+        vec![TemplateArg::Type(i), TemplateArg::Integral { value: -1, ty: i }],
+    );
+    assert_eq!(
+        free_fn(&c, "take_arrneg", arrneg, v),
+        "?take_arrneg@@YAXU?$Arr@H$0?0@@@Z"
+    );
+
+    let sizearr = intern_spec(
+        &mut c,
+        "SizeArr",
+        vec![TemplateArg::Type(i), TemplateArg::Integral { value: 4, ty: ul }],
+    );
+    assert_eq!(
+        free_fn(&c, "take_sizearr", sizearr, v),
+        "?take_sizearr@@YAXU?$SizeArr@H$03@@@Z"
+    );
+
+    let flag = intern_spec(
+        &mut c,
+        "Flag",
+        vec![TemplateArg::Integral { value: 1, ty: b }],
+    );
+    assert_eq!(
+        free_fn(&c, "take_flag", flag, v),
+        "?take_flag@@YAXU?$Flag@$00@@@Z"
+    );
+
+    let charbox = intern_spec(
+        &mut c,
+        "CharBox",
+        vec![TemplateArg::Integral { value: 65, ty: ch }],
+    );
+    assert_eq!(
+        free_fn(&c, "take_charbox", charbox, v),
+        "?take_charbox@@YAXU?$CharBox@$0EB@@@@Z"
+    );
+
+    let stack = intern_spec(
+        &mut c,
+        "Stack",
+        vec![
+            TemplateArg::Type(i),
+            TemplateArg::Template(NestedName(vec![NameSegment::Class(
+                Ident("Box".into()),
+            )])),
+        ],
+    );
+    assert_eq!(
+        free_fn(&c, "take_stack", stack, v),
+        "?take_stack@@YAXU?$Stack@HUBox@@@@@Z"
+    );
+}
+
 // -------- noexcept doesn't affect MSVC mangling ----------------------
 //
 // MSVC's mangler — unlike Itanium — doesn't encode `noexcept` into

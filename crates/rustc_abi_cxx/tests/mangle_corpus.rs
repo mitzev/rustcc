@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use rustc_abi_cxx::{
     ClassDef, ClassId, CtorVariant, CvQual, CxxType, CxxTypeCtx, DtorVariant,
     FloatKind, FnSig, Ident, IntWidth, MethodName, NameSegment, NestedName,
-    OperatorKind, RecordKind, RefKind, Symbol, Target, TypeId,
+    OperatorKind, RecordKind, RefKind, Symbol, Target, TemplateArg, TypeId,
 };
 use test_support::golden::{self, MangleDump};
 
@@ -657,4 +657,147 @@ fn mangle_rtti_symbols() {
     assert_eq!(ctx.mangle(&Symbol::VTable(base)), "_ZTV4Base");
     assert_eq!(ctx.mangle(&Symbol::TypeInfo(base)), "_ZTI4Base");
     assert_eq!(ctx.mangle(&Symbol::TypeInfoName(base)), "_ZTS4Base");
+}
+
+// -------- mangle_templates_nttp (non-type + template-template) -------
+
+/// Build a `ClassDef` for a single-segment `TemplateSpec` and intern it
+/// as a `Record` type, returning the type id.
+fn intern_spec(
+    c: &mut CxxTypeCtx,
+    name: &str,
+    args: Vec<TemplateArg>,
+) -> TypeId {
+    let cid = c.define_class(ClassDef {
+        name: NestedName(vec![NameSegment::TemplateSpec {
+            name: Ident(name.into()),
+            args,
+        }]),
+        bases: vec![],
+        fields: vec![],
+        methods: vec![],
+        kind: RecordKind::Struct,
+        is_polymorphic: false,
+        is_final: false,
+        source_alignment: None,
+    });
+    c.intern_type(CxxType::Record(cid))
+}
+
+fn free_fn(c: &CxxTypeCtx, name: &str, param: TypeId, ret: TypeId) -> String {
+    c.mangle(&Symbol::Function {
+        scope: NestedName(vec![]),
+        name: Ident(name.into()),
+        sig: FnSig {
+            params: vec![param],
+            ret,
+            cv: CvQual::default(),
+            ref_q: None,
+            variadic: false,
+            noexcept: false,
+        },
+    })
+}
+
+#[test]
+fn mangle_templates_nttp_golden_has_expected_symbols() {
+    let d = load("mangle_templates_nttp");
+    assert_all_present(
+        &d,
+        &[
+            ("take_arr4(Arr<int,4>)", "_Z9take_arr43ArrIiLi4EE"),
+            ("take_arrneg(Arr<int,-1>)", "_Z11take_arrneg3ArrIiLin1EE"),
+            (
+                "take_sizearr(SizeArr<int,4ull>)",
+                "_Z12take_sizearr7SizeArrIiLy4EE",
+            ),
+            ("take_flag(Flag<true>)", "_Z9take_flag4FlagILb1EE"),
+            (
+                "take_charbox(CharBox<'A'>)",
+                "_Z12take_charbox7CharBoxILc65EE",
+            ),
+            ("take_stack(Stack<int,Box>)", "_Z10take_stack5StackIi3BoxE"),
+        ],
+    );
+}
+
+#[test]
+fn mangle_templates_nttp_matches_clang() {
+    let mut c = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let v = c.intern_type(CxxType::Void);
+    let i = c.intern_type(CxxType::Int { signed: true, width: IntWidth::I32 });
+    let ul =
+        c.intern_type(CxxType::Int { signed: false, width: IntWidth::I64 });
+    let b = c.intern_type(CxxType::Bool);
+    let ch =
+        c.intern_type(CxxType::Int { signed: true, width: IntWidth::I8 });
+
+    // Arr<int, 4>  ->  3ArrIiLi4EE
+    let arr4 = intern_spec(
+        &mut c,
+        "Arr",
+        vec![TemplateArg::Type(i), TemplateArg::Integral { value: 4, ty: i }],
+    );
+    assert_eq!(free_fn(&c, "take_arr4", arr4, v), "_Z9take_arr43ArrIiLi4EE");
+
+    // Arr<int, -1>  ->  3ArrIiLin1EE  (negative -> `n` prefix)
+    let arrneg = intern_spec(
+        &mut c,
+        "Arr",
+        vec![TemplateArg::Type(i), TemplateArg::Integral { value: -1, ty: i }],
+    );
+    assert_eq!(
+        free_fn(&c, "take_arrneg", arrneg, v),
+        "_Z11take_arrneg3ArrIiLin1EE"
+    );
+
+    // SizeArr<int, 4ull>  ->  7SizeArrIiLy4EE  (unsigned long long -> `y`).
+    // NB: the IR collapses `long`/`long long` to one 64-bit width, so a
+    // `size_t` (= `unsigned long` on LP64) NTTP mangles as `y`, not `m`.
+    // That long/long-long ambiguity is a pre-existing, codebase-wide
+    // limitation (see `int_code`), not specific to template arguments.
+    let sizearr = intern_spec(
+        &mut c,
+        "SizeArr",
+        vec![TemplateArg::Type(i), TemplateArg::Integral { value: 4, ty: ul }],
+    );
+    assert_eq!(
+        free_fn(&c, "take_sizearr", sizearr, v),
+        "_Z12take_sizearr7SizeArrIiLy4EE"
+    );
+
+    // Flag<true>  ->  4FlagILb1EE
+    let flag = intern_spec(
+        &mut c,
+        "Flag",
+        vec![TemplateArg::Integral { value: 1, ty: b }],
+    );
+    assert_eq!(free_fn(&c, "take_flag", flag, v), "_Z9take_flag4FlagILb1EE");
+
+    // CharBox<'A'>  ->  7CharBoxILc65EE  ('A' == 65)
+    let charbox = intern_spec(
+        &mut c,
+        "CharBox",
+        vec![TemplateArg::Integral { value: 65, ty: ch }],
+    );
+    assert_eq!(
+        free_fn(&c, "take_charbox", charbox, v),
+        "_Z12take_charbox7CharBoxILc65EE"
+    );
+
+    // Stack<int, Box>  ->  5StackIi3BoxE  (template-template arg `Box`)
+    let stack = intern_spec(
+        &mut c,
+        "Stack",
+        vec![
+            TemplateArg::Type(i),
+            TemplateArg::Template(NestedName(vec![NameSegment::Class(
+                Ident("Box".into()),
+            )])),
+        ],
+    );
+    assert_eq!(
+        free_fn(&c, "take_stack", stack, v),
+        "_Z10take_stack5StackIi3BoxE"
+    );
 }

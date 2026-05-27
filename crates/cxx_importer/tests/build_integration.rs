@@ -551,3 +551,70 @@ public:
         "expected Result<Self, _> ctor wrapper; bindings:\n{bindings}"
     );
 }
+
+#[test]
+fn compile_auto_instantiates_referenced_template_specializations() {
+    // v1.13.3 task F: a template specialization referenced only by
+    // pointer (so it isn't implicitly instantiated) is discovered and
+    // force-instantiated by `Build`'s auto-instantiate pass, then
+    // emitted as a concrete binding. Turning auto-instantiate off (with
+    // no explicit list) leaves it out; an explicit `.instantiate(...)`
+    // brings it back even with auto off.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let header = tmp.path().join("wrapper.hpp");
+    std::fs::write(
+        &header,
+        "template<class T> struct Wrapper { T value; T unwrap() const; };\n\
+         template<class T> T Wrapper<T>::unwrap() const { return value; }\n\
+         // Referenced by pointer only: not implicitly instantiated, so\n\
+         // it surfaces as a full class solely via the discovery pass.\n\
+         struct Holder { Wrapper<int>* w; int tag; };\n\
+         Holder make_holder();\n",
+    )
+    .unwrap();
+
+    let compile_in = |sub: &str, auto: bool, explicit: Option<&str>| {
+        let out_dir = tmp.path().join(sub);
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let mut b = Build::new();
+        b.header(&header)
+            .cpp_std("c++17")
+            .out_dir(&out_dir)
+            .auto_instantiate(auto)
+            .invoke_cc(false);
+        if let Some(e) = explicit {
+            b.instantiate(e);
+        }
+        let outputs = b.compile("wrap_bindings").expect("compile");
+        std::fs::read_to_string(&outputs.bindings_path).unwrap()
+    };
+
+    // Auto ON (default): Wrapper<int> is discovered, force-instantiated,
+    // and emitted as the concrete `Wrapper_i32` with its `unwrap()`
+    // method bound (`_ZNK7WrapperIiE6unwrapEv`).
+    let auto = compile_in("auto_on", true, None);
+    assert!(
+        auto.contains("struct Wrapper_i32"),
+        "auto-instantiate should emit the concrete Wrapper<int>:\n{auto}"
+    );
+    assert!(
+        auto.contains("_ZNK7WrapperIiE6unwrapEv"),
+        "the instantiated method should be bound:\n{auto}"
+    );
+
+    // Auto OFF, no explicit list: the pointer-only spec is left as an
+    // opaque forward-decl — the concrete `Wrapper_i32` is not emitted.
+    let none = compile_in("auto_off", false, None);
+    assert!(
+        !none.contains("Wrapper_i32"),
+        "without auto-instantiate the spec should stay un-materialized:\n{none}"
+    );
+
+    // Auto OFF but explicitly requested: brought back.
+    let explicit = compile_in("explicit", false, Some("Wrapper<int>"));
+    assert!(
+        explicit.contains("struct Wrapper_i32"),
+        "explicit .instantiate(\"Wrapper<int>\") should emit it:\n{explicit}"
+    );
+}

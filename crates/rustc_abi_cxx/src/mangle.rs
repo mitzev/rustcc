@@ -317,6 +317,29 @@ impl<'a> Mangler<'a> {
                         TemplateArg::Type(ty) => {
                             self.emit_type(*ty);
                         }
+                        TemplateArg::Integral { value, ty } => {
+                            // `<expr-primary> ::= L <type> <number> E`.
+                            // The type letter comes from emitting `ty`
+                            // (`i`, `m`, `b`, `c`, an enum name, …);
+                            // negative numbers use an `n` prefix on the
+                            // magnitude (`Lin1E` for `int -1`).
+                            self.out.push('L');
+                            self.emit_type(*ty);
+                            if *value < 0 {
+                                self.out.push('n');
+                                let _ = write!(self.out, "{}", value.unsigned_abs());
+                            } else {
+                                let _ = write!(self.out, "{value}");
+                            }
+                            self.out.push('E');
+                        }
+                        TemplateArg::Template(nested) => {
+                            // A template-template argument mangles as the
+                            // bare name prefix (no `I…E`), participating
+                            // in the substitution table: `3Box`,
+                            // `St6vector`.
+                            self.emit_nested_prefix(&nested.0);
+                        }
                     }
                 }
                 self.out.push('E');

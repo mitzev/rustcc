@@ -335,10 +335,16 @@ fn render_segment(seg: &NameSegment) -> Result<String, HppError> {
             for arg in args {
                 match arg {
                     TemplateArg::Type(_ty) => {
-                        // Template args in .hpp output aren't
-                        // round-trippable without a full type printer;
-                        // for v1 emit a placeholder so users notice.
+                        // Type args in .hpp output aren't round-trippable
+                        // without a full type printer; for v1 emit a
+                        // placeholder so users notice.
                         arg_srcs.push("/* arg */".to_string());
+                    }
+                    TemplateArg::Integral { value, .. } => {
+                        arg_srcs.push(value.to_string());
+                    }
+                    TemplateArg::Template(nested) => {
+                        arg_srcs.push(render_nested_name(nested)?);
                     }
                 }
             }

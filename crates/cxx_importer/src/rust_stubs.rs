@@ -293,6 +293,24 @@ fn render_nested_name(name: &NestedName) -> Result<String, StubError> {
                 for arg in args {
                     match arg {
                         TemplateArg::Type(_) => a.push("/* arg */".to_string()),
+                        TemplateArg::Integral { value, .. } => {
+                            a.push(value.to_string())
+                        }
+                        TemplateArg::Template(nested) => a.push(
+                            nested
+                                .0
+                                .iter()
+                                .filter_map(|s| match s {
+                                    NameSegment::Namespace(i)
+                                    | NameSegment::Class(i)
+                                    | NameSegment::Enum(i) => {
+                                        Some(i.0.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("::"),
+                        ),
                     }
                 }
                 format!("{}<{}>", name.0, a.join(", "))

@@ -433,6 +433,17 @@ impl<'a> MsvcMangler<'a> {
                 for arg in args {
                     match arg {
                         TemplateArg::Type(ty) => self.emit_type_nested(*ty),
+                        TemplateArg::Integral { value, .. } => {
+                            push_msvc_template_int(&mut self.out, *value);
+                        }
+                        TemplateArg::Template(nested) => {
+                            // A template-template argument is encoded like
+                            // a struct-tag reference to the bare template
+                            // name: `UBox@@`. (The class-key isn't tracked
+                            // on the argument, so we default to `U`.)
+                            self.out.push('U');
+                            self.emit_qualified_name_tail(&nested.0);
+                        }
                     }
                 }
                 self.out.push('@'); // close template-args block
@@ -772,6 +783,35 @@ fn ptr_cv_letter(cv: CvQual) -> char {
         (true, false) => 'B',
         (false, true) => 'C',
         (true, true) => 'D',
+    }
+}
+
+/// Encode an integral non-type template argument in MSVC form.
+///
+/// The encoding is `$0` followed by the value:
+///   * magnitudes `1..=10` use a single digit `0`-`9` (the value minus
+///     one), so `1 → $00`, `10 → $09`;
+///   * `0` and magnitudes `>= 11` use base-16 nibbles mapped to letters
+///     `A`-`P` (`A=0 … P=15`), most-significant first, terminated by
+///     `@`, so `0 → $0A@`, `65 → $0EB@`, `100 → $0GE@`;
+///   * negative values gain a leading `?` before the magnitude
+///     encoding, so `-1 → $0?0`, `-11 → $0?L@`.
+fn push_msvc_template_int(out: &mut String, value: i128) {
+    out.push_str("$0");
+    let mag: u128 = if value < 0 {
+        out.push('?');
+        value.unsigned_abs()
+    } else {
+        value as u128
+    };
+    if (1..=10).contains(&mag) {
+        out.push((b'0' + (mag as u8 - 1)) as char);
+    } else {
+        for hex in format!("{mag:X}").bytes() {
+            let nib = (hex as char).to_digit(16).unwrap() as u8;
+            out.push((b'A' + nib) as char);
+        }
+        out.push('@');
     }
 }
 

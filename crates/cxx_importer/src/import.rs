@@ -34,8 +34,19 @@
 //!   walks the primary sub-table only, so secondary vtables
 //!   aren't reflected in `MethodDef::vtable_index`. The
 //!   single-inheritance case (the common one) works today.
-//! - Uninstantiated templates (`CXCursor_ClassTemplate`) are
-//!   skipped. Sidecar-driven explicit instantiation lands later.
+//! - Templates: explicit/auto instantiations import as concrete
+//!   classes. Type and non-type (integral) template arguments are
+//!   captured and mangled (`Box<int>`, `Arr<int, 4>`); `Build`'s
+//!   auto-instantiate pass + `Driver`'s discovery pre-scan
+//!   force-instantiate specializations referenced in the headers so
+//!   no hand-written list is needed for the common case. Still
+//!   skipped: a method signature mentioning a *nested* template
+//!   specialization parameterised on the class's own parameter (e.g.
+//!   a method returning `Box<T>`); the bare `CXCursor_ClassTemplate`
+//!   with no instantiation (Rust has no generic-C++-template
+//!   representation); and template-template / pointer-to-member
+//!   non-type arguments (libclang's type-only view can't recover
+//!   them — they're rejected, not mis-mangled).
 //!
 //! Recursive import: when a field or base references a record type,
 //! the importer recursively lowers that record before continuing. Each
@@ -48,7 +59,7 @@ use std::path::Path;
 
 use clang::{
     Clang, Entity, EntityKind, EntityVisitResult, ExceptionSpecification, Index,
-    RefQualifier, Type, TypeKind,
+    RefQualifier, TemplateArgument, Type, TypeKind,
 };
 use rustc_abi_cxx::{
     Access, BaseSpec, ClassDef, ClassId, CvQual, CxxType, CxxTypeCtx,
@@ -1772,12 +1783,13 @@ impl<'a> Importer<'a> {
                     // A record decl is a template specialization iff its
                     // type exposes template arguments. Wrap in
                     // TemplateSpec so the mangler emits `<name>I<args>E`.
-                    let tmpl_args = e
+                    let is_spec = e
                         .get_type()
-                        .and_then(|t| t.get_template_argument_types());
-                    if let Some(arg_tys) = tmpl_args {
+                        .and_then(|t| t.get_template_argument_types())
+                        .is_some();
+                    if is_spec {
                         let template_args =
-                            self.lower_template_args(&arg_tys, &name)?;
+                            self.lower_template_args(&e, &name)?;
                         segments.push(NameSegment::TemplateSpec {
                             name: Ident(name),
                             args: template_args,
@@ -1799,27 +1811,98 @@ impl<'a> Importer<'a> {
         Ok(segments)
     }
 
+    /// Lower the template arguments of a class-template specialization
+    /// cursor into IR `TemplateArg`s.
+    ///
+    /// Prefers libclang's cursor-based `get_template_arguments()` view,
+    /// which surfaces non-type (integral) arguments. Type-only arguments
+    /// fall back to `get_template_argument_types()` when the cursor API
+    /// doesn't classify the decl as a specialization.
     fn lower_template_args(
         &mut self,
-        args: &[Option<Type<'_>>],
+        spec: &Entity<'_>,
         parent_name: &str,
     ) -> Result<Vec<TemplateArg>, ImportError> {
-        let mut out = Vec::with_capacity(args.len());
-        for arg in args {
-            // `None` entries represent non-type template arguments
-            // (integral values, template-templates) that the clang
-            // crate's type-only view cannot represent. These are out of
-            // v1 scope — reject to avoid silent mis-mangling.
+        if let Some(args) = spec.get_template_arguments() {
+            // Recover each parameter's declared type from the primary
+            // template, positionally — integral NTTPs need it to pick the
+            // Itanium type letter (`Li…E`, `Lm…E`, `Lb…E`, …).
+            let param_types = template_param_types(spec);
+            let mut out = Vec::with_capacity(args.len());
+            for (i, arg) in args.iter().enumerate() {
+                match arg {
+                    TemplateArgument::Type(t) => {
+                        out.push(TemplateArg::Type(
+                            self.import_type(*t, parent_name)?,
+                        ));
+                    }
+                    TemplateArgument::Integral(signed, unsigned) => {
+                        let pty = param_types.get(i).copied().flatten();
+                        let (ty, value) = self.lower_nttp_integral(
+                            pty, *signed, *unsigned, parent_name,
+                        )?;
+                        out.push(TemplateArg::Integral { value, ty });
+                    }
+                    // Template-template, declaration (pointer/reference/
+                    // member-pointer), nullptr, parameter-pack, and
+                    // unresolved-expression arguments are not recoverable
+                    // through libclang's type-only argument view (the
+                    // `clang` crate's `Template` variant carries no name).
+                    // Reject rather than silently mis-mangle.
+                    other => {
+                        return Err(ImportError::UnsupportedFeature {
+                            what: unsupported_template_arg_kind(other),
+                            where_: parent_name.to_string(),
+                            span: None,
+                        });
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
+        // Type-only fallback: the cursor API didn't expose arguments, but
+        // the type does. A `None` entry here is a non-type argument the
+        // type view can't represent — reject to avoid mis-mangling.
+        let arg_tys = spec
+            .get_type()
+            .and_then(|t| t.get_template_argument_types())
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(arg_tys.len());
+        for arg in &arg_tys {
             let ty = arg.ok_or_else(|| ImportError::UnsupportedFeature {
                 what: "non-type template argument",
                 where_: parent_name.to_string(),
-                    span: None,
-                
+                span: None,
             })?;
-            let id = self.import_type(ty, parent_name)?;
-            out.push(TemplateArg::Type(id));
+            out.push(TemplateArg::Type(self.import_type(ty, parent_name)?));
         }
         Ok(out)
+    }
+
+    /// Lower an integral non-type template argument: import its declared
+    /// type (defaulting to `int` when the parameter type is unavailable)
+    /// and select the signed or unsigned value interpretation based on
+    /// that type's signedness.
+    fn lower_nttp_integral(
+        &mut self,
+        param_ty: Option<Type<'_>>,
+        signed: i64,
+        unsigned: u64,
+        parent_name: &str,
+    ) -> Result<(TypeId, i128), ImportError> {
+        let ty = match param_ty {
+            Some(t) => self.import_type(t, parent_name)?,
+            None => self.ctx.intern_type(CxxType::Int {
+                signed: true,
+                width: IntWidth::I32,
+            }),
+        };
+        let is_unsigned =
+            matches!(self.ctx.type_of(ty), CxxType::Int { signed: false, .. });
+        let value: i128 =
+            if is_unsigned { unsigned as i128 } else { signed as i128 };
+        Ok((ty, value))
     }
 
     /// M15: lower a `FunctionPrototype` / `FunctionNoPrototype`
@@ -1882,10 +1965,17 @@ impl<'a> Importer<'a> {
         // `TemplateTypeParameter` cursor. Substitute them with the
         // spec's argument types via the active substitution map
         // before any other dispatch — this handles `T get()` and
-        // `void set(T)` directly. Nested forms (`T*`, `vector<T>`)
-        // fall through to the regular dispatch and only resolve
-        // after we extend the substitution to walk types
-        // recursively (tracked as M24 follow-up).
+        // `void set(T)` directly. Pointer/reference forms (`T*`,
+        // `const T&`, `T&&`) resolve too: libclang reports them as
+        // structured `Pointer`/`LValueReference` types whose pointee is
+        // the `Unexposed` `T`, so the regular dispatch recurses here and
+        // substitutes the leaf (the leading `const`/`volatile` words in
+        // the pointee display are stripped before lookup). The remaining
+        // gap is a *nested template specialization* parameterised on `T`
+        // (e.g. a method returning `Box<T>` / `vector<T>`): that arrives
+        // as an opaque `Unexposed` with display `Box<T>` and no
+        // structure to recurse into, so it can't be resolved without
+        // instantiating the nested spec — such methods are skipped.
         if !self.current_template_subst.is_empty()
             && ty.get_kind() == TypeKind::Unexposed
         {
@@ -2530,6 +2620,52 @@ fn cv_from_type(ty: Type<'_>) -> CvQual {
 
 fn int(signed: bool, width: IntWidth) -> CxxType {
     CxxType::Int { signed, width }
+}
+
+/// Collect the declared types of a template's parameters, in declaration
+/// order, so a specialization's positional arguments can recover each
+/// parameter's type. Type and template-template parameters contribute a
+/// `None` (they have no value type); non-type parameters contribute their
+/// declared type (e.g. `int`, `size_t`, `bool`).
+fn template_param_types<'tu>(spec: &Entity<'tu>) -> Vec<Option<Type<'tu>>> {
+    let Some(tmpl) = spec.get_template() else {
+        return Vec::new();
+    };
+    tmpl.get_children()
+        .into_iter()
+        .filter(|c| {
+            matches!(
+                c.get_kind(),
+                EntityKind::TemplateTypeParameter
+                    | EntityKind::NonTypeTemplateParameter
+                    | EntityKind::TemplateTemplateParameter
+            )
+        })
+        .map(|c| c.get_type())
+        .collect()
+}
+
+/// A stable `&'static str` describing a template-argument kind that the
+/// importer cannot lower (used in `UnsupportedFeature` diagnostics).
+fn unsupported_template_arg_kind(arg: &TemplateArgument<'_>) -> &'static str {
+    match arg {
+        TemplateArgument::Template | TemplateArgument::TemplateExpansion => {
+            "template-template argument"
+        }
+        TemplateArgument::Declaration => {
+            "pointer/reference/member-pointer non-type template argument"
+        }
+        TemplateArgument::Nullptr => "null-pointer non-type template argument",
+        TemplateArgument::Pack => "template parameter pack",
+        TemplateArgument::Expression => {
+            "unresolved-expression template argument"
+        }
+        TemplateArgument::Null => "null template argument",
+        // Type and Integral are lowered, never routed here.
+        TemplateArgument::Type(_) | TemplateArgument::Integral(..) => {
+            "template argument"
+        }
+    }
 }
 
 // -------- v1.11 stretch 3: STL container auto-discovery (M24 follow-up) --

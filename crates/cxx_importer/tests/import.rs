@@ -20,8 +20,8 @@ use cxx_importer::rust_bindings::{
 };
 use rustc_abi_cxx::{
     CvQual, CxxType, CxxTypeCtx, FnSig, Ident, IntWidth, MethodName,
-    NameSegment, OperatorKind, RecordKind, SpecialMember, Symbol, Target,
-    TemplateArg, VTableEntry, Virtuality,
+    NameSegment, OperatorKind, RecordKind, RefKind, SpecialMember, Symbol,
+    Target, TemplateArg, TypeId, VTableEntry, Virtuality,
 };
 
 /// libclang's initialization is process-exclusive (`Clang::new()` errors
@@ -839,7 +839,9 @@ fn imports_class_template_specialization() {
     match box_class.name.0.last() {
         Some(NameSegment::TemplateSpec { args, .. }) => {
             assert_eq!(args.len(), 1);
-            let TemplateArg::Type(int_id) = &args[0];
+            let TemplateArg::Type(int_id) = &args[0] else {
+                panic!("expected a type argument, got {:?}", args[0]);
+            };
             assert!(matches!(
                 ctx.type_of(*int_id),
                 CxxType::Int {
@@ -907,6 +909,197 @@ fn imports_class_template_specialization() {
             sig: get_sig,
         }),
         "_ZNK3BoxIiE3getEv"
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn imports_class_template_with_nttp() {
+    // A class template with a non-type template parameter (`Arr<int, 3>`)
+    // imports as a concrete class whose `TemplateSpec` segment carries
+    // both the type argument (`int`) and the integral argument (`3`).
+    // This proves libclang's cursor-based `get_template_arguments()`
+    // surfaces NTTP values, and that they round-trip through the mangler
+    // as `L<type><value>E` (`_ZNK3ArrIiLi3EE3getEv`).
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "template<class T, int N>\n\
+         struct Arr {\n\
+             T first;\n\
+             T get() const;\n\
+         };\n\
+         template<class T, int N>\n\
+         T Arr<T, N>::get() const { return first; }\n\
+         \n\
+         template struct Arr<int, 3>;  // explicit instantiation\n\
+         \n\
+         struct Holder { Arr<int, 3> a; int tag; };\n\
+         Holder g_holder;\n",
+        "template_nttp",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let ids = import_header(&header, &["-x", "c++", "-std=c++17"], &mut ctx)
+        .expect("import");
+
+    let arr_id = *ids
+        .iter()
+        .find(|&&id| {
+            matches!(
+                ctx.class(id).name.0.last(),
+                Some(NameSegment::TemplateSpec { name, .. }) if name.0 == "Arr"
+            )
+        })
+        .expect("Arr<int, 3> imported");
+
+    // The spec carries a type arg (int) and an integral arg (3).
+    match ctx.class(arr_id).name.0.last() {
+        Some(NameSegment::TemplateSpec { args, .. }) => {
+            assert_eq!(args.len(), 2, "Arr has two template arguments");
+            assert!(
+                matches!(&args[0], TemplateArg::Type(t)
+                    if matches!(ctx.type_of(*t),
+                        CxxType::Int { signed: true, width: IntWidth::I32 })),
+                "first arg is type int, got {:?}",
+                args[0]
+            );
+            match &args[1] {
+                TemplateArg::Integral { value, ty } => {
+                    assert_eq!(*value, 3);
+                    assert!(matches!(
+                        ctx.type_of(*ty),
+                        CxxType::Int { signed: true, width: IntWidth::I32 }
+                    ));
+                }
+                other => panic!("second arg should be Integral(3), got {other:?}"),
+            }
+        }
+        other => panic!("expected TemplateSpec segment, got {other:?}"),
+    }
+
+    // Round-trip through the mangler: Arr<int, 3>::get() const must match
+    // clang's `_ZNK3ArrIiLi3EE3getEv`.
+    let int_ty = ctx.intern_type(CxxType::Int {
+        signed: true,
+        width: IntWidth::I32,
+    });
+    let get_sig = FnSig {
+        params: Vec::new(),
+        ret: int_ty,
+        cv: CvQual { is_const: true, is_volatile: false },
+        ref_q: None,
+        variadic: false,
+        noexcept: false,
+    };
+    assert_eq!(
+        ctx.mangle(&Symbol::Method {
+            class: arr_id,
+            name: MethodName::Ident(Ident("get".into())),
+            sig: get_sig,
+        }),
+        "_ZNK3ArrIiLi3EE3getEv"
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn imports_template_spec_methods_with_compound_t() {
+    // Methods of a class-template specialization whose signatures use the
+    // template parameter in compound positions — `T*`, `const T&`, plain
+    // `T`, and a nested template spec `Box<T>`. Verifies that the
+    // substitution walk resolves each `T` to the spec's argument (`int`),
+    // including inside pointer/reference wrappers and a nested
+    // specialization.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "template<class T> struct Box { T v; };\n\
+         template<class T>\n\
+         struct Vec {\n\
+             T* data;\n\
+             void push(const T& x);\n\
+             T* at(int i);\n\
+             const T& front() const;\n\
+             T value() const;\n\
+             Box<T> boxed() const;\n\
+         };\n\
+         template struct Vec<int>;  // explicit instantiation\n\
+         struct Holder { Vec<int> v; int tag; };\n\
+         Holder g_holder;\n",
+        "template_spec_methods",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let ids = import_header(&header, &["-x", "c++", "-std=c++17"], &mut ctx)
+        .expect("import");
+
+    let vec_id = *ids
+        .iter()
+        .find(|&&id| {
+            matches!(
+                ctx.class(id).name.0.last(),
+                Some(NameSegment::TemplateSpec { name, .. }) if name.0 == "Vec"
+            )
+        })
+        .expect("Vec<int> imported");
+
+    let method_named = |n: &str| -> Option<FnSig> {
+        ctx.class(vec_id).methods.iter().find_map(|m| match &m.name {
+            MethodName::Ident(i) if i.0 == n => Some(m.sig.clone()),
+            _ => None,
+        })
+    };
+    let is_int = |ctx: &CxxTypeCtx, t: TypeId| {
+        matches!(
+            ctx.type_of(t),
+            CxxType::Int { signed: true, width: IntWidth::I32 }
+        )
+    };
+
+    // push(const T& x)  ->  param is `const int&` (lvalue ref, const).
+    let push = method_named("push").expect("push imported");
+    assert_eq!(push.params.len(), 1);
+    match ctx.type_of(push.params[0]) {
+        CxxType::Ref { pointee, kind, cv } => {
+            assert!(matches!(kind, RefKind::Lvalue));
+            assert!(cv.is_const, "const T& must keep the const");
+            assert!(is_int(&ctx, *pointee));
+        }
+        other => panic!("push param should be const int&, got {other:?}"),
+    }
+
+    // at(int)  ->  returns `int*`.
+    let at = method_named("at").expect("at imported");
+    match ctx.type_of(at.ret) {
+        CxxType::Ptr { pointee, .. } => assert!(is_int(&ctx, *pointee)),
+        other => panic!("at should return int*, got {other:?}"),
+    }
+
+    // front() const  ->  returns `const int&`.
+    let front = method_named("front").expect("front imported");
+    match ctx.type_of(front.ret) {
+        CxxType::Ref { pointee, cv, .. } => {
+            assert!(cv.is_const);
+            assert!(is_int(&ctx, *pointee));
+        }
+        other => panic!("front should return const int&, got {other:?}"),
+    }
+
+    // value() const  ->  returns plain `int`.
+    let value = method_named("value").expect("value imported");
+    assert!(is_int(&ctx, value.ret), "value should return int");
+
+    // boxed() const returns a NESTED template specialization `Box<T>`.
+    // Resolving that to `Box<int>` from the primary template's dependent
+    // type requires mini-instantiation that libclang doesn't surface, so
+    // the method is *gracefully skipped* (not mis-imported). The other
+    // methods above still import correctly. This documents the remaining
+    // limitation: spec-method signatures that mention another template
+    // specialization parameterised on `T` are dropped rather than guessed.
+    assert!(
+        method_named("boxed").is_none(),
+        "nested-template-typed spec methods are skipped, not mis-imported"
     );
 
     cleanup(&header);

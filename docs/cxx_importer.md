@@ -158,16 +158,36 @@ collide, the importer emits a fatal error with both source locations.
 
 ## 8. Templates
 
-- Uninstantiated templates (`CXCursor_ClassTemplate`) are skipped.
+- Uninstantiated generic templates (`CXCursor_ClassTemplate`) are
+  skipped — there's no Rust representation for a generic C++ template.
 - Explicit instantiations (`template class std::vector<int>;`) become
   concrete imported classes.
-- `[[rustcc::instantiate(std::vector<int>)]]` on a header (or
-  `instantiations:` in sidecar YAML) forces instantiation Clang-side;
-  the importer lowers the result as a concrete class.
+- **Auto-instantiation (v1.13.3).** `Build` (default on; toggle with
+  `.auto_instantiate(bool)`) and `Driver`
+  (`HeaderGraph::auto_discover_template_specs`) pre-scan the headers
+  for specializations referenced by value / pointer / reference (e.g.
+  a function returning `std::vector<int>`) and force-instantiate them,
+  so the common case needs no hand-written list. STL containers also
+  pull in their internal helper specs (allocator, pair, default_delete).
+- `Build::instantiate("std::vector<int>")`,
+  `[[rustcc::instantiate(std::vector<int>)]]` on a header, or
+  `instantiations:` in sidecar YAML force an instantiation explicitly —
+  use these for specs the scan can't see (composed only inside another
+  template body, or selected at runtime).
+- **Template arguments (v1.13.3).** Type args and **non-type integral
+  args** are captured and mangled both ABIs: `Arr<int, 4>` → Itanium
+  `3ArrIiLi4EE` / MSVC `?$Arr@H$03@`. The `TemplateArg` IR also carries
+  template-template args (`Stack<int, Box>`), which mangle correctly
+  when supplied but can't be recovered from libclang's type-only view,
+  so the importer rejects them rather than mis-mangling.
 - Rust-side generics that bottom out in C++ templates are deferred.
 
 A method template inside a non-template class is itself a template and
-follows the same rules.
+follows the same rules. Within a specialization, method signatures that
+use the parameter directly or behind a pointer/reference (`T`, `T*`,
+`const T&`, `T&&`) substitute correctly; a signature mentioning a
+*nested* specialization parameterised on `T` (e.g. returning `Box<T>`)
+is the one case still skipped.
 
 ## 9. Inheritance
 

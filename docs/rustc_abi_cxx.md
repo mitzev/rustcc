@@ -49,21 +49,30 @@ deterministic, and tested against Clang as ground truth on every build.
 - **Multiple inheritance** — secondary vtables, `this`-adjusting
   thunks, per-base layout. *(shipped, clang-validated)*
 - **Virtual / diamond inheritance** — vbase layout + vbase-offset
-  vtable slots. *(shipped; VTT + construction vtables still TODO)*
+  vtable slots. *(shipped)*
+- **VTT / construction vtables** (Itanium) — `_ZTT` + `_ZTC`
+  construction-vtable groups for virtual-base hierarchies.
+  *(shipped v1.13.2, clang-validated)*
 - **Bit-fields** — Itanium `place_bitfield` + MSVC packing.
   *(shipped v1.13.1, clang-validated)*
 - **`__attribute__((packed))`** (Itanium) + **`#pragma pack`**
   (MSVC). *(shipped v1.13.1 / v1.09.x)*
 - **MSVC ABI** — full layout + vtable + mangling. *(shipped v1.09.x)*
 - **Empty Base Optimization** — both ABIs. *(shipped)*
+- **Template arguments** — type args, **non-type (integral) args**
+  (`Arr<int, 4>` → Itanium `Li4E` / MSVC `$03`), and
+  **template-template args** (`Stack<int, Box>`). Both ABIs,
+  clang-validated. *(shipped v1.13.3)*
 
 ### Still not in scope
 
-- VTT / construction vtables (construction-order vptr fixup for
-  virtual-base hierarchies rustcc itself constructs).
 - Covariant-return thunks. *(single-inheritance version is small.)*
-- Templates beyond what the caller hands us already-instantiated
-  (non-type template params, template-template params).
+- Uninstantiated generic templates (no Rust representation for a
+  generic C++ template; specializations import via explicit or
+  auto-instantiation). Template-template and pointer/reference/
+  member-pointer non-type *arguments* mangle correctly when supplied,
+  but the importer can't recover them from libclang's type-only view,
+  so it rejects rather than guesses.
 - Member pointers (partial: type exists, mangling/layout incomplete).
 - `thread_local` storage mangling (`TH`, `TW`).
 - Exception handling tables (not part of layout/mangling anyway).

@@ -217,7 +217,20 @@ pub enum NameSegment {
 pub enum TemplateArg {
     /// A type template argument. `Box<int>` has `[Type(int_id)]`.
     Type(TypeId),
-    // TODO: non-type (value) template arguments, template-template args.
+    /// A non-type (value) template argument: an integral, boolean,
+    /// character, or enumeration constant. `value` is the constant
+    /// sign-extended into `i128`; `ty` is its declared C++ type, which
+    /// selects the Itanium type letter inside the `L…E` literal wrapper
+    /// (`Li4E` for `int 4`, `Lm4E` for `unsigned long 4`, `Lb1E` for
+    /// `bool true`, `Lc65E` for `char 'A'`). MSVC ignores `ty` and
+    /// encodes every integral argument as `$0<number>`.
+    Integral { value: i128, ty: TypeId },
+    /// A template-template argument: the name of a class template passed
+    /// where a template-template parameter is expected, e.g. the second
+    /// argument of `Stack<int, std::vector>`. Itanium mangles it as the
+    /// bare name prefix (`3Box`, `St6vector`); MSVC encodes it as a
+    /// struct-tag reference (`UBox@@`).
+    Template(NestedName),
 }
 
 /// Where a `ClassDef` came from. Drives emitter routing (importer-side

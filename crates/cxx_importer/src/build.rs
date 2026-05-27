@@ -151,6 +151,19 @@ pub struct Build {
     /// `cc::Build` invocation. Useful for tests that don't have
     /// a C++ compiler set up. Default: `true`.
     invoke_cc: bool,
+    /// Explicit class-template instantiations to force-materialize,
+    /// e.g. `"std::vector<int>"`. Each becomes a
+    /// `template class <inst>;` line in a synthetic root so the
+    /// specialization is imported as a concrete class. Combined with
+    /// auto-discovered specs when [`Self::auto_instantiate`] is on.
+    template_instantiations: Vec<String>,
+    /// When `true` (default), `compile()` pre-scans the headers for
+    /// class-template specializations referenced by value / pointer /
+    /// reference (e.g. a function returning `std::vector<int>`) and
+    /// force-instantiates them — so template specializations "just
+    /// work" without a hand-written instantiation list. Set `false`
+    /// to import only the explicitly-listed instantiations.
+    auto_instantiate: bool,
 }
 
 impl Default for Build {
@@ -177,6 +190,8 @@ impl Build {
             out_dir_override: None,
             target: None,
             invoke_cc: true,
+            template_instantiations: Vec::new(),
+            auto_instantiate: true,
         }
     }
 
@@ -203,6 +218,29 @@ impl Build {
     /// `cc::Build::flag` so the shim compile sees it.
     pub fn clang_flag(&mut self, f: impl Into<String>) -> &mut Self {
         self.clang_flags.push(f.into());
+        self
+    }
+
+    /// Force-instantiate a class-template specialization so it imports
+    /// as a concrete class, e.g. `.instantiate("std::vector<int>")`.
+    /// Use this for specializations the auto-discovery pass can't see
+    /// (composed only inside another template body, or selected at
+    /// runtime). Auto-discovered specs are added on top unless
+    /// [`Self::auto_instantiate`] is turned off.
+    pub fn instantiate(&mut self, spec: impl Into<String>) -> &mut Self {
+        self.template_instantiations.push(spec.into());
+        self
+    }
+
+    /// Toggle automatic discovery of class-template specializations.
+    ///
+    /// On by default: `compile()` pre-scans the headers for
+    /// specializations referenced by value / pointer / reference (e.g.
+    /// a function returning `std::vector<int>`) and force-instantiates
+    /// them, so templates "just work" without a hand-written list. Pass
+    /// `false` to import only the specs added via [`Self::instantiate`].
+    pub fn auto_instantiate(&mut self, yes: bool) -> &mut Self {
+        self.auto_instantiate = yes;
         self
     }
 
@@ -416,6 +454,56 @@ impl Build {
                 message: format!("Clang::new: {e}"),
             })
         })?;
+
+        // ----- Template instantiation roots. -----
+        // Combine the explicitly-listed instantiations with any
+        // auto-discovered specializations (referenced by value /
+        // pointer / reference in the headers), then materialize them in
+        // a synthetic root that `#include`s the user headers and emits
+        // one `template class X<...>;` per spec. The synthetic root is
+        // imported in an extra pass *after* the per-header loop —
+        // classes only, since its re-surfaced user-header
+        // aliases / enums / free-fns would otherwise duplicate the
+        // per-header captures.
+        let synth = {
+            let mut instantiations = self.template_instantiations.clone();
+            if self.auto_instantiate {
+                let explicit: std::collections::HashSet<&String> =
+                    self.template_instantiations.iter().collect();
+                let mut discovered: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for header in &self.headers {
+                    let found =
+                        crate::import::discover_template_instantiations(
+                            &clang, header, &argv,
+                        )
+                        .map_err(BuildError::Import)?;
+                    discovered.extend(found);
+                }
+                // STL containers compose helper specs (allocator, pair,
+                // default_delete) internally that the reference scan
+                // misses but the importer needs force-instantiated.
+                let companions =
+                    crate::import::synthesize_stl_companions(&discovered);
+                discovered.extend(companions);
+                let mut extra: Vec<String> = discovered
+                    .into_iter()
+                    .filter(|s| !explicit.contains(s))
+                    .collect();
+                extra.sort();
+                instantiations.extend(extra);
+            }
+            let synth_graph = HeaderGraph {
+                roots: self.headers.clone(),
+                include_paths: self.include_paths.clone(),
+                clang_flags: full_clang_flags.clone(),
+                template_instantiations: instantiations,
+                ..HeaderGraph::default()
+            };
+            crate::driver::synthesize_instantiation_root(&synth_graph)
+                .map_err(BuildError::Import)?
+        };
+
         for header in &self.headers {
             let (
                 ids,
@@ -454,6 +542,29 @@ impl Build {
             .map_err(BuildError::Import)?;
             for (key, anns) in collected {
                 annotations.inline.entry(key).or_default().extend(anns);
+            }
+        }
+
+        // ----- 2b. Import the synthetic instantiation root. -----
+        // This surfaces the force-instantiated template specializations
+        // as concrete classes. Only the *new* classes are kept — the
+        // synth root `#include`s the user headers, so its side-tables
+        // and annotations duplicate the per-header passes above and are
+        // intentionally dropped. The guard keeps the temp file alive
+        // across this parse, then deletes it on scope exit.
+        if let Some((synth_path, _guard)) = synth.as_ref() {
+            let (ids, ..) = crate::import::import_header_with_clang(
+                &clang,
+                synth_path,
+                &argv,
+                &mut ctx,
+                &mut usr_cache,
+            )
+            .map_err(BuildError::Import)?;
+            for id in ids {
+                if seen.insert(id) {
+                    all_class_ids.push(id);
+                }
             }
         }
 

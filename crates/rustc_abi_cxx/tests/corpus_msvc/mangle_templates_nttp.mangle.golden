@@ -1,0 +1,9 @@
+# Generated from clang -target x86_64-pc-windows-msvc output.
+# Do not hand-edit; regenerate via fork/tests/refresh-msvc-corpus.sh.
+target x86_64-pc-windows-msvc
+symbol ?take_arr4@@YAXU?$Arr@H$03@@@Z
+symbol ?take_arrneg@@YAXU?$Arr@H$0?0@@@Z
+symbol ?take_charbox@@YAXU?$CharBox@$0EB@@@@Z
+symbol ?take_flag@@YAXU?$Flag@$00@@@Z
+symbol ?take_sizearr@@YAXU?$SizeArr@H$03@@@Z
+symbol ?take_stack@@YAXU?$Stack@HUBox@@@@@Z

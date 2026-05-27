@@ -449,7 +449,7 @@ impl Driver {
 /// RAII guard for a synthetic-root temp file. Deletes the file on
 /// drop so a successful (or failing) parse leaves no stray temp
 /// artifacts behind.
-struct SyntheticRootGuard {
+pub(crate) struct SyntheticRootGuard {
     path: PathBuf,
 }
 
@@ -460,7 +460,7 @@ impl Drop for SyntheticRootGuard {
 }
 
 #[cfg(feature = "libclang")]
-fn synthesize_instantiation_root(
+pub(crate) fn synthesize_instantiation_root(
     graph: &HeaderGraph,
 ) -> Result<Option<(PathBuf, SyntheticRootGuard)>, ImportError> {
     if graph.template_instantiations.is_empty() {

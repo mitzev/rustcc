@@ -5447,15 +5447,37 @@ fn ident_of_class_with_ctx(
     class.name.0.last().and_then(|seg| match seg {
         NameSegment::Class(id) | NameSegment::Namespace(id) => Some(id.0.clone()),
         NameSegment::TemplateSpec { name, args } => {
+            use rustc_abi_cxx::TemplateArg;
             let mut out = name.0.clone();
             if let Some(ctx) = ctx {
                 for a in args {
-                    // `TemplateArg` currently has only the `Type` variant;
-                    // use a refutable `let` so the lint `irrefutable_let_patterns`
-                    // (newly hardened to error in nightly) doesn't reject it.
-                    let rustc_abi_cxx::TemplateArg::Type(tid) = a;
                     out.push('_');
-                    out.push_str(&type_arg_ident(ctx, *tid));
+                    match a {
+                        TemplateArg::Type(tid) => {
+                            out.push_str(&type_arg_ident(ctx, *tid));
+                        }
+                        // Integral NTTPs contribute the value, with `n`
+                        // standing in for a leading minus so the suffix
+                        // stays a valid Rust identifier (`Arr_i32_n1`).
+                        TemplateArg::Integral { value, .. } => {
+                            if *value < 0 {
+                                out.push('n');
+                                out.push_str(&value.unsigned_abs().to_string());
+                            } else {
+                                out.push_str(&value.to_string());
+                            }
+                        }
+                        // Template-template args contribute the bare
+                        // template name.
+                        TemplateArg::Template(nested) => {
+                            if let Some(NameSegment::Namespace(i))
+                            | Some(NameSegment::Class(i))
+                            | Some(NameSegment::Enum(i)) = nested.0.last()
+                            {
+                                out.push_str(&i.0);
+                            }
+                        }
+                    }
                 }
             }
             Some(out)
