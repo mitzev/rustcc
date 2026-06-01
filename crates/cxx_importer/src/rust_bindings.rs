@@ -778,10 +778,14 @@ fn build_namespace_tree_full(
         let class = ctx.class(class_id);
         let segments = &class.name.0;
         if segments.is_empty() {
-            return Err(BindingsError::UnsupportedType {
-                where_: format!("class {class_id:?}"),
-                kind: "empty NestedName".into(),
-            });
+            // A class with no name path — an anonymous / unnamed
+            // system-header detail type reached via recursive import
+            // (e.g. an STL implementation helper pulled in through a
+            // user type's base). It can't be named or referenced from
+            // Rust, so skip it rather than aborting the whole emission —
+            // same "skip, don't fail" policy as the class-scope inner
+            // records handled just below.
+            continue;
         }
         // Walk every segment except the final one, which is the
         // class identifier itself.
