@@ -110,7 +110,10 @@ int do_thing(int selector) {
     std::fs::write(&cpp, &cpp_src).unwrap();
 
     let cxx_compile = Command::new(&clangpp)
-        .args(["-std=c++17", "-fexceptions", "-c"])
+        // -stdlib=libc++ so the shim's symbols match the `-lc++` link
+        // below (no-op on macOS; required on Linux, where clang++
+        // defaults to libstdc++).
+        .args(["-std=c++17", "-stdlib=libc++", "-fexceptions", "-c"])
         .arg(&cpp)
         .arg("-o")
         .arg(&obj)

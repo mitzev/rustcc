@@ -190,7 +190,10 @@ unsigned int C::b_id() const { return c_tag_ + 2000; }
 
     // Step 3: compile the C++ side.
     let cpp_compile = Command::new("clang++")
-        .args(["-c", "-std=c++17", "-fPIC"])
+        // -stdlib=libc++ so the C++ object's symbols match the `-lc++`
+        // link below (no-op on macOS; required on Linux, where clang++
+        // defaults to libstdc++).
+        .args(["-c", "-std=c++17", "-stdlib=libc++", "-fPIC"])
         .arg("-o")
         .arg(&cpp_obj)
         .arg(&cpp)
