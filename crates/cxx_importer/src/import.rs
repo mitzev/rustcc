@@ -591,7 +591,7 @@ fn walk_top_level(
                     | Some(EntityKind::NotImplemented)
                     | None
             );
-            if at_ns_scope {
+            if at_ns_scope && !entity_in_system_header(entity) {
                 let _ = importer.collect_enum(entity);
             }
         }
@@ -617,7 +617,7 @@ fn walk_top_level(
                     | Some(EntityKind::NotImplemented)
                     | None
             );
-            if at_ns_scope {
+            if at_ns_scope && !entity_in_system_header(entity) {
                 let _ = importer.collect_alias(entity);
             }
         }
@@ -639,7 +639,7 @@ fn walk_top_level(
                     | Some(EntityKind::NotImplemented)
                     | None
             );
-            if at_ns_scope {
+            if at_ns_scope && !entity_in_system_header(entity) {
                 let _ = importer.collect_free_fn(entity);
             }
         }
@@ -1228,8 +1228,37 @@ impl<'a> Importer<'a> {
         // for this class. Keyed by the class's FQN so the bindings
         // emitter can look them up by `NestedName::display`.
         let class_anns = read_annotations(entity);
+        let is_skipped = class_anns.iter().any(|a| matches!(a, Annotation::Skip));
         if !class_anns.is_empty() {
             self.annotations.insert(entity_fqn(entity), class_anns);
+        }
+
+        // v1.12.23: honor `[[clang::annotate("rustcc::skip")]]` at
+        // *import* time, not just emit time — pruning the recursive
+        // base / field / method walk for a skipped class.
+        //
+        // A skipped class is one the user has declared they don't want
+        // a Rust binding for. The canonical case is a C++-only
+        // exception type that derives from `std::exception` and is
+        // thrown + caught entirely on the C++ side (see
+        // `examples/cxx_throws_demo`). Walking such a class's bases and
+        // fields here would recursively `import_class` its entire
+        // reachable graph: `std::exception` drags in `namespace std`'s
+        // internals (the libstdc++ string / typeinfo / detail types),
+        // all of which then land in the ctx and get rendered by the
+        // bindings emitter as un-compilable `extern "C++"` blocks and
+        // references to STL types that were never emitted.
+        //
+        // The emit-time `Skip` filter (`emit_direct_extern_cpp`) drops
+        // the annotated class itself, but it does NOT drop the types
+        // transitively pulled in through its base / field graph — those
+        // aren't annotated. So the cascade has to be cut here, at the
+        // root. We leave the already-registered placeholder (empty body,
+        // correct name + kind) in the ctx so any reference to the
+        // skipped type still resolves to a stable `ClassId`, and return
+        // without recursing.
+        if is_skipped {
+            return Ok(id);
         }
 
         // **Known v1 gap for template specializations.** libclang's
