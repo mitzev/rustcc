@@ -119,8 +119,14 @@ int do_throw_int() {
 
     std::fs::write(&cpp, &cpp_src).unwrap();
 
+    // Compile the shim against libc++ (LLVM's C++ stdlib) so its
+    // symbols match the `-lc++` link below. On macOS libc++ is already
+    // the default; on Linux clang++ defaults to libstdc++, which would
+    // emit `std::__cxx11::*` symbols that don't resolve against libc++
+    // (undefined-symbol link errors). `-stdlib=libc++` makes both ends
+    // agree. (CI installs libc++-dev / libc++abi-dev for this.)
     let cxx_compile = Command::new(&clangpp)
-        .args(["-std=c++17", "-fexceptions", "-c"])
+        .args(["-std=c++17", "-stdlib=libc++", "-fexceptions", "-c"])
         .arg(&cpp)
         .arg("-o")
         .arg(&obj)
