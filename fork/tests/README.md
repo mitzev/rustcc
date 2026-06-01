@@ -13,7 +13,8 @@ RUSTC=<path to stage-1 rustc> ./fork/tests/run.sh
 ```
 
 If `$RUSTC` is unset the runner defaults to
-`$HOME/rust-lang-rust/build/host/stage1/bin/rustc`.
+`$HOME/rust-lang-rust-fork/build/host/stage1/bin/rustc` (where
+`fork/build.sh` clones and builds the fork).
 
 The runner builds each probe with `cargo clean` first to avoid
 stale-cache false passes, then invokes the resulting binary and

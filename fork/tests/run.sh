@@ -6,11 +6,12 @@
 # Usage:
 #   RUSTC=<path to stage-1 rustc> ./fork/tests/run.sh
 #
-# If $RUSTC is unset we default to the standard build location.
+# If $RUSTC is unset we default to the fork's standard build location
+# ($HOME/rust-lang-rust-fork, where fork/build.sh clones + builds).
 
 set -euo pipefail
 
-: "${RUSTC:=$HOME/rust-lang-rust/build/host/stage1/bin/rustc}"
+: "${RUSTC:=$HOME/rust-lang-rust-fork/build/host/stage1/bin/rustc}"
 
 if [[ ! -x "$RUSTC" ]]; then
   echo "error: stage-1 rustc not found at $RUSTC" >&2

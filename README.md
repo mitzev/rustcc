@@ -138,11 +138,11 @@ cd rustcc/fork
 ```
 
 After the build, the toolchain lives at
-`rust-lang-rust/build/host/stage1/bin/rustc`. Register it with
+`rust-lang-rust-fork/build/host/stage1/bin/rustc`. Register it with
 `rustup`:
 
 ```sh
-rustup toolchain link rustcc <absolute-path-to>/rust-lang-rust/build/host/stage1
+rustup toolchain link rustcc <absolute-path-to>/rust-lang-rust-fork/build/host/stage1
 rustup default rustcc
 ```
 

@@ -18,7 +18,7 @@ C++ side needed.
 
 ```bash
 cd examples/shape_hierarchy
-RUSTC=/path/to/rust-lang-rust/build/host/stage1/bin/rustc \
+RUSTC=/path/to/rust-lang-rust-fork/build/host/stage1/bin/rustc \
   RUSTC_BOOTSTRAP=1 cargo +nightly build
 ./target/debug/shape_hierarchy
 ```

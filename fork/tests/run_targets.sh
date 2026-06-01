@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-: "${RUSTC:=$HOME/rust-lang-rust/build/host/stage1/bin/rustc}"
+: "${RUSTC:=$HOME/rust-lang-rust-fork/build/host/stage1/bin/rustc}"
 
 if [[ ! -x "$RUSTC" ]]; then
   echo "error: stage-1 rustc not found at $RUSTC" >&2
