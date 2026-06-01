@@ -2,7 +2,7 @@
   "name": "rustcc-tools",
   "displayName": "rustcc",
   "description": "Syntax + commands + snippets for rustcc — the C++/Swift-interop fork of rustc",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "rustcc",
   "license": "MIT OR Apache-2.0",
   "engines": {
@@ -38,6 +38,11 @@
       {
         "command": "rustcc.installToolchain",
         "title": "rustcc: Install Toolchain (latest)",
+        "category": "rustcc"
+      },
+      {
+        "command": "rustcc.newProject",
+        "title": "rustcc: New Project",
         "category": "rustcc"
       },
       {

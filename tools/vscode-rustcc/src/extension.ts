@@ -36,6 +36,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // ---- Commands ------------------------------------------------
   context.subscriptions.push(
     vscode.commands.registerCommand("rustcc.installToolchain", installToolchain),
+    vscode.commands.registerCommand("rustcc.newProject", newProject),
     vscode.commands.registerCommand("rustcc.doctor", doctor),
     vscode.commands.registerCommand("rustcc.generateBindings", generateBindings),
     vscode.commands.registerCommand("rustcc.showSkips", showSkips),
@@ -92,6 +93,237 @@ function refreshStatusBar(): void {
 }
 
 // --------- Commands -------------------------------------------
+
+// --------- New project (cargo-new for rustcc) -----------------
+
+// Scaffolds a rustcc project the way `rustcc init` does — a
+// `rust-toolchain.toml` pinning the `rustcc` channel (so plain
+// `cargo build` uses the fork instead of erroring on `class` /
+// `extern "C++"`) + a compiling fork-surface starter — and adds the
+// pieces `rustcc init` skips: a `.gitignore`, `git init`, a CodeLLDB
+// `.vscode/launch.json` so F5 debugs the binary, and a recommendation
+// for the CodeLLDB extension. Done in-process (no `rustcc` CLI
+// dependency) so it works out of the box.
+async function newProject(): Promise<void> {
+  const name = await vscode.window.showInputBox({
+    prompt: "New rustcc project name",
+    placeHolder: "my-app",
+    validateInput: (v) =>
+      /^[a-zA-Z][a-zA-Z0-9_-]*$/.test(v.trim())
+        ? null
+        : "Use a valid crate name: a letter then letters/digits/_/-",
+  });
+  if (!name) return;
+  const crate = name.trim();
+
+  const surfacePick = await vscode.window.showQuickPick(
+    [
+      {
+        label: "class-keyword",
+        description: "Fork-only `class` keyword (needs the rustcc toolchain; fully self-contained)",
+      },
+      {
+        label: "cxx-class",
+        description: "cxx_class! proc macro (compiles on stable rustc; needs the rustcc_macros dep wired up)",
+      },
+    ],
+    { placeHolder: "Choose the interop surface" },
+  );
+  if (!surfacePick) return;
+  const surface = surfacePick.label;
+
+  const picked = await vscode.window.showOpenDialog({
+    canSelectFolders: true,
+    canSelectFiles: false,
+    canSelectMany: false,
+    openLabel: "Create project here",
+    defaultUri: vscode.workspace.workspaceFolders?.[0]?.uri,
+  });
+  if (!picked || picked.length === 0) return;
+  const parent = picked[0].fsPath;
+  const root = path.join(parent, crate);
+
+  if (fs.existsSync(root)) {
+    vscode.window.showErrorMessage(`rustcc: ${root} already exists.`);
+    return;
+  }
+
+  try {
+    fs.mkdirSync(path.join(root, "src"), { recursive: true });
+    fs.mkdirSync(path.join(root, ".vscode"), { recursive: true });
+
+    const isCxx = surface === "cxx-class";
+    fs.writeFileSync(
+      path.join(root, "Cargo.toml"),
+      (isCxx ? CARGO_TOML_CXX : CARGO_TOML_CLASS).replace(/__NAME__/g, crate),
+    );
+    fs.writeFileSync(
+      path.join(root, "rust-toolchain.toml"),
+      '[toolchain]\nchannel = "rustcc"\n',
+    );
+    fs.writeFileSync(
+      path.join(root, "src", "main.rs"),
+      isCxx ? MAIN_RS_CXX : MAIN_RS_CLASS,
+    );
+    fs.writeFileSync(path.join(root, ".gitignore"), "/target\n");
+    fs.writeFileSync(
+      path.join(root, ".vscode", "launch.json"),
+      launchJson(crate),
+    );
+    fs.writeFileSync(
+      path.join(root, ".vscode", "extensions.json"),
+      EXTENSIONS_JSON,
+    );
+    fs.writeFileSync(
+      path.join(root, "README.md"),
+      `# ${crate}\n\nScaffolded by \`rustcc: New Project\` (surface: ${surface}).\n\n` +
+        "```bash\ncargo build   # uses the pinned rustcc toolchain\n```\n\n" +
+        "Press F5 to debug (install the CodeLLDB extension when prompted).\n",
+    );
+  } catch (e) {
+    vscode.window.showErrorMessage(`rustcc: failed to scaffold project: ${e}`);
+    return;
+  }
+
+  // git init — best effort; a missing git binary shouldn't fail the
+  // scaffold.
+  try {
+    const { exec } = await import("child_process");
+    await new Promise<void>((resolve) => {
+      exec("git init -q", { cwd: root }, () => resolve());
+    });
+  } catch {
+    /* ignore */
+  }
+
+  if (surface === "cxx-class") {
+    vscode.window.showWarningMessage(
+      "rustcc: the cxx-class surface depends on `rustcc_macros` — edit Cargo.toml " +
+        "to point at your vendored/published copy before building.",
+    );
+  }
+
+  const choice = await vscode.window.showInformationMessage(
+    `rustcc: created ${crate} at ${root}.`,
+    "Open Folder",
+    "Open in New Window",
+  );
+  if (choice) {
+    await vscode.commands.executeCommand(
+      "vscode.openFolder",
+      vscode.Uri.file(root),
+      { forceNewWindow: choice === "Open in New Window" },
+    );
+  }
+}
+
+// CodeLLDB launch config. `${workspaceFolder}` is a VS Code variable
+// (kept literal); the crate name is interpolated. CodeLLDB's `cargo`
+// integration runs `cargo build` — which respects the project's
+// rust-toolchain.toml and so uses the rustcc fork — then launches the
+// resulting binary under LLDB.
+function launchJson(crate: string): string {
+  return JSON.stringify(
+    {
+      version: "0.2.0",
+      configurations: [
+        {
+          type: "lldb",
+          request: "launch",
+          name: `Debug ${crate}`,
+          cargo: { args: ["build", `--bin=${crate}`] },
+          args: [],
+          cwd: "${workspaceFolder}",
+        },
+      ],
+    },
+    null,
+    2,
+  ) + "\n";
+}
+
+const EXTENSIONS_JSON =
+  JSON.stringify(
+    { recommendations: ["vadimcn.vscode-lldb", "rustcc.rustcc-tools"] },
+    null,
+    2,
+  ) + "\n";
+
+const CARGO_TOML_CLASS = `[package]
+name = "__NAME__"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+`;
+
+const CARGO_TOML_CXX = `[package]
+name = "__NAME__"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The cxx_class! macro lives in rustcc_macros. Point this at your
+# vendored checkout or a published version before building.
+# rustcc_macros = { path = "/path/to/rustcc/crates/rustcc_macros" }
+`;
+
+const MAIN_RS_CLASS = `// Scaffolded by \`rustcc: New Project\` (class-keyword surface).
+// The \`class\` keyword is fork-only; build with the rustcc toolchain
+// (pinned in rust-toolchain.toml).
+#![feature(rustc_attrs)]
+
+pub class Counter {
+    n: i64,
+
+    #[constructor]
+    pub fn new() -> Self {
+        Counter { n: 0 }
+    }
+
+    pub fn bump(&mut self, by: i64) {
+        self.n += by;
+    }
+
+    pub fn value(&self) -> i64 {
+        self.n
+    }
+}
+
+fn main() {
+    let mut c = Counter::new();
+    c.bump(41);
+    c.bump(1);
+    println!("counter = {}", c.value());
+}
+`;
+
+const MAIN_RS_CXX = `// Scaffolded by \`rustcc: New Project\` (cxx-class surface).
+// \`cxx_class!\` is the stable-rustc-friendly proc-macro surface; the
+// rustcc fork gives it C++ ABI semantics at link time.
+use rustcc_macros::cxx_class;
+
+cxx_class! {
+    pub struct Counter {
+        n: i64,
+    }
+
+    impl Counter {
+        #[constructor]
+        pub fn new() -> Self;
+
+        pub fn bump(&mut self, by: i64);
+
+        pub fn value(&self) -> i64;
+    }
+}
+
+fn main() {
+    let mut c = Counter::new();
+    c.bump(42);
+    println!("counter = {}", c.value());
+}
+`;
 
 function rustccCli(): string {
   return vscode.workspace.getConfiguration("rustcc").get<string>("cliPath") ?? "rustcc";
