@@ -1101,6 +1101,40 @@ impl<'a> Importer<'a> {
         let entity = entity.get_definition().unwrap_or(*entity);
         let entity = &entity;
 
+        // Don't deep-import types declared in system headers when reached
+        // recursively (as a base / field / template arg of a user type).
+        // A single `#include <stdexcept>` + `: std::exception` would
+        // otherwise pull the entire reachable STL graph
+        // (`std::exception`'s bases, `basic_string` internals,
+        // `max_align_t`, …) into the bindings and emit it as unusable
+        // Rust. Bind such a type as an opaque poison node instead — the
+        // referencing user type still imports, with this one opaque.
+        //
+        // Types the user explicitly force-instantiates (via a synthetic
+        // `template class …;` root, the supported way to bind an STL
+        // container) are located at the instantiation directive, NOT a
+        // system header, so they are exempt and import in full.
+        if entity_in_system_header(entity) {
+            if let Some(target) = upgrade_target {
+                return Ok(target);
+            }
+            let name = entity.get_name().unwrap_or_default();
+            let id = self.poison_class(
+                entity,
+                NestedName(vec![NameSegment::Class(Ident(name.clone()))]),
+                format!(
+                    "`{name}` is declared in a system header; bound as an \
+                     opaque type (its members are not imported). Force-\
+                     instantiate it via a sidecar `instantiate(...)` \
+                     directive to bind it in full.",
+                ),
+            );
+            // Cache by USR so repeat references resolve to the same
+            // opaque node instead of minting duplicates.
+            self.classes.insert(usr, id);
+            return Ok(id);
+        }
+
         if !entity.is_definition() {
             // Forward-only declaration. Mint a poison node and
             // carry on — downstream consumers see an opaque type
