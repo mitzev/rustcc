@@ -144,6 +144,26 @@ if [[ -n "$BUILT" ]]; then
   echo
   echo "==> fork built: $BUILT"
   echo
+
+  # Install the Rust LLDB pretty-printers into the stage-1 sysroot.
+  # A bare stage-1 build doesn't copy these (upstream only does it
+  # during `dist`), so debuggers — CodeLLDB, `rust-lldb` — can't find
+  # the Rust data formatters and warn "Could not find LLDB data
+  # formatters in your Rust toolchain". Copy them from the source tree
+  # so the fork toolchain is debuggable out of the box.
+  STAGE1_SYSROOT="$(dirname "$(dirname "$BUILT")")"
+  ETC_DEST="$STAGE1_SYSROOT/lib/rustlib/etc"
+  if [[ -f "$CLONE_DIR/src/etc/lldb_lookup.py" ]]; then
+    mkdir -p "$ETC_DEST"
+    cp "$CLONE_DIR"/src/etc/lldb_lookup.py \
+       "$CLONE_DIR"/src/etc/lldb_commands \
+       "$CLONE_DIR"/src/etc/lldb_providers.py \
+       "$CLONE_DIR"/src/etc/lldb_batchmode.py \
+       "$ETC_DEST/" 2>/dev/null || true
+    echo "==> installed Rust LLDB formatters into $ETC_DEST"
+    echo
+  fi
+
   echo "To use it with the rustcc workspace:"
   echo "  RUSTC=\"$BUILT\" cargo test --workspace"
 else
