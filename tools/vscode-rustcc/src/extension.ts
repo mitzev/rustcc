@@ -115,7 +115,7 @@ async function installToolchain(): Promise<void> {
   const pick = await vscode.window.showQuickPick(
     [
       { label: "Latest", description: "Resolve `latest` against the GitHub releases redirect" },
-      { label: "Pinned tag", description: "Specify a release tag (e.g. v1.06.0)" },
+      { label: "Pinned tag", description: "Specify a release tag (e.g. v1.13.3)" },
     ],
     { placeHolder: "Which version of the rustcc toolchain to install?" },
   );
@@ -124,9 +124,9 @@ async function installToolchain(): Promise<void> {
   if (pick.label === "Pinned tag") {
     const input = await vscode.window.showInputBox({
       prompt: "Release tag",
-      placeHolder: "v1.06.0",
+      placeHolder: "v1.13.3",
       validateInput: (v) =>
-        /^v\d+\.\d+\.\d+/.test(v) ? null : "Expected a tag like v1.06.0",
+        /^v\d+\.\d+\.\d+/.test(v) ? null : "Expected a tag like v1.13.3",
     });
     if (!input) return;
     version = input;
@@ -229,7 +229,7 @@ async function installRaFork(
       },
       {
         label: "Pinned tag",
-        description: "Specify a release tag (e.g. v1.07.0)",
+        description: "Specify a release tag (e.g. v1.13.3)",
       },
     ],
     {
@@ -241,9 +241,9 @@ async function installRaFork(
   if (pick.label === "Pinned tag") {
     const input = await vscode.window.showInputBox({
       prompt: "Release tag",
-      placeHolder: "v1.07.0",
+      placeHolder: "v1.13.3",
       validateInput: (v) =>
-        /^v\d+\.\d+\.\d+/.test(v) ? null : "Expected a tag like v1.07.0",
+        /^v\d+\.\d+\.\d+/.test(v) ? null : "Expected a tag like v1.13.3",
     });
     if (!input) return;
     version = input;
@@ -284,7 +284,7 @@ async function installRaFork(
 
   const tarball = `rust-analyzer-rustcc-${triple}.tar.xz`;
   const sha = `${tarball}.sha256`;
-  const baseUrl = `https://github.com/rustcc/rustcc/releases/download/${resolvedTag}`;
+  const baseUrl = `https://github.com/mitzev/rustcc/releases/download/${resolvedTag}`;
   const targetFs = targetDir.fsPath;
 
   const cmd = [
@@ -345,7 +345,7 @@ async function resolveLatestTag(): Promise<string> {
   const { exec } = await import("child_process");
   return new Promise((resolve, reject) => {
     exec(
-      'curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/rustcc/rustcc/releases/latest',
+      'curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/mitzev/rustcc/releases/latest',
       (err, stdout) => {
         if (err) {
           reject(err);

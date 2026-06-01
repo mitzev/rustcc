@@ -2,7 +2,7 @@
   "name": "rustcc-tools",
   "displayName": "rustcc",
   "description": "Syntax + commands + snippets for rustcc — the C++/Swift-interop fork of rustc",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "rustcc",
   "license": "MIT OR Apache-2.0",
   "engines": {
@@ -12,7 +12,7 @@
   "keywords": ["rust", "rustcc", "cpp", "swift", "interop", "cxx"],
   "repository": {
     "type": "git",
-    "url": "https://github.com/rustcc/rustcc.git",
+    "url": "https://github.com/mitzev/rustcc.git",
     "directory": "tools/vscode-rustcc"
   },
   "main": "./out/extension.js",
