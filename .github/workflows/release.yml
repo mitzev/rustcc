@@ -157,12 +157,13 @@ jobs:
         # Smoke-test the just-built compiler against the
         # `fork/tests/class_keyword/` probe matrix:
         # 4 cpp_class probes (basic, inheritance, type_generics,
-        # const_generics) + 3 Swift probes (swift_nonpod,
-        # swift_value_attr, swift_throws). Catches regressions in
-        # the fork patches (P09.* class keyword, 13-swift-value-builtin,
-        # 14-swift-throws) before we ship a tarball — the workspace CI
-        # on stock nightly can't exercise these because the probes
-        # use fork-only features.
+        # const_generics) + 5 Swift probes (swift_nonpod,
+        # swift_value_attr, swift_throws, swift_extern_call,
+        # swift_value_type). Catches regressions in the fork patches
+        # (P09.* class keyword, P09.14/P09.17 extern "Swift",
+        # 13-swift-value-builtin, 14-swift-throws) before we ship a
+        # tarball — the workspace CI on stock nightly can't exercise
+        # these because the probes use fork-only features.
         #
         # If any probe fails, the job exits non-zero and the tarball
         # never gets packaged or uploaded. That's deliberate: we'd
