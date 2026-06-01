@@ -12,21 +12,17 @@ the fork links directly against Clang-compiled C++ and
 constructors, destructors, single inheritance, `dynamic_cast`, ARC,
 and Swift value-witness tables.
 
-> **Status — v1.07.0 published 2026-05-09.** v1 shipped 2026-04-21
-> with the feature matrix below on x86_64/aarch64 Linux/Darwin,
-> i686 Linux, and bare-metal ARM Cortex-M. Five tagged point
-> releases since: v1.02 / v1.03 closed initial adoption infra (prebuilt
-> binaries) and ABI follow-ups; v1.04 / v1.06 shipped the full
-> 26-milestone `cxx_importer` roadmap (Phases A + B + C through M26
-> — multi-inheritance, template-spec method extraction, build
-> orchestrator, real FLTK text editor demo); v1.07 shipped the
-> developer-experience layer (`rustcc-cli`, `vscode-rustcc`
-> extension) and **rust-analyzer Phase 2** — twelve patches in
-> `fork/ra-patches/` that give `class` items full IDE parity with
-> structs (hover, go-to-def, method completion, assists). See
-> [`fork/PATCHES.md`](fork/PATCHES.md) for per-patch history
-> (P09.22–P09.50) and `fork/RELEASE-NOTES-v1.07.0.md` for the
-> latest release.
+> **Status — v1.13.3 (current).** v1 shipped 2026-04-21; the feature
+> matrix below is the cumulative state of the v1.0x–v1.13x line.
+> Supported hosts: x86_64/aarch64 Linux & macOS, x86_64/aarch64
+> Windows MSVC, i686 Linux, and bare-metal ARM Cortex-M. Major
+> additions since v1: the full `cxx_importer` C++→Rust binding
+> generator, the Windows MSVC C++ ABI, C++ exception catching
+> (`cxx_throws`), C++ templates (incl. non-type arguments), the
+> developer-experience layer (`rustcc-cli`, the `vscode-rustcc`
+> extension, and a patched rust-analyzer), and the Swift interop
+> surface. See [`fork/PATCHES.md`](fork/PATCHES.md) for per-patch
+> history and the `fork/RELEASE-NOTES-*.md` files for each release.
 
 ## Why this project exists
 
@@ -47,102 +43,96 @@ runtime shim.
 If you've written `impl Drop for Widget { fn drop(&mut self) { unsafe
 { cxx_widget_destroy(self); } } }` before, this project is for you.
 
-## v1 feature matrix
+## Feature matrix
 
-| Capability | v1 | Notes |
-|---|---|---|
-| `#[repr(cpp)]` struct layout | ✓ | Itanium rules: empty-class size, `alignas`, inheritance subobject placement |
-| `extern "C++"` free functions | ✓ | Itanium mangling incl. nested module → namespace |
-| Inherent methods on `#[repr(cpp)]` | ✓ | Automatic C++ member-function mangling + calling convention |
-| C++ constructors | ✓ | `#[constructor]` on Rust impl methods or foreign-fn decls |
-| C++ destructors | ✓ | Via `impl Drop`. D0/D1/D2 variants auto-emitted |
-| Virtual methods / vtables | ✓ | `#[cpp_virtual]`; compiler emits `_ZTV` / `_ZTI` / `_ZTS` and auto-initializes vptr |
-| Single inheritance | ✓ | `class Derived : Base { ... }`; `__si_class_type_info` chain |
-| Virtual method override | ✓ | Derived virtual replaces base's vtable slot (P09.34) |
-| `dynamic_cast` across inheritance | ✓ | Via libc++abi's runtime typeinfo walk |
-| Parser-level `class` keyword | ✓ | Weak keyword, desugars to `#[repr(cpp)]` struct + impl |
-| Cross-crate polymorphic classes | ✓ | Ctor / wrapper / virtual attributes encode correctly across crates |
-| C++ operator overloading | ✓ | `#[operator = "Plus"]` and friends |
-| `extern "Swift"` calling convention | ✓ | swiftcc ABI + Swift symbol mangling for structs and classes |
-| Swift `#[repr(swift)]` value types | ✓ | Layout, retain/release semantics via VWT |
-| Swift class bindings | ✓ | ARC via `swift_retain` / `swift_release` |
-| `swift_value!` macro | ✓ | Auto-generates `impl Drop` + `impl Clone` for `#[repr(swift)]` |
-| Cross-compilation | ✓ | Per-invocation target params flow into C++ ABI paths (P09.35) |
-| Bare-metal ARM Cortex-M | ✓ | `thumbv7em`, `thumbv7m`, `thumbv8m.*` — zero compiler changes after P09.35 |
+Cumulative across the v1.0x–v1.13x line. Everything below is shipped.
 
-**Targets:** `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`,
-`aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `i686-*`
-(non-Windows), bare-metal `thumbv7em-*` / `thumbv7m-*` / `thumbv8m.*`.
-Cross-builds across these are supported.
+### C++ — types, dispatch, ABI
 
-## v2 roadmap — shipped
+| Capability | Notes |
+|---|---|
+| `#[repr(cpp)]` struct layout | Itanium rules: empty-class size, `alignas`, subobject placement |
+| `extern "C++"` free functions | Itanium mangling incl. nested module → namespace |
+| Inherent methods, constructors, destructors | member-function mangling; `#[constructor]`; `impl Drop` → D0/D1/D2 |
+| Virtual methods / vtables / override | `#[cpp_virtual]`; emits `_ZTV`/`_ZTI`/`_ZTS`, auto vptr init, slot override |
+| Single, multiple & virtual inheritance | secondary vtables, this-adjusting thunks, vbase offsets, VTT + construction vtables |
+| `dynamic_cast` across inheritance | via libc++abi runtime typeinfo walk |
+| Bit-fields, packing | `place_bitfield` + `__attribute__((packed))` / `#pragma pack`, clang-validated |
+| Copy / move special members | copy ctor → `impl Clone`; move ctor → `move_from`; `operator=` → `copy_assign`/`move_assign` |
+| C++ operator overloading | `#[operator = "Plus"]` and friends |
+| Parser-level `class` keyword | weak keyword, desugars to `#[repr(cpp)]` struct + impl |
+| Cross-crate polymorphic classes | ctor / wrapper / virtual attributes encode across crates |
+| **Windows MSVC C++ ABI** | vftables, scalar-deleting dtor, SEH funclets, sret-via-RCX/X8, dllexport; Wine-validated |
 
-The v2 stretch list from the original v1 README is **fully delivered**
-across v1.02–v1.07:
+### C++ — binding generation & interop
 
-- **Multi-inheritance and virtual bases** — shipped in v1.06.0
-  (M22). Secondary vtables, this-adjusting thunks, cross-base
-  `as_<base>` accessors, recursive-import convergence pass.
-- **True compiler auto-synthesis for `#[repr(swift)]`** — shipped
-  in v1.02.0 (P09.46). `#[swift_value]` is now a built-in
-  attribute macro; the proc-macro wrapper is retired.
-- **Multi-field class-backed Swift bindings with non-POD extra
-  fields** — shipped in 1.01 (P09.42). Class-backed `swift_value!`
-  Clone now does per-field clone for non-POD extras.
-- **Const generics on class headers** — shipped in 1.01
-  (P09.41). `class Array<T, const N: usize> { ... }` parses,
-  resolves, and emits correctly; the two-DefId class split
-  threads class generics through both the struct and impl halves.
-- **`cxx_importer` C++ → Rust binding generator** — shipped
-  across v1.04.0 (Phases A + B + C, M1–M21) and v1.06.0 (v2
-  roadmap M22–M26). Real-world target: `examples/fltk_text_editor`
-  pulls in ~50 FLTK classes and produces a working 800x600 editor.
-- **Developer experience layer** — shipped in v1.07.0.
-  `crates/rustcc-cli` (install / doctor / init); `tools/vscode-rustcc`
-  VS Code extension (grammar overlay, snippets, commands, status
-  bar, problems-pane integration with the JSON skip log);
-  `cxx_importer::Build::compile()` writes a structured
-  `bindings.skips.json` sidecar.
-- **rust-analyzer Phase 2** — shipped in v1.07.0
-  (`fork/ra-patches/01..12`). `class` items get full IDE parity
-  with structs: hover, go-to-def, find-references, completion,
-  inherent-method dispatch with C++-style derived-shadows-base,
-  plus class-aware assists (`generate_class_new`,
-  `change_visibility`, `find all overriders`, `implement override`).
-- **Windows MSVC C++ ABI** — shipped across v1.09.0 (workspace-side
-  mangler / record layout / vtable, 65 cross-validated golden cases
-  against Apple-clang's `-target x86_64-pc-windows-msvc` output) and
-  v1.09.1 (fork rustc patches: target routing, vftable+COL
-  emission, scalar deleting dtor, sret-via-RCX on x64 + X8 on
-  ARM64, dllexport). v1.09.2 adds the runtime smoke matrix
-  (5/5 PE32+ tests pass under Wine on macOS) + ARM64 HFA
-  detection + Windows CI runners.
+| Capability | Notes |
+|---|---|
+| `cxx_importer` C++ → Rust generator | parse headers → emit Rust bindings + C++ shims; `Build::compile()` build.rs driver |
+| C++ templates | type + non-type (integral) + template-template arguments; both ABIs, clang-validated |
+| Auto-instantiation of STL specs | `std::vector<int>` referenced in a user API is discovered + force-instantiated |
+| C++ exception catching | `[[rustcc::cxx_throws]]` → `Result<T, CxxException>`; catch-all + typed; Itanium + MSVC |
 
-Remaining stretch items (not in any near-term release):
+### Swift
 
-- **Runtime-dispatch CI validation for Itanium MI** — M22 work
-  has strong static evidence (vtable structure, mangled symbols,
-  FLTK link success) and v1.09.2's Wine smoke validates
-  single-inheritance virtual dispatch end-to-end. A test
-  specifically asserting `&B`-pointing-into-a-C routes through
-  the secondary thunk on Itanium multi-inheritance is still
-  pending — needs an Itanium-flavored multi-inheritance probe.
-- **STL container support for M24** — implicit instantiation
-  auto-discovery. Tracked at `docs/cxx_importer.md` row 24.
-- **Method flattening multi-level walk** — v1.07.0's
-  `flatten_inherited_methods` flag walks one level deep;
-  multi-level recursion is a follow-up. The current single-level
-  walk is at `crates/cxx_importer/src/rust_bindings.rs:2828`.
-- **`extern "C++"` throw-lowering** — design committed in
-  `fork/CXX-THROW-PLAN.md` (v1.09.2); implementation is a
-  focused v1.09.3 sprint (~1700 LoC, 3-4 weeks).
+| Capability | Notes |
+|---|---|
+| `extern "Swift"` calling convention | swiftcc ABI + Swift symbol mangling (calling `swiftc`-built functions) |
+| `#[repr(swift)]` value types | layout + Drop/Clone via the value-witness table |
+| Swift class bindings (ARC) | `swift_retain` / `swift_release` on a held class pointer |
+| `#[swift_value]` (built-in attribute) | auto-synthesizes `Drop` + `Clone` for value and class types |
+| Swift `throws` | `#[rustc_swift_throws]` + `SwiftError` → `Result` (swifterror register) |
+
+### Platforms
+
+| Capability | Notes |
+|---|---|
+| Cross-compilation | C++ ABI derives from the session `--target`, not the build host |
+| Bare-metal ARM Cortex-M | `thumbv7em` / `thumbv7m` / `thumbv8m.*` |
+
+**Hosts:** `x86_64`/`aarch64` `-apple-darwin` and `-unknown-linux-gnu`,
+`x86_64`/`aarch64` `-pc-windows-msvc`, `i686-unknown-linux-gnu`,
+`x86_64-pc-windows-gnu`, and bare-metal `thumbv7em-*` / `thumbv7m-*` /
+`thumbv8m.*`. Cross-builds across these are supported.
+
+## Editor & developer tooling
+
+- **VS Code extension** (`tools/vscode-rustcc/`) — syntax highlighting
+  for `class`, `extern "C++"`/`extern "Swift"`, and the rustcc
+  attributes; snippets; commands (toolchain + RA-fork install); a
+  status-bar pin indicator; and Problems-pane diagnostics fed by
+  `cxx_importer`'s `bindings.skips.json`. See
+  [Editor setup](#editor-setup-vs-code--rust-analyzer) below.
+- **Patched rust-analyzer** (`fork/ra-patches/`) — gives `class` items
+  full IDE parity with structs: hover, go-to-def, find-references,
+  completion, inherent-method dispatch, and class-aware assists.
+  Stock RA chokes on the `class` keyword; this fork doesn't.
+- **`rustcc-cli`** (`crates/rustcc-cli/`) — `rustcc install` / `doctor`
+  / `init` for toolchain install + project scaffolding.
+
+## Remaining gaps
+
+Honest list of what is **not** yet implemented:
+
+- **C++ templates beyond instantiation** — uninstantiated generic
+  templates (no Rust representation), and template-template /
+  pointer-to-member non-type *arguments* (they mangle correctly when
+  supplied but can't be auto-recovered from libclang's type view).
+- **Swift inheritance** — you can *call* Swift and hold/retain Swift
+  class instances, but a Rust type cannot *subclass* a Swift class or
+  override its methods. See the Swift section below.
+- **Member pointers** (partial), **covariant-return thunks**, and
+  **GCC-backend `cxx_throws`** (the catch path is Itanium/MSVC LLVM).
+- **Recursive STL import** — a user type that *derives from* a system
+  type (e.g. `: std::exception`) binds that base as opaque rather than
+  importing its whole graph; force-instantiate specs you want in full.
 
 ## Quick start
 
 ### Install the forked compiler
 
 ```sh
-git clone https://github.com/Mitzev/rustcc
+git clone https://github.com/mitzev/rustcc
 cd rustcc/fork
 ./build.sh               # applies patches, builds stage-1 rustc (~30–90 min)
 ```
@@ -240,6 +230,61 @@ int main(void) {
 More examples in [`examples/`](examples/). Full walkthrough:
 [`fork/getting-started.html`](fork/getting-started.html).
 
+## Editor setup (VS Code + rust-analyzer)
+
+The `class` keyword and `extern "C++"`/`extern "Swift"` blocks confuse
+stock tooling. rustcc ships a VS Code extension and a patched
+rust-analyzer that fix both.
+
+**1. Install the extension** (sideload from a source checkout):
+
+```sh
+cd tools/vscode-rustcc
+npm install && npm run package
+code --install-extension rustcc-tools-*.vsix
+```
+
+It adds: syntax highlighting for `class` / `extern "C++"` /
+`extern "Swift"` / the rustcc attributes (`#[cpp_virtual]`,
+`#[constructor]`, `#[rustc_cxx_throws]`, `#[swift_value]`, …); code
+snippets; a status-bar pin showing the active `rustcc` toolchain; and
+Problems-pane diagnostics sourced from the `bindings.skips.json` that
+`cxx_importer::Build::compile()` writes (so importer skips show up
+inline).
+
+**2. Point rust-analyzer at the patched server.** Stock RA reports
+errors on every `class`. With the extension installed, run
+`Cmd/Ctrl-Shift-P → rustcc: Install RA Fork (latest)` — it downloads
+the prebuilt `rust-analyzer-rustcc` binary (shipped on every release)
+and wires `rust-analyzer.server.path` for you. To do it by hand, see
+[`fork/INSTALL.md`](fork/INSTALL.md#rust-analyzer-for-editor-support).
+
+The patched RA gives `class` items full parity with structs: hover,
+go-to-definition, find-references, completion, inherent-method
+dispatch, and class-aware assists (generate `new`, change visibility,
+find overriders, implement override).
+
+## Swift interop
+
+rustcc speaks Swift's ABI directly — no C shim. What's supported:
+
+- **Calling Swift** — `extern "Swift"` routes through the `swiftcc`
+  calling convention with Swift symbol mangling, so you can call
+  `swiftc`-compiled functions (including `throws`, via
+  `#[rustc_swift_throws]` + `SwiftError`).
+- **Swift value types** — `#[repr(swift)]` + `#[swift_value]`
+  synthesize `Drop`/`Clone` routed through Swift's value-witness table.
+- **Swift classes** — bind by holding the class pointer; lifetime is
+  managed with ARC (`swift_retain` / `swift_release`).
+
+**Not supported: inheriting from Swift classes.** A Rust type cannot
+subclass a Swift class, override its methods, or participate in Swift's
+metadata/witness dispatch as a subclass — you can call into and hold
+Swift objects, but not *be* one. (Swift subclasses require emitting
+Swift type metadata + an isa layout the fork doesn't generate.)
+
+Full reference: [`docs/swift.md`](docs/swift.md).
+
 ## Repo layout
 
 - **`fork/`** — the canonical rustc fork. Patches, build script, and
@@ -269,7 +314,7 @@ More examples in [`examples/`](examples/). Full walkthrough:
 | [`docs/codegen.md`](docs/codegen.md) | LLVM IR generation for cross-language calls, vtables, ctors/dtors |
 | [`docs/ownership_and_safety.md`](docs/ownership_and_safety.md) | `CxxOwned<T>`, pinning, move/copy surface, borrow-checker contract |
 | [`docs/exception_boundary.md`](docs/exception_boundary.md) | Terminate-on-throw barrier between Rust and C++ |
-| [`docs/cxx_throws.md`](docs/cxx_throws.md) | `[[rustcc::cxx_throws]]` — catching C++ exceptions from Rust (Phase 0 ergonomic story + Phase 1/2/3 design) |
+| [`docs/cxx_throws.md`](docs/cxx_throws.md) | `[[rustcc::cxx_throws]]` — catching C++ exceptions from Rust as `Result` (shim + native-invoke paths, Itanium + MSVC) |
 | [`docs/repr_cpp.md`](docs/repr_cpp.md) | Rust types exposed to C++ with matching layout |
 | [`docs/swift.md`](docs/swift.md) | Swift interop — `extern "Swift"`, `#[repr(swift)]`, `#[swift_value]`, `throws` |
 | [`docs/build_integration.md`](docs/build_integration.md) | Driver, cargo manifest extensions, linking, toolchain detection |
@@ -281,9 +326,11 @@ More examples in [`examples/`](examples/). Full walkthrough:
   compiler.
 - **Silent compatibility with old Clang.** rustcc pins a Clang floor
   and rejects older toolchains at build time.
-- **MSVC ABI in the main tree.** A separate fork can add it; Itanium
-  and MSVC layout/mangling differ enough that sharing a crate across
-  them is a net loss.
+- **Subclassing C++/Swift types from Rust.** Rust can implement C++
+  virtual methods on its own `#[repr(cpp)]` classes and override across
+  a rustcc-defined inheritance chain, but making a Rust type a subclass
+  of an *imported* C++ or Swift class (participating in that language's
+  own dispatch as a derived class) is out of scope.
 
 ## License
 

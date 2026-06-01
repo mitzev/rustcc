@@ -98,43 +98,44 @@ running glibc-compat shims.
 
 ### Windows
 
-Native Windows MSVC C++ ABI support shipped in v1.09.0 + v1.09.1.
-The fork rustc emits real PE32+ binaries that link against the
-MSVC CRT and route through `??_7Class@@6B@` vftables + `??_G`
-scalar deleting dtors at runtime.
-
-For Windows hosts, see [Supported host triples](#supported-host-triples)
-below; prebuilt tarballs land in v1.09.2's release matrix
-(currently in flight — until they're up, build from source via
-`./fork/build.sh` on Windows or WSL2 + the Debian/Ubuntu recipe).
+Native Windows MSVC C++ ABI support is shipped and **prebuilt
+tarballs are published** for `x86_64-pc-windows-msvc` and
+`aarch64-pc-windows-msvc` (fast path below). The fork rustc emits real
+PE32+ binaries that link against the MSVC CRT and route through
+`??_7Class@@6B@` vftables + `??_G` scalar-deleting dtors, with SEH
+funclet exception handling at runtime.
 
 For Mac/Linux hosts cross-compiling to MSVC, see
-[`fork/CROSS-COMPILE-MSVC.md`](CROSS-COMPILE-MSVC.md) (v1.09.2)
-for the `xwin` + `lld-link` + Wine toolchain setup.
+[`fork/CROSS-COMPILE-MSVC.md`](CROSS-COMPILE-MSVC.md) for the `xwin`
++ `lld-link` + Wine toolchain setup. (Editor support — the prebuilt
+`rust-analyzer-rustcc` — currently ships for macOS/Linux hosts only;
+on Windows build the patched RA from source.)
 
 ## Fast path
 
 ### 1. Download and extract
 
 ```bash
-# Pick the triple for your host. Supported triples:
+# Pick the triple for your host. Prebuilt triples:
 #   aarch64-apple-darwin        (Apple Silicon Mac)
-#   x86_64-apple-darwin         (Intel Mac)
 #   x86_64-unknown-linux-gnu    (most x86_64 Linux)
 #   aarch64-unknown-linux-gnu   (arm64 Linux)
+#   x86_64-pc-windows-msvc      (Windows x64)
+#   aarch64-pc-windows-msvc     (Windows arm64)
+# (Intel Mac, x86_64-apple-darwin, is source-build only — see below.)
 TARGET=aarch64-apple-darwin
 VERSION=latest
 
 # Resolve `latest` to the most recent release tag. Replace with a
-# specific tag (e.g. `v1.08.0`) if you want to pin.
+# specific tag (e.g. `v1.13.3`) if you want to pin.
 if [ "$VERSION" = "latest" ]; then
-  VERSION=$(curl -fsSL https://api.github.com/repos/rustcc/rustcc/releases/latest \
+  VERSION=$(curl -fsSL https://api.github.com/repos/mitzev/rustcc/releases/latest \
             | grep -m1 '"tag_name"' \
             | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')
 fi
 echo "Installing rustcc $VERSION for $TARGET"
 
-BASE="https://github.com/rustcc/rustcc/releases/download/$VERSION"
+BASE="https://github.com/mitzev/rustcc/releases/download/$VERSION"
 curl -fsSL -o rustcc.tar.xz         "$BASE/rustcc-$TARGET.tar.xz"
 curl -fsSL -o rustcc.tar.xz.sha256  "$BASE/rustcc-$TARGET.tar.xz.sha256"
 
@@ -191,7 +192,7 @@ Requires ~10 GB free disk and 30–90 minutes (laptop) to 15+ hours
 - You don't trust prebuilt binaries.
 
 ```bash
-git clone https://github.com/rustcc/rustcc.git
+git clone https://github.com/mitzev/rustcc.git
 cd rustcc
 ./fork/build.sh
 # ... 30-90 min elapses ...
@@ -215,15 +216,14 @@ regression probes against the stage-1 binary (~1 min). See
 
 rustcc's `class` keyword confuses stock rust-analyzer. A patched
 RA that accepts `class` and gives it full IDE parity with structs
-lives under [`fork/ra-patches/`](ra-patches/) (12 patches as of
-v1.07.0 / v1.08.0).
+lives under [`fork/ra-patches/`](ra-patches/) (12 patches).
 
-**Fast path** — download the prebuilt tarball (new in v1.08.0):
+**Fast path** — download the prebuilt tarball (macOS/Linux hosts):
 
 ```bash
 TARGET=aarch64-apple-darwin   # pick yours; same triples as rustcc
-VERSION=v1.08.0
-BASE="https://github.com/rustcc/rustcc/releases/download/$VERSION"
+VERSION=v1.13.3
+BASE="https://github.com/mitzev/rustcc/releases/download/$VERSION"
 curl -fsSL -o ra.tar.xz "$BASE/rust-analyzer-rustcc-$TARGET.tar.xz"
 mkdir -p "$HOME/.rustcc/$VERSION"
 tar -xJf ra.tar.xz -C "$HOME/.rustcc/$VERSION"
@@ -231,7 +231,7 @@ tar -xJf ra.tar.xz -C "$HOME/.rustcc/$VERSION"
 # Point your editor at:
 #   $HOME/.rustcc/$VERSION/rust-analyzer-rustcc/rust-analyzer
 # VS Code (settings.json):
-#   "rust-analyzer.server.path": "/Users/you/.rustcc/v1.08.0/rust-analyzer-rustcc/rust-analyzer"
+#   "rust-analyzer.server.path": "/Users/you/.rustcc/v1.13.3/rust-analyzer-rustcc/rust-analyzer"
 ```
 
 VS Code users with the rustcc extension installed (see below) can
@@ -251,7 +251,7 @@ per-patch breakdown.
 
 ## Developer tooling (optional but recommended)
 
-Three pieces of optional tooling shipped in v1.07.0 / v1.08.0:
+Three pieces of optional tooling:
 
 ### `rustcc-cli`
 
@@ -282,7 +282,7 @@ code --install-extension rustcc-tools-*.vsix
 ```
 
 Provides: grammar overlay for `class` / `extern "C++"` /
-`extern "swiftcall"` / rustcc attributes, 6 snippets, 5 commands
+`extern "Swift"` / rustcc attributes, snippets, commands
 (including **Install RA Fork (latest)**), a status-bar pin
 indicator, and Problems-pane diagnostics fed by
 `bindings.skips.json`.
@@ -290,8 +290,8 @@ indicator, and Problems-pane diagnostics fed by
 ### Prebuilt rust-analyzer fork binary
 
 Covered in the [Rust-analyzer](#rust-analyzer-for-editor-support)
-section above — new in v1.08.0; ships alongside the rustcc tarball
-on every release.
+section above — ships alongside the rustcc tarball on every release
+(macOS/Linux hosts).
 
 ## CI: install rustcc in GitHub Actions
 
@@ -310,9 +310,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: rustcc/rustcc/.github/actions/install-rustcc@main
+      - uses: mitzev/rustcc/.github/actions/install-rustcc@main
         with:
-          version: latest           # or a pinned tag like v1.08.0
+          version: latest           # or a pinned tag like v1.13.3
           set-default: 'true'       # makes `cargo build` use rustcc
       - run: cargo build --workspace
       - run: cargo test --workspace
@@ -332,24 +332,24 @@ a complete minimal example.
 | Triple | Prebuilt | Source build |
 |---|---|---|
 | `aarch64-apple-darwin` | ✅ | ✅ |
-| `x86_64-apple-darwin` | ✅ | ✅ |
+| `x86_64-apple-darwin` | — (build from source) | ✅ |
 | `x86_64-unknown-linux-gnu` | ✅ | ✅ |
 | `aarch64-unknown-linux-gnu` | ✅ | ✅ |
 | `i686-unknown-linux-gnu` | — | ✅ |
-| `x86_64-pc-windows-gnu` | — | ✅ (mingw-w64, Itanium ABI via v1.09.0+) |
-| `x86_64-pc-windows-msvc` | 🚧 v1.09.2 | ✅ shipped v1.09.0 + v1.09.1 |
-| `aarch64-pc-windows-msvc` | 🚧 v1.09.2 | ✅ shipped v1.09.0 + v1.09.1 |
+| `x86_64-pc-windows-gnu` | — | ✅ (mingw-w64, Itanium ABI) |
+| `x86_64-pc-windows-msvc` | ✅ | ✅ |
+| `aarch64-pc-windows-msvc` | ✅ | ✅ |
 
-Native Windows MSVC C++ ABI support landed across v1.09.0
-(workspace-side mangler/layout/vtable) and v1.09.1 (fork rustc
-patches: target routing, vftable emission, scalar deleting dtor,
-sret-via-RCX/X8, dllexport). Prebuilt MSVC tarballs are tracked
-under v1.09.2; until that release lands, build from source on
-Windows via `./fork/build.sh` or use the Mac/Linux cross-link
-setup (see [`fork/CROSS-COMPILE-MSVC.md`](CROSS-COMPILE-MSVC.md)).
+Notes:
+- `x86_64-apple-darwin` (Intel Mac) is **source-build only** — its
+  prebuilt is not published (Intel-mac release runners are
+  unreliable). Apple Silicon (`aarch64-apple-darwin`) has a prebuilt.
+- Prebuilt **`rust-analyzer-rustcc`** ships for the three macOS/Linux
+  prebuilt triples; on Windows, build the patched RA from source.
 
 Cross-compilation targets (ESP32-C3, STM32, Raspberry Pi Pico,
-etc.) work from any supported host — see
+etc.) work from any supported host — the C++ ABI is derived from the
+session `--target`, not the build host. See
 [`fork/tests/run_targets.sh`](tests/run_targets.sh) for the
 validated list.
 
