@@ -31,6 +31,8 @@ declare -a probes=(
   "class_keyword/swift_nonpod"
   "class_keyword/swift_value_attr"
   "class_keyword/swift_throws"
+  "class_keyword/swift_extern_call"
+  "class_keyword/swift_value_type"
 )
 
 # Map of probe directory to expected stdout prefix (matches the
@@ -43,6 +45,8 @@ declare -a expect=(
   "ok: non-POD extra cloned"
   "ok: swift_value built-in attr"
   "ok: swift_throws wrapper"
+  "ok: extern Swift add="
+  "ok: swift_value value-type"
 )
 
 pass=0

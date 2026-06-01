@@ -271,6 +271,7 @@ More examples in [`examples/`](examples/). Full walkthrough:
 | [`docs/exception_boundary.md`](docs/exception_boundary.md) | Terminate-on-throw barrier between Rust and C++ |
 | [`docs/cxx_throws.md`](docs/cxx_throws.md) | `[[rustcc::cxx_throws]]` — catching C++ exceptions from Rust (Phase 0 ergonomic story + Phase 1/2/3 design) |
 | [`docs/repr_cpp.md`](docs/repr_cpp.md) | Rust types exposed to C++ with matching layout |
+| [`docs/swift.md`](docs/swift.md) | Swift interop — `extern "Swift"`, `#[repr(swift)]`, `#[swift_value]`, `throws` |
 | [`docs/build_integration.md`](docs/build_integration.md) | Driver, cargo manifest extensions, linking, toolchain detection |
 
 ## Non-goals
