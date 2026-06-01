@@ -89,6 +89,36 @@ fn imports_pod_struct_with_scalar_fields() {
 }
 
 #[test]
+fn imports_long_double_field() {
+    // `long double` must lower to FloatKind::LongDouble rather than
+    // aborting the import with "unsupported clang type kind". Regression
+    // for the libc `max_align_t` (an x86-Linux `long double` member,
+    // pulled in transitively by stdlib headers) that broke the
+    // cxx_throws_demo build on Linux CI.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct HasLongDouble {\n    long double ld;\n};\n",
+        "long_double",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids =
+        import_header(&header, &["-x", "c++", "-std=c++17"], &mut ctx)
+            .expect("import should not reject long double");
+
+    assert_eq!(class_ids.len(), 1);
+    let class = ctx.class(class_ids[0]);
+    assert_eq!(class.fields.len(), 1);
+    assert_eq!(class.fields[0].name.0, "ld");
+    assert!(matches!(
+        ctx.type_of(class.fields[0].ty),
+        CxxType::Float { kind: rustc_abi_cxx::FloatKind::LongDouble }
+    ));
+
+    cleanup(&header);
+}
+
+#[test]
 fn imported_struct_layouts_correctly_end_to_end() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
     let header = temp_header(

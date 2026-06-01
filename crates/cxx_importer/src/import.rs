@@ -2026,6 +2026,17 @@ impl<'a> Importer<'a> {
             TypeKind::Double => CxxType::Float {
                 kind: FloatKind::F64,
             },
+            // `long double`. The concrete width is target-dependent
+            // (64-bit on Apple/Windows, 80-bit x87 on x86-Linux,
+            // 128-bit elsewhere) and resolved by `rustc_abi_cxx`'s
+            // layout from the target's `long_double` kind; the importer
+            // just records the `LongDouble` float kind. Without this arm
+            // a stray `long double` (e.g. libc's `max_align_t` on
+            // x86-Linux, pulled in transitively by stdlib headers)
+            // aborts the whole import with "unsupported clang type kind".
+            TypeKind::LongDouble => CxxType::Float {
+                kind: FloatKind::LongDouble,
+            },
             TypeKind::Pointer => {
                 let pointee = ty.get_pointee_type().ok_or_else(|| {
                     ImportError::UnsupportedFeature {
