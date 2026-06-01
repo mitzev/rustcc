@@ -563,7 +563,14 @@ fn walk_top_level(
         EntityKind::StructDecl
         | EntityKind::ClassDecl
         | EntityKind::UnionDecl => {
-            if entity.is_definition() {
+            // Don't eagerly import system-header (`<...>`) class
+            // definitions. A user `#include <stdexcept>` drags all of
+            // `namespace std` into the TU; enumerating + importing every
+            // one of those (variadic helpers, anonymous detail types)
+            // is both wasteful and a source of import/emit failures.
+            // Types the user actually uses still arrive via recursive
+            // import of their fields/bases/template args.
+            if entity.is_definition() && !entity_in_system_header(entity) {
                 let id = importer.import_class(entity)?;
                 if seen.insert(id) {
                     imported.push(id);
@@ -2640,6 +2647,21 @@ fn populate_vtable_indices(ctx: &mut CxxTypeCtx, class_id: ClassId) {
     }
 }
 
+/// Whether an entity is declared in a system header (`<...>` include,
+/// or anything the compiler marks system). Used to scope eager,
+/// whole-TU enumeration to the user's own code: a `#include <stdexcept>`
+/// drags the entire STL into the translation unit, and we don't want to
+/// eagerly import/instantiate `namespace std`'s internals (variadic
+/// helpers like `std::conjunction`, anonymous detail types, …). Types
+/// the user actually *uses* still arrive via recursive import of their
+/// fields/bases/args, which is independent of this filter.
+fn entity_in_system_header(entity: &Entity<'_>) -> bool {
+    entity
+        .get_location()
+        .map(|loc| loc.is_in_system_header())
+        .unwrap_or(false)
+}
+
 fn entity_usr(entity: &Entity<'_>) -> String {
     entity
         .get_usr()
@@ -2770,14 +2792,20 @@ fn walk_entity_for_specs(
     entity: &Entity<'_>,
     found: &mut std::collections::HashSet<String>,
 ) {
-    // For this entity itself: examine its type (if any) and the
-    // type-result for functions / methods. Then recurse into
-    // children.
-    if let Some(ty) = entity.get_type() {
-        collect_specs_in_type(ty, found);
-    }
-    if let Some(rt) = entity.get_result_type() {
-        collect_specs_in_type(rt, found);
+    // Only collect template specializations referenced from the user's
+    // own code — not from transitively-included system headers. A user
+    // function returning `std::vector<int>` drives instantiation of
+    // `vector<int>`; the STL's own internal use of variadic helpers
+    // (`std::conjunction`, …) inside `<...>` headers does not. Without
+    // this filter, auto-instantiate force-instantiates swaths of
+    // `namespace std`, which then fail to import/emit.
+    if !entity_in_system_header(entity) {
+        if let Some(ty) = entity.get_type() {
+            collect_specs_in_type(ty, found);
+        }
+        if let Some(rt) = entity.get_result_type() {
+            collect_specs_in_type(rt, found);
+        }
     }
     for child in entity.get_children() {
         walk_entity_for_specs(&child, found);
