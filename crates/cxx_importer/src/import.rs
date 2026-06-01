@@ -1138,7 +1138,32 @@ impl<'a> Importer<'a> {
         // ClassDef with the freshly-derived `kind` + correct
         // `name_path`; the body walk below will populate fields /
         // bases / methods.
-        let name_path = self.build_nested_path(entity)?;
+        let name_path = match self.build_nested_path(entity) {
+            Ok(p) => p,
+            // A template argument we can't represent (parameter pack,
+            // template-template, pointer/member non-type arg, …). This
+            // is common in transitively-included system / STL headers
+            // (e.g. `std::conjunction<…>`, a variadic template). Skip
+            // just this type via a poison node — same recovery as a
+            // forward-decl above — instead of aborting the whole import.
+            // A type that merely *references* the un-importable one then
+            // still imports, with the inner type poisoned.
+            Err(ImportError::UnsupportedFeature { what, where_, .. }) => {
+                if let Some(target) = upgrade_target {
+                    return Ok(target);
+                }
+                let name = entity.get_name().unwrap_or_default();
+                return Ok(self.poison_class(
+                    entity,
+                    NestedName(vec![NameSegment::Class(Ident(name))]),
+                    format!(
+                        "unsupported template argument ({what}) while \
+                         lowering `{where_}`; type skipped.",
+                    ),
+                ));
+            }
+            Err(e) => return Err(e),
+        };
         let placeholder = ClassDef {
             name: NestedName(name_path),
             bases: Vec::new(),

@@ -119,6 +119,44 @@ fn imports_long_double_field() {
 }
 
 #[test]
+fn unsupported_template_arg_skips_type_without_aborting_import() {
+    // A template specialization whose argument we can't represent (here
+    // a template-template arg, `Stack<int, Box>`) must be skipped via a
+    // poison node, NOT abort the whole import. Regression for the
+    // `Build::compile` failure where a transitively-included STL
+    // variadic template (`std::conjunction`, a parameter pack) killed
+    // the entire build instead of being skipped. Uses a hermetic
+    // template-template arg so it reproduces on every platform.
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "template<class> struct Box { };\n\
+         template<class T, template<class> class C> struct Stack { };\n\
+         template struct Stack<int, Box>;  // template-template arg\n\
+         struct Plain { int x; };\n\
+         Plain g_plain;\n",
+        "unsupported_targ",
+    );
+
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    // The key assertion: import returns Ok rather than propagating the
+    // UnsupportedFeature error out of the whole translation unit.
+    let class_ids =
+        import_header(&header, &["-x", "c++", "-std=c++17"], &mut ctx)
+            .expect("import must not abort on an unrepresentable template arg");
+
+    // The unrelated `Plain` type still imports fine.
+    assert!(
+        class_ids.iter().any(|&id| matches!(
+            ctx.class(id).name.0.last(),
+            Some(NameSegment::Class(i)) if i.0 == "Plain"
+        )),
+        "Plain should import even though Stack<int, Box> was skipped"
+    );
+
+    cleanup(&header);
+}
+
+#[test]
 fn imported_struct_layouts_correctly_end_to_end() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
     let header = temp_header(
