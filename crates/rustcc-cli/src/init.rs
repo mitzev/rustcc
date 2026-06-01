@@ -114,6 +114,9 @@ const MAIN_RS_CLASS: &str = r#"// Scaffolded by `rustcc init --surface class-key
 // the alternative surfaces that work on stable rustc.
 
 #![feature(rustc_attrs)]
+// rustcc's class/ctor/virtual attributes ride `rustc_attrs`, an
+// internal feature — allow it so the build is warning-free.
+#![allow(internal_features)]
 
 pub class Counter {
     n: i64,

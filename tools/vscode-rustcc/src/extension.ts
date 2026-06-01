@@ -272,6 +272,9 @@ const MAIN_RS_CLASS = `// Scaffolded by \`rustcc: New Project\` (class-keyword s
 // The \`class\` keyword is fork-only; build with the rustcc toolchain
 // (pinned in rust-toolchain.toml).
 #![feature(rustc_attrs)]
+// rustcc's class/ctor/virtual attributes ride \`rustc_attrs\`, an
+// internal feature — allow it so the build is warning-free.
+#![allow(internal_features)]
 
 pub class Counter {
     n: i64,
