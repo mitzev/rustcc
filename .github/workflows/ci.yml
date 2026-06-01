@@ -27,7 +27,12 @@ jobs:
       - name: Install system deps (clang for clang-sys / cxx_importer)
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libclang-dev
+          # clang + libclang: clang-sys / cxx_importer libclang bindings.
+          # libc++ + libc++abi: the cxx_throws_phase0 runtime test links
+          # its C++ shim with `-lc++` (LLVM libc++); without these the
+          # Linux runner only has libstdc++ and the test fails to link
+          # (`rust-lld: error: unable to find library -lc++`).
+          sudo apt-get install -y clang libclang-dev libc++-dev libc++abi-dev
 
       - uses: Swatinem/rust-cache@v2.9.1  # Node 24 (v2 floating tag may still pull older Node 20 patch)
 
