@@ -61,13 +61,20 @@ pub class Derived : Base {
 
     // `override` is verified: a compile error if no base virtual of
     // this name exists (desugars to #[cpp_virtual] + #[rustc_cxx_override]).
-    override fn poke(&self) -> i32 { self.__base.x + self.extra }
+    // `self.x` reaches the base field transparently (v1.13.6).
+    override fn poke(&self) -> i32 { self.x + self.extra }
 }
 ```
 
 `constructor` is a contextual keyword (a field named `constructor`
 still parses); `virtual` / `override` are reserved keywords. You can't
 mix a keyword modifier with the matching attribute on one method.
+
+**Transparent base access (v1.13.6):** a derived `class D : B` gets
+auto-synthesized `Deref`/`DerefMut` to its `__base`, so base members
+are reachable as `self.member` (no `self.__base.` prefix) and `&D`
+upcasts to `&B`. `self.__base.member` still works. (rust-analyzer
+doesn't yet resolve the transparent form — editor may flag it.)
 
 Use **`cxx_class!`** (proc macro from `rustcc_macros`) *instead* when
 the code must also compile on stock / nightly rustc (graceful

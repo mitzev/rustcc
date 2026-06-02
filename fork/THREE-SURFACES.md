@@ -130,7 +130,9 @@ pub class Derived : Base {
     }
 
     override fn sum(&self) -> i32 {
-        self.__base.x + self.extra
+        // `self.x` reaches the base field transparently (v1.13.6) —
+        // no `self.__base.x` needed.
+        self.x + self.extra
     }
 }
 ```
@@ -138,6 +140,34 @@ pub class Derived : Base {
 The parser synthesizes a `__base: Base` field with
 `#[rustc_cxx_base]` so downstream layout and vtable emission
 recognizes the polymorphic base subobject automatically.
+
+### Transparent base-member access (v1.13.6)
+
+For a derived `class D : B`, the fork synthesizes
+`impl Deref for D { type Target = B; … }` (and `DerefMut`) targeting
+the `__base` subobject, so **base members are reachable directly**
+through Rust's existing autoderef:
+
+```rust
+let d = Derived::new(10, 5);
+let _ = d.x;          // base field      (was: d.__base.x)
+let _ = d.get_x();    // base method     (was: d.__base.get_x())
+d.x = 7;             // base field write (via DerefMut)
+fn takes_base(b: &Base) {}
+takes_base(&d);       // &Derived -> &Base upcast coercion
+```
+
+This works transitively up a multi-level chain, and through generic
+bases. A derived field shadows a base field of the same name (the
+derived one wins — C++ name-hiding), and `self.__base.member` still
+works for explicit access. Because it's plain autoderef, the emitted
+code is just a field projection at offset 0 — no runtime cost.
+
+> Editor note: rust-analyzer (fork) does not yet resolve the
+> transparent form in its native `class` model, so `self.base_member`
+> may show an unresolved-field/method diagnostic in the editor even
+> though it compiles. Use `self.__base.member` for editor-clean code
+> until the RA follow-up lands.
 
 ### Method-modifier keywords (v1.13.5)
 

@@ -3422,6 +3422,57 @@ keyword + modifier-run parsing; `parser`/`syntax` suites green).
 
 ---
 
+## P09.81 — transparent base-member access + RTTI/layout fixes (1.13.6)
+
+**Patch:** `38-class-transparent-base-access.patch`.
+
+For a derived `class D : B`, the parser synthesizes two ordinary trait
+impls — `impl Deref for D { type Target = B; fn deref(&self) -> &B {
+&self.__base } }` and the `DerefMut` analogue — stored as complete AST
+items on `ast::Class::deref_impls`. So `self.member` reaches base
+members via Rust's existing autoderef, and `&D` upcasts to `&B`.
+
+The synthesized impls deliberately flow through the **normal** item
+pipeline rather than custom HIR synthesis:
+
+- **`ast::Class`** gains `deref_impls: ThinVec<Box<Item>>`; the parser
+  (`build_cxx_class_deref_impls`) builds them with `DUMMY_NODE_ID`s.
+- **AST visitor** (`visit.rs` Class walk) visits `deref_impls` as
+  items → expansion assigns fresh ids, and `index_crate` registers
+  them as `AstOwner::Item` via the same walk.
+- **def_collector** visits them under the module parent (impl + assoc
+  fn + `Target` defs created normally).
+- **resolve** (`resolve_item`'s Class arm) resolves them as
+  module-scope sibling impls.
+- **ast_lowering** (`lower_item_ref`) emits their `ItemId`s into the
+  enclosing module; lowering is the ordinary `impl` path (no custom
+  code). Two struct/pretty destructures gain `deref_impls: _`.
+- New `sym::DerefMut`.
+
+Field access, method calls, mutation (DerefMut), and upcast coercion
+all fall out of autoderef; codegen is a field projection at offset 0.
+
+**RTTI + layout fixes** (a class inheriting from a non-polymorphic
+base used to fail to link or miscompute its vptr):
+
+- `is_polymorphic_cpp_class` (itanium + the cxx_bridge mirror) recurses
+  the base chain — a `#[rustc_cxx_base]` to a non-polymorphic base does
+  not make the derived polymorphic. Fixes "undefined symbol: typeinfo
+  for Base".
+- `has_polymorphic_base` (layout) requires the base to be polymorphic,
+  so a class introducing the first virtual on a plain base adds its own
+  vptr (was: garbage field offsets).
+- `emit_typeinfo` emits a non-polymorphic base's `_ZTS`/`_ZTI` on
+  demand (idempotent, recursing the chain).
+
+**Validation:** `fork/tests/class_keyword/base_member_access` (probe
+matrix 11/11); multi-level + generic bases + field shadowing; non-poly
+base + first-virtual-in-derived links with correct offsets. Editor:
+rust-analyzer transparent-form resolution is a documented follow-up
+(RA models `class` natively; `self.__base.member` resolves meanwhile).
+
+---
+
 ## Build & test
 
 See [`build.sh`](build.sh) and [`VERIFY.md`](VERIFY.md). Expected

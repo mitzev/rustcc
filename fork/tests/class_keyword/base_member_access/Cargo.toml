@@ -1,0 +1,10 @@
+[package]
+name = "class_keyword_base_member_access"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "class_keyword_base_member_access"
+path = "src/main.rs"
+
+[workspace]
