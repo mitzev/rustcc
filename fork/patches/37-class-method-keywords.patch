@@ -1,0 +1,394 @@
+From 2baad39c0a95a35d8d109af12853d1fdd5d02f96 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Wed, 3 Jun 2026 00:50:36 +0300
+Subject: [PATCH] P09.x (1.13.5): class-body method-modifier keywords +
+ verify-override
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add C++-style method-modifier keywords inside a `class` body:
+
+    (pub)? (virtual | override | constructor)* fn …
+
+These are pure parser sugar over the existing attributes, so all
+downstream layout/codegen is unchanged:
+
+  * `constructor`  ->  #[constructor]
+  * `virtual`      ->  #[cpp_virtual]
+  * `override`     ->  #[cpp_virtual] + #[rustc_cxx_override]
+
+`virtual` and `override` are reserved Rust keywords; `constructor` is
+a *contextual* keyword (only a modifier when a method follows, so a
+field literally named `constructor` still parses as a field).
+Combining a keyword modifier with an explicit `#[…]` attribute on the
+same method is a hard error (use one form or the other).
+
+`#[rustc_cxx_override]` is a new no-args internal marker attribute. It
+has no codegen effect; `check_attr` uses it to verify the method
+actually overrides a base-class virtual (walking the polymorphic base
+chain by method name, mirroring `virtuals_on_chain`'s by-name slot
+replacement). If it does not, that is a hard error — catching the
+footgun where a misspelled override silently appends a *new* vtable
+slot instead of replacing the base's.
+
+Touch points for the new attribute follow the existing
+`#[cpp_virtual]` / `#[rustc_cxx_base]` wiring: symbol, AttributeKind
+variant, cross-crate encoding (Yes), no-args parser + registration,
+builtin_attrs entry, and the check_attr dispatch arm.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../src/attributes/codegen_attrs.rs           |  13 +++
+ compiler/rustc_attr_parsing/src/context.rs    |   1 +
+ compiler/rustc_feature/src/builtin_attrs.rs   |   6 +
+ .../rustc_hir/src/attrs/data_structures.rs    |   9 ++
+ .../rustc_hir/src/attrs/encode_cross_crate.rs |   1 +
+ compiler/rustc_parse/src/parser/item.rs       | 103 ++++++++++++++++++
+ compiler/rustc_passes/src/check_attr.rs       |  97 ++++++++++++++++-
+ compiler/rustc_span/src/symbol.rs             |   1 +
+ 8 files changed, 230 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+index 6b495b9b748..35454b0b0b3 100644
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -781,6 +781,19 @@ impl<S: Stage> NoArgsAttributeParser<S> for $parser {
+     [Target::Field]
+ );
+ 
++// `#[rustc_cxx_override]` (P09.x / 1.13.5) — marks an inherent
++// virtual method declared to override a base-class virtual.
++// Synthesized (alongside `#[cpp_virtual]`) by the `override`
++// method modifier in a `class` body. No codegen effect of its
++// own; `check_attr` uses it to verify the method actually
++// overrides a base virtual (errors otherwise — like C++).
++rustcc_noargs_attr!(
++    RustcCxxOverrideParser,
++    rustc_cxx_override,
++    RustcCxxOverride,
++    [Target::Method(MethodKind::Inherent)]
++);
++
+ // `#[rustc_swift_throws]` (P09.48 / 1.02 throws) — marks a
+ // foreign fn inside an `extern "Swift"` block as a Swift
+ // throwing function. Codegen attaches LLVM's `swifterror`
+diff --git a/compiler/rustc_attr_parsing/src/context.rs b/compiler/rustc_attr_parsing/src/context.rs
+index d7ecc8d4aa3..1d0acf4f083 100644
+--- a/compiler/rustc_attr_parsing/src/context.rs
++++ b/compiler/rustc_attr_parsing/src/context.rs
+@@ -330,6 +330,7 @@ mod late {
+         Single<WithoutArgs<RustcCxxDropWrapperParser>>,
+         Single<WithoutArgs<RustcCxxVirtualParser>>,
+         Single<WithoutArgs<RustcCxxBaseParser>>,
++        Single<WithoutArgs<RustcCxxOverrideParser>>,
+         Single<RustcCxxOperatorParser>,
+         Single<RustcSwiftSymbolParser>,
+         Single<RustcSwiftTypeParser>,
+diff --git a/compiler/rustc_feature/src/builtin_attrs.rs b/compiler/rustc_feature/src/builtin_attrs.rs
+index 7ef6daaa0a2..5429c39bd0a 100644
+--- a/compiler/rustc_feature/src/builtin_attrs.rs
++++ b/compiler/rustc_feature/src/builtin_attrs.rs
+@@ -348,6 +348,12 @@ pub struct BuiltinAttribute {
+     // insert an extra vptr slot (the base already provides one),
+     // and the vtable/typeinfo emitters to chain to the base.
+     rustc_attr!(rustc_cxx_base, "marks a field as the polymorphic base subobject of a `#[repr(cpp)]` derived class (set automatically by the `class D : B` parser sugar)"),
++    // P09.x (1.13.5): marks an inherent virtual method as declared
++    // to override a base-class virtual. Synthesized (with
++    // `#[cpp_virtual]`) by the `override` method modifier in a
++    // `class` body. `check_attr` verifies it actually overrides a
++    // base virtual — error otherwise, mirroring C++ `override`.
++    rustc_attr!(rustc_cxx_override, "marks an inherent virtual method on a `#[repr(cpp)]` type as overriding a base-class virtual (synthesized by the `override` class modifier; verified by check_attr)"),
+     // P09.16: marks a fn in an `extern "Swift"` block as living
+     // in a named Swift module; the Swift mangler uses the module
+     // to produce `$s<module><name>...` link names.
+diff --git a/compiler/rustc_hir/src/attrs/data_structures.rs b/compiler/rustc_hir/src/attrs/data_structures.rs
+index 32af5be1183..3c7e81cf016 100644
+--- a/compiler/rustc_hir/src/attrs/data_structures.rs
++++ b/compiler/rustc_hir/src/attrs/data_structures.rs
+@@ -1590,6 +1590,15 @@ pub enum AttributeKind {
+     /// automatically by the `class D : B { … }` parser sugar.
+     RustcCxxBase(Span),
+ 
++    /// Represents `#[rustc_cxx_override]` (P09.x / 1.13.5) — marks
++    /// an inherent virtual method that is declared to override a
++    /// base-class virtual. Synthesized by the `override` method
++    /// modifier in a `class` body (alongside `#[cpp_virtual]`).
++    /// Drives the verify-override check in `check_attr`: it is an
++    /// error if no base in the polymorphic chain declares a
++    /// virtual method with the same name.
++    RustcCxxOverride(Span),
++
+     /// Represents `#[rustc_swift_throws]` (P09.48 / 1.02 throws)
+     /// — marks a foreign fn inside `extern "Swift"` block as a
+     /// Swift throwing function. The last parameter's slot is
+diff --git a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+index a9f132c26ed..22ee1e46b15 100644
+--- a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
++++ b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+@@ -186,6 +186,7 @@ pub fn encode_cross_crate(&self) -> EncodeCrossCrate {
+             RustcCxxDropWrapper(..) => Yes,
+             RustcCxxVirtual(..) => Yes,
+             RustcCxxBase(..) => Yes,
++            RustcCxxOverride(..) => Yes,
+             RustcSwiftSymbol { .. } => Yes,
+             RustcSwiftType { .. } => Yes,
+             RustcSwiftLabels { .. } => Yes,
+diff --git a/compiler/rustc_parse/src/parser/item.rs b/compiler/rustc_parse/src/parser/item.rs
+index c2d87ad6d86..f41b5797df0 100644
+--- a/compiler/rustc_parse/src/parser/item.rs
++++ b/compiler/rustc_parse/src/parser/item.rs
+@@ -2211,6 +2211,109 @@ fn parse_cxx_class_item(
+                             || next.kind == token::OpenParen
+                     });
+ 
++            // P09.x (v1.13.5): C++-style method-modifier keywords inside a
++            // `class` body — `(pub)? (virtual|override|constructor)* fn`.
++            // `virtual` and `override` are reserved keywords; `constructor`
++            // is a contextual keyword (only a modifier when a method
++            // follows, so a field named `constructor` still parses). They
++            // desugar to the existing `#[cpp_virtual]` / `#[constructor]`
++            // attributes (`override` adds `#[rustc_cxx_override]` too, which
++            // drives the verify-override check), so all downstream
++            // layout/codegen is unchanged.
++            let is_class_modifier = |t: &token::Token| {
++                t.is_keyword(kw::Virtual)
++                    || t.is_keyword(kw::Override)
++                    || t.is_ident_named(sym::constructor)
++            };
++            let modifier_off = if is_class_modifier(&first) {
++                Some(0)
++            } else if first.is_keyword(kw::Pub) && is_class_modifier(&peek(1)) {
++                Some(1)
++            } else {
++                None
++            };
++            // Only a modified method if a real method keyword follows the
++            // modifier run (guards a field literally named `constructor`).
++            let is_modified_method = modifier_off.is_some_and(|off| {
++                let mut k = off;
++                while is_class_modifier(&peek(k)) {
++                    k += 1;
++                }
++                is_method_after_vis(&peek(k))
++            });
++
++            if is_modified_method {
++                let off = modifier_off.unwrap();
++                if post_attrs != 0 {
++                    return Err(self.dcx().struct_span_err(
++                        self.token.span,
++                        "`virtual` / `override` / `constructor` keyword modifiers can't be \
++                         combined with attributes; use the `#[cpp_virtual]` / `#[constructor]` \
++                         attribute form instead",
++                    ));
++                }
++                // Consume an optional leading `pub` ourselves (the delegated
++                // `parse_assoc_item` would otherwise choke on the following
++                // modifier keyword); graft it back onto the parsed method.
++                let saved_vis = if off == 1 {
++                    Some(self.parse_visibility(FollowedByType::No)?)
++                } else {
++                    None
++                };
++                // Consume the modifier run, synthesizing the matching attrs.
++                let mut synth: ThinVec<Attribute> = ThinVec::new();
++                while is_class_modifier(&self.token) {
++                    let is_virtual = self.token.is_keyword(kw::Virtual);
++                    let is_override = self.token.is_keyword(kw::Override);
++                    let sp = self.token.span;
++                    self.bump();
++                    // `virtual` and `override` are both virtual member fns;
++                    // `override` additionally carries the verify-override
++                    // marker. `constructor` maps to `#[constructor]`.
++                    let mut emit = |name| {
++                        synth.push(rustc_ast::attr::mk_attr_word(
++                            &self.psess.attr_id_generator,
++                            ast::AttrStyle::Outer,
++                            ast::Safety::Default,
++                            name,
++                            sp,
++                        ));
++                    };
++                    if is_virtual || is_override {
++                        emit(sym::cpp_virtual);
++                    }
++                    if is_override {
++                        emit(sym::rustc_cxx_override);
++                    }
++                    if !is_virtual && !is_override {
++                        emit(sym::constructor);
++                    }
++                }
++                let fn_parse_mode = FnParseMode {
++                    req_name: |_, _| true,
++                    context: FnContext::Impl,
++                    req_body: true,
++                };
++                let assoc = self.parse_assoc_item(fn_parse_mode, ForceCollect::No)?;
++                match assoc {
++                    Some(Some(mut item)) => {
++                        if let Some(vis) = saved_vis {
++                            item.vis = vis;
++                        }
++                        item.attrs.extend(synth);
++                        methods.push(item);
++                        saw_method = true;
++                    }
++                    Some(None) | None => {
++                        return Err(self.dcx().struct_span_err(
++                            self.token.span,
++                            "expected a method inside `class` body",
++                        ));
++                    }
++                }
++                continue;
++            }
++
+             if looks_like_method {
+                 // Delegate to the existing fn/assoc-item machinery
+                 // so outer attributes and tokens are handled
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+index 73d1fff3163..bbb7731d73e 100644
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -21,7 +21,7 @@
+     ReprAttr, SanitizerSet,
+ };
+ use rustc_hir::def::DefKind;
+-use rustc_hir::def_id::LocalModDefId;
++use rustc_hir::def_id::{DefId, LocalModDefId};
+ use rustc_hir::intravisit::{self, Visitor};
+ use rustc_hir::{
+     self as hir, Attribute, CRATE_HIR_ID, Constness, FnSig, ForeignItem, GenericParamKind, HirId,
+@@ -228,6 +228,9 @@ fn check_attributes(
+                 Attribute::Parsed(AttributeKind::OnMove { span, directive }) => {
+                     self.check_diagnostic_on_move(*span, hir_id, target, directive.as_deref())
+                 },
++                &Attribute::Parsed(AttributeKind::RustcCxxOverride(attr_span)) => {
++                    self.check_cxx_override(hir_id, attr_span, target)
++                }
+                 Attribute::Parsed(
+                     // tidy-alphabetical-start
+                     AttributeKind::RustcAllowIncoherentImpl(..)
+@@ -774,6 +777,65 @@ fn check_sanitize(
+         });
+     }
+ 
++    /// Verify-override check for the `override` method modifier in a
++    /// `class` body (P09.x / 1.13.5). `override fn m` desugars to
++    /// `#[cpp_virtual] #[rustc_cxx_override] fn m`; this confirms that
++    /// some class in the polymorphic base chain declares a virtual
++    /// method named `m`. If none does, the `override` is a no-op that
++    /// silently *adds* a new vtable slot (because override-matching is
++    /// by name) — exactly the footgun C++'s `override` exists to catch
++    /// — so we make it a hard error.
++    fn check_cxx_override(&self, hir_id: HirId, attr_span: Span, target: Target) {
++        // The attribute parser already restricts placement to inherent
++        // methods; bail defensively on anything else.
++        if !matches!(target, Target::Method(MethodKind::Inherent)) {
++            return;
++        }
++        let tcx = self.tcx;
++        let method_did = hir_id.owner.def_id.to_def_id();
++        // Parent of an inherent assoc fn is its `impl`; the impl's Self
++        // type is the class ADT we walk the base chain of.
++        let impl_did = tcx.local_parent(hir_id.owner.def_id).to_def_id();
++        let ty::Adt(adt, _) = tcx.type_of(impl_did).skip_binder().kind() else {
++            return;
++        };
++        let method_name = tcx.item_name(method_did);
++
++        // Walk the polymorphic base chain looking for a virtual with
++        // the same name. Mirrors `polymorphic_base_of_class` /
++        // `virtual_methods_on_class` in rustc_symbol_mangling (kept
++        // local to avoid a crate dependency from rustc_passes).
++        let mut cursor = cxx_polymorphic_base_of(tcx, adt.did());
++        let mut overrides_base = false;
++        while let Some(base_did) = cursor {
++            if cxx_virtual_methods_on(tcx, base_did)
++                .into_iter()
++                .any(|m| tcx.item_name(m) == method_name)
++            {
++                overrides_base = true;
++                break;
++            }
++            cursor = cxx_polymorphic_base_of(tcx, base_did);
++        }
++
++        if !overrides_base {
++            self.tcx
++                .dcx()
++                .struct_span_err(
++                    attr_span,
++                    format!(
++                        "method `{method_name}` is marked `override` but does not \
++                         override a virtual method from a base class"
++                    ),
++                )
++                .with_help(
++                    "use `virtual` instead to declare a new virtual method, or check \
++                     that a base class declares a `virtual` method with this name",
++                )
++                .emit();
++        }
++    }
++
+     /// Checks if `#[naked]` is applied to a function definition.
+     fn check_naked(&self, hir_id: HirId, target: Target) {
+         match target {
+@@ -2076,6 +2138,39 @@ pub(crate) fn provide(providers: &mut Providers) {
+     *providers = Providers { check_mod_attrs, ..*providers };
+ }
+ 
++/// The polymorphic base ADT of a `#[repr(cpp)]` class, if its first
++/// field carries `#[rustc_cxx_base]`. Local copy of
++/// `rustc_symbol_mangling::itanium::polymorphic_base_of_class` (which
++/// rustc_passes does not depend on). Used by the `override`
++/// verify-override check.
++fn cxx_polymorphic_base_of(tcx: TyCtxt<'_>, adt_did: DefId) -> Option<DefId> {
++    let adt = tcx.adt_def(adt_did);
++    let variant = adt.variants().iter().next()?;
++    let first = variant.fields.raw.first()?;
++    if !find_attr!(tcx, first.did, RustcCxxBase(..)) {
++        return None;
++    }
++    match tcx.type_of(first.did).skip_binder().kind() {
++        ty::Adt(base_adt, _) => Some(base_adt.did()),
++        _ => None,
++    }
++}
++
++/// The inherent methods of `adt_did` that carry `#[cpp_virtual]`.
++/// Local copy of `rustc_symbol_mangling::itanium::
++/// virtual_methods_on_class` (membership-only; order irrelevant here).
++fn cxx_virtual_methods_on(tcx: TyCtxt<'_>, adt_did: DefId) -> Vec<DefId> {
++    let mut out = Vec::new();
++    for impl_did in tcx.inherent_impls(adt_did).iter().copied() {
++        for m in tcx.associated_item_def_ids(impl_did).iter().copied() {
++            if tcx.def_kind(m) == DefKind::AssocFn && find_attr!(tcx, m, RustcCxxVirtual(..)) {
++                out.push(m);
++            }
++        }
++    }
++    out
++}
++
+ fn doc_fake_variadic_is_allowed_self_ty(self_ty: &hir::Ty<'_>) -> bool {
+     matches!(&self_ty.kind, hir::TyKind::Tup([_]))
+         || if let hir::TyKind::FnPtr(fn_ptr_ty) = &self_ty.kind {
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index c1319d4df42..64a356aef04 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -1739,6 +1739,7 @@
+         // Internal attributes (no public rename target).
+         rustc_cxx_base,
+         rustc_cxx_drop_wrapper,
++        rustc_cxx_override,
+         rustc_cxx_throws,
+         rustc_cxx_throws_msvc_typedescs,
+         rustc_cxx_throws_typeinfos,
+-- 
+2.50.1 (Apple Git-155)
+

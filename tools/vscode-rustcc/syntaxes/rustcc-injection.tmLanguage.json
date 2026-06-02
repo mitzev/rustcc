@@ -5,6 +5,7 @@
   "injectionSelector": "L:source.rust",
   "patterns": [
     { "include": "#class-keyword" },
+    { "include": "#class-method-modifiers" },
     { "include": "#extern-cpp-string" },
     { "include": "#extern-swift-string" },
     { "include": "#rustcc-attributes" },
@@ -12,6 +13,13 @@
     { "include": "#rustcc-cxx-throws-typeinfos-attr" }
   ],
   "repository": {
+    "class-method-modifiers": {
+      "comment": "P09.x / v1.13.5: C++-style method-modifier keywords inside a `class` body — `(pub)? (virtual|override|constructor)* fn`. A modifier is highlighted only when its run ends in `fn`, so a field literally named `constructor` (followed by `:`) is NOT highlighted. `virtual`/`override` are reserved Rust keywords; `constructor` is contextual.",
+      "match": "\\b(virtual|override|constructor)\\b(?=\\s+(?:(?:virtual|override|constructor)\\s+)*fn\\b)",
+      "captures": {
+        "1": { "name": "keyword.other.rustcc.method-modifier storage.modifier.rust" }
+      }
+    },
     "class-keyword": {
       "comment": "Highlight `class` / `pub class` as a keyword. Stock Rust treats `class` as an identifier; rustcc's fork promotes it to a contextual keyword.",
       "match": "\\b(class)\\s+([A-Z][A-Za-z0-9_]*)",
@@ -38,7 +46,7 @@
     },
     "rustcc-attributes": {
       "comment": "Bare attribute names that the fork understands. `rustc_cxx_throws` (P09.60+) marks a foreign fn as a C++ throwing function so the fork's codegen lowers it to LLVM invoke + landingpad.",
-      "match": "(#\\[)(cpp_virtual|constructor|swift_throws|swift_value|rustc_cxx_throws)(\\])",
+      "match": "(#\\[)(cpp_virtual|constructor|swift_throws|swift_value|rustc_cxx_throws|rustc_cxx_override)(\\])",
       "captures": {
         "1": { "name": "punctuation.brackets.attribute.rust" },
         "2": { "name": "support.function.attribute.rustcc" },

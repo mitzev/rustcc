@@ -5,18 +5,16 @@
       "pub class ${1:ClassName} {",
       "    ${2:value}: ${3:i32},",
       "",
-      "    #[constructor]",
-      "    pub fn new(${4:value: i32}) -> Self {",
+      "    constructor fn new(${4:value: i32}) -> Self {",
       "        ${1:ClassName} { ${2:value} }",
       "    }",
       "",
-      "    #[cpp_virtual]",
-      "    pub fn ${5:method_name}(&self) -> ${6:i32} {",
+      "    virtual fn ${5:method_name}(&self) -> ${6:i32} {",
       "        $0",
       "    }",
       "}"
     ],
-    "description": "rustcc class with a constructor and one virtual method (fork-only `class` keyword surface)."
+    "description": "rustcc class with a constructor and one virtual method, using the v1.13.5 method-modifier keywords (`constructor fn` / `virtual fn`). These desugar to #[constructor] / #[cpp_virtual]."
   },
   "rustcc class with inheritance": {
     "prefix": "cppclass-inherit",
@@ -24,18 +22,25 @@
       "pub class ${1:Derived} : ${2:Base} {",
       "    ${3:extra_field}: ${4:i32},",
       "",
-      "    #[constructor]",
-      "    pub fn new(${5:args}) -> Self {",
+      "    constructor fn new(${5:args}) -> Self {",
       "        ${1:Derived} { __base: ${2:Base}::new(), ${3:extra_field} }",
       "    }",
       "",
-      "    #[cpp_virtual]",
-      "    pub fn ${6:override_method}(&self) -> ${7:i32} {",
+      "    override fn ${6:base_virtual_method}(&self) -> ${7:i32} {",
       "        $0",
       "    }",
       "}"
     ],
-    "description": "rustcc class inheriting from a base, with one virtual override."
+    "description": "rustcc class inheriting from a base, overriding a base virtual with `override fn` (verified at compile time: errors if no base virtual of that name exists). Desugars to #[cpp_virtual] + #[rustc_cxx_override]."
+  },
+  "rustcc class method-modifier method": {
+    "prefix": ["virtual-fn", "override-fn", "constructor-fn"],
+    "body": [
+      "${1|constructor,virtual,override,pub virtual,pub override|} fn ${2:name}(&self) -> ${3:i32} {",
+      "    $0",
+      "}"
+    ],
+    "description": "A single class-body method using a v1.13.5 modifier keyword (constructor / virtual / override). `constructor` is contextual; `virtual` / `override` are reserved keywords."
   },
   "cxx_class! macro": {
     "prefix": ["cxxclass", "cxx-class"],

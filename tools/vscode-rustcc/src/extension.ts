@@ -279,16 +279,18 @@ const MAIN_RS_CLASS = `// Scaffolded by \`rustcc: New Project\` (class-keyword s
 pub class Counter {
     n: i64,
 
-    #[constructor]
-    pub fn new() -> Self {
+    // v1.13.5 method-modifier keywords: \`constructor fn\` / \`virtual fn\`
+    // desugar to #[constructor] / #[cpp_virtual]. \`constructor\` is a
+    // contextual keyword; \`virtual\` / \`override\` are reserved keywords.
+    constructor fn new() -> Self {
         Counter { n: 0 }
     }
 
-    pub fn bump(&mut self, by: i64) {
+    virtual fn bump(&mut self, by: i64) {
         self.n += by;
     }
 
-    pub fn value(&self) -> i64 {
+    virtual fn value(&self) -> i64 {
         self.n
     }
 }

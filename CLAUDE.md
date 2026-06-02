@@ -37,29 +37,37 @@ root needs:
 #![allow(internal_features)]   // class/ctor/virtual attrs ride rustc_attrs
 ```
 
-Canonical form:
+Canonical form (v1.13.5 method-modifier keywords — `constructor` /
+`virtual` / `override` — preferred on this surface; they desugar to
+`#[constructor]` / `#[cpp_virtual]` and produce identical machine
+code, and the attribute forms still work):
 
 ```rust
 pub class Widget {
     x: i32,
 
-    #[constructor]
-    pub fn new(x: i32) -> Self { Self { x } }
+    constructor fn new(x: i32) -> Self { Self { x } }
 
-    #[cpp_virtual]
-    pub fn poke(&self) -> i32 { self.x }
+    virtual fn poke(&self) -> i32 { self.x }
 }
 
 // Single inheritance — the parser synthesizes a `__base` field:
 pub class Derived : Base {
     extra: i32,
 
-    #[constructor]
-    pub fn new(x: i32, extra: i32) -> Self {
+    constructor fn new(x: i32, extra: i32) -> Self {
         Self { __base: Base::new(x), extra }
     }
+
+    // `override` is verified: a compile error if no base virtual of
+    // this name exists (desugars to #[cpp_virtual] + #[rustc_cxx_override]).
+    override fn poke(&self) -> i32 { self.__base.x + self.extra }
 }
 ```
+
+`constructor` is a contextual keyword (a field named `constructor`
+still parses); `virtual` / `override` are reserved keywords. You can't
+mix a keyword modifier with the matching attribute on one method.
 
 Use **`cxx_class!`** (proc macro from `rustcc_macros`) *instead* when
 the code must also compile on stock / nightly rustc (graceful

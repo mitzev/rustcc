@@ -3376,6 +3376,52 @@ must all pass on both `aarch64-apple-darwin` and
 
 ---
 
+## P09.80 — `class`-body method-modifier keywords (1.13.5)
+
+**Patch:** `37-class-method-keywords.patch`.
+
+Adds C++-style method modifiers inside a `class` body —
+`(pub)? (virtual | override | constructor)* fn …` — as pure parser
+sugar over the existing attributes (emitted IR is byte-identical):
+
+- `constructor` → `#[constructor]` (a **contextual** keyword: only a
+  modifier when a method follows, so a field named `constructor` still
+  parses);
+- `virtual` → `#[cpp_virtual]` (reserved keyword);
+- `override` → `#[cpp_virtual]` + `#[rustc_cxx_override]` (reserved
+  keyword; the marker drives the verify-override check).
+
+**Parser** (`parse_cxx_class_item`, `rustc_parse`): before the
+field/method decision, detect a `(pub)? <modifier>+ fn` run, consume an
+optional leading `pub`, then the modifier run (synthesizing the
+matching attributes via `mk_attr_word`), and delegate the rest to
+`parse_assoc_item`, grafting the saved visibility + synthesized attrs
+onto the finished item. Combining a keyword modifier with an explicit
+attribute on the same method is a hard error.
+
+**New attribute `#[rustc_cxx_override]`** — a no-args internal marker
+wired exactly like `#[cpp_virtual]`/`#[rustc_cxx_base]`: `sym`,
+`AttributeKind::RustcCxxOverride`, cross-crate `Yes`, a
+`rustcc_noargs_attr!` parser + `context.rs` registration, a
+`builtin_attrs` entry, and a `check_attr` dispatch arm.
+
+**Verify-override** (`check_attr`): for a method carrying
+`#[rustc_cxx_override]`, walk the polymorphic base chain (local copies
+of `polymorphic_base_of_class` / `virtual_methods_on_class` from
+`rustc_symbol_mangling::itanium`, to avoid a crate dependency) and
+error if no base virtual of the same name exists. This catches the
+footgun where a misspelled override silently appends a *new* vtable
+slot (overrides are matched by name in `virtuals_on_chain`).
+
+**Validation:** `fork/tests/class_keyword/keyword_modifiers` (probe
+matrix 10/10); keyword forms emit byte-identical LLVM IR to the
+attribute forms; `override` errors on a non-overriding name and on a
+base-less class. Editor: VS Code grammar/snippets/scaffold (ext
+v0.1.4) + rust-analyzer fork patch 13 (`CONSTRUCTOR_KW` contextual
+keyword + modifier-run parsing; `parser`/`syntax` suites green).
+
+---
+
 ## Build & test
 
 See [`build.sh`](build.sh) and [`VERIFY.md`](VERIFY.md). Expected

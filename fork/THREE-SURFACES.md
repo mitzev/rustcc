@@ -109,11 +109,11 @@ pub class Widget {
     x: i32,
     y: i32,
 
-    pub fn new(x: i32, y: i32) -> Self {
+    constructor fn new(x: i32, y: i32) -> Self {
         Self { x, y }
     }
 
-    pub fn sum(&self) -> i32 {
+    virtual fn sum(&self) -> i32 {
         self.x + self.y
     }
 }
@@ -125,8 +125,12 @@ Supports single inheritance directly in the syntax:
 pub class Derived : Base {
     extra: i32,
 
-    pub fn new(x: i32, extra: i32) -> Self {
+    constructor fn new(x: i32, extra: i32) -> Self {
         Self { __base: Base::new(x), extra }
+    }
+
+    override fn sum(&self) -> i32 {
+        self.__base.x + self.extra
     }
 }
 ```
@@ -134,6 +138,33 @@ pub class Derived : Base {
 The parser synthesizes a `__base: Base` field with
 `#[rustc_cxx_base]` so downstream layout and vtable emission
 recognizes the polymorphic base subobject automatically.
+
+### Method-modifier keywords (v1.13.5)
+
+Inside a `class` body you may write C++-style method modifiers
+instead of the attribute forms — `(pub)? (virtual | override |
+constructor)* fn`:
+
+| Keyword       | Desugars to                            | Notes                                            |
+|---------------|----------------------------------------|--------------------------------------------------|
+| `constructor` | `#[constructor]`                       | Contextual keyword — a field named `constructor` still parses |
+| `virtual`     | `#[cpp_virtual]`                       | Reserved keyword                                 |
+| `override`    | `#[cpp_virtual]` + `#[rustc_cxx_override]` | Reserved keyword; **verified** — see below   |
+
+These are pure parser sugar: they produce byte-identical machine
+code to the attribute forms, so all downstream layout/codegen is
+unchanged. `override` additionally triggers a **verify-override
+check** — it is a hard compile error if the method does not
+override a virtual declared by some class in the polymorphic base
+chain (matched by name). That catches the footgun where a
+misspelled override silently *adds* a new vtable slot instead of
+replacing the base's (overrides are matched by name).
+
+You cannot combine a keyword modifier with the matching attribute
+on the same method (`#[cpp_virtual] virtual fn …` is an error) —
+pick one form. The attribute forms remain fully supported; the
+keywords are the lowest-boilerplate option and mirror C++ at the
+declaration site.
 
 **Use when**:
 - You want the cleanest possible syntax — mirrors C++ at the
@@ -186,15 +217,19 @@ rename table. Common user-facing attributes:
 
 | User attribute    | Works on which surface?          | Purpose                                             |
 |-------------------|----------------------------------|-----------------------------------------------------|
-| `#[constructor]`  | `cxx_class!`, `cxx_class_native!`| Marks a method as `Foo::Foo(...)` in C++ mangling   |
+| `#[constructor]`  | All three                        | Marks a method as `Foo::Foo(...)` in C++ mangling   |
 | `#[cpp_virtual]`  | All three                        | Adds a slot in the vtable; overridable              |
 | `#[operator]`     | All three                        | Operator overload (`op_add` → `operator+`, etc.)    |
 | `#[swift_type]`   | `swift_value!` macro             | Marks a type as `#[repr(swift)]`                    |
 | `#[swift_symbol]` | `swift_value!` macro             | Swift demangled name for a foreign item             |
 
-The parser `class` keyword doesn't need `#[constructor]` because
-it uses Rust's normal `Self::new(...)` convention, which the
-parser-level sugar translates to the Itanium ctor mangling.
+On the `class` keyword surface, the `constructor` / `virtual` /
+`override` method-modifier keywords (v1.13.5) are equivalent to
+the `#[constructor]` / `#[cpp_virtual]` attributes and are usually
+preferred there — see *Method-modifier keywords* above. The class
+keyword also accepts a bare `Self::new(...)` without `#[constructor]`
+(the parser sugar applies the Itanium ctor mangling), but spelling
+`constructor fn new` makes the intent explicit.
 
 ---
 
