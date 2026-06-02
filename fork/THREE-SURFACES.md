@@ -163,11 +163,10 @@ derived one wins — C++ name-hiding), and `self.__base.member` still
 works for explicit access. Because it's plain autoderef, the emitted
 code is just a field projection at offset 0 — no runtime cost.
 
-> Editor note: rust-analyzer (fork) does not yet resolve the
-> transparent form in its native `class` model, so `self.base_member`
-> may show an unresolved-field/method diagnostic in the editor even
-> though it compiles. Use `self.__base.member` for editor-clean code
-> until the RA follow-up lands.
+> Editor support: the patched rust-analyzer (fork) resolves the
+> transparent form too (v1.13.6 RA patch 14) — `self.base_member` gets
+> hover, go-to-def, no false "unresolved" diagnostic, and base
+> fields/methods appear in dot-completion on a derived receiver.
 
 ### Method-modifier keywords (v1.13.5)
 

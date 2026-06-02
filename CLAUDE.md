@@ -73,8 +73,9 @@ mix a keyword modifier with the matching attribute on one method.
 **Transparent base access (v1.13.6):** a derived `class D : B` gets
 auto-synthesized `Deref`/`DerefMut` to its `__base`, so base members
 are reachable as `self.member` (no `self.__base.` prefix) and `&D`
-upcasts to `&B`. `self.__base.member` still works. (rust-analyzer
-doesn't yet resolve the transparent form — editor may flag it.)
+upcasts to `&B`. `self.__base.member` still works. The patched
+rust-analyzer resolves the transparent form too (hover, go-to-def,
+dot-completion of base members).
 
 Use **`cxx_class!`** (proc macro from `rustcc_macros`) *instead* when
 the code must also compile on stock / nightly rustc (graceful

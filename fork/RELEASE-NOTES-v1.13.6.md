@@ -81,15 +81,19 @@ compile, link, and run with correct layouts.
 - Validated additionally: multi-level inheritance, generic bases,
   field shadowing, and correct vptr offsets across all chain shapes.
 
-## Editor support (known limitation)
+## Editor support
 
-rust-analyzer (fork) models `class` natively (not desugared to
-struct + impl), and its class field/method resolution does not yet
-walk the base chain. So the new transparent form (`self.base_member`)
-may show an unresolved-field/method diagnostic **in the editor** even
-though it compiles and runs. Workaround: use `self.__base.member`,
-which resolves in both. A follow-up will teach the RA fork to resolve
-the transparent form.
+The patched **rust-analyzer** (fork, RA patch 14) resolves the
+transparent form too. RA models `class` natively (not desugared to
+struct + impl), so its field resolution + dot-completion now walk the
+`#[rustc_cxx_base]` base chain directly (`hir_ty::class_base_ty` +
+`resolve_class_field_chain` + `hir::Type::fields`). Result:
+`self.base_member` gets hover, go-to-definition, no false "unresolved"
+diagnostic, and base fields/methods appear in dot-completion on a
+derived receiver. (Method resolution already walked the base, so base
+methods worked before; this release adds the field side.) New
+inference + completion regression tests cover base fields, multi-level
+chains, generic bases, and shadowing.
 
 ## Toolchain
 

@@ -3467,9 +3467,14 @@ base used to fail to link or miscompute its vptr):
 
 **Validation:** `fork/tests/class_keyword/base_member_access` (probe
 matrix 11/11); multi-level + generic bases + field shadowing; non-poly
-base + first-virtual-in-derived links with correct offsets. Editor:
-rust-analyzer transparent-form resolution is a documented follow-up
-(RA models `class` natively; `self.__base.member` resolves meanwhile).
+base + first-virtual-in-derived links with correct offsets.
+
+**Editor (RA patch 14, `fork/ra-patches/14-ra-class-transparent-base`):**
+RA models `class` natively, so its field resolution + dot-completion
+walk the base chain (`hir_ty::class_base_ty` + `resolve_class_field_chain`
++ `hir::Type::fields`). `self.base_member` gets hover, go-to-def, and
+completion; method resolution already walked the base. hir-ty (976) +
+ide-completion (730) suites green.
 
 ---
 
