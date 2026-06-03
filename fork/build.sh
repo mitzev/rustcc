@@ -20,7 +20,13 @@ WS_ROOT="$(cd "$FORK_DIR/.." && pwd)"
 # Full upstream SHA the patch series is authored against. GitHub's
 # uploadpack only resolves full 40-char SHAs for fetch-by-sha, so a short
 # prefix here will cause `git fetch` to fail.
-PINNED_COMMIT="${PINNED_COMMIT:-e22c616e4e87914135c1db261a03e0437255335e}"
+#
+# v1.13.8: the fork is now based on **Rust 1.96.0 stable** (the current
+# official release) rather than a 1.97.0-dev master snapshot — see
+# fork/MIGRATION-1.96.0.md. To build against the old 1.97-dev base,
+# `PINNED_COMMIT=e22c616e4e87914135c1db261a03e0437255335e PATCHES_DIR=patches-1.97dev ./fork/build.sh`.
+PINNED_COMMIT="${PINNED_COMMIT:-ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96}"
+PATCHES_DIR="${PATCHES_DIR:-patches}"
 
 CLONE_DIR="${CLONE_DIR:-$HOME/rust-lang-rust-fork}"
 APPLY_ONLY=0
@@ -62,7 +68,7 @@ echo "==> applying rustcc patches"
   if ! git config --get user.name >/dev/null 2>&1; then
     git config user.name "rustcc-build"
   fi
-  for patch in "$FORK_DIR"/patches/*.patch; do
+  for patch in "$FORK_DIR"/"$PATCHES_DIR"/*.patch; do
     echo "    apply $(basename "$patch")"
     if ! git am --3way "$patch"; then
       echo "==> patch $(basename "$patch") failed to apply; aborting" >&2
@@ -109,10 +115,16 @@ text = re.sub(r'^#?\s*assertions\s*=.*$', 'assertions = false', text, flags=re.M
 if not text.endswith('\n'):
     text += '\n'
 text += (
-    '\n# rustcc fork override - see fork/build.sh for why the\n'
-    '# pinned upstream commit can no longer use the CI LLVM.\n'
+    '\n# rustcc fork override (v1.13.8, Rust 1.96.0 base).\n'
+    '# 1.96.0 is a tagged release -> its CI LLVM artifact exists, so\n'
+    '# download it instead of building LLVM from source (much faster).\n'
+    '# 1.96.0 is a *stable* channel, which forbids `#![feature(...)]`;\n'
+    '# the fork needs `feature(rustc_attrs)`, so force the nightly\n'
+    '# channel on the built toolchain.\n'
     '[llvm]\n'
-    'download-ci-llvm = false\n'
+    'download-ci-llvm = true\n'
+    '[rust]\n'
+    'channel = "nightly"\n'
 )
 with open(path, 'w', encoding='utf-8') as f: f.write(text)
 PY
@@ -125,10 +137,13 @@ fi
 if ! grep -q "^# rustcc fork override" "$CLONE_DIR/bootstrap.toml"; then
   # ASCII-only — see Windows-cp1252 caveat in the python block above.
   {
-    printf '\n# rustcc fork override - see fork/build.sh for why the\n'
-    printf '# pinned upstream commit can no longer use the CI LLVM.\n'
+    printf '\n# rustcc fork override (v1.13.8, Rust 1.96.0 base).\n'
+    printf '# Release tag -> CI LLVM exists (faster); stable channel\n'
+    printf '# forbids feature gates, so force nightly for the toolchain.\n'
     printf '[llvm]\n'
-    printf 'download-ci-llvm = false\n'
+    printf 'download-ci-llvm = true\n'
+    printf '[rust]\n'
+    printf 'channel = "nightly"\n'
   } >> "$CLONE_DIR/bootstrap.toml"
 fi
 

@@ -1,35 +1,43 @@
 # Migrating the rustcc fork to Rust 1.96.0
 
 This documents a completed, validated rebase of the fork patch series
-from its current base (1.97.0-dev master) onto the **1.96.0 stable**
-release. The result lives in [`fork/patches-1.96.0/`](patches-1.96.0/)
-(42 patches), separate from the in-use [`fork/patches/`](patches/) so
-the current release path is undisturbed.
+from the 1.97.0-dev master snapshot onto the **1.96.0 stable** release.
+
+**As of v1.13.8 this is the active base.** The 42-patch 1.96.0 series
+is now [`fork/patches/`](patches/) (what `fork/build.sh` applies by
+default); the previous 41-patch 1.97-dev series is archived under
+[`fork/patches-1.97dev/`](patches-1.97dev/). To build against the old
+1.97-dev base, see "How to build on 1.97-dev" below.
 
 ## Direction note
 
-The fork normally tracks **1.97.0-dev** (master commit
+The fork was developed against **1.97.0-dev** (master commit
 `e22c616e4e87914135c1db261a03e0437255335e`, 2026-04-19 — the
 `introduce-unnormalized` commit `#155083`). **1.96.0 stable**
 (`ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96`, released 2026-05-25)
 branched from master earlier and is therefore a *sibling, slightly
-older* lineage — this is a lateral/backward re-pin, not an upgrade. If
-the goal is simply "build on a released, reproducible toolchain,"
-**1.97.0 (≈early July) is the cheaper target** since the fork already
-tracks 1.97-dev. Use 1.96.0 only if a downstream consumer is pinned to
-it.
+older* lineage. v1.13.8 pins 1.96.0 deliberately: it is the **current
+official stable release**, so rustcc tracks a real, reproducible
+toolchain that downstream consumers can pin until 1.97.0 ships
+(≈early July), at which point re-pinning to 1.97 is the cheaper target
+since the 1.97-dev series is preserved under `fork/patches-1.97dev/`.
 
-## How to build on 1.96.0
+## How to build (default — 1.96.0)
 
-In `fork/build.sh` (or a copy):
+`fork/build.sh` already defaults to the 1.96.0 base and applies
+`fork/patches/`; a plain `./fork/build.sh` is all that's needed. It sets
+`PINNED_COMMIT=ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96` and
+`PATCHES_DIR=patches`.
+
+### How to build on 1.97-dev
 
 ```sh
-PINNED_COMMIT=ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96   # 1.96.0
-# apply fork/patches-1.96.0/*.patch  (instead of fork/patches/)
+PINNED_COMMIT=e22c616e4e87914135c1db261a03e0437255335e \
+  PATCHES_DIR=patches-1.97dev ./fork/build.sh
 ```
 
 The 1.96.0 checkout's `bootstrap.toml` needs two settings the master
-pin doesn't:
+pin doesn't (`fork/build.sh` now writes both automatically):
 
 ```toml
 [rust]
