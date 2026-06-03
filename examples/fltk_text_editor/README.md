@@ -43,6 +43,48 @@ You should see an 800x600 window with a banner comment in a code-style monospace
 > dedup). Tracking the remaining work to a green editor build as a
 > follow-up.
 
+## Subclassing an FLTK widget from Rust (v1.13.7)
+
+Before v1.13.7 this example could only *compose* FLTK widgets (hold a
+C++ object and call its methods). As of v1.13.7 the fork supports the
+other direction — a Rust `class` that **subclasses** an imported C++
+polymorphic widget and overrides its virtuals, with C++ dispatching
+into the Rust override and `delete` running the Rust `Drop`:
+
+```rust
+// Fl_Widget is imported by gen_bindings; cxx_importer emits the
+// #[rustc_cxx_imported_vtable] attribute (carrying its virtual slots +
+// virtual destructor) that lets rustcc extend the C++ vtable.
+pub class MyButton : Fl_Widget {
+    clicks: u32,
+
+    pub constructor fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        MyButton { __base: Fl_Widget::new(x, y, w, h), clicks: 0 }
+    }
+
+    // FLTK calls handle()/draw() through an Fl_Widget* — they land here.
+    pub override fn handle(&mut self, event: i32) -> i32 { self.clicks += 1; 1 }
+    pub override fn draw(&self) { /* custom drawing */ }
+}
+```
+
+When FLTK owns the widget (added to a group) and `delete`s it, the Rust
+`Drop` runs and the storage is reclaimed — see `docs/repr_cpp.md §5`.
+
+**Runnable, tested proof of the mechanism:** `examples/subclass_cpp_base/`
+exercises exactly this (override of a concrete *and* a pure virtual,
+plus a virtual destructor) end-to-end against a clang-compiled base, on
+`aarch64-apple-darwin` and `x86_64-apple-darwin`.
+
+**Scope note:** v1.13.7 supports **single-level** inheritance from a
+*root* polymorphic base (`class D : Base`, `Base` itself has no
+polymorphic base). FLTK's deeper chains (`Fl_Text_Editor → Fl_Text_Display
+→ Fl_Group → Fl_Widget`) and multiple inheritance are a follow-up; a Rust
+subclass should target a root FLTK base (e.g. `Fl_Widget`) for now. The
+full GUI editor bin (step 2) is still being reconciled with the importer
+(see the status note above), so this section documents the pattern; the
+self-contained proof lives in `subclass_cpp_base`.
+
 ## File layout
 
 ```
