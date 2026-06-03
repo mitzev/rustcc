@@ -3376,13 +3376,25 @@ must all pass on both `aarch64-apple-darwin` and
 
 ---
 
+### Patch-series backfill (1.13.5 / 1.13.6)
+
+Patches **37–38** export two fork commits that prior host-side releases
+left un-exported, so the v1.13.7 toolchain finally ships them:
+
+- **37 (`37-cxx-class-method-keywords`)** — P09.x (1.13.5): `class`-body
+  `virtual` / `override` / `constructor` method-modifier keywords +
+  verify-override (`#[rustc_cxx_override]`).
+- **38 (`38-cxx-transparent-base-access`)** — P09.x (1.13.6): transparent
+  base-member access via synthesized `Deref`/`DerefMut` + RTTI/layout
+  fixes for the `__base` subobject.
+
 ### P09.x (1.13.7) — Subclass an imported C++ class + virtual destructor
 
-Patches **37–39**. A Rust `class Derived : CppBase` may now inherit from
+Patches **39–41**. A Rust `class Derived : CppBase` may now inherit from
 an *imported* C++ polymorphic class with cross-boundary virtual dispatch
 **and a virtual destructor**.
 
-- **37 (`37-cxx-subclass-imported-base`)** — new attribute
+- **39 (`39-cxx-subclass-imported-base`)** — new attribute
   `#[rustc_cxx_imported_vtable = "<spec>"]` (`rustc_span` symbol,
   `rustc_hir` `AttributeKind`, `rustc_attr_parsing` `NameValueStr`
   parser on `Target::Struct`, `rustc_feature` builtin registration). The
@@ -3396,7 +3408,7 @@ an *imported* C++ polymorphic class with cross-boundary virtual dispatch
   `_ZTV`/`_ZTI`/`_ZTS`. `rustc_ty_to_cxx` maps an imported base by name
   so it can appear in C++-mangled signatures (the auto-`Deref`).
 
-- **38 (`38-cxx-virtual-destructor`)** — `vdtor=1` in the spec marks a
+- **40 (`40-cxx-virtual-destructor`)** — `vdtor=1` in the spec marks a
   virtual destructor; `chain_has_virtual_dtor` walks the chain.
   `emit_vtable` prepends the two leading Itanium dtor slots (complete
   `D1` = `drop_in_place::<D>`, deleting `D0` = a thunk running
@@ -3407,7 +3419,7 @@ an *imported* C++ polymorphic class with cross-boundary virtual dispatch
   root for such classes (the vtable reference is invisible to lazy
   collection).
 
-- **39 (`39-msvc-cxx-virtual-dtor-slot`)** — MSVC analogue: a single
+- **41 (`41-msvc-cxx-virtual-dtor-slot`)** — MSVC analogue: a single
   scalar-deleting destructor (`??_G`-shaped `void*(this, flags)` thunk)
   in the vftable's leading dtor slot, via the shared ABI-aware
   `cxx_dtor_slots`.

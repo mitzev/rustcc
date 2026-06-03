@@ -1,0 +1,577 @@
+From eee9107a31de58b758fc404d4f3a431f8c666be8 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Wed, 3 Jun 2026 02:10:49 +0300
+Subject: [PATCH 38/41] P09.x (1.13.6): transparent base-member access via
+ auto-Deref + RTTI/layout fixes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Transparent base-member access for `class D : B { ... }`:
+`self.member` now reaches B's fields and methods directly (no
+`self.__base.` prefix), and `&D` upcasts to `&B`. The parser
+synthesizes two ordinary trait impls per derived class —
+
+    impl Deref    for D { type Target = B; fn deref(&self)     -> &B     { &self.__base } }
+    impl DerefMut for D {                  fn deref_mut(&mut self) -> &mut B { &mut self.__base } }
+
+— stored in `ast::Class::deref_impls` as complete AST items. They flow
+through the normal def-collection / resolve / lowering paths (no custom
+HIR synthesis): expansion fills their `DUMMY_NODE_ID`s, def_collector
+visits them, `index_crate` registers them as owners via the Class walk,
+`lower_item_ref` emits their `ItemId`s, and `resolve_item` resolves
+them as module-scope siblings. Field/method access and upcasting then
+fall out of Rust's existing autoderef — emitted code is just a field
+projection at offset 0.
+
+Plumbing: `ast::Class` gains `deref_impls`; the AST visitor, parser
+(`build_cxx_class_deref_impls`), def_collector, ast_lowering
+(`lower_item_ref` + the two struct/pretty destructures), and resolve
+are updated. New `sym::DerefMut`.
+
+RTTI + layout fixes (a class deriving from a NON-polymorphic base used
+to fail to link / miscompute its vptr):
+- `is_polymorphic_cpp_class` (itanium + the cxx_bridge mirror) now
+  recurses the base chain: a `#[rustc_cxx_base]` to a non-polymorphic
+  base does NOT make the derived class polymorphic. Fixes a dangling
+  `_ZTI` reference ("undefined symbol: typeinfo for Base") when neither
+  class has virtuals.
+- `has_polymorphic_base` (layout) now requires the base to be
+  polymorphic, so a class that introduces the *first* virtual on a
+  plain base correctly adds its own vptr instead of assuming the base
+  provides one (was: garbage field offsets at runtime).
+- `emit_typeinfo` emits a non-polymorphic base's `_ZTS`/`_ZTI` on
+  demand (idempotently, recursing the chain) so a polymorphic derived
+  class's `__si_class_type_info` resolves.
+
+Validated: transparent field read/write + method calls + upcast;
+multi-level inheritance; generic bases; field shadowing (derived wins);
+non-poly-base + first-virtual-in-derived links and computes correct
+offsets. Probe matrix 11/11.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ compiler/rustc_ast/src/ast.rs                 |   9 +
+ compiler/rustc_ast/src/visit.rs               |   7 +
+ compiler/rustc_ast_lowering/src/item.rs       |   8 +
+ .../rustc_ast_pretty/src/pprust/state/item.rs |   1 +
+ compiler/rustc_codegen_llvm/src/cxx_vtable.rs |  44 ++++-
+ compiler/rustc_parse/src/parser/item.rs       | 177 ++++++++++++++++++
+ compiler/rustc_resolve/src/def_collector.rs   |   8 +
+ compiler/rustc_resolve/src/late.rs            |   6 +
+ compiler/rustc_span/src/symbol.rs             |   1 +
+ compiler/rustc_symbol_mangling/src/itanium.rs |  14 +-
+ .../rustc_ty_utils/src/layout/cxx_bridge.rs   |  56 ++++--
+ 11 files changed, 314 insertions(+), 17 deletions(-)
+
+diff --git a/compiler/rustc_ast/src/ast.rs b/compiler/rustc_ast/src/ast.rs
+index d444e612e59..5478909cc29 100644
+--- a/compiler/rustc_ast/src/ast.rs
++++ b/compiler/rustc_ast/src/ast.rs
+@@ -4042,6 +4042,15 @@ pub struct Class {
+     /// Resolution picks up the impl's generic params because
+     /// `resolve_class` pushes the impl rib before walking the self-type.
+     pub self_ty: Box<Ty>,
++    /// P09.x (1.13.6): for `class D : B { ... }`, two parser-synthesized
++    /// trait impls giving transparent base-member access —
++    /// `impl Deref for D { type Target = B; fn deref(&self) -> &B { &self.__base } }`
++    /// and the `DerefMut` analogue. Empty for a root class. These are
++    /// complete `ast::Item`s with `DUMMY_NODE_ID`s; expansion assigns
++    /// fresh ids, def_collector creates their defs, and they lower via
++    /// the ordinary `impl` path, so `self.member` reaches base members
++    /// through Rust's existing autoderef.
++    pub deref_impls: ThinVec<Box<Item>>,
+ }
+ 
+ // Adding a new variant? Please update `test_item` in `tests/ui/macros/stringify.rs`.
+diff --git a/compiler/rustc_ast/src/visit.rs b/compiler/rustc_ast/src/visit.rs
+index fca7ba7c523..28d0f1718bd 100644
+--- a/compiler/rustc_ast/src/visit.rs
++++ b/compiler/rustc_ast/src/visit.rs
+@@ -987,6 +987,7 @@ pub fn walk_fn<$($lt,)? V: $Visitor$(<$lt>)?>(vis: &mut V, kind: FnKind<$($lt)?
+                 methods,
+                 impl_id,
+                 self_ty,
++                deref_impls,
+             } = self;
+             visit_visitable!($($mut)? vis, impl_id);
+             visit_visitable!($($mut)? vis, ident, generics);
+@@ -994,6 +995,12 @@ pub fn walk_fn<$($lt,)? V: $Visitor$(<$lt>)?>(vis: &mut V, kind: FnKind<$($lt)?
+             visit_visitable!($($mut)? vis, impl_generics);
+             try_visit!(vis.visit_ty(self_ty));
+             visit_visitable_with!($($mut)? vis, methods, AssocCtxt::Impl { of_trait: false });
++            // P09.x (1.13.6): the synthetic Deref/DerefMut impls are
++            // ordinary `impl` items. Walking them as items routes each
++            // through `visit_item`, so expansion assigns fresh node
++            // ids and `index_crate` registers them as owners — they
++            // then lower via the normal `impl` path.
++            visit_visitable!($($mut)? vis, deref_impls);
+             V::Result::output()
+         });
+ 
+diff --git a/compiler/rustc_ast_lowering/src/item.rs b/compiler/rustc_ast_lowering/src/item.rs
+index c8f3d2bd924..575c377b344 100644
+--- a/compiler/rustc_ast_lowering/src/item.rs
++++ b/compiler/rustc_ast_lowering/src/item.rs
+@@ -161,6 +161,13 @@ pub(super) fn lower_mod(
+         // `item_ids` list.
+         if let ItemKind::Class(class) = &i.kind {
+             node_ids.push(hir::ItemId { owner_id: self.owner_id(class.impl_id) });
++            // P09.x (1.13.6): the synthetic Deref/DerefMut impl items
++            // are real owners (registered by `index_crate` via the
++            // Class walk); emit their `ItemId`s so they appear in the
++            // enclosing module's item list and get lowered.
++            for deref_impl in &class.deref_impls {
++                node_ids.push(hir::ItemId { owner_id: self.owner_id(deref_impl.id) });
++            }
+         }
+         node_ids
+     }
+@@ -564,6 +571,7 @@ fn lower_item_kind(
+             }
+             ItemKind::Class(box ast::Class {
+                 ident, generics, impl_generics: _, fields, methods: _, impl_id: _, self_ty: _,
++                deref_impls: _,
+             }) => {
+                 // P09.39: AST-level `class` lowers to two HIR items.
+                 // This branch produces the struct half; the inherent
+diff --git a/compiler/rustc_ast_pretty/src/pprust/state/item.rs b/compiler/rustc_ast_pretty/src/pprust/state/item.rs
+index beebe6de8b2..00f0eef0f5c 100644
+--- a/compiler/rustc_ast_pretty/src/pprust/state/item.rs
++++ b/compiler/rustc_ast_pretty/src/pprust/state/item.rs
+@@ -323,6 +323,7 @@ pub(crate) fn print_item(&mut self, item: &ast::Item) {
+             }
+             ast::ItemKind::Class(box ast::Class {
+                 ident, generics, impl_generics: _, fields, methods, impl_id: _, self_ty: _,
++                deref_impls: _,
+             }) => {
+                 let (cb, ib) = self.head(visibility_qualified(&item.vis, "class"));
+                 self.print_ident(*ident);
+diff --git a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+index 5d242060cc5..568723f95f4 100644
+--- a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
++++ b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+@@ -252,8 +252,21 @@ fn emit_typeinfo<'ll, 'tcx>(
+     };
+ 
+     let initializer = if let Some(base_did) = base_did {
+-        let base_typeinfo_sym = cxx_mangle::mangle_cxx_typeinfo_symbol(tcx, base_did);
+-        let base_typeinfo_ref = cx.declare_global(&base_typeinfo_sym, ptr_ty);
++        // P09.x (1.13.6): a derived class's `__si_class_type_info`
++        // points at the base's `_ZTI`. If the base is polymorphic it
++        // emits its own typeinfo (its metadata pass) — reference it.
++        // But a base may be *non-polymorphic* (no vtable of its own,
++        // e.g. a POD base under a class that adds the first virtual):
++        // nothing else emits its typeinfo, so emit it here (a
++        // `__class_type_info`), recursively up the chain. Without
++        // this, the link fails with "undefined symbol: typeinfo for
++        // Base".
++        let base_typeinfo_ref = if cxx_mangle::is_polymorphic_cpp_class(tcx, base_did) {
++            let base_typeinfo_sym = cxx_mangle::mangle_cxx_typeinfo_symbol(tcx, base_did);
++            cx.declare_global(&base_typeinfo_sym, ptr_ty)
++        } else {
++            ensure_nonpoly_base_typeinfo(cx, tcx, base_did)
++        };
+         cx.const_struct(
+             &[rtti_vtable_addr_point, typeinfo_name, base_typeinfo_ref],
+             false,
+@@ -275,6 +288,33 @@ fn emit_typeinfo<'ll, 'tcx>(
+     gv
+ }
+ 
++/// P09.x (1.13.6): emit the `_ZTS` + `_ZTI` (typeinfo name + typeinfo)
++/// for a **non-polymorphic** base class. Such a base has no vtable, so
++/// its metadata pass (`emit_class_metadata`) never runs — yet a
++/// polymorphic derived class's `__si_class_type_info` references its
++/// `_ZTI`. Emit it here, idempotently (two derived classes may share a
++/// base in one CGU; LinkOnceODR + comdat dedups across CGUs). Recurses
++/// through `emit_typeinfo`, so a chain of non-polymorphic bases all get
++/// their typeinfos.
++fn ensure_nonpoly_base_typeinfo<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    tcx: TyCtxt<'tcx>,
++    adt_did: DefId,
++) -> &'ll Value {
++    let typeinfo_sym = cxx_mangle::mangle_cxx_typeinfo_symbol(tcx, adt_did);
++    if let Some(existing) = cx.get_defined_value(&typeinfo_sym) {
++        return existing;
++    }
++    let class_name = tcx.item_name(adt_did).to_string();
++    let class_name_mangled = mangled_class_ident(&class_name);
++    let typeinfo_name_sym = cxx_mangle::mangle_cxx_typeinfo_name_symbol(tcx, adt_did);
++    let typeinfo_name_gv = match cx.get_defined_value(&typeinfo_name_sym) {
++        Some(v) => v,
++        None => emit_typeinfo_name(cx, &typeinfo_name_sym, &class_name_mangled),
++    };
++    emit_typeinfo(cx, tcx, adt_did, &typeinfo_sym, typeinfo_name_gv)
++}
++
+ fn emit_vtable<'ll, 'tcx>(
+     cx: &CodegenCx<'ll, 'tcx>,
+     adt_did: DefId,
+diff --git a/compiler/rustc_parse/src/parser/item.rs b/compiler/rustc_parse/src/parser/item.rs
+index f41b5797df0..0203d4204ea 100644
+--- a/compiler/rustc_parse/src/parser/item.rs
++++ b/compiler/rustc_parse/src/parser/item.rs
+@@ -2078,6 +2078,165 @@ fn build_cxx_class_self_path(ident: Ident, generics: &Generics) -> ast::Path {
+         ast::Path { span: seg_span, segments: thin_vec![segment], tokens: None }
+     }
+ 
++    /// P09.x (1.13.6): build the synthetic `impl Deref for D` +
++    /// `impl DerefMut for D` items for `class D : B { ... }`. These give
++    /// transparent base-member access: `self.member` reaches `B`'s
++    /// fields/methods through Rust's existing autoderef (the `__base`
++    /// subobject sits at offset 0). Bodies are `&self.__base` /
++    /// `&mut self.__base`. Returned as ordinary AST `impl` items
++    /// (with `DUMMY_NODE_ID`s filled in by expansion) so they lower
++    /// through the normal impl path — no custom HIR synthesis needed.
++    fn build_cxx_class_deref_impls(
++        generics: &Generics,
++        self_ty: &Ty,
++        base_ty: &Ty,
++        span: Span,
++    ) -> ThinVec<Box<Item>> {
++        let inherited_vis = || Visibility {
++            kind: VisibilityKind::Inherited,
++            span: span.shrink_to_lo(),
++            tokens: None,
++        };
++        let empty_where = || WhereClause {
++            has_where_token: false,
++            predicates: ThinVec::new(),
++            span,
++        };
++        let empty_generics =
++            || Generics { params: ThinVec::new(), where_clause: empty_where(), span };
++        // `&[mut] self.__base`
++        let body_addr_of = |mutbl: Mutability| -> Box<Expr> {
++            let self_expr = Box::new(Expr {
++                id: DUMMY_NODE_ID,
++                kind: ExprKind::Path(None, ast::Path::from_ident(Ident::new(kw::SelfLower, span))),
++                span,
++                attrs: ThinVec::new(),
++                tokens: None,
++            });
++            let field_expr = Box::new(Expr {
++                id: DUMMY_NODE_ID,
++                kind: ExprKind::Field(self_expr, Ident::new(sym::__base, span)),
++                span,
++                attrs: ThinVec::new(),
++                tokens: None,
++            });
++            Box::new(Expr {
++                id: DUMMY_NODE_ID,
++                kind: ExprKind::AddrOf(BorrowKind::Ref, mutbl, field_expr),
++                span,
++                attrs: ThinVec::new(),
++                tokens: None,
++            })
++        };
++        // `fn <name>(&[mut] self) -> &[mut] Base { &[mut] self.__base }`
++        let mk_deref_fn = |name: Symbol, mutbl: Mutability| -> Box<AssocItem> {
++            let eself = respan(span, SelfKind::Region(None, mutbl));
++            let self_param =
++                Param::from_self(ThinVec::new(), eself, Ident::new(kw::SelfLower, span));
++            let ret_ty = Box::new(Ty {
++                id: DUMMY_NODE_ID,
++                kind: TyKind::Ref(None, MutTy { ty: Box::new(base_ty.clone()), mutbl }),
++                span,
++                tokens: None,
++            });
++            let block = Box::new(Block {
++                stmts: thin_vec![Stmt {
++                    id: DUMMY_NODE_ID,
++                    kind: StmtKind::Expr(body_addr_of(mutbl)),
++                    span,
++                }],
++                id: DUMMY_NODE_ID,
++                rules: BlockCheckMode::Default,
++                span,
++                tokens: None,
++            });
++            let func = Fn {
++                defaultness: Defaultness::Implicit,
++                ident: Ident::new(name, span),
++                generics: empty_generics(),
++                sig: FnSig {
++                    header: FnHeader {
++                        constness: Const::No,
++                        coroutine_kind: None,
++                        safety: Safety::Default,
++                        ext: Extern::None,
++                    },
++                    decl: Box::new(FnDecl {
++                        inputs: thin_vec![self_param],
++                        output: FnRetTy::Ty(ret_ty),
++                    }),
++                    span,
++                },
++                contract: None,
++                define_opaque: None,
++                body: Some(block),
++                eii_impls: ThinVec::new(),
++            };
++            Box::new(Item {
++                attrs: ThinVec::new(),
++                id: DUMMY_NODE_ID,
++                span,
++                vis: inherited_vis(),
++                kind: AssocItemKind::Fn(Box::new(func)),
++                tokens: None,
++            })
++        };
++        // Trait path `::core::ops::<trait>`.
++        let trait_path = |trait_sym: Symbol| -> ast::Path {
++            let segments = [kw::PathRoot, sym::core, sym::ops, trait_sym]
++                .into_iter()
++                .map(|s| ast::PathSegment {
++                    ident: Ident::new(s, span),
++                    id: DUMMY_NODE_ID,
++                    args: None,
++                })
++                .collect();
++            ast::Path { span, segments, tokens: None }
++        };
++        let mk_impl = |trait_sym: Symbol, items: ThinVec<Box<AssocItem>>| -> Box<Item> {
++            Box::new(Item {
++                attrs: ThinVec::new(),
++                id: DUMMY_NODE_ID,
++                span,
++                vis: inherited_vis(),
++                kind: ItemKind::Impl(Impl {
++                    generics: generics.clone(),
++                    constness: Const::No,
++                    of_trait: Some(Box::new(TraitImplHeader {
++                        defaultness: Defaultness::Implicit,
++                        safety: Safety::Default,
++                        polarity: ImplPolarity::Positive,
++                        trait_ref: TraitRef { path: trait_path(trait_sym), ref_id: DUMMY_NODE_ID },
++                    })),
++                    self_ty: Box::new(self_ty.clone()),
++                    items,
++                }),
++                tokens: None,
++            })
++        };
++        // `type Target = Base;`
++        let target_assoc = Box::new(Item {
++            attrs: ThinVec::new(),
++            id: DUMMY_NODE_ID,
++            span,
++            vis: inherited_vis(),
++            kind: AssocItemKind::Type(Box::new(TyAlias {
++                defaultness: Defaultness::Implicit,
++                ident: Ident::new(sym::Target, span),
++                generics: empty_generics(),
++                after_where_clause: empty_where(),
++                bounds: Vec::new(),
++                ty: Some(Box::new(base_ty.clone())),
++            })),
++            tokens: None,
++        });
++        let deref_impl =
++            mk_impl(sym::Deref, thin_vec![target_assoc, mk_deref_fn(sym::deref, Mutability::Not)]);
++        let deref_mut_impl =
++            mk_impl(sym::DerefMut, thin_vec![mk_deref_fn(sym::deref_mut, Mutability::Mut)]);
++        thin_vec![deref_impl, deref_mut_impl]
++    }
++
+     /// P09.32: peek-only helper — return the 0-based distance
+     /// from `self.token` to the first token that's NOT part of
+     /// any leading outer-attribute groups (`#[...]`*). Used by
+@@ -2156,6 +2315,12 @@ fn parse_cxx_class_item(
+ 
+         let mut fields: ThinVec<FieldDef> = ThinVec::new();
+ 
++        // P09.x (1.13.6): keep a clone of the base type for the Class
++        // node so the lowerer can synthesize `impl Deref/DerefMut for
++        // D` targeting it (transparent base-member access). The
++        // original `base_ty` is moved into the `__base` field below.
++        let class_base_ty: Option<Box<Ty>> = base_ty.clone();
++
+         // Inject `__base: Base` as the first field when derived.
+         if let Some(ty) = base_ty {
+             let base_attr = rustc_ast::attr::mk_attr_word(
+@@ -2387,6 +2552,17 @@ fn parse_cxx_class_item(
+         // struct and impl halves end up with distinct `DefId`s.
+         let impl_generics = generics.clone();
+ 
++        // P09.x (1.13.6): for a derived class, synthesize
++        // `impl Deref/DerefMut for D` targeting the base, giving
++        // transparent base-member access. Built before `generics` /
++        // `self_ty` are moved into the Class node.
++        let deref_impls = match &class_base_ty {
++            Some(base) => {
++                Self::build_cxx_class_deref_impls(&generics, &self_ty, base, ident.span)
++            }
++            None => ThinVec::new(),
++        };
++
+         Ok(ItemKind::Class(Box::new(ast::Class {
+             ident,
+             generics,
+@@ -2395,6 +2571,7 @@ fn parse_cxx_class_item(
+             methods,
+             impl_id: DUMMY_NODE_ID,
+             self_ty,
++            deref_impls,
+         })))
+     }
+ 
+diff --git a/compiler/rustc_resolve/src/def_collector.rs b/compiler/rustc_resolve/src/def_collector.rs
+index 39803fa0728..7c2a9108eda 100644
+--- a/compiler/rustc_resolve/src/def_collector.rs
++++ b/compiler/rustc_resolve/src/def_collector.rs
+@@ -240,6 +240,14 @@ fn visit_item(&mut self, i: &'a Item) {
+                             this.visit_assoc_item(method, AssocCtxt::Impl { of_trait: false });
+                         }
+                     });
++                    // P09.x (1.13.6): the synthetic `impl Deref/DerefMut
++                    // for D` items are ordinary impls living in the
++                    // enclosing module; collect their defs (impl + assoc
++                    // fn + `Target`) under the module parent, exactly as
++                    // hand-written sibling impls would be.
++                    for deref_impl in &class.deref_impls {
++                        this.visit_item(deref_impl);
++                    }
+                     return;
+                 }
+                 visit::walk_item(this, i);
+diff --git a/compiler/rustc_resolve/src/late.rs b/compiler/rustc_resolve/src/late.rs
+index 04219be861f..145bca5e7ea 100644
+--- a/compiler/rustc_resolve/src/late.rs
++++ b/compiler/rustc_resolve/src/late.rs
+@@ -2904,6 +2904,12 @@ fn resolve_item(&mut self, item: &'ast Item) {
+             // `impl<A> Foo<A> { ... }` pair.
+             ItemKind::Class(class) => {
+                 self.resolve_class(item, class);
++                // P09.x (1.13.6): resolve the synthetic Deref/DerefMut
++                // impls as ordinary sibling impls in the module scope
++                // (they live next to the class, not under its ribs).
++                for deref_impl in &class.deref_impls {
++                    self.resolve_item(deref_impl);
++                }
+             }
+ 
+             ItemKind::Impl(Impl { generics, of_trait, self_ty, items: impl_items, .. }) => {
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 64a356aef04..8c7e85aa302 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -213,6 +213,7 @@
+         Debug,
+         Default,
+         Deref,
++        DerefMut,
+         DispatchFromDyn,
+         Display,
+         Dual,
+diff --git a/compiler/rustc_symbol_mangling/src/itanium.rs b/compiler/rustc_symbol_mangling/src/itanium.rs
+index 5a936b711d5..11cdd4b6868 100644
+--- a/compiler/rustc_symbol_mangling/src/itanium.rs
++++ b/compiler/rustc_symbol_mangling/src/itanium.rs
+@@ -237,11 +237,23 @@ pub(crate) fn mangle_dtor_variant<'tcx>(
+ /// declares any virtual methods OR inherits from a polymorphic
+ /// class (single-inheritance chain, marked by
+ /// `#[rustc_cxx_base]` on the first field).
++///
++/// P09.x (1.13.6): inheriting from a base only makes the derived
++/// class polymorphic if the base *chain* is itself polymorphic —
++/// i.e. some ancestor declares a virtual. A `#[rustc_cxx_base]`
++/// pointing at a non-polymorphic base (no vtable) does NOT make the
++/// derived class polymorphic. Walking the chain here keeps the
++/// vtable/typeinfo emitters from emitting a derived `_ZTI` that
++/// references a base typeinfo the base never emits (a link error:
++/// "undefined symbol: typeinfo for Base").
+ pub fn is_polymorphic_cpp_class<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> bool {
+     if !virtual_methods_on_class(tcx, adt_did).is_empty() {
+         return true;
+     }
+-    polymorphic_base_of_class(tcx, adt_did).is_some()
++    match polymorphic_base_of_class(tcx, adt_did) {
++        Some(base_did) => is_polymorphic_cpp_class(tcx, base_did),
++        None => false,
++    }
+ }
+ 
+ /// P09.35: if `adt_did` is a derived class (its first field
+diff --git a/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs b/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
+index 30136684713..85092169dcd 100644
+--- a/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
++++ b/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
+@@ -200,22 +200,47 @@ pub(crate) fn correct_layout<'tcx>(
+     Ok(candidate)
+ }
+ 
+-/// P09.35: true iff the ADT's first declared field carries
+-/// `#[rustc_cxx_base]`. That marker is inserted by the
+-/// `class D : B { ... }` parser sugar and signals the layout
+-/// path "don't add a second vptr slot — base already owns
+-/// offset 0."
++/// The base ADT of a `#[repr(cpp)]` class, if its first declared
++/// field carries `#[rustc_cxx_base]` (the `class D : B { ... }`
++/// marker). Mirrors `rustc_symbol_mangling::itanium::
++/// polymorphic_base_of_class` (rustc_ty_utils can't depend on that
++/// crate — it's downstream).
++fn cxx_base_of<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    adt_did: rustc_hir::def_id::DefId,
++) -> Option<rustc_hir::def_id::DefId> {
++    let adt = tcx.adt_def(adt_did);
++    let variant = adt.variants().get(VariantIdx::ZERO)?;
++    let first = variant.fields.raw.first()?;
++    if !rustc_hir::find_attr!(tcx, first.did, RustcCxxBase(..)) {
++        return None;
++    }
++    match tcx.type_of(first.did).skip_binder().kind() {
++        rustc_middle::ty::Adt(base_adt, _) => Some(base_adt.did()),
++        _ => None,
++    }
++}
++
++/// P09.35 / P09.x (1.13.6): true iff this class inherits a vptr from
++/// a base — i.e. its first field is `#[rustc_cxx_base]` AND that base
++/// is itself polymorphic (has a vtable). A `#[rustc_cxx_base]`
++/// pointing at a *non-polymorphic* base provides no vptr, so the
++/// derived class must add its own (it isn't "inheriting" one). When
++/// this is true the layout skips the vptr shift — the base subobject
++/// at offset 0 already owns the vptr.
+ fn has_polymorphic_base<'tcx>(tcx: TyCtxt<'tcx>, def: AdtDef<'tcx>) -> bool {
+-    let Some(variant) = def.variants().get(VariantIdx::ZERO) else { return false };
+-    let Some(first) = variant.fields.raw.first() else { return false };
+-    rustc_hir::find_attr!(tcx, first.did, RustcCxxBase(..))
++    match cxx_base_of(tcx, def.did()) {
++        Some(base_did) => is_polymorphic_cpp_class(tcx, base_did),
++        None => false,
++    }
+ }
+ 
+-/// True iff any inherent method on `adt_did` carries
+-/// `#[rustc_cxx_virtual]`. Duplicated from
+-/// `rustc_symbol_mangling::itanium::is_polymorphic_cpp_class`
+-/// because `rustc_ty_utils` can't depend on that crate (it's
+-/// downstream). Kept tiny to minimize drift risk.
++/// True iff `adt_did` is a polymorphic C++ class: it declares an
++/// inherent `#[rustc_cxx_virtual]` method, OR its base chain is
++/// polymorphic. Mirrors `rustc_symbol_mangling::itanium::
++/// is_polymorphic_cpp_class` (duplicated because rustc_ty_utils
++/// can't depend on that crate). Kept in sync to avoid layout vs
++/// codegen drift.
+ fn is_polymorphic_cpp_class<'tcx>(
+     tcx: TyCtxt<'tcx>,
+     adt_did: rustc_hir::def_id::DefId,
+@@ -230,7 +255,10 @@ fn is_polymorphic_cpp_class<'tcx>(
+             }
+         }
+     }
+-    false
++    match cxx_base_of(tcx, adt_did) {
++        Some(base_did) => is_polymorphic_cpp_class(tcx, base_did),
++        None => false,
++    }
+ }
+ 
+ /// Shift every field offset in `Arbitrary` layouts by `ptr_bytes`,
+-- 
+2.50.1 (Apple Git-155)
+
