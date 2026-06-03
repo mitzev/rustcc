@@ -681,6 +681,14 @@ impl Build {
 
         // ----- 5. Compile shims. ------
         let static_lib_path = if self.invoke_cc {
+            // `cc::Build::compile` reads OUT_DIR / TARGET / HOST /
+            // OPT_LEVEL from the environment. Cargo sets these for
+            // build scripts, but this helper is also documented for
+            // standalone use (e.g. a `gen_bindings` bin) — synthesize
+            // host defaults for any that are missing so the cc step
+            // works there too, without clobbering a real build
+            // script's target (e.g. a cross build).
+            prepare_cc_env(&out_dir);
             let mut cc_build = cc::Build::new();
             cc_build
                 .cpp(true)
@@ -1413,6 +1421,48 @@ fn collect_throws_specs_for_ctors(
         }
     }
     specs
+}
+
+/// Ensure the environment variables `cc::Build::compile` requires are
+/// present. Cargo sets `OUT_DIR` / `TARGET` / `HOST` / `OPT_LEVEL` for
+/// build scripts; standalone callers of [`Build::compile`] (per this
+/// module's docs) may not have them. `OUT_DIR` is always pointed at
+/// the resolved output dir so cc writes its archive where the helper
+/// reports it; the rest are filled in only when missing, so a real
+/// build script's target (e.g. a cross build) is never overridden.
+fn prepare_cc_env(out_dir: &std::path::Path) {
+    // SAFETY: edition 2021 — `set_var` is a safe fn. Called from the
+    // single-threaded `compile()` path before cc spawns the compiler.
+    std::env::set_var("OUT_DIR", out_dir);
+    if std::env::var_os("OPT_LEVEL").is_none() {
+        std::env::set_var("OPT_LEVEL", "0");
+    }
+    let target_missing = std::env::var_os("TARGET").is_none();
+    let host_missing = std::env::var_os("HOST").is_none();
+    if target_missing || host_missing {
+        if let Some(triple) = detect_host_triple() {
+            if target_missing {
+                std::env::set_var("TARGET", &triple);
+            }
+            if host_missing {
+                std::env::set_var("HOST", &triple);
+            }
+        }
+    }
+}
+
+/// Best-effort host target triple, parsed from `rustc -vV` (honoring
+/// the `RUSTC` env override). Returns `None` if `rustc` can't be run —
+/// in which case cc-rs surfaces its own "TARGET not defined" error.
+fn detect_host_triple() -> Option<String> {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let output = std::process::Command::new(rustc).arg("-vV").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.lines()
+        .find_map(|l| l.strip_prefix("host: ").map(|s| s.trim().to_string()))
 }
 
 #[cfg(test)]

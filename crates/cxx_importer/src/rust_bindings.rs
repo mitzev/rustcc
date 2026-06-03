@@ -897,6 +897,16 @@ fn render_namespace_tree(
         Vec<&crate::static_data::StaticDataDef>,
     >,
 ) -> Result<(), BindingsError> {
+    // Names already emitted as a type at this scope, so the alias
+    // pass below can skip a `typedef`/`using` whose flattened rust
+    // ident collides with an enum we already emitted (e.g. FLTK's
+    // `typedef Fl::Option Fl_Option` flattening onto the enum's own
+    // `Fl_Fl_Option` newtype) — and also dedup repeated alias entries.
+    // Without this the generated file has `pub struct X` + `pub type X`
+    // for the same name (E0428 "defined multiple times").
+    let mut emitted_type_names: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
     // M16: emit imported enum bodies first — classes and aliases
     // at this scope may reference them by name in their fields /
     // method signatures.
@@ -905,6 +915,7 @@ fn render_namespace_tree(
             Ok(block) => {
                 out.push_str(&block);
                 out.push('\n');
+                emitted_type_names.insert(enum_def.name.0.clone());
             }
             Err(BindingsError::UnsupportedType { kind, .. }) => {
                 // Underlying integer width not supported (i128 /
@@ -926,6 +937,16 @@ fn render_namespace_tree(
     // drop the alias rather than aborting: aliases are emit-only
     // ergonomics, not correctness.
     for (alias_name, target) in &tree.aliases {
+        // Skip an alias whose name was already emitted as an enum/class
+        // at this scope, or a duplicate alias entry — `insert` returns
+        // false when the name is already present.
+        if !emitted_type_names.insert(alias_name.clone()) {
+            let _ = writeln!(
+                out,
+                "{indent}// alias `{alias_name}` skipped: name already emitted at this scope",
+            );
+            continue;
+        }
         let where_ = format!("alias `{alias_name}`");
         match render_rust_type(ctx, *target, &where_) {
             Ok(rendered) => {
@@ -1300,8 +1321,13 @@ fn render_direct_extern_class(
             format!("__cxx_static_{}_{}", class_name, sd.name.0);
         let mut_kw = if sd.cv.is_const { "" } else { "mut " };
         cxx_extern_lines.push(format!("{indent}    #[link_name = \"{link_name}\"]"));
+        // `pub(crate)` (not `pub(super)`): the generated bindings may be
+        // `include!`d at the crate root (e.g. the fltk_text_editor
+        // example), where `super` has no parent and `pub(super)` is a
+        // hard error. `pub(crate)` is valid at any module depth and
+        // still keeps these `__cxx_static_*` extern items crate-private.
         cxx_extern_lines.push(format!(
-            "{indent}    pub(super) static {mut_kw}{ext}: {rendered_ty};",
+            "{indent}    pub(crate) static {mut_kw}{ext}: {rendered_ty};",
             ext = extern_ident,
         ));
         emitted_statics.push((
