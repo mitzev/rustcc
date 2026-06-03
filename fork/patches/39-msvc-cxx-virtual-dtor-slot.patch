@@ -1,0 +1,137 @@
+From 3e79392f6414ea8e5eb02173f20ae3a3c17dfbff Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Wed, 3 Jun 2026 10:53:42 +0300
+Subject: [PATCH 39/39] P09.x (1.13.7): MSVC vftable dtor slot for
+ cross-boundary virtual dtor
+
+Make the virtual-destructor vtable dtor slot ABI-aware. Itanium emits
+the complete (`D1` = drop_in_place) + deleting (`D0` = drop_in_place +
+`operator delete`) pair; MSVC emits a single scalar-deleting destructor
+(`??_G`-shaped `void*(this, flags)` thunk = drop_in_place + MSVC
+`operator delete`, returning `this`) in the vftable's leading dtor slot.
+`emit_msvc_vftable` now prepends it via the shared `cxx_dtor_slots`.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ compiler/rustc_codegen_llvm/src/cxx_vtable.rs | 83 ++++++++++++++++---
+ 1 file changed, 70 insertions(+), 13 deletions(-)
+
+diff --git a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+index 8ee7ebf9f41..b7b6162a7d8 100644
+--- a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
++++ b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+@@ -449,9 +449,17 @@ fn cxx_dtor_slots<'ll, 'tcx>(
+     // no generic parameters, so empty args is the monomorphic type.
+     let ty = Ty::new_adt(cx.tcx, cx.tcx.adt_def(adt_did), cx.tcx.mk_args(&[]));
+     let drop_instance = Instance::resolve_drop_in_place(cx.tcx, ty);
+-    // D1 (complete object dtor, no free) = drop_in_place::<D>.
++
++    if cx.tcx.sess.target.is_like_msvc {
++        // MSVC: a single scalar-deleting destructor (`??_G`) slot —
++        // `drop_in_place::<D>(this)` then frees, matching the
++        // most-derived vftable's leading dtor entry.
++        return vec![emit_cxx_msvc_deleting_dtor_thunk(cx, adt_did, drop_instance)];
++    }
++
++    // Itanium: two leading slots — complete (`D1`, no free) then
++    // deleting (`D0`, frees). Both run the full Rust drop glue.
+     let d1 = cx.get_fn_addr(drop_instance);
+-    // D0 (deleting dtor) = drop_in_place::<D> + free.
+     let d0 = emit_cxx_deleting_dtor_thunk(cx, adt_did, ty, drop_instance);
+     vec![d1, d0]
+ }
+@@ -503,20 +511,64 @@ fn emit_cxx_deleting_dtor_thunk<'ll, 'tcx>(
+     let drop_callee = cx.get_fn_addr(drop_instance);
+     bx.call(drop_fn_ty, None, Some(drop_abi), drop_callee, &[this], None, Some(drop_instance));
+ 
+-    // operator delete(this) — `_ZdlPv` (Itanium) / `??3@YAXPEAX@Z` (MSVC).
+-    let op_delete_name = if cx.tcx.sess.target.is_like_msvc {
+-        "??3@YAXPEAX@Z"
+-    } else {
+-        "_ZdlPv"
+-    };
++    // operator delete(this) — Itanium `_ZdlPv`.
+     let op_delete_ty = cx.type_func(&[ptr_ty], void_ty);
+-    let op_delete = cx.declare_cfn(op_delete_name, llvm::UnnamedAddr::Global, op_delete_ty);
++    let op_delete = cx.declare_cfn("_ZdlPv", llvm::UnnamedAddr::Global, op_delete_ty);
+     bx.call(op_delete_ty, None, None, op_delete, &[this], None, None);
+ 
+     bx.ret_void();
+     thunk
+ }
+ 
++/// Emit the MSVC scalar-deleting destructor thunk for `adt_did`: a
++/// `void* (this, i32 flags)` function placed in the vftable's leading
++/// dtor slot. It runs `drop_in_place::<D>(this)` then frees with
++/// `operator delete` (`??3@YAXPEAX@Z`) and returns `this`. Matching the
++/// fork's v1 MSVC posture (see `maybe_add_cxx_dtor_variants`), it always
++/// deletes — the FLTK/`delete`-through-base ownership model this feature
++/// targets always reaches it via `delete p`, where the flag is set.
++fn emit_cxx_msvc_deleting_dtor_thunk<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    adt_did: DefId,
++    drop_instance: Instance<'tcx>,
++) -> &'ll Value {
++    let name = format!(
++        "__rustcc_cxx_msvc_delete${}",
++        cxx_mangle::mangle_cxx_vtable_symbol(cx.tcx, adt_did)
++    );
++    if let Some(existing) = cx.get_defined_value(&name) {
++        return existing;
++    }
++
++    let ptr_ty = cx.type_ptr();
++    let i32_ty = cx.type_i32();
++    // MSVC `??_G`: `void* (this, int flags)`.
++    let thunk_ty = cx.type_func(&[ptr_ty, i32_ty], ptr_ty);
++    let thunk = cx.declare_cfn(&name, llvm::UnnamedAddr::No, thunk_ty);
++    llvm::set_linkage(thunk, llvm::Linkage::LinkOnceODRLinkage);
++    if cx.tcx.sess.target.supports_comdat() {
++        llvm::SetUniqueComdat(cx.llmod, thunk);
++    }
++
++    let start = Builder::append_block(cx, thunk, "start");
++    let mut bx = Builder::build(cx, start);
++    let this = llvm::get_param(thunk, 0);
++
++    let drop_abi = cx.fn_abi_of_instance(drop_instance, ty::List::empty());
++    let drop_fn_ty = drop_abi.llvm_type(cx);
++    let drop_callee = cx.get_fn_addr(drop_instance);
++    bx.call(drop_fn_ty, None, Some(drop_abi), drop_callee, &[this], None, Some(drop_instance));
++
++    // operator delete(this) — MSVC `??3@YAXPEAX@Z`.
++    let void_ty = cx.type_void();
++    let op_delete_ty = cx.type_func(&[ptr_ty], void_ty);
++    let op_delete = cx.declare_cfn("??3@YAXPEAX@Z", llvm::UnnamedAddr::Global, op_delete_ty);
++    bx.call(op_delete_ty, None, None, op_delete, &[this], None, None);
++
++    bx.ret(this);
++    thunk
++}
++
+ // -------- MSVC vtable emission (P09.56) --------------------------------
+ //
+ // MSVC's vtable shape diverges from Itanium at every layer:
+@@ -704,10 +756,15 @@ fn emit_msvc_vftable<'ll, 'tcx>(
+     let mut slots: Vec<&'ll Value> = Vec::new();
+     slots.push(col);
+ 
+-    // Slots 1+: virtual fn pointers in declaration order. Same
+-    // chain-walk as Itanium emission; the only difference is the
+-    // dtor entry, which we route through P09.57 (patch 18) to
+-    // pick the scalar deleting destructor.
++    // Slots 1+: virtual fn pointers. If the chain has a virtual
++    // destructor, the leading function-pointer slot is this class's
++    // scalar-deleting destructor (`??_G`), then the other virtuals in
++    // declaration order (P09.x / 1.13.7). A derived `override` replaces
++    // a base slot; a non-overridden imported slot points at the real
++    // C++ symbol.
++    for dtor_slot in cxx_dtor_slots(cx, adt_did) {
++        slots.push(dtor_slot);
++    }
+     let virtuals = cxx_mangle::virtuals_on_chain(tcx, adt_did);
+     for slot in &virtuals {
+         slots.push(cxx_vt_slot_fn_addr(cx, slot));
+-- 
+2.50.1 (Apple Git-155)
+

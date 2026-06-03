@@ -102,30 +102,45 @@ the base's slot — so a C++ caller dispatching through a base pointer
 lands in the Rust override. See `examples/virtual_override/` for the
 round-trip and `examples/shape_hierarchy/` for the surface.
 
-### Subclassing an *imported* C++ class — not supported
+### Subclassing an *imported* C++ class — shipped (v1.13.7)
 
-You can define a whole Rust class hierarchy (`class Derived : Base`)
-where **both** base and derived are Rust-defined, and C++ dispatches
-into it correctly. You **cannot** currently make a Rust `class`
-inherit from an *imported* C++ class (e.g. `class MyWidget :
-Fl_Widget`) with working cross-boundary virtual dispatch. The reason
-is structural:
+A Rust `class Derived : CppBase` can now inherit from an **imported**
+C++ polymorphic class (one `cxx_importer` generated) with working
+cross-boundary virtual dispatch — **including a virtual destructor**.
+C++ dispatching a virtual through a `CppBase*` that actually points at
+a `Derived` lands in the Rust `override`; `delete (CppBase*)d` runs the
+Rust `Drop`, destroys the base subobject, and frees. This is the
+canonical FLTK custom-widget pattern (override `handle()` / `draw()`).
+See `examples/subclass_cpp_base/`.
 
-- `#[cpp_virtual]` may only mark **inherent** methods; an imported C++
-  class's methods live in `extern "C++"` blocks (foreign items), which
-  the attribute rejects.
-- The vtable-chain + override-verify passes only scan inherent
-  `#[cpp_virtual]` methods, so an imported base contributes no
-  overridable slots — `override fn` errors, and a plain `virtual fn`
-  would build a *new* Rust vtable rather than extending the C++ base's.
+How it works:
 
-A true Rust-subclasses-C++ feature would need the Rust derived ctor to
-install a vtable that **extends** the C++ base's (the C++
-derived-ctor-overwrites-vptr dance, across the language boundary).
-That's a substantial future feature. **Workaround today:** use
-*composition* — hold the C++ object and call its methods from Rust
-(this is what `examples/fltk_text_editor/` does), rather than
-subclassing it.
+- `cxx_importer` emits `#[rustc_cxx_imported_vtable = "<spec>"]` on the
+  imported base's `#[repr(C)]` struct. The spec lists the base's
+  primary-vtable function-pointer slots in C++ order
+  (`zti=…;[vdtor=1;]slot=<name>,<symbol>;…`); pure virtuals carry
+  `__cxa_pure_virtual`, and `vdtor=1` flags a virtual destructor.
+- The chain-walk (`virtuals_on_chain`) seeds the derived vtable from
+  those slots. A Rust `override fn` matched by name takes over a slot;
+  a non-overridden slot points directly at the real C++ symbol. The
+  derived's vtable shares the base vptr at offset 0, and `_ZTI<Derived>`
+  chains to the external base `_ZTI` (`__si_class_type_info`). The
+  imported base never emits its own `_ZTV`/`_ZTI`/`_ZTS` (C++ owns them).
+- With a virtual destructor, the derived vtable's leading dtor slots run
+  the full Rust drop glue (`drop_in_place::<Derived>` — `Drop::drop` +
+  every field, so the `__base` subobject's `Drop` runs the C++ base
+  destructor). The deleting slot also frees via `operator delete`.
+
+**Ownership model.** Because C++ owns and `delete`s the object (the
+FLTK model), allocate the Rust subclass through the C++ allocator
+(`operator new` + placement-construct); the vtable's deleting
+destructor reclaims it with `operator delete`. The imported base's
+`Drop` calls the *base-object* destructor (`D2`) so destroying the base
+subobject is heap-safe.
+
+**Scope.** Single inheritance, Itanium (Linux/macOS) and MSVC. No
+virtual bases (the importer rejects them). MSVC uses the single
+scalar-deleting destructor (`??_G`) in the vftable's leading dtor slot.
 
 ## 6. Constructors and destructors
 

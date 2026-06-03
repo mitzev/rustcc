@@ -1,0 +1,329 @@
+From 94117355eddb6a166077d9ff4365f975a973ae83 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Wed, 3 Jun 2026 09:42:13 +0300
+Subject: [PATCH 38/39] P09.x (1.13.7): cross-boundary virtual destructors for
+ Rust subclasses
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When a Rust `class D : CppBase` subclasses an imported C++ base with a
+virtual destructor, `delete (CppBase*)d` from C++ now runs the Rust
+`Drop`, destroys the base subobject, and frees — exactly once.
+
+- The imported base's `#[rustc_cxx_imported_vtable]` carries `vdtor=1`
+  (it declares a virtual dtor). `chain_has_virtual_dtor` walks the base
+  chain for this marker.
+- `emit_vtable` prepends the two leading Itanium dtor slots (complete
+  `D1`, deleting `D0`) of the most-derived class. Both run the full Rust
+  drop glue `drop_in_place::<D>` — which runs `Drop::drop` AND drops every
+  field, including the `__base` subobject whose own `Drop` runs the C++
+  base destructor (the bare `_ZN<D>D1Ev` symbol is only the `Drop::drop`
+  body and would leak the base). The `D0` slot is a thunk that runs
+  `drop_in_place::<D>` then `operator delete` (`_ZdlPv` / MSVC
+  `??3@YAXPEAX@Z`), pairing with a factory that allocates via
+  `operator new`.
+- The mono collector now collects `drop_in_place::<D>` as a root for a
+  `#[repr(cpp)]` class in a virtual-dtor chain (the vtable's reference is
+  invisible to lazy collection).
+
+Verified end-to-end (counters): base ctor/dtor balanced at 1, Rust Drop
+runs once, no leak or double-free.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ compiler/rustc_codegen_llvm/src/cxx_vtable.rs | 117 +++++++++++++++++-
+ compiler/rustc_monomorphize/src/collector.rs  |  44 +++++++
+ compiler/rustc_symbol_mangling/src/itanium.rs |  66 ++++++++++
+ 3 files changed, 224 insertions(+), 3 deletions(-)
+
+diff --git a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+index a397b13872b..8ee7ebf9f41 100644
+--- a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
++++ b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+@@ -42,9 +42,11 @@
+ use rustc_hir::def::DefKind;
+ use rustc_hir::def_id::DefId;
+ use rustc_middle::bug;
+-use rustc_middle::ty::{self, Instance, TyCtxt};
++use rustc_middle::ty::layout::FnAbiOf;
++use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
+ use rustc_symbol_mangling::itanium as cxx_mangle;
+ 
++use crate::abi::FnAbiLlvmExt;
+ use crate::builder::Builder;
+ use crate::context::CodegenCx;
+ use crate::llvm::{self, Value};
+@@ -359,6 +361,13 @@ fn emit_vtable<'ll, 'tcx>(
+     // inherited from an *imported* C++ base that isn't overridden
+     // points directly at the real C++ implementation symbol
+     // (P09.x / 1.13.7).
++    //
++    // P09.x (1.13.7): if the chain has a virtual destructor, the two
++    // leading slots (before the other virtuals) are this class's
++    // complete (`D1`) and deleting (`D0`) destructors — Itanium order.
++    for dtor_slot in cxx_dtor_slots(cx, adt_did) {
++        slots.push(dtor_slot);
++    }
+     let virtuals = cxx_mangle::virtuals_on_chain(tcx, adt_did);
+     for slot in &virtuals {
+         slots.push(cxx_vt_slot_fn_addr(cx, slot));
+@@ -400,12 +409,114 @@ fn cxx_vt_slot_fn_addr<'ll, 'tcx>(
+             cx.get_fn_addr(Instance::mono(cx.tcx, *def_id))
+         }
+         cxx_mangle::CxxVtSlot::Imported { link_name, .. } => {
+-            let fn_ty = cx.type_func(&[], cx.type_void());
+-            cx.declare_cfn(link_name.as_str(), llvm::UnnamedAddr::No, fn_ty)
++            declare_extern_fn_addr(cx, link_name.as_str())
+         }
+     }
+ }
+ 
++/// The address of an external function symbol, declared as an opaque
++/// `void()` if not already present. Used for imported C++ method
++/// targets and for derived-class destructor (`D1`/`D0`) symbols placed
++/// in vtable dtor slots. The declared signature is irrelevant under
++/// opaque pointers — only the symbol's address is stored.
++fn declare_extern_fn_addr<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    symbol: &str,
++) -> &'ll Value {
++    let fn_ty = cx.type_func(&[], cx.type_void());
++    cx.declare_cfn(symbol, llvm::UnnamedAddr::No, fn_ty)
++}
++
++/// P09.x (1.13.7): the two leading Itanium vtable dtor slots for a class
++/// whose chain has a virtual destructor — the complete-object (`D1`)
++/// then the deleting (`D0`) destructor of the *most-derived* class
++/// (`adt_did`). `delete (Base*)derived` dispatches to the `D0` slot.
++/// Returns `[]` when the chain has no virtual destructor.
++///
++/// Both slots run the full Rust drop glue (`drop_in_place::<D>`), which
++/// runs `Drop::drop` *and* drops every field — including the `__base`
++/// subobject, whose own `Drop` runs the C++ base destructor. (The plain
++/// `_ZN<D>D1Ev` symbol would be only the `Drop::drop` *body*, leaking
++/// the base subobject.) The `D0` slot additionally frees the storage.
++fn cxx_dtor_slots<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    adt_did: DefId,
++) -> Vec<&'ll Value> {
++    if !cxx_mangle::chain_has_virtual_dtor(cx.tcx, adt_did) {
++        return Vec::new();
++    }
++    // The concrete (non-generic) ADT type; `#[repr(cpp)]` classes have
++    // no generic parameters, so empty args is the monomorphic type.
++    let ty = Ty::new_adt(cx.tcx, cx.tcx.adt_def(adt_did), cx.tcx.mk_args(&[]));
++    let drop_instance = Instance::resolve_drop_in_place(cx.tcx, ty);
++    // D1 (complete object dtor, no free) = drop_in_place::<D>.
++    let d1 = cx.get_fn_addr(drop_instance);
++    // D0 (deleting dtor) = drop_in_place::<D> + free.
++    let d0 = emit_cxx_deleting_dtor_thunk(cx, adt_did, ty, drop_instance);
++    vec![d1, d0]
++}
++
++/// Emit the deleting-destructor thunk for `adt_did`: a `void(this)`
++/// function that runs `drop_in_place::<D>(this)` then frees `this` with
++/// the C++ allocator (`operator delete`, Itanium `_ZdlPv` / MSVC
++/// `??3@YAXPEAX@Z`). The vtable's `D0` slot points here, so
++/// `delete (Base*)derived` from C++ destroys the Rust object and
++/// reclaims its storage exactly once.
++///
++/// This pairs with a Rust factory that allocates the instance through
++/// the C++ allocator (`operator new` + placement-construct), which is
++/// the natural ownership model when C++ owns and `delete`s the object
++/// (e.g. an FLTK widget added to a group). `_ZdlPv` is always provided
++/// by the C++ runtime the final binary links, so the Rust staticlib has
++/// no allocator-shim link dependency.
++fn emit_cxx_deleting_dtor_thunk<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    adt_did: DefId,
++    _ty: Ty<'tcx>,
++    drop_instance: Instance<'tcx>,
++) -> &'ll Value {
++    let name = format!(
++        "__rustcc_cxx_delete${}",
++        cxx_mangle::mangle_cxx_vtable_symbol(cx.tcx, adt_did)
++    );
++    if let Some(existing) = cx.get_defined_value(&name) {
++        return existing;
++    }
++
++    let void_ty = cx.type_void();
++    let ptr_ty = cx.type_ptr();
++    let thunk_ty = cx.type_func(&[ptr_ty], void_ty);
++    let thunk = cx.declare_cfn(&name, llvm::UnnamedAddr::No, thunk_ty);
++    llvm::set_linkage(thunk, llvm::Linkage::LinkOnceODRLinkage);
++    if cx.tcx.sess.target.supports_comdat() {
++        llvm::SetUniqueComdat(cx.llmod, thunk);
++    }
++
++    let start = Builder::append_block(cx, thunk, "start");
++    let mut bx = Builder::build(cx, start);
++    let this = llvm::get_param(thunk, 0);
++
++    // drop_in_place::<D>(this) — runs Drop + all field drops (including
++    // the `__base` subobject, whose Drop runs the C++ base destructor).
++    let drop_abi = cx.fn_abi_of_instance(drop_instance, ty::List::empty());
++    let drop_fn_ty = drop_abi.llvm_type(cx);
++    let drop_callee = cx.get_fn_addr(drop_instance);
++    bx.call(drop_fn_ty, None, Some(drop_abi), drop_callee, &[this], None, Some(drop_instance));
++
++    // operator delete(this) — `_ZdlPv` (Itanium) / `??3@YAXPEAX@Z` (MSVC).
++    let op_delete_name = if cx.tcx.sess.target.is_like_msvc {
++        "??3@YAXPEAX@Z"
++    } else {
++        "_ZdlPv"
++    };
++    let op_delete_ty = cx.type_func(&[ptr_ty], void_ty);
++    let op_delete = cx.declare_cfn(op_delete_name, llvm::UnnamedAddr::Global, op_delete_ty);
++    bx.call(op_delete_ty, None, None, op_delete, &[this], None, None);
++
++    bx.ret_void();
++    thunk
++}
++
+ // -------- MSVC vtable emission (P09.56) --------------------------------
+ //
+ // MSVC's vtable shape diverges from Itanium at every layer:
+diff --git a/compiler/rustc_monomorphize/src/collector.rs b/compiler/rustc_monomorphize/src/collector.rs
+index f819ee42441..f4557434913 100644
+--- a/compiler/rustc_monomorphize/src/collector.rs
++++ b/compiler/rustc_monomorphize/src/collector.rs
+@@ -939,6 +939,33 @@ fn visit_drop_use<'tcx>(
+     visit_instance_use(tcx, instance, is_direct_call, source, output);
+ }
+ 
++/// P09.x (1.13.7): true iff `adt_did`'s polymorphic chain has a virtual
++/// destructor — its own `#[rustc_cxx_imported_vtable]` carries `vdtor=1`,
++/// or a `#[rustc_cxx_base]` ancestor does. Such a `#[repr(cpp)]` derived
++/// class has its `drop_in_place` placed in the C++ vtable dtor slots by
++/// codegen; that reference is invisible to lazy mono collection, so the
++/// glue must be collected as a root (see `process_item`). Duplicated
++/// from `rustc_symbol_mangling::itanium::chain_has_virtual_dtor` —
++/// rustc_monomorphize can't depend on that crate.
++fn cxx_chain_has_virtual_dtor(tcx: TyCtxt<'_>, adt_did: DefId) -> bool {
++    if let Some(spec) =
++        rustc_hir::find_attr!(tcx, adt_did, RustcCxxImportedVtable { spec, .. } => *spec)
++        && spec.as_str().split(';').any(|r| r.trim() == "vdtor=1")
++    {
++        return true;
++    }
++    let adt = tcx.adt_def(adt_did);
++    let Some(variant) = adt.variants().iter().next() else { return false };
++    let Some(first) = variant.fields.raw.first() else { return false };
++    if !rustc_hir::find_attr!(tcx, first.did, RustcCxxBase(..)) {
++        return false;
++    }
++    match tcx.type_of(first.did).skip_binder().kind() {
++        ty::Adt(base_adt, _) => cxx_chain_has_virtual_dtor(tcx, base_adt.did()),
++        _ => false,
++    }
++}
++
+ /// For every call of this function in the visitor, make sure there is a matching call in the
+ /// `mentioned_items` pass!
+ fn visit_fn_use<'tcx>(
+@@ -1508,6 +1535,23 @@ impl<'v> RootCollector<'_, 'v> {
+     fn process_item(&mut self, id: hir::ItemId) {
+         match self.tcx.def_kind(id.owner_id) {
+             DefKind::Enum | DefKind::Struct | DefKind::Union => {
++                // P09.x (1.13.7): a `#[repr(cpp)]` class whose chain has a
++                // virtual destructor needs its `drop_in_place` collected
++                // even in lazy mode — codegen places it in the C++ vtable
++                // dtor slots, a reference the collector can't otherwise see.
++                if self.tcx.def_kind(id.owner_id) == DefKind::Struct {
++                    let adt_did = id.owner_id.to_def_id();
++                    if self.tcx.adt_def(adt_did).repr().cpp()
++                        && cxx_chain_has_virtual_dtor(self.tcx, adt_did)
++                    {
++                        let ty = Ty::new_adt(
++                            self.tcx,
++                            self.tcx.adt_def(adt_did),
++                            self.tcx.mk_args(&[]),
++                        );
++                        visit_drop_use(self.tcx, ty, true, DUMMY_SP, self.output);
++                    }
++                }
+                 if self.strategy == MonoItemCollectionStrategy::Eager
+                     && !self.tcx.generics_of(id.owner_id).requires_monomorphization(self.tcx)
+                 {
+diff --git a/compiler/rustc_symbol_mangling/src/itanium.rs b/compiler/rustc_symbol_mangling/src/itanium.rs
+index a8cefe575fa..81f9a82744a 100644
+--- a/compiler/rustc_symbol_mangling/src/itanium.rs
++++ b/compiler/rustc_symbol_mangling/src/itanium.rs
+@@ -339,6 +339,72 @@ pub fn imported_base_zti<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> Option<rust
+     None
+ }
+ 
++/// True iff this imported base declares a **virtual destructor** — its
++/// `#[rustc_cxx_imported_vtable]` spec carries a `vdtor=1` record. A
++/// virtual-dtor base puts the two leading dtor slots (complete `D1`,
++/// deleting `D0`) in the primary vtable, so a derived class must extend
++/// them with its own destructors for `delete (Base*)derived` to run the
++/// Rust drop.
++fn imported_vtable_has_vdtor<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> bool {
++    let Some(spec) = imported_vtable_spec(tcx, adt_did) else { return false };
++    spec.as_str().split(';').any(|r| r.trim() == "vdtor=1")
++}
++
++/// Whether `adt_did`'s polymorphic chain contains a class with a
++/// virtual destructor (an imported base carrying `vdtor=1`). When true,
++/// the leaf class's vtable gets two leading dtor slots resolving to the
++/// leaf's own `D1`/`D0` destructors (P09.x / 1.13.7).
++pub fn chain_has_virtual_dtor<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> bool {
++    if imported_vtable_has_vdtor(tcx, adt_did) {
++        return true;
++    }
++    match polymorphic_base_of_class(tcx, adt_did) {
++        Some(base_did) => chain_has_virtual_dtor(tcx, base_did),
++        None => false,
++    }
++}
++
++/// The complete-object destructor symbol (`_ZN<class>D1Ev`) for the
++/// derived class's vtable dtor slot 0.
++pub fn mangle_cxx_complete_dtor<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> String {
++    mangle_cxx_dtor_for_adt(tcx, adt_did, DtorVariant::D1)
++}
++
++/// The deleting destructor symbol (`_ZN<class>D0Ev`) for the derived
++/// class's vtable dtor slot 1 (`delete (Base*)derived` lands here).
++pub fn mangle_cxx_deleting_dtor<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> String {
++    mangle_cxx_dtor_for_adt(tcx, adt_did, DtorVariant::D0)
++}
++
++/// Itanium-mangle a destructor variant (`_ZN<class>D{0,1,2}Ev`) for a
++/// `#[repr(cpp)]` ADT directly from its `DefId` (no `Drop`-impl lookup,
++/// unlike [`mangle_dtor_variant`]). Used to fill the derived class's
++/// vtable dtor slots with its own `D1`/`D0` symbols.
++fn mangle_cxx_dtor_for_adt<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    adt_did: DefId,
++    variant: DtorVariant,
++) -> String {
++    let class_name = tcx.item_name(adt_did).to_string();
++    let mut path = cxx_namespace_path(tcx, adt_did);
++    path.push(NameSegment::Class(Ident(class_name)));
++    let mut ctx = CxxTypeCtx::new(CxxTarget::from_rustc_triple(
++        tcx.sess.opts.target_triple.tuple(),
++        tcx.sess.target.pointer_width as u32,
++    ));
++    let class_id = ctx.define_class(ClassDef {
++        name: NestedName(path),
++        bases: Vec::new(),
++        fields: Vec::new(),
++        methods: Vec::new(),
++        kind: RecordKind::Struct,
++        is_polymorphic: true,
++        is_final: false,
++        source_alignment: None,
++    });
++    ctx.mangle(&CxxSymbol::Dtor { class: class_id, variant })
++}
++
+ /// P09.35: if `adt_did` is a derived class (its first field
+ /// carries `#[rustc_cxx_base]`), returns the base ADT's DefId.
+ /// Otherwise returns None. Chains: calling this repeatedly walks
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,526 @@
+From 9f27d30abdcdb21783e2495074f7066f8aaf05f3 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Wed, 3 Jun 2026 06:33:35 +0300
+Subject: [PATCH 37/39] P09.x (1.13.7): subclass an imported C++ polymorphic
+ base from Rust
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Lets a Rust `class D : CppBase` inherit from an *imported* C++
+polymorphic class (cxx_importer-generated) with working cross-boundary
+virtual dispatch: C++ calling a virtual through a `CppBase*` that points
+at a `D` lands in the Rust `override`.
+
+New attribute `#[rustc_cxx_imported_vtable = "<spec>"]` on the imported
+base's `#[repr(C)]` struct carries its primary-vtable function-pointer
+slots in C++ order (`zti=…;slot=<name>,<symbol>;…`). The chain-walk
+(`virtuals_on_chain`) seeds the derived vtable from those slots; a Rust
+`override` matched by name replaces a slot, a non-overridden slot points
+directly at the real C++ symbol (or `__cxa_pure_virtual` for an
+unoverridden pure virtual). `is_polymorphic_cpp_class` (itanium,
+check_attr, cxx_bridge copies) treats the attribute as polymorphic so
+the derived shares the base vptr at offset 0; `emit_typeinfo` chains the
+derived `_ZTI` to the base's external `_ZTI`. Imported bases never emit
+their own `_ZTV`/`_ZTI`/`_ZTS` (C++ owns them). `rustc_ty_to_cxx` maps an
+imported base by name so it can appear in C++-mangled signatures (e.g.
+the auto-generated `Deref for D`).
+
+Supports concrete and pure-virtual base methods (single inheritance,
+Itanium). Virtual destructors land in a follow-up commit.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../src/attributes/codegen_attrs.rs           |  31 +++++
+ compiler/rustc_attr_parsing/src/context.rs    |   1 +
+ compiler/rustc_codegen_llvm/src/cxx_vtable.rs |  65 +++++++---
+ compiler/rustc_feature/src/builtin_attrs.rs   |   8 ++
+ .../rustc_hir/src/attrs/data_structures.rs    |  17 +++
+ .../rustc_hir/src/attrs/encode_cross_crate.rs |   1 +
+ compiler/rustc_passes/src/check_attr.rs       |  36 +++++-
+ compiler/rustc_span/src/symbol.rs             |   1 +
+ compiler/rustc_symbol_mangling/src/itanium.rs | 115 ++++++++++++++++--
+ .../rustc_ty_utils/src/layout/cxx_bridge.rs   |   7 ++
+ 10 files changed, 253 insertions(+), 29 deletions(-)
+
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+index 35454b0b0b3..de800591d83 100644
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -794,6 +794,37 @@ impl<S: Stage> NoArgsAttributeParser<S> for $parser {
+     [Target::Method(MethodKind::Inherent)]
+ );
+ 
++/// `#[rustc_cxx_imported_vtable = "<spec>"]` — placed by `cxx_importer`
++/// on an imported C++ polymorphic class's `#[repr(C)]` struct so a Rust
++/// `class D : CppBase` can subclass it with cross-boundary virtual
++/// dispatch. The `<spec>` lists the base's primary-vtable
++/// function-pointer slots in C++ order:
++/// `zti=<_ZTI sym>;slot=<name>,<sym>;slot=<name>,<sym>…`.
++/// See `AttributeKind::RustcCxxImportedVtable` for the full grammar.
++pub(crate) struct RustcCxxImportedVtableParser;
++
++impl<S: Stage> SingleAttributeParser<S> for RustcCxxImportedVtableParser {
++    const PATH: &[Symbol] = &[sym::rustc_cxx_imported_vtable];
++    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
++    const ALLOWED_TARGETS: AllowedTargets =
++        AllowedTargets::AllowList(&[Allow(Target::Struct)]);
++    const TEMPLATE: AttributeTemplate =
++        template!(NameValueStr: "zti=_ZTI8CppBase;slot=foo,_ZN8CppBase3fooEv");
++
++    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
++        let Some(nv) = args.name_value() else {
++            let attr_span = cx.attr_span;
++            cx.adcx().expected_name_value(attr_span, None);
++            return None;
++        };
++        let Some(spec) = nv.value_as_str() else {
++            cx.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
++            return None;
++        };
++        Some(AttributeKind::RustcCxxImportedVtable { spec, span: cx.attr_span })
++    }
++}
++
+ // `#[rustc_swift_throws]` (P09.48 / 1.02 throws) — marks a
+ // foreign fn inside an `extern "Swift"` block as a Swift
+ // throwing function. Codegen attaches LLVM's `swifterror`
+diff --git a/compiler/rustc_attr_parsing/src/context.rs b/compiler/rustc_attr_parsing/src/context.rs
+index 1d0acf4f083..5fa667e6637 100644
+--- a/compiler/rustc_attr_parsing/src/context.rs
++++ b/compiler/rustc_attr_parsing/src/context.rs
+@@ -331,6 +331,7 @@ mod late {
+         Single<WithoutArgs<RustcCxxVirtualParser>>,
+         Single<WithoutArgs<RustcCxxBaseParser>>,
+         Single<WithoutArgs<RustcCxxOverrideParser>>,
++        Single<RustcCxxImportedVtableParser>,
+         Single<RustcCxxOperatorParser>,
+         Single<RustcSwiftSymbolParser>,
+         Single<RustcSwiftTypeParser>,
+diff --git a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+index 568723f95f4..a397b13872b 100644
+--- a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
++++ b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+@@ -120,6 +120,14 @@ pub(crate) fn maybe_emit_class_metadata<'ll, 'tcx>(
+     if !cxx_mangle::is_polymorphic_cpp_class(cx.tcx, adt_did) {
+         return;
+     }
++    // P09.x (1.13.7): never emit `_ZTV`/`_ZTI`/`_ZTS` for an imported
++    // C++ base — the C++ translation unit owns those symbols. (Belt and
++    // suspenders: an imported base is `#[repr(C)]`, so `cpp_class_of_method`
++    // already returns `None` for its methods; this also guards a
++    // hand-written `#[repr(cpp)]` base carrying the attribute.)
++    if cxx_mangle::is_imported_cpp_base(cx.tcx, adt_did) {
++        return;
++    }
+     // Per-CGU dedup. LinkOnceODR comdat deals with across-CGU
+     // collisions, but emitting twice in the same CGU is a hard
+     // error from LLVM.
+@@ -261,7 +269,13 @@ fn emit_typeinfo<'ll, 'tcx>(
+         // `__class_type_info`), recursively up the chain. Without
+         // this, the link fails with "undefined symbol: typeinfo for
+         // Base".
+-        let base_typeinfo_ref = if cxx_mangle::is_polymorphic_cpp_class(tcx, base_did) {
++        let base_typeinfo_ref = if let Some(zti) = cxx_mangle::imported_base_zti(tcx, base_did) {
++            // P09.x (1.13.7): imported C++ base — reference the exact
++            // `_ZTI` symbol clang emits (carried in the attribute),
++            // declared external. Robust across namespaces, where
++            // name-based mangling could diverge from clang's.
++            cx.declare_global(zti.as_str(), ptr_ty)
++        } else if cxx_mangle::is_polymorphic_cpp_class(tcx, base_did) {
+             let base_typeinfo_sym = cxx_mangle::mangle_cxx_typeinfo_symbol(tcx, base_did);
+             cx.declare_global(&base_typeinfo_sym, ptr_ty)
+         } else {
+@@ -340,20 +354,14 @@ fn emit_vtable<'ll, 'tcx>(
+     slots.push(typeinfo);
+ 
+     // Slots 2+: virtual method fn-pointers along the inheritance
+-    // chain — base virtuals first, then derived-class virtuals.
+-    // For v1 there's no override support, so base slots always
+-    // point at base's own implementations; users must keep the
+-    // C++ header's virtual order in sync.
++    // chain — base virtuals first, then derived-class virtuals. A
++    // derived `override` replaces the base slot (P09.34); a slot
++    // inherited from an *imported* C++ base that isn't overridden
++    // points directly at the real C++ implementation symbol
++    // (P09.x / 1.13.7).
+     let virtuals = cxx_mangle::virtuals_on_chain(tcx, adt_did);
+-    for method_did in virtuals {
+-        // Non-generic methods only in v1. If we hit a generic, the
+-        // user should monomorphize it manually before the polymorphic
+-        // use site. Here we synthesize an Instance with empty args
+-        // and rely on the usual Rust monomorphization machinery to
+-        // have already run.
+-        let instance = Instance::mono(tcx, method_did);
+-        let fn_val = cx.get_fn_addr(instance);
+-        slots.push(fn_val);
++    for slot in &virtuals {
++        slots.push(cxx_vt_slot_fn_addr(cx, slot));
+     }
+     let _ = ptr_ty; // (retained for readability; const_struct infers)
+ 
+@@ -375,6 +383,29 @@ fn emit_vtable<'ll, 'tcx>(
+     }
+ }
+ 
++/// P09.x (1.13.7): the function-pointer constant for one vtable slot.
++/// A Rust method uses its monomorphized address (`get_fn_addr`); a slot
++/// inherited from an *imported* C++ base that isn't overridden uses the
++/// real C++ implementation symbol, declared as an external function.
++/// Taking the declaration's address is all the vtable needs — the
++/// declared signature (`void()`) is irrelevant under opaque pointers,
++/// and if the importer also declared the same symbol with its true
++/// signature LLVM unifies the two by name.
++fn cxx_vt_slot_fn_addr<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    slot: &cxx_mangle::CxxVtSlot,
++) -> &'ll Value {
++    match slot {
++        cxx_mangle::CxxVtSlot::Rust { def_id, .. } => {
++            cx.get_fn_addr(Instance::mono(cx.tcx, *def_id))
++        }
++        cxx_mangle::CxxVtSlot::Imported { link_name, .. } => {
++            let fn_ty = cx.type_func(&[], cx.type_void());
++            cx.declare_cfn(link_name.as_str(), llvm::UnnamedAddr::No, fn_ty)
++        }
++    }
++}
++
+ // -------- MSVC vtable emission (P09.56) --------------------------------
+ //
+ // MSVC's vtable shape diverges from Itanium at every layer:
+@@ -567,10 +598,8 @@ fn emit_msvc_vftable<'ll, 'tcx>(
+     // dtor entry, which we route through P09.57 (patch 18) to
+     // pick the scalar deleting destructor.
+     let virtuals = cxx_mangle::virtuals_on_chain(tcx, adt_did);
+-    for method_did in virtuals {
+-        let instance = Instance::mono(tcx, method_did);
+-        let fn_val = cx.get_fn_addr(instance);
+-        slots.push(fn_val);
++    for slot in &virtuals {
++        slots.push(cxx_vt_slot_fn_addr(cx, slot));
+     }
+ 
+     let initializer = cx.const_struct(&slots, false);
+diff --git a/compiler/rustc_feature/src/builtin_attrs.rs b/compiler/rustc_feature/src/builtin_attrs.rs
+index 5429c39bd0a..32335b14c48 100644
+--- a/compiler/rustc_feature/src/builtin_attrs.rs
++++ b/compiler/rustc_feature/src/builtin_attrs.rs
+@@ -354,6 +354,14 @@ pub struct BuiltinAttribute {
+     // `class` body. `check_attr` verifies it actually overrides a
+     // base virtual — error otherwise, mirroring C++ `override`.
+     rustc_attr!(rustc_cxx_override, "marks an inherent virtual method on a `#[repr(cpp)]` type as overriding a base-class virtual (synthesized by the `override` class modifier; verified by check_attr)"),
++    // P09.x (1.13.7): placed by `cxx_importer` on an imported C++
++    // polymorphic class's struct. Carries the base's primary-vtable
++    // function-pointer slots in C++ order
++    // (`zti=…;slot=<name>,<sym>;…`) so a Rust `class D : CppBase` can
++    // extend the C++ vtable across the language boundary. Marks the
++    // class polymorphic and suppresses standalone `_ZTV`/`_ZTI`/`_ZTS`
++    // emission (the C++ TU owns those).
++    rustc_attr!(rustc_cxx_imported_vtable, "carries an imported C++ polymorphic base's vtable slots so a Rust `class` can subclass it with cross-boundary virtual dispatch"),
+     // P09.16: marks a fn in an `extern "Swift"` block as living
+     // in a named Swift module; the Swift mangler uses the module
+     // to produce `$s<module><name>...` link names.
+diff --git a/compiler/rustc_hir/src/attrs/data_structures.rs b/compiler/rustc_hir/src/attrs/data_structures.rs
+index 3c7e81cf016..762c5278446 100644
+--- a/compiler/rustc_hir/src/attrs/data_structures.rs
++++ b/compiler/rustc_hir/src/attrs/data_structures.rs
+@@ -1599,6 +1599,23 @@ pub enum AttributeKind {
+     /// virtual method with the same name.
+     RustcCxxOverride(Span),
+ 
++    /// Represents `#[rustc_cxx_imported_vtable = "<spec>"]` — placed
++    /// on an imported C++ polymorphic class's `#[repr(C)]` struct.
++    /// Marks the struct as a *subclassable imported base* and carries
++    /// its primary vtable's function-pointer slots in C++ order so a
++    /// Rust `class D : CppBase` can extend the C++ vtable across the
++    /// language boundary.
++    ///
++    /// The `<spec>` is a `;`-separated record:
++    /// `zti=<_ZTI symbol>;slot=<name>,<symbol>;slot=<name>,<symbol>…`
++    /// where each `slot` carries the method NAME (for override-matching
++    /// by name against a derived `override fn`) and the mangled C++
++    /// SYMBOL used when the slot is *not* overridden (pure virtuals
++    /// carry `__cxa_pure_virtual`). Presence of this attribute makes
++    /// `is_polymorphic_cpp_class` true and suppresses standalone
++    /// `_ZTV`/`_ZTI`/`_ZTS` emission (C++ owns those).
++    RustcCxxImportedVtable { spec: Symbol, span: Span },
++
+     /// Represents `#[rustc_swift_throws]` (P09.48 / 1.02 throws)
+     /// — marks a foreign fn inside `extern "Swift"` block as a
+     /// Swift throwing function. The last parameter's slot is
+diff --git a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+index 22ee1e46b15..30c883971a6 100644
+--- a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
++++ b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+@@ -187,6 +187,7 @@ pub fn encode_cross_crate(&self) -> EncodeCrossCrate {
+             RustcCxxVirtual(..) => Yes,
+             RustcCxxBase(..) => Yes,
+             RustcCxxOverride(..) => Yes,
++            RustcCxxImportedVtable { .. } => Yes,
+             RustcSwiftSymbol { .. } => Yes,
+             RustcSwiftType { .. } => Yes,
+             RustcSwiftLabels { .. } => Yes,
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+index bbb7731d73e..9f3fd2c4225 100644
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -369,6 +369,7 @@ fn check_attributes(
+                     | AttributeKind::RustcCxxDropWrapper(..)
+                     | AttributeKind::RustcCxxVirtual(..)
+                     | AttributeKind::RustcCxxBase(..)
++                    | AttributeKind::RustcCxxImportedVtable { .. }
+                     | AttributeKind::RustcSwiftSymbol { .. }
+                     | AttributeKind::RustcSwiftType { .. }
+                     | AttributeKind::RustcSwiftLabels { .. }
+@@ -808,10 +809,16 @@ fn check_cxx_override(&self, hir_id: HirId, attr_span: Span, target: Target) {
+         let mut cursor = cxx_polymorphic_base_of(tcx, adt.did());
+         let mut overrides_base = false;
+         while let Some(base_did) = cursor {
+-            if cxx_virtual_methods_on(tcx, base_did)
++            // A base virtual matches either an inherent `#[cpp_virtual]`
++            // method (Rust base) or a `slot=<name>,…` of an imported C++
++            // base's `#[rustc_cxx_imported_vtable]` (P09.x / 1.13.7).
++            let matches_inherent = cxx_virtual_methods_on(tcx, base_did)
+                 .into_iter()
+-                .any(|m| tcx.item_name(m) == method_name)
+-            {
++                .any(|m| tcx.item_name(m) == method_name);
++            let matches_imported = cxx_imported_slot_names(tcx, base_did)
++                .iter()
++                .any(|n| n == method_name.as_str());
++            if matches_inherent || matches_imported {
+                 overrides_base = true;
+                 break;
+             }
+@@ -2171,6 +2178,29 @@ fn cxx_virtual_methods_on(tcx: TyCtxt<'_>, adt_did: DefId) -> Vec<DefId> {
+     out
+ }
+ 
++/// The virtual-method NAMES carried by an imported C++ base's
++/// `#[rustc_cxx_imported_vtable = "…;slot=<name>,<sym>;…"]` attribute.
++/// Used by the `override` verify-override check so `override fn m` is
++/// accepted when an imported base declares a virtual `m`. Local to
++/// rustc_passes (no dep on rustc_symbol_mangling's parser).
++fn cxx_imported_slot_names(tcx: TyCtxt<'_>, adt_did: DefId) -> Vec<String> {
++    let Some(spec) = find_attr!(tcx, adt_did, RustcCxxImportedVtable { spec, .. } => *spec) else {
++        return Vec::new();
++    };
++    let mut out = Vec::new();
++    for record in spec.as_str().split(';') {
++        if let Some(rest) = record.trim().strip_prefix("slot=")
++            && let Some(name) = rest.split(',').next()
++        {
++            let name = name.trim();
++            if !name.is_empty() {
++                out.push(name.to_string());
++            }
++        }
++    }
++    out
++}
++
+ fn doc_fake_variadic_is_allowed_self_ty(self_ty: &hir::Ty<'_>) -> bool {
+     matches!(&self_ty.kind, hir::TyKind::Tup([_]))
+         || if let hir::TyKind::FnPtr(fn_ptr_ty) = &self_ty.kind {
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 8c7e85aa302..a084a4bb8ff 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -1740,6 +1740,7 @@
+         // Internal attributes (no public rename target).
+         rustc_cxx_base,
+         rustc_cxx_drop_wrapper,
++        rustc_cxx_imported_vtable,
+         rustc_cxx_override,
+         rustc_cxx_throws,
+         rustc_cxx_throws_msvc_typedescs,
+diff --git a/compiler/rustc_symbol_mangling/src/itanium.rs b/compiler/rustc_symbol_mangling/src/itanium.rs
+index 11cdd4b6868..a8cefe575fa 100644
+--- a/compiler/rustc_symbol_mangling/src/itanium.rs
++++ b/compiler/rustc_symbol_mangling/src/itanium.rs
+@@ -247,6 +247,13 @@ pub(crate) fn mangle_dtor_variant<'tcx>(
+ /// references a base typeinfo the base never emits (a link error:
+ /// "undefined symbol: typeinfo for Base").
+ pub fn is_polymorphic_cpp_class<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> bool {
++    // P09.x (1.13.7): an imported C++ base carries its virtual slots in
++    // a `#[rustc_cxx_imported_vtable]` attribute (it has no inherent
++    // `#[cpp_virtual]` methods of its own). Treat it as polymorphic so a
++    // Rust `class D : CppBase` shares the base vptr at offset 0.
++    if imported_vtable_spec(tcx, adt_did).is_some() {
++        return true;
++    }
+     if !virtual_methods_on_class(tcx, adt_did).is_empty() {
+         return true;
+     }
+@@ -256,6 +263,82 @@ pub fn is_polymorphic_cpp_class<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> bool
+     }
+ }
+ 
++/// P09.x (1.13.7): one slot in a class's primary vtable, in C++
++/// declaration order. Either a Rust method (referenced by `DefId`;
++/// codegen takes its address with `get_fn_addr`) or an *imported* C++
++/// base's slot (referenced by its mangled symbol; codegen declares it
++/// external and takes its address — a direct, zero-indirection call to
++/// the real C++ implementation). The `name` drives override-matching:
++/// a derived Rust `#[cpp_virtual]` method whose name equals a slot's
++/// name REPLACES that slot (C++ override semantics).
++#[derive(Clone, Debug)]
++pub enum CxxVtSlot {
++    Rust { name: rustc_span::Symbol, def_id: DefId },
++    Imported { name: rustc_span::Symbol, link_name: rustc_span::Symbol },
++}
++
++impl CxxVtSlot {
++    pub fn name(&self) -> rustc_span::Symbol {
++        match self {
++            CxxVtSlot::Rust { name, .. } | CxxVtSlot::Imported { name, .. } => *name,
++        }
++    }
++}
++
++/// The raw `#[rustc_cxx_imported_vtable = "<spec>"]` string on `adt_did`,
++/// if it is an imported C++ polymorphic base.
++fn imported_vtable_spec<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> Option<rustc_span::Symbol> {
++    rustc_hir::find_attr!(tcx, adt_did, RustcCxxImportedVtable { spec, .. } => *spec)
++}
++
++/// Parse the `slot=<name>,<symbol>` records of an imported-vtable spec
++/// into ordered `CxxVtSlot::Imported` entries. Pure-virtual slots carry
++/// `__cxa_pure_virtual` as their symbol. The `zti=`/`ztv=` records are
++/// consumed elsewhere ([`imported_base_zti`]).
++fn parse_imported_slots(spec: rustc_span::Symbol) -> Vec<CxxVtSlot> {
++    let mut out = Vec::new();
++    for record in spec.as_str().split(';') {
++        if let Some(rest) = record.trim().strip_prefix("slot=") {
++            let mut parts = rest.splitn(2, ',');
++            let name = parts.next().unwrap_or("").trim();
++            let symbol = parts.next().unwrap_or("").trim();
++            if name.is_empty() || symbol.is_empty() {
++                continue;
++            }
++            out.push(CxxVtSlot::Imported {
++                name: rustc_span::Symbol::intern(name),
++                link_name: rustc_span::Symbol::intern(symbol),
++            });
++        }
++    }
++    out
++}
++
++/// The imported base's `_ZTI` (typeinfo) symbol from its
++/// `#[rustc_cxx_imported_vtable]` `zti=` record, if present. Used by the
++/// derived class's `__si_class_type_info` chain so the RTTI link matches
++/// the symbol clang actually emits for the C++ base (robust to
++/// namespaces, where name-based mangling could diverge).
++/// True if `adt_did` is an imported C++ polymorphic base (carries
++/// `#[rustc_cxx_imported_vtable]`). Such a class's `_ZTV`/`_ZTI`/`_ZTS`
++/// are owned by the C++ translation unit — codegen must not emit them.
++pub fn is_imported_cpp_base<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> bool {
++    imported_vtable_spec(tcx, adt_did).is_some()
++}
++
++pub fn imported_base_zti<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> Option<rustc_span::Symbol> {
++    let spec = imported_vtable_spec(tcx, adt_did)?;
++    for record in spec.as_str().split(';') {
++        if let Some(rest) = record.trim().strip_prefix("zti=") {
++            let zti = rest.trim();
++            if !zti.is_empty() {
++                return Some(rustc_span::Symbol::intern(zti));
++            }
++        }
++    }
++    None
++}
++
+ /// P09.35: if `adt_did` is a derived class (its first field
+ /// carries `#[rustc_cxx_base]`), returns the base ADT's DefId.
+ /// Otherwise returns None. Chains: calling this repeatedly walks
+@@ -283,9 +366,16 @@ pub fn polymorphic_base_of_class<'tcx>(
+ /// derived class's own new virtuals. v1 assumes no derived
+ /// class overrides a base virtual (the entries for base's
+ /// virtuals point at base's methods).
+-pub fn virtuals_on_chain<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> Vec<DefId> {
+-    let mut out: Vec<DefId> = Vec::new();
+-    if let Some(base_did) = polymorphic_base_of_class(tcx, adt_did) {
++pub fn virtuals_on_chain<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> Vec<CxxVtSlot> {
++    let mut out: Vec<CxxVtSlot> = Vec::new();
++    // P09.x (1.13.7): an imported C++ base seeds its slots from the
++    // `#[rustc_cxx_imported_vtable]` attribute (the C++ vtable order,
++    // baked in by `cxx_importer`). It recurses no further — the
++    // attribute already encodes its own base chain. A Rust class with a
++    // (Rust or imported) polymorphic base recurses base-first.
++    if let Some(spec) = imported_vtable_spec(tcx, adt_did) {
++        out.extend(parse_imported_slots(spec));
++    } else if let Some(base_did) = polymorphic_base_of_class(tcx, adt_did) {
+         out.extend(virtuals_on_chain(tcx, base_did));
+     }
+     // P09.34: when a derived class declares a virtual whose name
+@@ -293,7 +383,9 @@ pub fn virtuals_on_chain<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> Vec<DefId>
+     // base's slot rather than appending a new one. That's what
+     // gives us override semantics: C++ callers going through the
+     // base slot land in the derived's implementation because the
+-    // slot now holds the derived method's DefId.
++    // slot now holds the derived method (Rust or, if not overridden,
++    // the imported C++ symbol). For an imported base this loop is
++    // empty — the base has no inherent `#[cpp_virtual]` methods.
+     //
+     // Matching is by method name only (v1). Same name with a
+     // different signature is user error — diagnosed by C++'s
+@@ -301,16 +393,17 @@ pub fn virtuals_on_chain<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> Vec<DefId>
+     // requires signature compatibility is future work.
+     for derived_did in virtual_methods_on_class(tcx, adt_did) {
+         let derived_name = tcx.item_name(derived_did);
++        let new_slot = CxxVtSlot::Rust { name: derived_name, def_id: derived_did };
+         let mut replaced = false;
+         for slot in out.iter_mut() {
+-            if tcx.item_name(*slot) == derived_name {
+-                *slot = derived_did;
++            if slot.name() == derived_name {
++                *slot = new_slot.clone();
+                 replaced = true;
+                 break;
+             }
+         }
+         if !replaced {
+-            out.push(derived_did);
++            out.push(new_slot);
+         }
+     }
+     out
+@@ -691,7 +784,13 @@ fn rustc_ty_to_cxx<'tcx>(
+     // enough; rustc_abi_cxx's mangler walks the NestedName to
+     // produce `N<len><name>E`.
+     if let ty::Adt(def, _) = ty.kind() {
+-        if !def.repr().cpp() {
++        // An imported C++ base (`#[rustc_cxx_imported_vtable]`) is a real
++        // C++ class even though its Rust struct is `#[repr(C)]` opaque —
++        // map it by name like a `#[repr(cpp)]` record. This lets it appear
++        // in C++-mangled signatures (e.g. the auto-generated
++        // `Deref for D { fn deref(&self) -> &CppBase }` on a derived
++        // `#[repr(cpp)]` class, P09.x / 1.13.7).
++        if !def.repr().cpp() && !is_imported_cpp_base(tcx, def.did()) {
+             return Err(ty);
+         }
+         let name = tcx.item_name(def.did()).to_string();
+diff --git a/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs b/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
+index 85092169dcd..81d50db6961 100644
+--- a/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
++++ b/compiler/rustc_ty_utils/src/layout/cxx_bridge.rs
+@@ -245,6 +245,13 @@ fn is_polymorphic_cpp_class<'tcx>(
+     tcx: TyCtxt<'tcx>,
+     adt_did: rustc_hir::def_id::DefId,
+ ) -> bool {
++    // P09.x (1.13.7): an imported C++ base carries its virtual slots in
++    // `#[rustc_cxx_imported_vtable]` (no inherent `#[cpp_virtual]` of its
++    // own). It is polymorphic — so a derived `class D : CppBase` shares
++    // the base's vptr at offset 0 and skips the vptr shift.
++    if rustc_hir::find_attr!(tcx, adt_did, RustcCxxImportedVtable { .. }) {
++        return true;
++    }
+     for &impl_did in tcx.inherent_impls(adt_did).iter() {
+         for &assoc in tcx.associated_item_def_ids(impl_did).iter() {
+             if tcx.def_kind(assoc) != rustc_hir::def::DefKind::AssocFn {
+-- 
+2.50.1 (Apple Git-155)
+

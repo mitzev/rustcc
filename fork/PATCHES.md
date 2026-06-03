@@ -3376,6 +3376,54 @@ must all pass on both `aarch64-apple-darwin` and
 
 ---
 
+### P09.x (1.13.7) — Subclass an imported C++ class + virtual destructor
+
+Patches **37–39**. A Rust `class Derived : CppBase` may now inherit from
+an *imported* C++ polymorphic class with cross-boundary virtual dispatch
+**and a virtual destructor**.
+
+- **37 (`37-cxx-subclass-imported-base`)** — new attribute
+  `#[rustc_cxx_imported_vtable = "<spec>"]` (`rustc_span` symbol,
+  `rustc_hir` `AttributeKind`, `rustc_attr_parsing` `NameValueStr`
+  parser on `Target::Struct`, `rustc_feature` builtin registration). The
+  slot model in `rustc_symbol_mangling::itanium` becomes `CxxVtSlot`
+  (`Rust { def_id }` | `Imported { link_name }`); `virtuals_on_chain`
+  seeds the derived vtable from the attribute (C++ order; pure virtuals
+  → `__cxa_pure_virtual`), a Rust `override` replaces a slot by name.
+  `is_polymorphic_cpp_class` (itanium, `check_attr`, `cxx_bridge`
+  copies) treats the attribute as polymorphic; `emit_typeinfo` chains to
+  the external base `_ZTI`; imported bases never emit their own
+  `_ZTV`/`_ZTI`/`_ZTS`. `rustc_ty_to_cxx` maps an imported base by name
+  so it can appear in C++-mangled signatures (the auto-`Deref`).
+
+- **38 (`38-cxx-virtual-destructor`)** — `vdtor=1` in the spec marks a
+  virtual destructor; `chain_has_virtual_dtor` walks the chain.
+  `emit_vtable` prepends the two leading Itanium dtor slots (complete
+  `D1` = `drop_in_place::<D>`, deleting `D0` = a thunk running
+  `drop_in_place::<D>` then `operator delete`). `drop_in_place` runs
+  `Drop::drop` *and* drops every field — including the `__base`
+  subobject, whose `Drop` runs the C++ base destructor. The mono
+  collector (`rustc_monomorphize`) collects `drop_in_place::<D>` as a
+  root for such classes (the vtable reference is invisible to lazy
+  collection).
+
+- **39 (`39-msvc-cxx-virtual-dtor-slot`)** — MSVC analogue: a single
+  scalar-deleting destructor (`??_G`-shaped `void*(this, flags)` thunk)
+  in the vftable's leading dtor slot, via the shared ABI-aware
+  `cxx_dtor_slots`.
+
+**Ownership model:** C++ owns and `delete`s the object; the Rust factory
+allocates via `operator new` + placement-construct, the deleting
+destructor reclaims via `operator delete`. The importer's base `Drop`
+calls the base-object destructor (`D2`), subobject-safe.
+
+**Validation probe:** `examples/subclass_cpp_base` —
+`delete (CppBase*)widget` runs the Rust `Drop`, destroys the base
+subobject, and frees, each exactly once (balanced ctor/dtor counters),
+on `aarch64-apple-darwin` and `x86_64-apple-darwin`.
+
+---
+
 ## Build & test
 
 See [`build.sh`](build.sh) and [`VERIFY.md`](VERIFY.md). Expected
