@@ -10,9 +10,15 @@ C++ side needed.
 |---|---|---|
 | `class Name { fields; methods }` | `pub class Shape { ... }` | P09.30 / P09.39 |
 | Single inheritance via `: Base` | `pub class Rectangle : Shape { ... }` | P09.32 |
-| Base-subobject field access | `self.__base.tag` | P09.32 |
-| Virtual methods | `#[cpp_virtual] pub fn area(...)` | P09.24 / P09.34 |
-| Constructor method | `#[constructor] pub fn new(...)` | P09.22 / P09.33 |
+| Transparent base-member access | `self.tag` (no `self.__base.` prefix) | P09.81 / v1.13.6 |
+| Constructor method | `pub constructor fn new(...)` | P09.80 / v1.13.5 |
+| Virtual method | `pub virtual fn area(...)` | P09.80 / v1.13.5 |
+| Verified override | `pub override fn area(...)` | P09.80 / v1.13.5 |
+
+> The method-modifier keywords (`constructor` / `virtual` / `override`)
+> desugar to the `#[constructor]` / `#[cpp_virtual]` attributes — same
+> machine code, lower boilerplate. `override` is a compile error if no
+> base virtual of that name exists.
 
 ## Running
 
@@ -34,7 +40,7 @@ shape hierarchy demo — Rust-side method calls
   circ (Circle)   : name_tag=20002  area=78.5398
 -----
 total area: 96.7898
-ok: class keyword + inheritance + vtable emission all compile and run
+ok: class keyword + inheritance + keyword modifiers + transparent base access
 ```
 
 ## Why no polymorphic `Vec<Box<Shape>>` loop?
@@ -46,7 +52,7 @@ compile time. Even when you cast a `Box<Rectangle>` to a
 `Shape::area`, not the Rectangle override. This is Rust's
 default behavior and doesn't change with the `class` keyword.
 
-The `#[cpp_virtual]` methods DO land in the class's vtable
+The `virtual` / `override` methods DO land in the class's vtable
 (verifiable via `_ZTV<class>` in the emitted object file), but
 the vtable is consumed by **C++ callers** that dispatch through
 a base pointer. See `examples/virtual_override/` for the

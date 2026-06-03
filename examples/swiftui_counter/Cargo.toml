@@ -1,0 +1,32 @@
+# SwiftUI ↔ Rust model demo.
+#
+# A SwiftUI app (Swift `@main`, Swift views) calls DOWN into a Rust
+# model through the rustcc fork's Swift `swiftcc` ABI. This is the
+# *inverted* shape of the FLTK example: there Rust drives a C++ UI;
+# here Swift drives the UI and Rust is the model/engine. SwiftUI's
+# declarative DSL (`@main`, `View`/`some View`, `@ViewBuilder`,
+# property wrappers) is a Swift-compiler construct and can't be driven
+# from Rust — so the UI lives in Swift and only the data/logic crosses.
+#
+# Build the Rust model as a static library for the Swift app:
+#   cargo +rustcc build --release           # -> target/release/libswiftui_counter.a
+# Validate the Rust half (no Swift toolchain needed):
+#   cargo +rustcc test                       # exercises the extern "Swift" API
+
+[package]
+name = "swiftui_counter"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "swiftui_counter"
+path = "src/lib.rs"
+# `staticlib` for the Swift app to link; `rlib` so `cargo test` can
+# exercise the model in-process.
+crate-type = ["staticlib", "rlib"]
+# No doctests — and stock `rustdoc` can't compile `extern "Swift"`
+# (a fork-only ABI), so leaving them on would break `cargo test`.
+doctest = false
+
+[workspace]

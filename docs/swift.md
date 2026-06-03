@@ -266,6 +266,18 @@ These are part of the release pipeline: `.github/workflows/release.yml`
 runs `fork/tests/run.sh` against the just-built stage-1 before
 packaging, so a Swift/class regression fails the release build.
 
+### End-to-end example — `examples/swiftui_counter`
+
+A full **SwiftUI ↔ Rust** demo: a SwiftUI app (Swift `@main` + views)
+calls down into a Rust model through `extern "Swift"` (swiftcc),
+bound from the Swift side with `@_silgen_name`. The Rust half is
+`cargo test`-validated; the SwiftUI app builds + links with `swiftc`
+on macOS (the swiftcc symbols resolve from the Rust staticlib). This
+is the *inverted* shape of the FLTK example — Swift drives the UI,
+Rust is the model — because SwiftUI's declarative DSL can't be driven
+from Rust (see §8). See that example's README for the architecture and
+build steps.
+
 ---
 
 ## 8. Limitations

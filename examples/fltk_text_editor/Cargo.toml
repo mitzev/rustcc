@@ -25,5 +25,10 @@ path = "src/main.rs"
 [dependencies]
 cxx_importer = { path = "../../crates/cxx_importer", features = ["libclang", "build"] }
 rustc_abi_cxx = { path = "../../crates/rustc_abi_cxx" }
+# The generated bindings emit `::cxx::CxxBase<Base>` upcast impls for
+# imported inheritance chains, so the `editor` bin links the runtime
+# support crate. (`gen_bindings` doesn't need it, but one dep table is
+# simplest.)
+cxx = { path = "../../crates/cxx" }
 
 [workspace]

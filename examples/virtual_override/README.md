@@ -8,10 +8,12 @@ an `Animal*` that actually points at a `Dog`. Dispatch hits the
 This demonstrates:
 
 - `class` keyword with inheritance (`class Dog : Animal`).
-- `#[cpp_virtual]` on methods — rustc emits `_ZTV` / `_ZTI` / `_ZTS`.
-- Override semantics: a derived virtual with the same name as a
-  base virtual replaces the base's vtable slot (P09.34).
-- Addition of a new virtual at a fresh slot (`Dog::wag`).
+- Method-modifier keywords (v1.13.5): `constructor fn` / `virtual fn`
+  / `override fn` instead of the `#[constructor]` / `#[cpp_virtual]`
+  attributes. rustc emits `_ZTV` / `_ZTI` / `_ZTS`.
+- Override semantics: `override fn speak` (verified against the base)
+  replaces `Animal::speak`'s vtable slot (P09.34); `virtual fn wag`
+  adds a new virtual at a fresh slot.
 - `__si_class_type_info` chain so `static_cast<Animal*>(d)` is a
   no-op at codegen and the `Animal*`'s vtable is the `Dog` vtable.
 

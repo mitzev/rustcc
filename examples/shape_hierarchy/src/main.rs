@@ -1,5 +1,5 @@
 //! rustcc `class` keyword walkthrough — a small Shape hierarchy
-//! demonstrating three features the fork adds on top of stock rustc:
+//! demonstrating four features the fork adds on top of stock rustc:
 //!
 //! 1. **The `class` keyword** (P09.30 / P09.39) — syntactic sugar
 //!    for a `#[repr(cpp)]` struct + inherent `impl` block, with
@@ -12,24 +12,32 @@
 //!    class with the base subobject at offset 0 plus a shared
 //!    vtable-pointer slot.
 //!
-//! 3. **Virtual vtable emission** (P09.24 / P09.34) —
-//!    `#[cpp_virtual]` methods land in the class's vtable. The
-//!    vtable isn't used for Rust-side method calls (Rust's
-//!    `shape.area()` is statically dispatched by the compiler),
-//!    but it IS used when C++ consumers call through a base
-//!    pointer. See `examples/virtual_override/` for the
-//!    Rust-defines-class, C++-calls-through-base-pointer
-//!    round-trip; this example focuses on the Rust-side API
-//!    ergonomics.
+//! 3. **Method-modifier keywords** (v1.13.5) — `constructor fn`,
+//!    `virtual fn`, and `override fn` inside a `class` body, instead
+//!    of the `#[constructor]` / `#[cpp_virtual]` attributes. `override`
+//!    is verified: it's a compile error if no base virtual of that
+//!    name exists. (Identical machine code to the attribute forms.)
+//!
+//! 4. **Transparent base-member access** (v1.13.6) — a derived class
+//!    reaches base fields/methods as `self.field` (via an
+//!    auto-synthesized `Deref` to the `__base` subobject), so the
+//!    `self.__base.` prefix is no longer needed for reads.
+//!
+//! The vtable isn't used for Rust-side method calls (Rust's
+//! `shape.area()` is statically dispatched by the compiler), but it
+//! IS used when C++ consumers call through a base pointer. See
+//! `examples/virtual_override/` for the Rust-defines-class,
+//! C++-calls-through-base-pointer round-trip; this example focuses on
+//! the Rust-side API ergonomics.
 
 #![feature(rustc_attrs)]
+#![allow(internal_features)] // class/ctor/virtual attrs ride rustc_attrs
 
 // Base class.
 pub class Shape {
     tag: u32,
 
-    #[constructor]
-    pub fn new(tag: u32) -> Self {
+    pub constructor fn new(tag: u32) -> Self {
         Shape { tag }
     }
 
@@ -37,13 +45,11 @@ pub class Shape {
     // vtable level — and for direct-typed Rust callers,
     // override at the impl-block level via the derived class's
     // own method of the same name.
-    #[cpp_virtual]
-    pub fn area(&self) -> f64 {
+    pub virtual fn area(&self) -> f64 {
         0.0
     }
 
-    #[cpp_virtual]
-    pub fn name_tag(&self) -> u32 {
+    pub virtual fn name_tag(&self) -> u32 {
         self.tag
     }
 }
@@ -53,8 +59,10 @@ pub class Rectangle : Shape {
     width: f64,
     height: f64,
 
-    #[constructor]
-    pub fn new(tag: u32, width: f64, height: f64) -> Self {
+    pub constructor fn new(tag: u32, width: f64, height: f64) -> Self {
+        // Construction still names `__base` explicitly — the base
+        // subobject has to be initialized. Transparent access is for
+        // *reads* (`self.tag`), not for the struct literal.
         Rectangle {
             __base: Shape::new(tag),
             width,
@@ -62,18 +70,18 @@ pub class Rectangle : Shape {
         }
     }
 
-    // Overrides Shape::area at the vtable slot + Rust-level.
-    #[cpp_virtual]
-    pub fn area(&self) -> f64 {
+    // `override fn` is verified against `Shape::area` (a base virtual
+    // of the same name); it fills the base's vtable slot + the
+    // Rust-level method.
+    pub override fn area(&self) -> f64 {
         self.width * self.height
     }
 
-    // Derived classes can reach the base's fields through
-    // `self.__base.<field>` — that's the synthesized base
-    // subobject the parser inserted via the `: Shape` syntax.
-    #[cpp_virtual]
-    pub fn name_tag(&self) -> u32 {
-        self.__base.tag + 10_000
+    // `self.tag` reaches the base field transparently (v1.13.6) — it
+    // resolves through the auto-`Deref` to the `__base` subobject the
+    // parser inserted via the `: Shape` syntax.
+    pub override fn name_tag(&self) -> u32 {
+        self.tag + 10_000
     }
 }
 
@@ -81,22 +89,19 @@ pub class Rectangle : Shape {
 pub class Circle : Shape {
     radius: f64,
 
-    #[constructor]
-    pub fn new(tag: u32, radius: f64) -> Self {
+    pub constructor fn new(tag: u32, radius: f64) -> Self {
         Circle {
             __base: Shape::new(tag),
             radius,
         }
     }
 
-    #[cpp_virtual]
-    pub fn area(&self) -> f64 {
+    pub override fn area(&self) -> f64 {
         core::f64::consts::PI * self.radius * self.radius
     }
 
-    #[cpp_virtual]
-    pub fn name_tag(&self) -> u32 {
-        self.__base.tag + 20_000
+    pub override fn name_tag(&self) -> u32 {
+        self.tag + 20_000
     }
 }
 
@@ -137,11 +142,8 @@ fn main() {
     println!("-----");
     println!("total area: {total_area:.4}");
 
-    // Fields are accessible through `self.<field>` inside the
-    // class body; base fields via `self.__base.<field>`. From
-    // outside the class, the fields are private by default
-    // (same visibility rules as a plain `struct`), so we use
-    // the getters instead of touching them directly.
+    // `rect.name_tag()` reads `self.tag` (a Shape field) transparently
+    // through the derived class's auto-`Deref` — no `__base` in sight.
 
     // Sanity checks — if any of these panic, the class
     // inheritance + method-resolution machinery has regressed.
@@ -158,6 +160,6 @@ fn main() {
     assert_eq!(rect2.name_tag(), 10_003);
     assert_eq!(base.name_tag(), 99);
 
-    println!("ok: class keyword + inheritance + vtable emission all compile and run");
+    println!("ok: class keyword + inheritance + keyword modifiers + transparent base access");
     println!("(virtual dispatch through a base pointer is exercised in examples/virtual_override/)");
 }

@@ -15,7 +15,7 @@ A minimal FLTK text editor in Rust. End-to-end smoke test for rustcc's cxx_impor
 
 - macOS / Linux with libclang available to `clang-sys` (`brew install llvm`, `apt install libclang-dev`).
 - FLTK 1.4.x installed system-wide. macOS: `brew install fltk`. The build helper expects FLTK at `/opt/homebrew/include` and `/opt/homebrew/Cellar/fltk/1.4.5/lib`; edit `gen_bindings.rs` if your install lives elsewhere.
-- The rustcc fork toolchain to actually run the editor — `extern "C++"` is a fork extension. Install via the [v1.05.0 release](https://github.com/rustcc/rustcc/releases/tag/v1.05.0) or `./fork/build.sh` from this repo's root.
+- The rustcc fork toolchain to actually run the editor — `extern "C++"` is a fork extension. Build it with `./fork/build.sh` from this repo's root (then `rustup toolchain link rustcc …/build/host/stage1`), or grab a prebuilt toolchain from the [releases page](https://github.com/mitzev/rustcc/releases). See `fork/INSTALL.md` for the full setup.
 
 ## Build + run
 
@@ -31,6 +31,17 @@ cargo +rustcc run --release --bin editor
 ```
 
 You should see an 800x600 window with a banner comment in a code-style monospace font. Type into it; the cursor blinks; selection works; `Ctrl+C / Ctrl+V` work because Fl_Text_Editor's default key bindings handle them. Close the window to exit.
+
+> **Status (v1.13.x):** step 1 (binding generation) works against
+> FLTK 1.4.5 with the current `cxx_importer`. Step 2 (the `editor`
+> bin) is being reconciled with the much-advanced importer — its
+> output for FLTK's *full* surface still references a few nested types
+> it doesn't yet emit at the right scope (`Key_Binding`, `matrix`,
+> …). Recent importer-robustness fixes landed along the way
+> (standalone `OUT_DIR`/`TARGET` defaults in `Build::compile`,
+> `pub(crate)` statics for crate-root `include!`, enum/alias name
+> dedup). Tracking the remaining work to a green editor build as a
+> follow-up.
 
 ## File layout
 

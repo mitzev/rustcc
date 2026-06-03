@@ -1,6 +1,7 @@
 #![no_std]
 #![feature(rustc_attrs)]
 #![allow(dead_code)]
+#![allow(internal_features)] // class/ctor/virtual attrs ride rustc_attrs
 
 //! Bare-metal ARM Cortex-M (STM32) example.
 //!
@@ -8,19 +9,18 @@
 //! `thumbv7m` / `thumbv7em` / `thumbv8m.*` targets. Demonstrates:
 //!
 //! 1. `#[repr(cpp)]` layout on 32-bit ARM.
-//! 2. `#[cpp_virtual]` emits correct vtable / typeinfo with 4-byte
+//! 2. `virtual fn` emits correct vtable / typeinfo with 4-byte
 //!    pointer slots.
-//! 3. Parser-level `class` keyword survives under `#![no_std]`.
+//! 3. Parser-level `class` keyword + method-modifier keywords
+//!    (`constructor` / `virtual`, v1.13.5) survive under `#![no_std]`.
 //! 4. Generated Rust ctor mangling matches Clang's on ARM32.
 
 pub class Widget {
     v: i32,
 
-    #[constructor]
-    pub fn new(v: i32) -> Self { Widget { v } }
+    pub constructor fn new(v: i32) -> Self { Widget { v } }
 
-    #[cpp_virtual]
-    pub fn foo(&self) -> i32 { self.v + 100 }
+    pub virtual fn foo(&self) -> i32 { self.v + 100 }
 }
 
 // Static storage — no heap on bare-metal.

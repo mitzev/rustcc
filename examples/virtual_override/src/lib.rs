@@ -1,5 +1,6 @@
 #![feature(rustc_attrs)]
 #![allow(dead_code)]
+#![allow(internal_features)] // class/ctor/virtual attrs ride rustc_attrs
 
 //! Virtual-method override across single inheritance.
 //!
@@ -12,32 +13,28 @@
 pub class Animal {
     tag: u32,
 
-    #[constructor]
-    pub fn new(tag: u32) -> Self { Animal { tag } }
+    pub constructor fn new(tag: u32) -> Self { Animal { tag } }
 
-    #[cpp_virtual]
-    pub fn speak(&self) -> u32 { self.tag * 10 }
+    pub virtual fn speak(&self) -> u32 { self.tag * 10 }
 
-    #[cpp_virtual]
-    pub fn legs(&self) -> u32 { 4 }
+    pub virtual fn legs(&self) -> u32 { 4 }
 }
 
 pub class Dog : Animal {
     bark: u32,
 
-    #[constructor]
-    pub fn new(tag: u32, bark: u32) -> Self {
+    pub constructor fn new(tag: u32, bark: u32) -> Self {
         Dog { __base: Animal::new(tag), bark }
     }
 
-    // Same name as Animal::speak → OVERRIDE (takes over the
-    // base's vtable slot).
-    #[cpp_virtual]
-    pub fn speak(&self) -> u32 { self.bark + 1000 }
+    // `override fn` (v1.13.5): verified against `Animal::speak` — takes
+    // over the base's vtable slot, so a C++ caller going through an
+    // `Animal*` lands here.
+    pub override fn speak(&self) -> u32 { self.bark + 1000 }
 
-    // New virtual, not in Animal — appended as a new slot.
-    #[cpp_virtual]
-    pub fn wag(&self) -> u32 { self.bark * 2 }
+    // `virtual fn` (not `override`): a brand-new virtual not in Animal,
+    // appended as a fresh vtable slot.
+    pub virtual fn wag(&self) -> u32 { self.bark * 2 }
 }
 
 #[unsafe(no_mangle)]

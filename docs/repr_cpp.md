@@ -94,17 +94,38 @@ Non-virtual methods are regular calls: codegen emits the body as a
 function with the mangled symbol and C++ calling convention. C++
 callers emit an ordinary call.
 
-Virtual methods are **deferred to v1.5**. They require:
+Virtual methods on **Rust-defined** classes are **shipped**: mark an
+inherent method `virtual` / `override` (or `#[cpp_virtual]`) inside a
+`class`. The compiler emits the vtable globals (`_ZTV`/`_ZTI`/`_ZTS`),
+the ctor installs the vptr, and a derived class's `override` replaces
+the base's slot — so a C++ caller dispatching through a base pointer
+lands in the Rust override. See `examples/virtual_override/` for the
+round-trip and `examples/shape_hierarchy/` for the surface.
 
-- Rust-emitted vtable globals matching `rustc_abi_cxx::vtable`.
-- A vptr installed by the Rust-side ctor.
-- Override-resolution across the `impl` hierarchy — tricky because
-  Rust has no concept of method virtuality today.
+### Subclassing an *imported* C++ class — not supported
 
-The v1 rule: `extern "C++" impl` may not declare `virtual` methods.
-Users who need virtual dispatch Rust-side can implement a trait
-object manually on the Rust side and only expose non-virtual methods
-to C++.
+You can define a whole Rust class hierarchy (`class Derived : Base`)
+where **both** base and derived are Rust-defined, and C++ dispatches
+into it correctly. You **cannot** currently make a Rust `class`
+inherit from an *imported* C++ class (e.g. `class MyWidget :
+Fl_Widget`) with working cross-boundary virtual dispatch. The reason
+is structural:
+
+- `#[cpp_virtual]` may only mark **inherent** methods; an imported C++
+  class's methods live in `extern "C++"` blocks (foreign items), which
+  the attribute rejects.
+- The vtable-chain + override-verify passes only scan inherent
+  `#[cpp_virtual]` methods, so an imported base contributes no
+  overridable slots — `override fn` errors, and a plain `virtual fn`
+  would build a *new* Rust vtable rather than extending the C++ base's.
+
+A true Rust-subclasses-C++ feature would need the Rust derived ctor to
+install a vtable that **extends** the C++ base's (the C++
+derived-ctor-overwrites-vptr dance, across the language boundary).
+That's a substantial future feature. **Workaround today:** use
+*composition* — hold the C++ object and call its methods from Rust
+(this is what `examples/fltk_text_editor/` does), rather than
+subclassing it.
 
 ## 6. Constructors and destructors
 
