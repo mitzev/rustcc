@@ -61,6 +61,7 @@ Cumulative across the v1.0x–v1.13x line. Everything below is shipped.
 | Copy / move special members | copy ctor → `impl Clone`; move ctor → `move_from`; `operator=` → `copy_assign`/`move_assign` |
 | C++ operator overloading | `#[operator = "Plus"]` and friends |
 | Parser-level `class` keyword | weak keyword, desugars to `#[repr(cpp)]` struct + impl |
+| **Subclass an imported C++ class** | `class D : CppBase` over a `cxx_importer`-imported base: override concrete + pure virtuals and the virtual destructor; C++ dispatches through `CppBase*` into the Rust `override`, `delete` runs Rust `Drop` (v1.13.7, single inheritance) |
 | Cross-crate polymorphic classes | ctor / wrapper / virtual attributes encode across crates |
 | **Windows MSVC C++ ABI** | vftables, scalar-deleting dtor, SEH funclets, sret-via-RCX/X8, dllexport; Wine-validated |
 
@@ -121,6 +122,11 @@ Honest list of what is **not** yet implemented:
 - **Swift inheritance** — you can *call* Swift and hold/retain Swift
   class instances, but a Rust type cannot *subclass* a Swift class or
   override its methods. See the Swift section below.
+- **Deep / multiple-inheritance C++ bases for Rust subclasses** —
+  subclassing an imported C++ class (above) is single-inheritance from a
+  *root* polymorphic base; deeper chains (e.g. FLTK's
+  `Fl_Text_Editor → … → Fl_Widget`) and multiple/virtual inheritance of
+  the base are future work.
 - **Member pointers** (partial), **covariant-return thunks**, and
   **GCC-backend `cxx_throws`** (the catch path is Itanium/MSVC LLVM).
 - **Recursive STL import** — a user type that *derives from* a system
@@ -326,11 +332,15 @@ Full reference: [`docs/swift.md`](docs/swift.md).
   compiler.
 - **Silent compatibility with old Clang.** rustcc pins a Clang floor
   and rejects older toolchains at build time.
-- **Subclassing C++/Swift types from Rust.** Rust can implement C++
-  virtual methods on its own `#[repr(cpp)]` classes and override across
-  a rustcc-defined inheritance chain, but making a Rust type a subclass
-  of an *imported* C++ or Swift class (participating in that language's
-  own dispatch as a derived class) is out of scope.
+- **Subclassing imported *Swift* types from Rust.** Subclassing an
+  imported *C++* polymorphic class is **supported** (v1.13.7): a Rust
+  `class D : CppBase` overrides the base's virtuals — concrete and pure
+  — and its virtual destructor, with C++ dispatching through a
+  `CppBase*` into the Rust `override` and `delete` running the Rust
+  `Drop` (see [`docs/repr_cpp.md §5`](docs/repr_cpp.md) and
+  `examples/subclass_cpp_base/`). The equivalent for imported *Swift*
+  classes (participating in Swift's own dispatch as a derived class)
+  remains out of scope.
 
 ## License
 
