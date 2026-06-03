@@ -61,7 +61,7 @@ Cumulative across the v1.0x–v1.13x line. Everything below is shipped.
 | Copy / move special members | copy ctor → `impl Clone`; move ctor → `move_from`; `operator=` → `copy_assign`/`move_assign` |
 | C++ operator overloading | `#[operator = "Plus"]` and friends |
 | Parser-level `class` keyword | weak keyword, desugars to `#[repr(cpp)]` struct + impl |
-| **Subclass an imported C++ class** | `class D : CppBase` over a `cxx_importer`-imported base: override concrete + pure virtuals and the virtual destructor; C++ dispatches through `CppBase*` into the Rust `override`, `delete` runs Rust `Drop` (v1.13.7, single inheritance; validated on Itanium ARM/Intel + Linux + MSVC). The virtual-destructor path uses `operator new`/`delete`, so it needs a heap — not for bare-metal `no_std` |
+| **Subclass an imported C++ class** | `class D : CppBase` over a `cxx_importer`-imported base — including a **deep** multi-level chain (e.g. `Fl_Text_Editor → … → Fl_Widget`): override concrete + pure virtuals at any level and the virtual destructor; C++ dispatches through a base pointer into the Rust `override`, `delete` runs Rust `Drop` (v1.13.7+; single-inheritance chain; validated on Itanium ARM/Intel + Linux + MSVC). The virtual-destructor path uses `operator new`/`delete`, so it needs a heap — not for bare-metal `no_std` |
 | Cross-crate polymorphic classes | ctor / wrapper / virtual attributes encode across crates |
 | **Windows MSVC C++ ABI** | vftables, scalar-deleting dtor, SEH funclets, sret-via-RCX/X8, dllexport; Wine-validated |
 
@@ -122,12 +122,19 @@ Honest list of what is **not** yet implemented:
 - **Swift inheritance** — you can *call* Swift and hold/retain Swift
   class instances, but a Rust type cannot *subclass* a Swift class or
   override its methods. See the Swift section below.
-- **Deep / multi-level C++ bases for Rust subclasses** — subclassing an
-  imported C++ class (above) is single-inheritance from a *root*
-  polymorphic base. Deeper **multi-level** single-inheritance chains —
-  e.g. FLTK's `Fl_Text_Editor → Fl_Text_Display → Fl_Group → Fl_Widget`
-  (FLTK's widget hierarchy is deep but single-inheritance) — and
-  multiple/virtual inheritance of the base are future work.
+- **Multiple / virtual inheritance of a Rust subclass's C++ base.**
+  *Deep* multi-level single-inheritance chains are now **supported** —
+  a Rust class can subclass e.g. FLTK's
+  `Fl_Text_Editor → Fl_Text_Display → Fl_Group → Fl_Widget` and override
+  virtuals introduced at any level. What remains future work is a base
+  reached through *multiple* or *virtual* inheritance (FLTK's widget
+  hierarchy is deep but single-inheritance, so it's covered). Also: when
+  the deepest imported base is **abstract** (an unoverridden pure
+  virtual, e.g. `Fl_Widget::draw`) *and* C++ owns/`delete`s the object,
+  destruction needs the base's base-object dtor (`D2`), which clang
+  doesn't emit for a Rust-only subclass — add a one-line C++ force-dtor
+  stub (a concrete subclass overriding the pure virtuals) until the
+  importer emits it.
 - **Bare-metal subclassing is unvalidated.** The heap-free override path
   (override virtuals, statically-allocated object, no virtual dtor) is
   target-agnostic codegen and *should* work on Cortex-M (cf. the general
