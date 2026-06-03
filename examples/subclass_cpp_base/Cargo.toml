@@ -1,0 +1,28 @@
+# Standalone manifest (outside the workspace) so the libclang-feature
+# dependency on cxx_importer doesn't bleed into the main workspace.
+#
+# Build flow (see build_demo.sh / README.md):
+#   1. `cargo run --bin gen_bindings --release`   (stock nightly + libclang)
+#        -> target/gen-out/bindings.rs  (the imported CppBase binding,
+#           carrying #[rustc_cxx_imported_vtable])
+#   2. compile src/mywidget.rs with the rustcc fork rustc
+#        -> the Rust `class MyWidget : CppBase` subclass staticlib
+#
+# `src/mywidget.rs` uses the fork-only `class` keyword, so it is NOT a
+# cargo `[lib]` target (cargo would try to build it on stock nightly);
+# it's compiled directly by the fork `rustc` in step 2.
+[package]
+name = "subclass_cpp_base"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "gen_bindings"
+path = "gen_bindings.rs"
+
+[dependencies]
+cxx_importer = { path = "../../crates/cxx_importer", features = ["libclang", "build"] }
+rustc_abi_cxx = { path = "../../crates/rustc_abi_cxx" }
+
+[workspace]

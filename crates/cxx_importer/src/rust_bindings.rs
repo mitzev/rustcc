@@ -106,7 +106,7 @@ use std::fmt::Write as _;
 use rustc_abi_cxx::{
     ClassId, CtorVariant, CxxType, CxxTypeCtx, DtorVariant, FloatKind, IntWidth,
     MethodDef, MethodName, NameSegment, OperatorKind, SpecialMember, Symbol, TypeId,
-    Virtuality,
+    VTableEntry, Virtuality,
 };
 
 use crate::annotations::{Annotation, AnnotationSet};
@@ -1030,6 +1030,91 @@ fn render_namespace_tree(
     Ok(())
 }
 
+/// P09.x (1.13.7): build the `#[rustc_cxx_imported_vtable = "…"]`
+/// attribute for an imported polymorphic C++ class, enabling a Rust
+/// `class D : CppBase` to subclass it with cross-boundary virtual
+/// dispatch. The attribute lists the class's primary-vtable
+/// function-pointer slots in C++ order:
+///
+/// ```text
+/// ztv=<_ZTV>;zti=<_ZTI>;slot=<rust_name>,<symbol>;…
+/// ```
+///
+/// where `<symbol>` is the C++ implementation a *non-overridden* slot
+/// calls (or `__cxa_pure_virtual` for an unoverridden pure virtual),
+/// and `<rust_name>` is the disambiguated Rust method name a derived
+/// `override fn <rust_name>` matches against.
+///
+/// Returns `None` when the class is non-polymorphic (`ctx.vtable`
+/// yields `None`), or when the vtable carries a virtual *destructor*
+/// slot. Running the Rust drop when an object is `delete`d through a
+/// base pointer needs vtable dtor slots this landing doesn't emit, so
+/// a virtual-destructor base isn't subclassable yet (documented
+/// limitation — e.g. a real `Fl_Widget`, whose destructor is virtual).
+/// True iff the class is abstract — its primary vtable has an
+/// unoverridden pure-virtual slot (`__cxa_pure_virtual`). An abstract
+/// class has no complete-object constructor (`C1`) emitted by clang
+/// (you can't instantiate it directly), only the base-object ctor
+/// (`C2`), which a *derived* class invokes to construct the base
+/// subobject. So the ctor binding for an abstract base must target
+/// `C2` (P09.x / 1.13.7) — otherwise a Rust `class D : CppBase` ctor
+/// would link against a `_ZN..C1E..` symbol clang never emitted.
+fn class_is_abstract(ctx: &CxxTypeCtx, class_id: ClassId) -> bool {
+    let Some(vt) = ctx.vtable(class_id) else { return false };
+    vt.sub_tables.iter().any(|st| {
+        st.entries.iter().any(|e| {
+            matches!(
+                e,
+                VTableEntry::FunctionPointer { mangled_target, .. }
+                    if mangled_target == "__cxa_pure_virtual"
+            )
+        })
+    })
+}
+
+fn build_imported_vtable_attr(
+    ctx: &CxxTypeCtx,
+    class_id: ClassId,
+    methods: &[MethodDef],
+    resolved_names: &[String],
+) -> Option<String> {
+    let vtable = ctx.vtable(class_id)?;
+    let primary = vtable.sub_tables.first()?;
+
+    let mut slots: Vec<String> = Vec::new();
+    for entry in &primary.entries {
+        let VTableEntry::FunctionPointer { mangled_target, method } = entry else {
+            continue;
+        };
+        let m_idx = method.as_index();
+        // A virtual destructor slot → not yet subclassable (see above).
+        if methods.get(m_idx).is_some_and(|m| matches!(m.special, Some(SpecialMember::Dtor))) {
+            return None;
+        }
+        // The resolved Rust name is what a derived `override fn <name>`
+        // matches. Skip a slot we can't name (e.g. an inherited base
+        // virtual not present in this class's own method list — deeper
+        // base chains are future work; MVP targets root bases).
+        let Some(name) = resolved_names.get(m_idx) else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        slots.push(format!("slot={name},{mangled_target}"));
+    }
+    if slots.is_empty() {
+        return None;
+    }
+
+    let ztv = ctx.mangle(&Symbol::VTable(class_id));
+    let zti = ctx.mangle(&Symbol::TypeInfo(class_id));
+    let mut spec = format!("ztv={ztv};zti={zti}");
+    for slot in slots {
+        spec.push(';');
+        spec.push_str(&slot);
+    }
+    Some(format!("#[rustc_cxx_imported_vtable = \"{spec}\"]"))
+}
+
 fn render_direct_extern_class(
     ctx: &CxxTypeCtx,
     class_id: ClassId,
@@ -1101,18 +1186,43 @@ fn render_direct_extern_class(
     // a single method shape isn't implemented yet.
     let methods = ctx.class(class_id).methods.clone();
 
+    // Pre-compute the disambiguated Rust name for each method (needed
+    // both for the imported-vtable attribute below and the impl block).
+    // Ctors and dtors are special-cased to `new` / `drop`; operators
+    // route through `rust_name_for_operator`; identifier-named methods
+    // keep their source name, with collisions resolved by appending a
+    // stringified parameter-type signature.
+    let resolved_names = resolve_method_names(
+        ctx,
+        &methods,
+        &class_name,
+        &class_fqn,
+        annotations,
+    )?;
+
+    // P09.x (1.13.7): if this is a polymorphic C++ class, build the
+    // `#[rustc_cxx_imported_vtable]` attribute so a Rust `class D :
+    // CppBase` can subclass it with cross-boundary virtual dispatch.
+    // `None` for non-polymorphic classes and for virtual-destructor
+    // bases (not yet subclassable — see the helper).
+    let imported_vtable_attr =
+        build_imported_vtable_attr(ctx, class_id, &methods, &resolved_names);
+
     let mut block = String::new();
     if config.doc_hidden {
         let _ = writeln!(block, "{indent}#[doc(hidden)]");
     }
 
     // 1. Struct decl. `#[repr(C)]` + explicit alignment matches the
-    //    C++ class layout for POD shapes (single inheritance, no
-    //    vtable). Polymorphic / virtual-base classes need
-    //    `#[repr(cpp)]` and the full Itanium layout machinery —
-    //    rejected at the top of this function.
+    //    C++ class layout. The opaque storage already includes any
+    //    leading vptr (its size comes from libclang), so a polymorphic
+    //    base needs no `#[repr(cpp)]` shift — just the imported-vtable
+    //    attribute (P09.x / 1.13.7) marking it subclassable.
     let _ = writeln!(block, "{indent}#[repr(C)]");
     let _ = writeln!(block, "{indent}#[repr(align({}))]", layout.align_bytes);
+    if let Some(attr) = &imported_vtable_attr {
+        let _ = writeln!(block, "{indent}{attr}");
+    }
     let _ = writeln!(block, "{indent}pub struct {class_name} {{");
     let _ = writeln!(
         block,
@@ -1147,18 +1257,8 @@ fn render_direct_extern_class(
     // Side-buffer for throws-tagged extern decls.
     let mut throws_extern_lines: Vec<String> = Vec::new();
 
-    // Pre-compute the disambiguated Rust name for each method.
-    // Ctors and dtors are special-cased to `new` / `drop`; operators
-    // route through `rust_name_for_operator`; identifier-named
-    // methods keep their source name, with collisions resolved by
-    // appending a stringified parameter-type signature.
-    let resolved_names = resolve_method_names(
-        ctx,
-        &methods,
-        &class_name,
-        &class_fqn,
-        annotations,
-    )?;
+    // `resolved_names` was computed above (before the struct decl) so
+    // the imported-vtable attribute could reuse it.
 
     let mut ctor_seen = 0usize;
     let mut method_blocks: Vec<MethodEmission> = Vec::with_capacity(methods.len());
@@ -2319,7 +2419,14 @@ fn classify_for_direct_extern(
                 (
                     ctx.mangle(&Symbol::Ctor {
                         class: class_id,
-                        variant: CtorVariant::C1,
+                        // Abstract bases have no `C1` (complete-object)
+                        // ctor — only `C2` (base-object), used to build
+                        // the base subobject from a derived ctor.
+                        variant: if class_is_abstract(ctx, class_id) {
+                            CtorVariant::C2
+                        } else {
+                            CtorVariant::C1
+                        },
                         sig: method.sig.clone(),
                     }),
                     String::new(),
