@@ -116,13 +116,15 @@ if not text.endswith('\n'):
     text += '\n'
 text += (
     '\n# rustcc fork override (v1.13.8, Rust 1.96.0 base).\n'
-    '# 1.96.0 is a tagged release -> its CI LLVM artifact exists, so\n'
-    '# download it instead of building LLVM from source (much faster).\n'
+    '# rust-lang CI prunes download-ci-llvm artifacts for older commits;\n'
+    '# even the 1.96.0 *release* commit returns 404 now, so build LLVM\n'
+    '# from source (reliable -- adds ~30 min to a cold build but never\n'
+    '# bit-rots like the artifact bucket does).\n'
     '# 1.96.0 is a *stable* channel, which forbids `#![feature(...)]`;\n'
     '# the fork needs `feature(rustc_attrs)`, so force the nightly\n'
     '# channel on the built toolchain.\n'
     '[llvm]\n'
-    'download-ci-llvm = true\n'
+    'download-ci-llvm = false\n'
     '[rust]\n'
     'channel = "nightly"\n'
 )
@@ -138,10 +140,11 @@ if ! grep -q "^# rustcc fork override" "$CLONE_DIR/bootstrap.toml"; then
   # ASCII-only — see Windows-cp1252 caveat in the python block above.
   {
     printf '\n# rustcc fork override (v1.13.8, Rust 1.96.0 base).\n'
-    printf '# Release tag -> CI LLVM exists (faster); stable channel\n'
-    printf '# forbids feature gates, so force nightly for the toolchain.\n'
+    printf '# CI LLVM artifact for this commit is pruned (404) -> build\n'
+    printf '# LLVM from source; stable channel forbids feature gates, so\n'
+    printf '# force nightly for the toolchain.\n'
     printf '[llvm]\n'
-    printf 'download-ci-llvm = true\n'
+    printf 'download-ci-llvm = false\n'
     printf '[rust]\n'
     printf 'channel = "nightly"\n'
   } >> "$CLONE_DIR/bootstrap.toml"

@@ -16,8 +16,9 @@ from v1.13.7, and re-validates the bare-metal codegen path.
 archived under `fork/patches-1.97dev/`). The 1.96.0 base needs two
 config tweaks `build.sh` now sets automatically: `channel = "nightly"`
 (a stable tag forbids the `feature(rustc_attrs)` the fork uses) and
-`download-ci-llvm = true` (a release tag has CI LLVM — much faster than
-building LLVM from source). See `fork/MIGRATION-1.96.0.md` for the
+`download-ci-llvm = false` (rust-lang CI prunes the LLVM artifact for
+older commits — even this release commit 404s — so LLVM is built from
+source). See `fork/MIGRATION-1.96.0.md` for the
 3 conflict resolutions + 5 small API-drift fixes (notably the
 `rustc_attr!` 2-arg shim, `FnSig` field-vs-method, `mk_fn_sig` arity,
 and `From` diagnostic-item). All 42 patches apply cleanly via

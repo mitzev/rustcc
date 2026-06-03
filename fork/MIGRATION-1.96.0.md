@@ -44,8 +44,9 @@ pin doesn't (`fork/build.sh` now writes both automatically):
 channel = "nightly"          # 1.96.0 is a *stable* tag; the fork needs
                              # `#![feature(rustc_attrs)]`, forbidden on stable
 [llvm]
-download-ci-llvm = true      # 1.96.0 is a real release -> CI LLVM exists
-                             # (the master pin can't use it, hence false there)
+download-ci-llvm = false     # rust-lang CI prunes the LLVM artifact for
+                             # older commits; even this release commit 404s,
+                             # so build LLVM from source (same as the master pin)
 ```
 
 All 42 patches apply cleanly via `git am --3way` onto the 1.96.0 tag
