@@ -113,6 +113,20 @@ Rust `Drop`, destroys the base subobject, and frees. This is the
 canonical FLTK custom-widget pattern (override `handle()` / `draw()`).
 See `examples/subclass_cpp_base/`.
 
+**Deep (multi-level) chains (v1.13.8).** The imported base may itself be
+deeply derived — e.g. `Widget : Drawable : Shape`, or FLTK's
+`Fl_Text_Editor : Fl_Text_Display : Fl_Group : Fl_Widget`. `cxx_importer`
+flattens the entire primary vtable into the deepest class's
+`#[rustc_cxx_imported_vtable]`, so a Rust `class MyWidget : Widget` can
+override a virtual introduced at **any** ancestor (including a
+grandparent's), and `delete` through any base pointer in the chain runs
+the Rust `Drop` + the full C++ destructor chain. See
+`examples/subclass_cpp_deep/`. Caveat: if the deepest imported base is
+itself **abstract** (an unoverridden pure virtual) *and* C++ owns/deletes
+the object, destruction needs that base's base-object destructor (`D2`),
+which clang doesn't emit for a Rust-only subclass — add a one-line C++
+force-dtor stub until the importer emits one (dispatch is unaffected).
+
 How it works:
 
 - `cxx_importer` emits `#[rustc_cxx_imported_vtable = "<spec>"]` on the
