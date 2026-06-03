@@ -1073,43 +1073,34 @@ fn class_is_abstract(ctx: &CxxTypeCtx, class_id: ClassId) -> bool {
     })
 }
 
-fn build_imported_vtable_attr(
-    ctx: &CxxTypeCtx,
-    class_id: ClassId,
-    methods: &[MethodDef],
-    resolved_names: &[String],
-) -> Option<String> {
-    let vtable = ctx.vtable(class_id)?;
-    let primary = vtable.sub_tables.first()?;
+fn build_imported_vtable_attr(ctx: &CxxTypeCtx, class_id: ClassId) -> Option<String> {
+    // `primary_vtable_slots` flattens the FULL single-inheritance chain
+    // and resolves each slot's override-matching name via its declaring
+    // class — so this works for *deep* imported bases (e.g. FLTK's
+    // `Fl_Text_Editor : Fl_Text_Display : Fl_Group : Fl_Widget`), where
+    // most slots are inherited rather than declared on the leaf class.
+    let slots = ctx.primary_vtable_slots(class_id)?;
 
-    let mut slots: Vec<String> = Vec::new();
+    let mut slot_specs: Vec<String> = Vec::new();
     let mut has_vdtor = false;
-    for entry in &primary.entries {
-        let VTableEntry::FunctionPointer { mangled_target, method } = entry else {
-            continue;
-        };
-        let m_idx = method.as_index();
-        // Virtual destructor slots (Itanium emits the complete `D1` and
-        // deleting `D0` pair at the front). Record the flag and skip them
-        // — a derived Rust class supplies its own `D1`/`D0` in those
-        // leading slots (P09.x / 1.13.7); `delete (Base*)derived` then
-        // runs the Rust `Drop`, destroys the base subobject, and frees.
-        if methods.get(m_idx).is_some_and(|m| matches!(m.special, Some(SpecialMember::Dtor))) {
+    for s in &slots {
+        // Virtual destructor: the derived Rust class supplies its own
+        // `D1`/`D0` in the leading slots (P09.x / 1.13.7), so record the
+        // flag and skip the base's dtor entries.
+        if s.is_dtor {
             has_vdtor = true;
             continue;
         }
-        // The resolved Rust name is what a derived `override fn <name>`
-        // matches. Skip a slot we can't name (e.g. an inherited base
-        // virtual not present in this class's own method list — deeper
-        // base chains are future work; MVP targets root bases).
-        let Some(name) = resolved_names.get(m_idx) else { continue };
+        // Skip operator/conversion slots (no plain name to match an
+        // `override fn` against); the base keeps its own implementation.
+        let Some(name) = &s.name else { continue };
         if name.is_empty() {
             continue;
         }
-        slots.push(format!("slot={name},{mangled_target}"));
+        slot_specs.push(format!("slot={},{}", name, s.mangled_target));
     }
     // Nothing to extend (not polymorphic in a useful way) → no attribute.
-    if slots.is_empty() && !has_vdtor {
+    if slot_specs.is_empty() && !has_vdtor {
         return None;
     }
 
@@ -1119,7 +1110,7 @@ fn build_imported_vtable_attr(
     if has_vdtor {
         spec.push_str(";vdtor=1");
     }
-    for slot in slots {
+    for slot in slot_specs {
         spec.push(';');
         spec.push_str(&slot);
     }
@@ -1213,11 +1204,10 @@ fn render_direct_extern_class(
 
     // P09.x (1.13.7): if this is a polymorphic C++ class, build the
     // `#[rustc_cxx_imported_vtable]` attribute so a Rust `class D :
-    // CppBase` can subclass it with cross-boundary virtual dispatch.
-    // `None` for non-polymorphic classes and for virtual-destructor
-    // bases (not yet subclassable — see the helper).
-    let imported_vtable_attr =
-        build_imported_vtable_attr(ctx, class_id, &methods, &resolved_names);
+    // CppBase` can subclass it with cross-boundary virtual dispatch —
+    // including deep (multi-level) bases. `None` for non-polymorphic
+    // classes.
+    let imported_vtable_attr = build_imported_vtable_attr(ctx, class_id);
 
     let mut block = String::new();
     if config.doc_hidden {
@@ -1738,6 +1728,43 @@ fn render_direct_extern_class(
             block,
             "{indent}        unsafe {{ {ext}(self as *mut Self); }}",
             ext = dtor.extern_ident,
+        );
+        let _ = writeln!(block, "{indent}    }}");
+        let _ = writeln!(block, "{indent}}}");
+    } else if imported_vtable_attr
+        .as_deref()
+        .is_some_and(|a| a.contains("vdtor=1"))
+        && !class_is_abstract(ctx, class_id)
+    {
+        // P09.x (1.13.7): the class INHERITS a virtual destructor (it
+        // declares none of its own — e.g. FLTK's `Fl_Group` for a class
+        // derived from it). A Rust subclass's
+        // `__base: <this>` subobject must still run the C++ destruction
+        // chain when dropped, so emit a `Drop` calling this class's
+        // destructor, which C++ chains to its bases. Without this,
+        // dropping the base subobject is a silent no-op and the C++ base
+        // resources leak.
+        //
+        // Use the complete-object dtor (`D1`), not the base-object dtor
+        // (`D2`): for an *implicit* (inherited) dtor clang only emits the
+        // variants the vtable forces — `D1`/`D0` — and never `D2` (which
+        // it would emit solely for a C++ *derived* class, of which there
+        // are none here). With no virtual bases `D1` ≡ `D2` behaviorally,
+        // so it is correct for the subobject and is guaranteed to link.
+        let d2 = ctx.mangle(&Symbol::Dtor { class: class_id, variant: DtorVariant::D1 });
+        let _ = writeln!(block);
+        let _ = writeln!(block, "{indent}unsafe extern \"C++\" {{");
+        let _ = writeln!(block, "{indent}    #[link_name = \"{d2}\"]");
+        let _ = writeln!(
+            block,
+            "{indent}    fn __cxx_{class_name}_inherited_dtor(this: *mut {class_name});"
+        );
+        let _ = writeln!(block, "{indent}}}");
+        let _ = writeln!(block, "{indent}impl ::core::ops::Drop for {class_name} {{");
+        let _ = writeln!(block, "{indent}    fn drop(&mut self) {{");
+        let _ = writeln!(
+            block,
+            "{indent}        unsafe {{ __cxx_{class_name}_inherited_dtor(self as *mut Self); }}"
         );
         let _ = writeln!(block, "{indent}    }}");
         let _ = writeln!(block, "{indent}}}");

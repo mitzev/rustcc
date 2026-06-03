@@ -75,6 +75,26 @@ pub enum VTableEntry {
     },
 }
 
+/// One function-pointer slot of a class's primary vtable, with its
+/// override-matching name resolved across the full single-inheritance
+/// chain (so slots *inherited* from a base — not just the class's own —
+/// carry the declaring method's name). Used by `cxx_importer` to emit a
+/// complete `#[rustc_cxx_imported_vtable]` attribute for *deep*
+/// (multi-level) imported polymorphic bases.
+#[derive(Clone, Debug)]
+pub struct PrimaryVtableSlot {
+    /// The source method name a derived `override fn <name>` matches
+    /// (the name at the slot's declaring class). `None` for the
+    /// destructor slots and for operator/conversion methods (not
+    /// name-overridable).
+    pub name: Option<String>,
+    /// The slot's target symbol: the final overrider's mangled name, or
+    /// `__cxa_pure_virtual` for an unoverridden pure virtual.
+    pub mangled_target: String,
+    /// True for the two leading Itanium destructor slots (`D1`/`D0`).
+    pub is_dtor: bool,
+}
+
 impl CxxTypeCtx {
     /// Vtable dispatcher. Routes to either Itanium ([`Self::vtable_itanium`])
     /// or MSVC ([`Self::vtable_msvc`]) based on `target().abi_flavor`.
@@ -83,6 +103,42 @@ impl CxxTypeCtx {
             crate::target::AbiFlavor::Itanium => self.vtable_itanium(class_id),
             crate::target::AbiFlavor::Msvc => self.vtable_msvc(class_id),
         }
+    }
+
+    /// The primary vtable's function-pointer slots in C++ order, with
+    /// each slot's override-matching name resolved across the entire
+    /// (single-)inheritance chain via its declaring class. Returns
+    /// `None` for a non-polymorphic class. Unlike walking
+    /// [`VTableEntry::FunctionPointer`] (which exposes only a
+    /// class-relative `MethodId`), this resolves the name of a slot a
+    /// deep base introduced — enabling a Rust subclass of e.g.
+    /// `Fl_Text_Editor` to match overrides against the *inherited*
+    /// `Fl_Widget`/`Fl_Group` virtuals.
+    pub fn primary_vtable_slots(&self, class_id: ClassId) -> Option<Vec<PrimaryVtableSlot>> {
+        if !self.class(class_id).is_polymorphic {
+            return None;
+        }
+        let mut out = Vec::new();
+        for slot in build_virtual_slots(self, class_id) {
+            let VTableEntry::FunctionPointer { mangled_target, .. } =
+                slot_to_entry(self, &slot)
+            else {
+                continue;
+            };
+            let (name, is_dtor) = match slot.kind {
+                VSlotKind::DtorD1 | VSlotKind::DtorD0 => (None, true),
+                VSlotKind::Method => {
+                    // Name from the *declaring* class (override-matching
+                    // is by the name as introduced; the overrider keeps it).
+                    let name = slot.originator_method_idx.and_then(|i| {
+                        method_ident(&self.class(slot.originator_class).methods[i].name)
+                    });
+                    (name, false)
+                }
+            };
+            out.push(PrimaryVtableSlot { name, mangled_target, is_dtor });
+        }
+        Some(out)
     }
 
     /// Itanium-only vtable entry point. Exposed for tests and the
@@ -515,6 +571,16 @@ fn slot_to_entry(ctx: &CxxTypeCtx, slot: &VSlot) -> VTableEntry {
             };
             function_slot(target, MethodId(method_idx as u32))
         }
+    }
+}
+
+/// The simple identifier name of a method, for override-matching.
+/// `None` for operator overloads and conversion functions (not matched
+/// by a plain `override fn <name>`).
+fn method_ident(name: &crate::ty::MethodName) -> Option<String> {
+    match name {
+        crate::ty::MethodName::Ident(i) => Some(i.0.clone()),
+        _ => None,
     }
 }
 

@@ -33,5 +33,5 @@ pub use ty::{
     RustEnumId, RustEnumVariant, SpecialMember, TemplateArg, TypeId,
     TypeOrigin, Virtuality,
 };
-pub use vtable::{VTable, VTableEntry, VTableSubTable};
+pub use vtable::{PrimaryVtableSlot, VTable, VTableEntry, VTableSubTable};
 pub use vtt::{ConstructionVtable, Vtt, VttEntry, VttVtableRef};
