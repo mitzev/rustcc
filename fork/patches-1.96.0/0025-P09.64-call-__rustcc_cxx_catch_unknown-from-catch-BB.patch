@@ -1,0 +1,230 @@
+From d2a6a8ae6350ab1605f780f0bc88e4c82e7fb1e7 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 10:24:39 +0300
+Subject: [PATCH 25/42] P09.64: call __rustcc_cxx_catch_unknown from catch BB
+ (Phase 1D)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fourth codegen patch in the Phase 1 series. Replaces P09.63's
+placeholder abort-after-landingpad with a call to the v1.12.5
+runtime helper `cxx::native_invoke::__rustcc_cxx_catch_unknown`.
+
+Three changes:
+
+1. New trait method `MiscCodegenMethods::cxx_throws_catch_fn`
+   returns a function reference to `__rustcc_cxx_catch_unknown`
+   (declared as `extern "C" fn(ptr) -> { i32, ptr }` matching
+   `cxx::CxxRawError`'s `#[repr(C)]` layout).
+2. LLVM backend impl mirrors `eh_personality` exactly: cached
+   `Cell<Option<&Value>>` on CodegenCx, `declare_cfn(name, type)`
+   for the FFI declaration, name-based reuse via
+   `get_declared_value` for CGUs that hit the helper multiple
+   times. GCC backend ships a stub.
+3. The catch BB synthesized by `cxx_throws_catch_pad` (P09.63)
+   now calls the helper with the exception pointer immediately
+   after the landingpad. The result (the CxxRawError struct)
+   is discarded for now — P09.65 wires it into Result::Err
+   construction.
+
+What this delivers (once bootstrapped):
+- `#[rustc_cxx_throws]` calls lower to invoke (P09.61)
+- Landingpad catches the exception (P09.62 + P09.63)
+- Runtime helper is called with the caught exception ptr
+  (this patch) — drains `__cxa_begin_catch` / `__cxa_end_catch`
+  so the Itanium exception lifetime is properly closed before
+  the abort
+- Currently aborts after the catch + drain — P09.65 swaps the
+  abort for Result::Err construction into the call's
+  destination slot
+
+This is a meaningful intermediate state: the exception is
+properly caught + released through the C++ ABI, the helper's
+allocation/release plumbing is exercised, and the program
+aborts cleanly. Real "catch and return" awaits P09.65's
+Result-slot work.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ compiler/rustc_codegen_gcc/src/context.rs     | 15 +++++++
+ compiler/rustc_codegen_llvm/src/context.rs    | 44 +++++++++++++++++++
+ compiler/rustc_codegen_ssa/src/mir/block.rs   | 35 ++++++++++++---
+ compiler/rustc_codegen_ssa/src/traits/misc.rs | 13 ++++++
+ 4 files changed, 100 insertions(+), 7 deletions(-)
+
+diff --git a/compiler/rustc_codegen_gcc/src/context.rs b/compiler/rustc_codegen_gcc/src/context.rs
+index c7a2b92ac13..1ce660ba198 100644
+--- a/compiler/rustc_codegen_gcc/src/context.rs
++++ b/compiler/rustc_codegen_gcc/src/context.rs
+@@ -476,6 +476,21 @@ fn eh_personality(&self) -> Function<'gcc> {
+         func
+     }
+ 
++    // P09.64 / 1.13 throws Phase 1D: GCC backend stub.
++    // `#[rustc_cxx_throws]` codegen targets the LLVM backend
++    // exclusively for v1.13.0; the GCC backend's path through
++    // the catch BB is gated by P09.62-gcc's stub (which already
++    // delegates to `cleanup_landing_pad`), so this method is
++    // never reached on the GCC backend in practice. A real GCC
++    // impl needs libgccjit's external-fn-by-name declaration
++    // surface and the struct-by-value return-shape work.
++    fn cxx_throws_catch_fn(&self) -> (Self::Value, Self::FunctionSignature) {
++        unimplemented!(
++            "cxx_throws codegen path is LLVM-only for v1.13.0; \
++             GCC backend support is queued as P09.64-gcc"
++        );
++    }
++
+     fn sess(&self) -> &Session {
+         self.tcx.sess
+     }
+diff --git a/compiler/rustc_codegen_llvm/src/context.rs b/compiler/rustc_codegen_llvm/src/context.rs
+index 3d4a70ea2ba..dbdfac6ae65 100644
+--- a/compiler/rustc_codegen_llvm/src/context.rs
++++ b/compiler/rustc_codegen_llvm/src/context.rs
+@@ -136,6 +136,12 @@ pub(crate) struct FullCx<'ll, 'tcx> {
+ 
+     eh_personality: Cell<Option<&'ll Value>>,
+     eh_catch_typeinfo: Cell<Option<&'ll Value>>,
++    /// P09.64 / 1.13 throws Phase 1D: cached function reference
++    /// to the `__rustcc_cxx_catch_unknown` runtime helper.
++    /// Lives in `cxx::native_invoke`; the codegen layer
++    /// declares it as an extern "C" symbol on first reference
++    /// per CGU.
++    cxx_throws_catch_fn: Cell<Option<&'ll Value>>,
+     pub rust_try_fn: Cell<Option<(&'ll Type, &'ll Value)>>,
+ 
+     intrinsics:
+@@ -646,6 +652,7 @@ pub(crate) fn new(
+                 dbg_cx,
+                 eh_personality: Cell::new(None),
+                 eh_catch_typeinfo: Cell::new(None),
++                cxx_throws_catch_fn: Cell::new(None),
+                 rust_try_fn: Cell::new(None),
+                 intrinsics: Default::default(),
+                 local_gen_sym_counter: Cell::new(0),
+@@ -907,6 +914,43 @@ fn eh_personality(&self) -> &'ll Value {
+         llfn
+     }
+ 
++    fn cxx_throws_catch_fn(&self) -> (&'ll Value, &'ll Type) {
++        // P09.64 / 1.13 throws Phase 1D: declare (or look up the
++        // already-declared) `__rustcc_cxx_catch_unknown` runtime
++        // helper for this CGU. Lives in `cxx::native_invoke` —
++        // the user's final link line is responsible for pulling
++        // in the `cxx` runtime crate.
++        //
++        // LLVM signature: `fn(ptr) -> { i32, ptr }`. The arg is
++        // the Itanium exception pointer (extractvalue 0 of the
++        // landingpad result); the return is the `CxxRawError`
++        // tagged union (`{ kind: u32, message: *const c_char }`,
++        // matching `cxx::CxxRawError`'s `#[repr(C)]` layout).
++        //
++        // Returns both the callable function `&Value` and its
++        // `&Type` so the caller doesn't need to reconstruct the
++        // type for `bx.call`.
++        let cxx_raw_error_ty = self.type_struct(
++            &[self.type_i32(), self.type_ptr()],
++            /* packed: */ false,
++        );
++        let fty = self.type_func(&[self.type_ptr()], cxx_raw_error_ty);
++        if let Some(llfn) = self.cxx_throws_catch_fn.get() {
++            return (llfn, fty);
++        }
++        let name = "__rustcc_cxx_catch_unknown";
++        let llfn = if let Some(llfn) = self.get_declared_value(name) {
++            llfn
++        } else {
++            let llfn = self.declare_cfn(name, llvm::UnnamedAddr::Global, fty);
++            let target_cpu = attributes::target_cpu_attr(self, self.sess());
++            attributes::apply_to_llfn(llfn, llvm::AttributePlace::Function, &[target_cpu]);
++            llfn
++        };
++        self.cxx_throws_catch_fn.set(Some(llfn));
++        (llfn, fty)
++    }
++
+     fn sess(&self) -> &Session {
+         self.tcx.sess
+     }
+diff --git a/compiler/rustc_codegen_ssa/src/mir/block.rs b/compiler/rustc_codegen_ssa/src/mir/block.rs
+index f37dbab1e3e..075e425e243 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/block.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/block.rs
+@@ -1918,8 +1918,8 @@ fn cxx_throws_catch_pad(&mut self, _outer_bx: &mut Bx) -> Bx::BasicBlock {
+ 
+         // Itanium landingpad path: emit catch-all landingpad,
+         // store exception ptr + type-info index into the
+-        // function's personality slot (so debuggers + future
+-        // P09.64 work can recover them), then abort.
++        // function's personality slot (so debuggers can recover
++        // them), then call the runtime helper.
+         let llpersonality = self.cx.eh_personality();
+         let (exn0, exn1) = catch_bx.cxx_catch_landing_pad(llpersonality);
+ 
+@@ -1927,11 +1927,32 @@ fn cxx_throws_catch_pad(&mut self, _outer_bx: &mut Bx) -> Bx::BasicBlock {
+         slot.storage_live(&mut catch_bx);
+         Pair(exn0, exn1).store(&mut catch_bx, slot);
+ 
+-        // Placeholder: abort instead of building Result::Err.
+-        // P09.64 replaces this with a call to
+-        // `cxx::native_invoke::__rustcc_cxx_catch_unknown(exn0)`
+-        // + a Result::Err construction into the call's return
+-        // slot.
++        // P09.64 / 1.13 throws Phase 1D: call the runtime
++        // helper `cxx::native_invoke::__rustcc_cxx_catch_unknown`
++        // with the caught exception pointer. The helper handles
++        // `__cxa_begin_catch` / `__cxa_end_catch` internally and
++        // returns a `CxxRawError` tagged union ({ i32, ptr }).
++        //
++        // The return value is currently discarded — P09.65 will
++        // store it into the call's destination slot as a
++        // `Result::Err(CxxException::from_raw(raw.kind, raw.message))`.
++        // For now the abort below means the program exits after
++        // a clean catch instead of propagating the exception
++        // into Rust frames (UB) or yielding a Result::Err
++        // (the eventual target shape).
++        let (helper_fn, helper_ty) = self.cx.cxx_throws_catch_fn();
++        let _raw_err = catch_bx.call(
++            helper_ty,
++            /* fn_attrs: */ None,
++            /* fn_abi: */ None,
++            helper_fn,
++            &[exn0],
++            /* funclet: */ None,
++            /* instance: */ None,
++        );
++
++        // P09.65 will replace abort with a Result::Err
++        // construction + branch to the call's success target.
+         catch_bx.abort();
+         catch_bx.unreachable();
+ 
+diff --git a/compiler/rustc_codegen_ssa/src/traits/misc.rs b/compiler/rustc_codegen_ssa/src/traits/misc.rs
+index 6a0f8898334..2c02a594182 100644
+--- a/compiler/rustc_codegen_ssa/src/traits/misc.rs
++++ b/compiler/rustc_codegen_ssa/src/traits/misc.rs
+@@ -20,6 +20,19 @@ fn apply_vcall_visibility_metadata(
+     fn get_fn(&self, instance: Instance<'tcx>) -> Self::Function;
+     fn get_fn_addr(&self, instance: Instance<'tcx>) -> Self::Value;
+     fn eh_personality(&self) -> Self::Function;
++    /// P09.64 / 1.13 throws Phase 1D: function reference + type
++    /// for the `__rustcc_cxx_catch_unknown` runtime helper.
++    /// Declared as `extern "C" fn(*mut c_void) -> { u32, *const c_char }`
++    /// (the FFI shape of `cxx::CxxRawError`). Lives in
++    /// `cxx::native_invoke`; the codegen layer declares it as an
++    /// extern symbol on first reference per CGU and caches the
++    /// pair so subsequent CXX_THROWS call sites within the same
++    /// CGU don't re-declare.
++    ///
++    /// Returns `(callable_value, fn_signature)`. The catch BB
++    /// synthesized by `cxx_throws_catch_pad` (P09.63) passes
++    /// both to `bx.call`.
++    fn cxx_throws_catch_fn(&self) -> (Self::Value, Self::FunctionSignature);
+     fn sess(&self) -> &Session;
+     fn set_frame_pointer_type(&self, llfn: Self::Function);
+     fn apply_target_cpu_attr(&self, llfn: Self::Function);
+-- 
+2.50.1 (Apple Git-155)
+

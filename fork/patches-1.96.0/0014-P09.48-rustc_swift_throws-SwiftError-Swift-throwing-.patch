@@ -1,0 +1,430 @@
+From ca8e84b766e85f37e1e2d956f53fd11abb4478e1 Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Sat, 25 Apr 2026 02:06:26 +0300
+Subject: [PATCH 14/42] =?UTF-8?q?P09.48:=20#[rustc=5Fswift=5Fthrows]=20+?=
+ =?UTF-8?q?=20SwiftError=20=E2=80=94=20Swift=20throwing=20fns=20(1.02=20th?=
+ =?UTF-8?q?rows)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Ships Swift `throws` interop: `extern "Swift"` foreign-fn decls
+marked `#[rustc_swift_throws]` attach LLVM's `swifterror`
+attribute to their last parameter, pinning it to the Swift-ABI
+error register (r12 on x86_64, x21 on aarch64 Darwin) per the
+Swift calling convention. Both function declarations and call
+sites get the attribute, so throwing calls round-trip through
+LLVM's register-allocation machinery without any hand-rolled
+register-move plumbing.
+
+Closes the most-commonly-cited Swift interop gap I called out in
+the 1.02 scope discussion.
+
+Plumbing:
+
+- compiler/rustc_llvm/llvm-wrapper/RustWrapper.cpp: new
+  `LLVMRustAttributeKind::SwiftError = 50` variant + mapping to
+  LLVM's `Attribute::SwiftError` in `fromRust`.
+- compiler/rustc_codegen_llvm/src/llvm/ffi.rs: mirror Rust-side
+  `AttributeKind::SwiftError` enumerator.
+- compiler/rustc_span/src/symbol.rs: +`rustc_swift_throws`.
+- compiler/rustc_feature/src/builtin_attrs.rs: register the attr.
+- compiler/rustc_hir/src/attrs/data_structures.rs: new
+  `AttributeKind::RustcSwiftThrows(Span)` variant.
+- compiler/rustc_hir/src/attrs/encode_cross_crate.rs: Yes (attr
+  travels across crates).
+- compiler/rustc_passes/src/check_attr.rs: include in the
+  accepted-without-target-check list.
+- compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs:
+  `RustcSwiftThrowsParser` via the P09.43 `rustcc_noargs_attr!`
+  macro, allowed on `Target::ForeignFn`.
+- compiler/rustc_attr_parsing/src/context.rs: register the parser.
+- compiler/rustc_middle/src/middle/codegen_fn_attrs.rs: new
+  `CodegenFnAttrFlags::SWIFT_ERROR_LAST_ARG = 1 << 19`.
+- compiler/rustc_codegen_ssa/src/codegen_attrs.rs: set the flag
+  on the callee's CodegenFnAttrs when the attr is present.
+- compiler/rustc_target/src/callconv/mod.rs: new
+  `FnAbi::swift_error_last_arg: bool`. Static-size assert bumped
+  80 → 88.
+- compiler/rustc_ty_utils/src/abi.rs: populate the new FnAbi
+  field from `codegen_fn_attrs`.
+- compiler/rustc_codegen_gcc/src/int.rs: default the field to
+  false in its synthetic FnAbi.
+- compiler/rustc_codegen_llvm/src/abi.rs: `apply_attrs_llfn` +
+  `apply_attrs_callsite` attach SwiftError to the last LLVM
+  argument (`Argument(i - 1)` after the normal arg loop) when
+  `swift_error_last_arg` is set.
+
+User-facing shape:
+
+```rust
+use rustcc_swift_rt::SwiftError;
+
+unsafe extern "Swift" {
+    #[rustc_swift_throws]
+    #[link_name = "$s5MyLib8do_thingSiSiAA5InputVtKF"]
+    fn do_thing_raw(
+        input: i64,
+        err: *mut *mut core::ffi::c_void,
+    ) -> i64;
+}
+
+fn do_thing(input: i64) -> Result<i64, SwiftError> {
+    let mut err: *mut core::ffi::c_void = core::ptr::null_mut();
+    let ret = unsafe { do_thing_raw(input, &mut err) };
+    if err.is_null() {
+        Ok(ret)
+    } else {
+        Err(unsafe { SwiftError::from_retained(err) })
+    }
+}
+```
+
+Validation:
+
+- `cargo check compiler` → clean.
+- `./x.py build --stage 1 library` → clean.
+- /tmp/p09-48-swift-throws/ probe: emitted LLVM IR contains
+  `declare swiftcc i64 @"..."(i64, ptr swifterror)` on the
+  declaration and `call swiftcc i64 @"..."(i64 %input, ptr
+  swifterror %err)` on the call site. That's what the Swift
+  ABI wants LLVM to see.
+- rustcc workspace: cargo test --workspace → 235/0 (unchanged).
+
+Not done / scope notes:
+
+- SwiftError wrapper + #[rustc_swift_throws] declaration work;
+  end-to-end runtime round-trip requires linking against a real
+  Swift runtime (which ships its own `swift_retain`/`swift_release`
+  and actually respects the swifterror register convention at
+  call time). In-tree probe exercises only the Rust-side ownership
+  semantics (from_retained / into_raw / is_null / Drop); runtime
+  integration against a Swift library is a user-side concern.
+- Last-argument convention is positional for now. Future work
+  could add a per-arg `#[rustc_swift_error_slot]` attribute for
+  non-last placements, matching Swift's own flexibility — but
+  every Swift throwing fn the ABI emits has the error slot as
+  the implicit trailing hidden arg anyway, so last-arg covers
+  100% of expected use.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../src/attributes/codegen_attrs.rs           | 12 +++++++++
+ compiler/rustc_attr_parsing/src/context.rs    |  1 +
+ compiler/rustc_codegen_gcc/src/int.rs         |  1 +
+ compiler/rustc_codegen_llvm/src/abi.rs        | 25 +++++++++++++++++++
+ compiler/rustc_codegen_llvm/src/llvm/ffi.rs   |  7 ++++++
+ .../rustc_codegen_ssa/src/codegen_attrs.rs    |  3 +++
+ compiler/rustc_feature/src/builtin_attrs.rs   |  5 ++++
+ .../rustc_hir/src/attrs/data_structures.rs    |  8 ++++++
+ .../rustc_hir/src/attrs/encode_cross_crate.rs |  1 +
+ .../rustc_llvm/llvm-wrapper/RustWrapper.cpp   |  8 ++++++
+ .../src/middle/codegen_fn_attrs.rs            |  9 +++++++
+ compiler/rustc_passes/src/check_attr.rs       |  1 +
+ compiler/rustc_span/src/symbol.rs             |  1 +
+ compiler/rustc_target/src/callconv/mod.rs     | 11 ++++++--
+ compiler/rustc_ty_utils/src/abi.rs            |  9 +++++++
+ 15 files changed, 100 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+index dc972259202..56a106c1106 100644
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -801,6 +801,18 @@ impl<S: Stage> NoArgsAttributeParser<S> for $parser {
+     [Target::Field]
+ );
+ 
++// `#[rustc_swift_throws]` (P09.48 / 1.02 throws) — marks a
++// foreign fn inside an `extern "Swift"` block as a Swift
++// throwing function. Codegen attaches LLVM's `swifterror`
++// attribute to the last parameter so it's pinned to the
++// Swift-ABI error register.
++rustcc_noargs_attr!(
++    RustcSwiftThrowsParser,
++    rustc_swift_throws,
++    RustcSwiftThrows,
++    [Target::ForeignFn]
++);
++
+ /// P09.20: `#[rustc_cxx_operator = "Plus"]` — marks a method on
+ /// a `#[repr(cpp)]` impl as a C++ operator overload. The string
+ /// value names the operator kind (matches the variants of
+diff --git a/compiler/rustc_attr_parsing/src/context.rs b/compiler/rustc_attr_parsing/src/context.rs
+index eda50fbea64..7bc9c4adbf3 100644
+--- a/compiler/rustc_attr_parsing/src/context.rs
++++ b/compiler/rustc_attr_parsing/src/context.rs
+@@ -330,6 +330,7 @@ mod late {
+         Single<RustcSwiftSymbolParser>,
+         Single<RustcSwiftTypeParser>,
+         Single<RustcSwiftLabelsParser>,
++        Single<WithoutArgs<RustcSwiftThrowsParser>>,
+         Single<WithoutArgs<RustcPreserveUbChecksParser>>,
+         Single<WithoutArgs<RustcProcMacroDeclsParser>>,
+         Single<WithoutArgs<RustcPubTransparentParser>>,
+diff --git a/compiler/rustc_codegen_gcc/src/int.rs b/compiler/rustc_codegen_gcc/src/int.rs
+index dfae4eceebe..3efd1a60865 100644
+--- a/compiler/rustc_codegen_gcc/src/int.rs
++++ b/compiler/rustc_codegen_gcc/src/int.rs
+@@ -375,6 +375,7 @@ pub fn operation_with_overflow(
+             fixed_count: 3,
+             conv: CanonAbi::C,
+             can_unwind: false,
++            swift_error_last_arg: false,
+         };
+         fn_abi.adjust_for_foreign_abi(self.cx, ExternAbi::C { unwind: false });
+ 
+diff --git a/compiler/rustc_codegen_llvm/src/abi.rs b/compiler/rustc_codegen_llvm/src/abi.rs
+index 3c59248b9b7..8a003d218d2 100644
+--- a/compiler/rustc_codegen_llvm/src/abi.rs
++++ b/compiler/rustc_codegen_llvm/src/abi.rs
+@@ -567,6 +567,19 @@ fn apply_attrs_llfn(
+                 Some(instance),
+             );
+         }
++
++        // rustcc fork (P09.48 / 1.02 throws): attach LLVM's
++        // `swifterror` attribute to the last argument when the
++        // callee is marked `#[rustc_swift_throws]`. `i` at this
++        // point holds one-past-the-last argument index, so the
++        // last slot is `i - 1`.
++        if self.swift_error_last_arg && i > 0 {
++            attributes::apply_to_llfn(
++                llfn,
++                llvm::AttributePlace::Argument(i - 1),
++                &[llvm::AttributeKind::SwiftError.create_attr(cx.llcx)],
++            );
++        }
+     }
+ 
+     fn apply_attrs_callsite(&self, bx: &mut Builder<'_, 'll, 'tcx>, callsite: &'ll Value) {
+@@ -643,6 +656,18 @@ fn apply_attrs_callsite(&self, bx: &mut Builder<'_, 'll, 'tcx>, callsite: &'ll V
+             }
+         }
+ 
++        // rustcc fork (P09.48 / 1.02 throws): mirror the
++        // declaration-side `swifterror` attachment for the call
++        // site. `i` is one-past-the-last argument index; last
++        // argument lives at `i - 1`.
++        if self.swift_error_last_arg && i > 0 {
++            attributes::apply_to_callsite(
++                callsite,
++                llvm::AttributePlace::Argument(i - 1),
++                &[llvm::AttributeKind::SwiftError.create_attr(bx.cx.llcx)],
++            );
++        }
++
+         let cconv = self.llvm_cconv(&bx.cx);
+         if cconv != llvm::CCallConv {
+             llvm::SetInstructionCallConv(callsite, cconv);
+diff --git a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+index 0163802b9d8..9d022fbeba8 100644
+--- a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
++++ b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+@@ -295,6 +295,13 @@ pub(crate) enum AttributeKind {
+     SanitizeRealtimeNonblocking = 47,
+     SanitizeRealtimeBlocking = 48,
+     Convergent = 49,
++    /// rustcc fork (P09.48 / 1.02 throws): marks a parameter as
++    /// the Swift-ABI error slot. LLVM pins it to the register
++    /// reserved by the Swift calling convention and handles the
++    /// caller-side read automatically. See
++    /// <https://llvm.org/docs/LangRef.html#parameter-attributes>
++    /// for `swifterror`.
++    SwiftError = 50,
+ }
+ 
+ /// LLVMIntPredicate
+diff --git a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+index f7a5ca18540..6d012e04fe8 100644
+--- a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
++++ b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+@@ -186,6 +186,9 @@ fn process_builtin_attrs(
+             },
+             AttributeKind::FfiConst(_) => codegen_fn_attrs.flags |= CodegenFnAttrFlags::FFI_CONST,
+             AttributeKind::FfiPure(_) => codegen_fn_attrs.flags |= CodegenFnAttrFlags::FFI_PURE,
++            AttributeKind::RustcSwiftThrows(_) => {
++                codegen_fn_attrs.flags |= CodegenFnAttrFlags::SWIFT_ERROR_LAST_ARG
++            }
+             AttributeKind::RustcStdInternalSymbol(_) => {
+                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
+             }
+diff --git a/compiler/rustc_feature/src/builtin_attrs.rs b/compiler/rustc_feature/src/builtin_attrs.rs
+index 71c9d3f182a..281aa69f901 100644
+--- a/compiler/rustc_feature/src/builtin_attrs.rs
++++ b/compiler/rustc_feature/src/builtin_attrs.rs
+@@ -736,6 +736,11 @@ pub struct BuiltinAttribute {
+     // P09.17: Swift parameter labels for an `extern "Swift"` fn.
+     // Comma-separated; `_` for unnamed, `<label>` for named.
+     rustc_attr!(rustc_swift_labels, "Swift parameter labels for an `extern \"Swift\"` function (comma-separated, `_` for unnamed)"),
++    // P09.48 / 1.02 throws: marks an extern "Swift" foreign fn
++    // as a Swift throwing function. Codegen attaches LLVM's
++    // `swifterror` to the last parameter so it's pinned to the
++    // Swift-ABI error register.
++    rustc_attr!(rustc_swift_throws, "marks an `extern \"Swift\"` foreign fn as a Swift throwing function; the last param carries LLVM's `swifterror` attribute"),
+ 
+     // Limits:
+     ungated!(
+diff --git a/compiler/rustc_hir/src/attrs/data_structures.rs b/compiler/rustc_hir/src/attrs/data_structures.rs
+index c28687406bb..9654c069dab 100644
+--- a/compiler/rustc_hir/src/attrs/data_structures.rs
++++ b/compiler/rustc_hir/src/attrs/data_structures.rs
+@@ -1584,6 +1584,14 @@ pub enum AttributeKind {
+     /// automatically by the `class D : B { … }` parser sugar.
+     RustcCxxBase(Span),
+ 
++    /// Represents `#[rustc_swift_throws]` (P09.48 / 1.02 throws)
++    /// — marks a foreign fn inside `extern "Swift"` block as a
++    /// Swift throwing function. The last parameter's slot is
++    /// pinned to the Swift-ABI error register via LLVM's
++    /// `swifterror` attribute; callers read the register after
++    /// the call to detect thrown errors.
++    RustcSwiftThrows(Span),
++
+     /// Represents `#[rustc_swift_symbol = "ModuleName"]` — names
+     /// the Swift module hosting an `extern "Swift"` function so
+     /// the Swift mangler can produce `$s<module><name>...F`.
+diff --git a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+index 70820f47139..3b524dcf830 100644
+--- a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
++++ b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+@@ -189,6 +189,7 @@ pub fn encode_cross_crate(&self) -> EncodeCrossCrate {
+             RustcSwiftSymbol { .. } => Yes,
+             RustcSwiftType { .. } => Yes,
+             RustcSwiftLabels { .. } => Yes,
++            RustcSwiftThrows(..) => Yes,
+             RustcPreserveUbChecks => No,
+             RustcProcMacroDecls => No,
+             RustcPubTransparent(..) => Yes,
+diff --git a/compiler/rustc_llvm/llvm-wrapper/RustWrapper.cpp b/compiler/rustc_llvm/llvm-wrapper/RustWrapper.cpp
+index f7fccf6296b..fca098bdf6c 100644
+--- a/compiler/rustc_llvm/llvm-wrapper/RustWrapper.cpp
++++ b/compiler/rustc_llvm/llvm-wrapper/RustWrapper.cpp
+@@ -366,6 +366,12 @@ enum class LLVMRustAttributeKind {
+   SanitizeRealtimeNonblocking = 47,
+   SanitizeRealtimeBlocking = 48,
+   Convergent = 49,
++  // rustcc fork (P09.48 / 1.02 throws): Swift's register-based
++  // error-return parameter. When attached to a `**T` parameter,
++  // LLVM codegen pins it to the Swift-ABI error register (r12 on
++  // x86_64, x21 on aarch64 Darwin) and handles the caller-side
++  // read after the call.
++  SwiftError = 50,
+ };
+ 
+ static Attribute::AttrKind fromRust(LLVMRustAttributeKind Kind) {
+@@ -464,6 +470,8 @@ static Attribute::AttrKind fromRust(LLVMRustAttributeKind Kind) {
+     return Attribute::SanitizeRealtimeBlocking;
+   case LLVMRustAttributeKind::Convergent:
+     return Attribute::Convergent;
++  case LLVMRustAttributeKind::SwiftError:
++    return Attribute::SwiftError;
+   }
+   report_fatal_error("bad LLVMRustAttributeKind");
+ }
+diff --git a/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs b/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
+index 6f5b927bc17..0ba984ee8e7 100644
+--- a/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
++++ b/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
+@@ -210,6 +210,15 @@ impl CodegenFnAttrFlags: u32 {
+         /// As such, we must make sure these symbols really do exist in the final binary/library.
+         /// This flag is put on both the implementations of EIIs and the foreign item they implement.
+         const EXTERNALLY_IMPLEMENTABLE_ITEM = 1 << 18;
++        /// rustcc fork (P09.48 / 1.02 throws): marks the last parameter of an
++        /// `extern "Swift"` foreign fn declaration as LLVM's `swifterror`
++        /// attribute. LLVM then pins that parameter to the Swift-ABI error
++        /// register (r12 on x86_64, x21 on aarch64 Darwin) so callers read
++        /// the Swift throw state directly from the register after the call.
++        /// Applied via `#[rustc_swift_throws]`. The parameter is expected to
++        /// be a `*mut *mut SomeError`; layout validation is the user's
++        /// responsibility for now.
++        const SWIFT_ERROR_LAST_ARG      = 1 << 19;
+     }
+ }
+ rustc_data_structures::external_bitflags_debug! { CodegenFnAttrFlags }
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+index ca6264dfe14..edba19e31e7 100644
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -372,6 +372,7 @@ fn check_attributes(
+                     | AttributeKind::RustcSwiftSymbol { .. }
+                     | AttributeKind::RustcSwiftType { .. }
+                     | AttributeKind::RustcSwiftLabels { .. }
++                    | AttributeKind::RustcSwiftThrows(..)
+                     | AttributeKind::RustcPreserveUbChecks
+                     | AttributeKind::RustcProcMacroDecls
+                     | AttributeKind::RustcReallocator
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 2534ecfb7a3..28ef4fd2e71 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -1811,6 +1811,7 @@
+         rustc_specialization_trait,
+         rustc_std_internal_symbol,
+         rustc_swift_labels,
++        rustc_swift_throws,
+         swift_symbol,
+         swift_type,
+         swift_value,
+diff --git a/compiler/rustc_target/src/callconv/mod.rs b/compiler/rustc_target/src/callconv/mod.rs
+index 39e2f69c8bd..d41526d2a81 100644
+--- a/compiler/rustc_target/src/callconv/mod.rs
++++ b/compiler/rustc_target/src/callconv/mod.rs
+@@ -639,12 +639,18 @@ pub struct FnAbi<'a, Ty> {
+     pub conv: CanonAbi,
+     /// Indicates if an unwind may happen across a call to this function.
+     pub can_unwind: bool,
++    /// rustcc fork (P09.48 / 1.02 throws): when `true`, the last
++    /// LLVM parameter carries Swift's `swifterror` attribute at
++    /// both declaration and call sites. Populated during FnAbi
++    /// construction from the callee's
++    /// `CodegenFnAttrFlags::SWIFT_ERROR_LAST_ARG`.
++    pub swift_error_last_arg: bool,
+ }
+ 
+ // Needs to be a custom impl because of the bounds on the `TyAndLayout` debug impl.
+ impl<'a, Ty: fmt::Display> fmt::Debug for FnAbi<'a, Ty> {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        let FnAbi { args, ret, c_variadic, fixed_count, conv, can_unwind } = self;
++        let FnAbi { args, ret, c_variadic, fixed_count, conv, can_unwind, swift_error_last_arg } = self;
+         f.debug_struct("FnAbi")
+             .field("args", args)
+             .field("ret", ret)
+@@ -652,6 +658,7 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+             .field("fixed_count", fixed_count)
+             .field("conv", conv)
+             .field("can_unwind", can_unwind)
++            .field("swift_error_last_arg", swift_error_last_arg)
+             .finish()
+     }
+ }
+@@ -986,6 +993,6 @@ mod size_asserts {
+     use super::*;
+     // tidy-alphabetical-start
+     static_assert_size!(ArgAbi<'_, usize>, 56);
+-    static_assert_size!(FnAbi<'_, usize>, 80);
++    static_assert_size!(FnAbi<'_, usize>, 88);
+     // tidy-alphabetical-end
+ }
+diff --git a/compiler/rustc_ty_utils/src/abi.rs b/compiler/rustc_ty_utils/src/abi.rs
+index 7bbac77b7ba..7819bce259b 100644
+--- a/compiler/rustc_ty_utils/src/abi.rs
++++ b/compiler/rustc_ty_utils/src/abi.rs
+@@ -682,6 +682,15 @@ fn fn_abi_new_uncached<'tcx>(
+             determined_fn_def_id,
+             sig.abi,
+         ),
++        // P09.48 / 1.02 throws: thread the SWIFT_ERROR_LAST_ARG flag
++        // from the callee's CodegenFnAttrs into FnAbi so codegen on
++        // both the function declaration and every call site can
++        // attach LLVM's `swifterror` attribute to the last argument.
++        swift_error_last_arg: determined_fn_def_id.is_some_and(|did| {
++            tcx.codegen_fn_attrs(did)
++                .flags
++                .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::SWIFT_ERROR_LAST_ARG)
++        }),
+     };
+     fn_abi_adjust_for_abi(cx, &mut fn_abi, effective_abi);
+     debug!("fn_abi_new_uncached = {:?}", fn_abi);
+-- 
+2.50.1 (Apple Git-155)
+

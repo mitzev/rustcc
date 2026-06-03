@@ -1,0 +1,241 @@
+From de59426bcdc7593d1867d618381accc0eeb8ed26 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 08:43:43 +0300
+Subject: [PATCH 21/42] P09.60: #[rustc_cxx_throws] attribute scaffolding (1.12
+ throws Phase 1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Registers the `#[rustc_cxx_throws]` attribute that will drive
+LLVM `invoke` lowering for `extern "C++"` calls in P09.61
+(Itanium catch landingpad) and P09.62 (MSVC funclet
+catchpad/catchswitch). This patch ships only the attribute
+recognition layer: parser, HIR variant, cross-crate encoding,
+check-attr allowlist, and a CodegenFnAttrFlags::CXX_THROWS
+flag that the next patches inspect to decide which call sites
+get rewritten from `call` to `invoke`.
+
+Why scaffolding-only here: the codegen invoke lowering is a
+substantial chunk on its own (~300 LoC across rustc_codegen_ssa
++ rustc_codegen_llvm), and splitting it from the attribute plumbing
+keeps each patch's review surface tight and lets the cxx_importer
+side ship the v1.12.5 runtime crate (cxx::native_invoke) against
+a stable attribute name immediately.
+
+Plumbing (mirrors P09.48's rustc_swift_throws):
+
+- compiler/rustc_span/src/symbol.rs: +rustc_cxx_throws symbol.
+- compiler/rustc_feature/src/builtin_attrs.rs: register the attr.
+- compiler/rustc_hir/src/attrs/data_structures.rs:
+  AttributeKind::RustcCxxThrows(Span) variant.
+- compiler/rustc_hir/src/attrs/encode_cross_crate.rs: travels
+  across crates (Yes).
+- compiler/rustc_passes/src/check_attr.rs: included in the
+  accept-without-target-check allowlist.
+- compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs:
+  RustcCxxThrowsParser via the P09.43 rustcc_noargs_attr! macro,
+  allowed on Target::ForeignFn.
+- compiler/rustc_attr_parsing/src/context.rs: register the parser.
+- compiler/rustc_middle/src/middle/codegen_fn_attrs.rs:
+  CodegenFnAttrFlags::CXX_THROWS = 1 << 20.
+- compiler/rustc_codegen_ssa/src/codegen_attrs.rs: set the flag
+  on the callee's CodegenFnAttrs when the attr is present.
+
+User-facing shape (codegen-side activation lands in P09.61):
+
+```rust
+unsafe extern "C++" {
+    #[rustc_cxx_throws]
+    #[link_name = "_Z9do_dividei i"]
+    fn do_divide(a: i32, b: i32) -> i32;
+}
+
+// After P09.61, the visible signature becomes:
+//   fn do_divide(a: i32, b: i32) -> Result<i32, ::cxx::CxxException>
+// and call sites lower to LLVM `invoke` with an Itanium catch
+// landingpad that calls __rustcc_cxx_catch_unknown.
+```
+
+Validation:
+
+- This patch alone does not change codegen behavior; the attribute
+  is accepted by the parser and round-trips through HIR + the
+  codegen_fn_attrs layer, but no consumer reads CXX_THROWS yet.
+- P09.61 / P09.62 will use the flag to gate `call → invoke`
+  rewriting.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../src/attributes/codegen_attrs.rs           | 20 +++++++++++++++++++
+ compiler/rustc_attr_parsing/src/context.rs    |  1 +
+ .../rustc_codegen_ssa/src/codegen_attrs.rs    |  3 +++
+ compiler/rustc_feature/src/builtin_attrs.rs   |  8 ++++++++
+ .../rustc_hir/src/attrs/data_structures.rs    | 14 +++++++++++++
+ .../rustc_hir/src/attrs/encode_cross_crate.rs |  1 +
+ .../src/middle/codegen_fn_attrs.rs            | 10 ++++++++++
+ compiler/rustc_passes/src/check_attr.rs       |  1 +
+ compiler/rustc_span/src/symbol.rs             |  1 +
+ 9 files changed, 59 insertions(+)
+
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+index 56a106c1106..11cd30a07e6 100644
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -813,6 +813,26 @@ impl<S: Stage> NoArgsAttributeParser<S> for $parser {
+     [Target::ForeignFn]
+ );
+ 
++// `#[rustc_cxx_throws]` (P09.60 / 1.12 throws Phase 1) — marks a
++// foreign fn inside an `extern "C++"` block as a C++ throwing
++// function. Codegen lowers the call site from `call` to LLVM's
++// `invoke` instruction with an Itanium catch landingpad (or a
++// `catchpad`/`catchswitch` funclet on MSVC), wrapping the return
++// type in `Result<T, ::cxx::CxxException>`. See
++// `fork/CXX-THROW-PLAN.md` for the full Phase 1/2/3 design.
++//
++// This patch (P09.60) only registers the attribute; the codegen
++// lowering ships in P09.61 (Itanium invoke) + P09.62 (MSVC
++// funclet). The attribute is accepted but a no-op at codegen
++// today, so the boundary is safe to mark on user-side code
++// before the codegen patches land.
++rustcc_noargs_attr!(
++    RustcCxxThrowsParser,
++    rustc_cxx_throws,
++    RustcCxxThrows,
++    [Target::ForeignFn]
++);
++
+ /// P09.20: `#[rustc_cxx_operator = "Plus"]` — marks a method on
+ /// a `#[repr(cpp)]` impl as a C++ operator overload. The string
+ /// value names the operator kind (matches the variants of
+diff --git a/compiler/rustc_attr_parsing/src/context.rs b/compiler/rustc_attr_parsing/src/context.rs
+index 7bc9c4adbf3..b3b307a08bf 100644
+--- a/compiler/rustc_attr_parsing/src/context.rs
++++ b/compiler/rustc_attr_parsing/src/context.rs
+@@ -331,6 +331,7 @@ mod late {
+         Single<RustcSwiftTypeParser>,
+         Single<RustcSwiftLabelsParser>,
+         Single<WithoutArgs<RustcSwiftThrowsParser>>,
++        Single<WithoutArgs<RustcCxxThrowsParser>>,
+         Single<WithoutArgs<RustcPreserveUbChecksParser>>,
+         Single<WithoutArgs<RustcProcMacroDeclsParser>>,
+         Single<WithoutArgs<RustcPubTransparentParser>>,
+diff --git a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+index 6d012e04fe8..75701f343f0 100644
+--- a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
++++ b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+@@ -189,6 +189,9 @@ fn process_builtin_attrs(
+             AttributeKind::RustcSwiftThrows(_) => {
+                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::SWIFT_ERROR_LAST_ARG
+             }
++            AttributeKind::RustcCxxThrows(_) => {
++                codegen_fn_attrs.flags |= CodegenFnAttrFlags::CXX_THROWS
++            }
+             AttributeKind::RustcStdInternalSymbol(_) => {
+                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
+             }
+diff --git a/compiler/rustc_feature/src/builtin_attrs.rs b/compiler/rustc_feature/src/builtin_attrs.rs
+index 281aa69f901..3bc5309750c 100644
+--- a/compiler/rustc_feature/src/builtin_attrs.rs
++++ b/compiler/rustc_feature/src/builtin_attrs.rs
+@@ -742,6 +742,14 @@ pub struct BuiltinAttribute {
+     // Swift-ABI error register.
+     rustc_attr!(rustc_swift_throws, "marks an `extern \"Swift\"` foreign fn as a Swift throwing function; the last param carries LLVM's `swifterror` attribute"),
+ 
++    // P09.60 / 1.12 throws Phase 1 — `#[rustc_cxx_throws]` marks a
++    // foreign fn inside an `extern \"C++\"` block as a throwing C++
++    // function. Codegen lowers the call site from `call` to `invoke`
++    // with a catch landingpad; the visible Rust signature wraps the
++    // return in `Result<T, ::cxx::CxxException>`. Codegen lowering
++    // ships in P09.61 (Itanium) + P09.62 (MSVC funclet).
++    rustc_attr!(rustc_cxx_throws, "marks an `extern \"C++\"` foreign fn as a C++ throwing function; call sites lower to LLVM `invoke` with a catch landingpad and the return type becomes `Result<T, ::cxx::CxxException>`"),
++
+     // Limits:
+     ungated!(
+         recursion_limit, CrateLevel,
+diff --git a/compiler/rustc_hir/src/attrs/data_structures.rs b/compiler/rustc_hir/src/attrs/data_structures.rs
+index 9654c069dab..5b4fba856b1 100644
+--- a/compiler/rustc_hir/src/attrs/data_structures.rs
++++ b/compiler/rustc_hir/src/attrs/data_structures.rs
+@@ -1592,6 +1592,20 @@ pub enum AttributeKind {
+     /// the call to detect thrown errors.
+     RustcSwiftThrows(Span),
+ 
++    /// Represents `#[rustc_cxx_throws]` (P09.60 / 1.12 throws
++    /// Phase 1) — marks a foreign fn inside `extern "C++"` block
++    /// as a C++ throwing function. Codegen lowers each call site
++    /// from `call` to LLVM's `invoke` instruction with an Itanium
++    /// catch landingpad (or MSVC `catchpad`/`catchswitch` funclet
++    /// on Windows MSVC targets); the visible Rust signature wraps
++    /// the return type in `Result<T, ::cxx::CxxException>`.
++    ///
++    /// Codegen lowering is gated on P09.61 (Itanium) and P09.62
++    /// (MSVC funclet); P09.60 only registers the attribute so
++    /// user-side code can mark callees before the codegen
++    /// patches land.
++    RustcCxxThrows(Span),
++
+     /// Represents `#[rustc_swift_symbol = "ModuleName"]` — names
+     /// the Swift module hosting an `extern "Swift"` function so
+     /// the Swift mangler can produce `$s<module><name>...F`.
+diff --git a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+index 3b524dcf830..cd0a86a0427 100644
+--- a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
++++ b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+@@ -190,6 +190,7 @@ pub fn encode_cross_crate(&self) -> EncodeCrossCrate {
+             RustcSwiftType { .. } => Yes,
+             RustcSwiftLabels { .. } => Yes,
+             RustcSwiftThrows(..) => Yes,
++            RustcCxxThrows(..) => Yes,
+             RustcPreserveUbChecks => No,
+             RustcProcMacroDecls => No,
+             RustcPubTransparent(..) => Yes,
+diff --git a/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs b/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
+index 0ba984ee8e7..a6cb7588d91 100644
+--- a/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
++++ b/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
+@@ -219,6 +219,16 @@ impl CodegenFnAttrFlags: u32 {
+         /// be a `*mut *mut SomeError`; layout validation is the user's
+         /// responsibility for now.
+         const SWIFT_ERROR_LAST_ARG      = 1 << 19;
++        /// Lower the call site from `call` to LLVM `invoke` with a
++        /// catch landingpad (Itanium) / funclet (MSVC). Catches the
++        /// C++ exception and returns `Result::Err(CxxException)`
++        /// instead of unwinding through the Rust frame. Applied via
++        /// `#[rustc_cxx_throws]`. Codegen lowering ships in P09.61
++        /// (Itanium) and P09.62 (MSVC funclet); this flag exists in
++        /// P09.60 so the attribute round-trips through the HIR +
++        /// codegen_fn_attrs layer cleanly before the codegen
++        /// patches land.
++        const CXX_THROWS                = 1 << 20;
+     }
+ }
+ rustc_data_structures::external_bitflags_debug! { CodegenFnAttrFlags }
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+index edba19e31e7..4394d11b12c 100644
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -373,6 +373,7 @@ fn check_attributes(
+                     | AttributeKind::RustcSwiftType { .. }
+                     | AttributeKind::RustcSwiftLabels { .. }
+                     | AttributeKind::RustcSwiftThrows(..)
++                    | AttributeKind::RustcCxxThrows(..)
+                     | AttributeKind::RustcPreserveUbChecks
+                     | AttributeKind::RustcProcMacroDecls
+                     | AttributeKind::RustcReallocator
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 28ef4fd2e71..394d86c09dc 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -1726,6 +1726,7 @@
+         // Internal attributes (no public rename target).
+         rustc_cxx_base,
+         rustc_cxx_drop_wrapper,
++        rustc_cxx_throws,
+         rustc_cxx_wrapper,
+         rustc_deallocator,
+         rustc_default_body_unstable,
+-- 
+2.50.1 (Apple Git-155)
+

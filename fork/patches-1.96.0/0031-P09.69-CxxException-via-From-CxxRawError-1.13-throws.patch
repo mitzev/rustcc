@@ -1,0 +1,563 @@
+From 9d83812b2b62024ed06dcdd6c9b85f0d70088571 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 12:13:55 +0300
+Subject: [PATCH 31/42] P09.69: CxxException via From<CxxRawError> (1.13 throws
+ Phase 2A)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The MIR pass cxx_throws_wrap now auto-converts the catch
+payload from CxxRawError (what the runtime helper produces)
+to whatever Err type the user declared in their Result —
+provided the type impls From<CxxRawError>.
+
+User can now write:
+
+    extern "C++" {
+        #[rustc_cxx_throws]
+        fn maybe_throws(x: i32) -> Result<i32, CxxException>;
+    }
+
+and the catch path automatically calls
+`<CxxException as From<CxxRawError>>::from` on the raw
+helper return before wrapping into Result::Err.
+
+Smoke test confirms:
+
+    maybe_throws(5)   →  Ok(10)                    ✅
+    maybe_throws(-1)  →  Err(kind=Runtime)         ✅
+                                  ^^^ from CxxException's
+                                      typed-kind mapping
+
+The MIR shape changes when conversion is needed. Without
+conversion:
+
+  bb_err_wrap:
+    dest = Result::Err(move raw_err_local)
+    goto orig_target
+
+With conversion (E != CxxRawError):
+
+  bb_err_convert:
+    converted = <E as From<CxxRawError>>::from(move raw_err_local)
+      -> [return: bb_err_finalize, unwind: Continue]
+  bb_err_finalize:
+    dest = Result::Err(move converted)
+    goto orig_target
+
+The CxxThrowsCleanup unwind action points at bb_err_convert
+when conversion is required; codegen's catch BB still stores
+the helper result into raw_err_local (typed as CxxRawError)
+and branches to bb_err_convert, which then calls the user's
+From impl and continues.
+
+CxxRawError is looked up via
+`rustc_diagnostic_item = "CxxRawError"`. The cxx runtime
+crate marks its type with this attribute. If the diagnostic
+item isn't in scope (no cxx crate dependency), the pass falls
+back to the Phase 1 behavior — trust the user's declared
+type. This keeps the Phase 1 smoke test (smoke.rs) working
+unchanged.
+
+If the conversion is required but `E: From<CxxRawError>`
+doesn't hold, the pass emits a `span_delayed_bug` that
+surfaces as a compile error rather than silently
+miscompiling.
+
+Resolution uses tcx.codegen_select_candidate against the
+`From` lang item, then tcx.associated_items().find_by_*
+to locate the `from` method, then ty::Instance::try_resolve
+to monomorphize.
+
+The conversion call's unwind action is Continue — if the
+user's `From::from` panics, the panic propagates up the
+stack like any other Rust panic. (`From` impls shouldn't
+panic; this just matches normal Rust semantics.)
+
+New diagnostic item symbol `CxxRawError` added in
+rustc_span/src/symbol.rs.
+---
+ .../src/cxx_throws_wrap.rs                    | 398 +++++++++++++-----
+ compiler/rustc_span/src/symbol.rs             |   7 +
+ 2 files changed, 310 insertions(+), 95 deletions(-)
+
+diff --git a/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs b/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+index 769b4031c0f..3306bb60fe1 100644
+--- a/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
++++ b/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+@@ -1,47 +1,56 @@
+-//! P09.65 / 1.13 throws Phase 1E: MIR-level Result wrapping for
+-//! `#[rustc_cxx_throws]` calls.
++//! P09.65 / 1.13 throws Phase 1E-G + P09.69 Phase 2:
++//! MIR-level Result wrapping for `#[rustc_cxx_throws]` calls.
+ //!
+-//! User writes:
++//! User writes (Phase 2 — with auto-conversion):
+ //!
+ //! ```rust,ignore
+ //! extern "C++" {
+ //!     #[rustc_cxx_throws]
+-//!     fn foo(x: i32) -> Result<*mut Bar, ::cxx::CxxRawError>;
++//!     fn foo(x: i32) -> Result<*mut Bar, ::cxx::CxxException>;
+ //! }
+-//!
+-//! let r: Result<*mut Bar, ::cxx::CxxRawError> = unsafe { foo(42) };
+ //! ```
+ //!
+-//! At the IR level, the actual extern symbol `foo` has signature
+-//! `fn(x) -> *mut Bar` (no Result — that's the C++ side's view).
+-//! The MIR pass bridges the gap:
++//! At the IR level, the actual extern symbol `foo` returns
++//! `*mut Bar`. The runtime helper
++//! `__rustcc_cxx_catch_unknown` returns a `CxxRawError`. The
++//! MIR pass bridges all three:
+ //!
+ //! 1. For each Call to a `#[rustc_cxx_throws]` callee, the
+-//!    destination Place must have type `Result<T, E>`. We
+-//!    decompose: `T` is the IR-level return; `E` is the
+-//!    catch-path payload (typically `cxx::CxxRawError` for
+-//!    Phase 1; user can pick any 2-word type matching the
+-//!    runtime helper's return).
+-//! 2. Allocate a fresh local of type `T`. Rewrite the Call
+-//!    terminator's destination to this local. The IR-level
+-//!    extern signature now matches: `fn foo() -> T`.
+-//! 3. Insert a new `ok_wrap_bb` between the Call and its
+-//!    original target. The wrap block does
+-//!    `dest = Result::Ok(local)` and branches to the original
+-//!    target.
+-//! 4. Allocate a fresh local of type `E`. Insert a new
+-//!    `err_wrap_bb` that does `dest = Result::Err(raw_err_local)`
+-//!    and branches to the original target. The Call
+-//!    terminator's `unwind` is set to
+-//!    `UnwindAction::CxxThrowsCleanup { bb: err_wrap_bb, raw_err_local }`
+-//!    — codegen's catch BB (P09.65d) recognizes the variant,
+-//!    calls the runtime helper, stores the result into
+-//!    raw_err_local, then branches to err_wrap_bb.
++//!    destination Place must have type `Result<T, E>`.
++//! 2. Allocate `raw_ok_local: T`. Rewrite the Call's
++//!    destination to this local. The IR-level extern
++//!    signature now matches the C++ side: `fn foo() -> T`.
++//! 3. Allocate `raw_err_local: CxxRawError` (looked up via
++//!    `rustc_diagnostic_item = "CxxRawError"` — the cxx
++//!    runtime crate marks its type with this item).
++//! 4. Insert `bb_ok_wrap`:
++//!        dest = Result::Ok(move raw_ok_local)
++//!        goto orig_target
++//! 5. Insert `bb_err_wrap`:
++//!        - if E == CxxRawError:
++//!            dest = Result::Err(move raw_err_local)
++//!            goto orig_target
++//!        - else (E impls From<CxxRawError>):
++//!            converted = <E as From<CxxRawError>>::from(move raw_err_local)
++//!                -> [return: bb_err_finalize, unwind: Continue]
++//!          bb_err_finalize:
++//!            dest = Result::Err(move converted)
++//!            goto orig_target
++//! 6. Set the Call's `unwind` to
++//!    `CxxThrowsCleanup { bb: bb_err_wrap, raw_err_local }`.
++//!    Codegen's catch BB lands the exception, calls the
++//!    runtime helper, stores the result into raw_err_local,
++//!    then branches to bb_err_wrap. The MIR-level conversion
++//!    (if any) runs as regular code thereafter.
+ 
++use rustc_hir::LangItem;
+ use rustc_index::IndexVec;
+ use rustc_middle::mir::*;
+-use rustc_middle::ty::{self, TyCtxt};
++use rustc_middle::ty::{self, Ty, TyCtxt};
+ use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
++use rustc_middle::traits;
++use rustc_span::{Spanned, sym};
++use tracing::debug;
+ 
+ pub(super) struct CxxThrowsWrap;
+ 
+@@ -80,34 +89,28 @@ fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+             return;
+         }
+ 
+-        // P09.65b + c: rewrite both the happy path and the catch
+-        // path. For each target:
+-        //
+-        // Original MIR shape:
+-        //   bb_call:
+-        //     call foo(args) -> dest_place                 (type: Result<T, E>)
+-        //     target → orig_target
+-        //     unwind → <existing UnwindAction>
+-        //
+-        // After this pass:
+-        //   bb_call:
+-        //     call foo(args) -> raw_local                  (type: T)
+-        //     target → bb_ok_wrap
+-        //     unwind → CxxThrowsCleanup { bb: bb_err_wrap, raw_err_local }
+-        //   bb_ok_wrap:
+-        //     dest_place = Result::Ok(raw_local)
+-        //     goto → orig_target
+-        //   bb_err_wrap:  (is_cleanup = true)
+-        //     dest_place = Result::Err(raw_err_local)
+-        //     goto → orig_target
+-        //
+-        // Codegen's P09.65d catch BB recognizes
+-        // CxxThrowsCleanup, calls the runtime helper, stores
+-        // the result into raw_err_local, then branches to
+-        // bb_err_wrap.
++        // Look up the runtime's CxxRawError type once per body.
++        // The cxx crate marks its CxxRawError with
++        // `#[rustc_diagnostic_item = "CxxRawError"]`. If the
++        // diagnostic item isn't available (e.g., the cxx crate
++        // isn't a dependency), we skip the conversion path and
++        // fall back to using whatever the user declared as E.
++        let cxx_raw_error_ty: Option<Ty<'tcx>> = tcx
++            .get_diagnostic_item(sym::CxxRawError)
++            .map(|did| tcx.type_of(did).skip_binder());
++        debug!("CxxThrowsWrap: cxx_raw_error_ty = {:?}", cxx_raw_error_ty);
++
++        let typing_env = body.typing_env(tcx);
+         let basic_blocks = body.basic_blocks.as_mut();
+         for bb in targets {
+-            rewrite_call(tcx, basic_blocks, &mut body.local_decls, bb);
++            rewrite_call(
++                tcx,
++                basic_blocks,
++                &mut body.local_decls,
++                bb,
++                cxx_raw_error_ty,
++                typing_env,
++            );
+         }
+     }
+ }
+@@ -117,6 +120,8 @@ fn rewrite_call<'tcx>(
+     basic_blocks: &mut IndexVec<BasicBlock, BasicBlockData<'tcx>>,
+     local_decls: &mut IndexVec<Local, LocalDecl<'tcx>>,
+     call_bb: BasicBlock,
++    cxx_raw_error_ty: Option<Ty<'tcx>>,
++    typing_env: ty::TypingEnv<'tcx>,
+ ) {
+     // Extract Call destination + target from the terminator.
+     let (dest_place, dest_ty, orig_target) = {
+@@ -156,12 +161,36 @@ fn rewrite_call<'tcx>(
+     let ok_payload_ty = ok_variant.fields[rustc_abi::FieldIdx::from_usize(0)].ty(tcx, generics);
+     let err_payload_ty = err_variant.fields[rustc_abi::FieldIdx::from_usize(0)].ty(tcx, generics);
+ 
+-    // Allocate the two fresh locals: T (Ok payload) and E
+-    // (Err payload). Source info copied from the call's
+-    // source_info.
++    // P09.69: the runtime helper always returns CxxRawError,
++    // so raw_err_local is *always* CxxRawError (when the
++    // diagnostic item is available). If the user's declared
++    // E type isn't CxxRawError, we'll synthesize a
++    // `From<CxxRawError>::from` conversion call before
++    // wrapping into Result::Err. If the diagnostic item is
++    // unavailable (no cxx crate in scope), fall back to
++    // using E directly — works only for E == CxxRawError-
++    // shaped types (the Phase 1 contract).
++    let (raw_err_ty, needs_from_conversion) = match cxx_raw_error_ty {
++        Some(raw_ty) if raw_ty != err_payload_ty => {
++            // Differs from declared E — need conversion.
++            (raw_ty, true)
++        }
++        Some(raw_ty) => {
++            // E == CxxRawError — no conversion.
++            (raw_ty, false)
++        }
++        None => {
++            // No diagnostic item available — fall back to
++            // trusting the user's declaration. Same as Phase 1.
++            (err_payload_ty, false)
++        }
++    };
++
++    // Allocate the fresh locals. Source info copied from the
++    // call's source_info.
+     let source_info = basic_blocks[call_bb].terminator.as_ref().unwrap().source_info;
+     let raw_ok_local = local_decls.push(LocalDecl::new(ok_payload_ty, source_info.span));
+-    let raw_err_local = local_decls.push(LocalDecl::new(err_payload_ty, source_info.span));
++    let raw_err_local = local_decls.push(LocalDecl::new(raw_err_ty, source_info.span));
+ 
+     // Build the new bb_ok_wrap block:
+     //   dest_place = Result::Ok(Move(raw_ok_local));
+@@ -191,43 +220,165 @@ fn rewrite_call<'tcx>(
+     );
+     let ok_wrap_bb = basic_blocks.push(ok_wrap_bb_data);
+ 
+-    // Build the new bb_err_wrap block:
+-    //   dest_place = Result::Err(Move(raw_err_local));
+-    //   goto orig_target
++    // Build the err-wrap chain. Two cases:
+     //
+-    // is_cleanup = true because this block is reachable only
+-    // via the catch path (UnwindAction::CxxThrowsCleanup).
+-    // Codegen's catch BB will populate raw_err_local with the
+-    // runtime helper's return value before branching here.
+-    let err_rvalue = Rvalue::Aggregate(
+-        Box::new(AggregateKind::Adt(
+-            adt_def.did(),
+-            err_variant_idx,
+-            generics,
+-            None,
+-            None,
+-        )),
+-        IndexVec::from_iter([Operand::Move(Place::from(raw_err_local))]),
+-    );
+-    let err_stmt = Statement::new(
+-        source_info,
+-        StatementKind::Assign(Box::new((dest_place, err_rvalue))),
+-    );
+-    let err_terminator = Terminator {
+-        source_info,
+-        kind: TerminatorKind::Goto { target: orig_target },
++    // 1. No conversion (E == raw_err_ty): a single block that
++    //    just wraps into Result::Err.
++    //
++    // 2. Conversion (E impls From<CxxRawError>): two blocks —
++    //    a "convert" block calls `<E as From<CxxRawError>>::from`,
++    //    then a "finalize" block does the Result::Err wrap.
++    //
++    // The Call from the catch path lands on bb_err_wrap (the
++    // first of the chain). is_cleanup = false: the catch
++    // terminates the unwind, so the err-wrap chain is regular
++    // code (the validator has a CxxThrowsCleanup-specific edge
++    // rule allowing this — see validate.rs).
++    let (err_wrap_bb, converted_err_local) = if needs_from_conversion {
++        match resolve_from_cxx_raw_error_impl(
++            tcx,
++            typing_env,
++            err_payload_ty,
++            raw_err_ty,
++        ) {
++            Some(from_fn) => {
++                let converted_local = local_decls.push(LocalDecl::new(
++                    err_payload_ty,
++                    source_info.span,
++                ));
++                // Finalize block: dest = Result::Err(move converted_local);
++                //                 goto orig_target.
++                let err_rvalue = Rvalue::Aggregate(
++                    Box::new(AggregateKind::Adt(
++                        adt_def.did(),
++                        err_variant_idx,
++                        generics,
++                        None,
++                        None,
++                    )),
++                    IndexVec::from_iter([Operand::Move(Place::from(
++                        converted_local,
++                    ))]),
++                );
++                let err_stmt = Statement::new(
++                    source_info,
++                    StatementKind::Assign(Box::new((dest_place, err_rvalue))),
++                );
++                let finalize_bb_data = BasicBlockData::new_stmts(
++                    vec![err_stmt],
++                    Some(Terminator {
++                        source_info,
++                        kind: TerminatorKind::Goto { target: orig_target },
++                    }),
++                    /* is_cleanup: */ false,
++                );
++                let finalize_bb = basic_blocks.push(finalize_bb_data);
++
++                // Convert block: converted_local =
++                //     <E as From<CxxRawError>>::from(move raw_err_local)
++                //   -> [return: finalize_bb, unwind: Continue]
++                let from_fn_ty =
++                    Ty::new_fn_def(tcx, from_fn.def_id(), from_fn.args);
++                let from_operand = Operand::Constant(Box::new(ConstOperand {
++                    span: source_info.span,
++                    user_ty: None,
++                    const_: Const::Val(ConstValue::ZeroSized, from_fn_ty),
++                }));
++                let convert_call = Terminator {
++                    source_info,
++                    kind: TerminatorKind::Call {
++                        func: from_operand,
++                        args: [Spanned {
++                            node: Operand::Move(Place::from(raw_err_local)),
++                            span: source_info.span,
++                        }]
++                        .into_iter()
++                        .collect::<Box<[_]>>(),
++                        destination: Place::from(converted_local),
++                        target: Some(finalize_bb),
++                        unwind: UnwindAction::Continue,
++                        call_source: CallSource::Misc,
++                        fn_span: source_info.span,
++                    },
++                };
++                let convert_bb_data = BasicBlockData::new_stmts(
++                    Vec::new(),
++                    Some(convert_call),
++                    /* is_cleanup: */ false,
++                );
++                let convert_bb = basic_blocks.push(convert_bb_data);
++                (convert_bb, Some(converted_local))
++            }
++            None => {
++                // Trait resolution failed — diagnostic-item
++                // type exists but `E: From<CxxRawError>` doesn't
++                // hold. Emit a delayed bug so the user sees
++                // an error rather than a silent miscompile.
++                tcx.dcx().span_delayed_bug(
++                    source_info.span,
++                    format!(
++                        "`#[rustc_cxx_throws]` requires `{err_payload_ty}: \
++                         From<{raw_err_ty}>` (cxx::CxxRawError); add the \
++                         impl or change the Result's Err type",
++                    ),
++                );
++                // Fall back to a direct (likely-unsound) move so
++                // the compile can proceed. The delayed bug will
++                // surface at error-reporting time.
++                let err_rvalue = Rvalue::Aggregate(
++                    Box::new(AggregateKind::Adt(
++                        adt_def.did(),
++                        err_variant_idx,
++                        generics,
++                        None,
++                        None,
++                    )),
++                    IndexVec::from_iter([Operand::Move(Place::from(
++                        raw_err_local,
++                    ))]),
++                );
++                let err_stmt = Statement::new(
++                    source_info,
++                    StatementKind::Assign(Box::new((dest_place, err_rvalue))),
++                );
++                let err_wrap_bb_data = BasicBlockData::new_stmts(
++                    vec![err_stmt],
++                    Some(Terminator {
++                        source_info,
++                        kind: TerminatorKind::Goto { target: orig_target },
++                    }),
++                    /* is_cleanup: */ false,
++                );
++                (basic_blocks.push(err_wrap_bb_data), None)
++            }
++        }
++    } else {
++        // No conversion needed — direct wrap.
++        let err_rvalue = Rvalue::Aggregate(
++            Box::new(AggregateKind::Adt(
++                adt_def.did(),
++                err_variant_idx,
++                generics,
++                None,
++                None,
++            )),
++            IndexVec::from_iter([Operand::Move(Place::from(raw_err_local))]),
++        );
++        let err_stmt = Statement::new(
++            source_info,
++            StatementKind::Assign(Box::new((dest_place, err_rvalue))),
++        );
++        let err_wrap_bb_data = BasicBlockData::new_stmts(
++            vec![err_stmt],
++            Some(Terminator {
++                source_info,
++                kind: TerminatorKind::Goto { target: orig_target },
++            }),
++            /* is_cleanup: */ false,
++        );
++        (basic_blocks.push(err_wrap_bb_data), None)
+     };
+-    // is_cleanup = false: the catch terminates the unwind, so
+-    // the err_wrap_bb is regular code that flows back into the
+-    // normal CFG. This requires a corresponding validator
+-    // relaxation for the CxxThrowsCleanup unwind edge (see
+-    // validate.rs).
+-    let err_wrap_bb_data = BasicBlockData::new_stmts(
+-        vec![err_stmt],
+-        Some(err_terminator),
+-        /* is_cleanup: */ false,
+-    );
+-    let err_wrap_bb = basic_blocks.push(err_wrap_bb_data);
++    let _ = converted_err_local; // documented; the Place::from is what matters
+ 
+     // Rewrite the Call terminator:
+     //   destination → raw_ok_local
+@@ -242,3 +393,60 @@ fn rewrite_call<'tcx>(
+     *target = Some(ok_wrap_bb);
+     *unwind = UnwindAction::CxxThrowsCleanup { bb: err_wrap_bb, raw_err_local };
+ }
++
++/// Resolve the `<E as From<CxxRawError>>::from` associated
++/// function as a monomorphized `Instance`. Returns `None` if
++/// no such impl exists in scope, or if the resolution can't
++/// be completed (the caller handles either case by emitting
++/// a delayed compile error and falling back).
++fn resolve_from_cxx_raw_error_impl<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    typing_env: ty::TypingEnv<'tcx>,
++    err_ty: Ty<'tcx>,
++    raw_err_ty: Ty<'tcx>,
++) -> Option<ty::Instance<'tcx>> {
++    // Build the trait ref `E: From<CxxRawError>`.
++    let from_trait_did = tcx.lang_items().get(LangItem::From)?;
++    let trait_ref = ty::TraitRef::new(tcx, from_trait_did, [err_ty, raw_err_ty]);
++
++    // Select the impl.
++    let impl_source = tcx
++        .codegen_select_candidate(typing_env.as_query_input(trait_ref))
++        .ok()?;
++    let traits::ImplSource::UserDefined(traits::ImplSourceUserDefinedData {
++        impl_def_id,
++        args,
++        ..
++    }) = impl_source
++    else {
++        // Builtin / blanket impls — the only relevant blanket
++        // is `impl<T> From<T> for T` (the reflexive impl),
++        // which only triggers when err_ty == raw_err_ty. The
++        // caller already filtered that case before calling
++        // here, so anything other than UserDefined means
++        // resolution didn't find an applicable user impl.
++        debug!("resolve_from_cxx_raw_error_impl: non-user impl: {:?}", impl_source);
++        return None;
++    };
++
++    // Find the `from` associated function on the impl.
++    let from_method_did = tcx
++        .associated_items(*impl_def_id)
++        .find_by_ident_and_kind(
++            tcx,
++            rustc_span::Ident::with_dummy_span(sym::from),
++            ty::AssocTag::Fn,
++            *impl_def_id,
++        )?
++        .def_id;
++
++    // Build the monomorphized instance.
++    let instance = ty::Instance::try_resolve(
++        tcx,
++        typing_env,
++        from_method_did,
++        args,
++    )
++    .ok()??;
++    Some(instance)
++}
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 394d86c09dc..2a06effcb43 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -203,6 +203,13 @@
+         ControlFlow,
+         Copy,
+         Cow,
++        // rustcc fork (P09.69 / 1.13 throws Phase 2): diagnostic
++        // item for the runtime's CxxRawError tagged-union type.
++        // The cxx_throws_wrap MIR pass looks this up to allocate
++        // raw_err_local in the right shape, then resolves
++        // `From<CxxRawError>::from` if the user's Err payload
++        // type differs.
++        CxxRawError,
+         Debug,
+         Default,
+         Deref,
+-- 
+2.50.1 (Apple Git-155)
+

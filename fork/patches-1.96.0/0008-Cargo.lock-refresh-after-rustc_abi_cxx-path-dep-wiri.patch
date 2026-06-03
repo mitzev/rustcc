@@ -1,0 +1,43 @@
+From 28eca29a18c245e74f931605557d4e3e342b5920 Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Tue, 21 Apr 2026 23:24:10 +0300
+Subject: [PATCH 08/42] Cargo.lock: refresh after rustc_abi_cxx path dep wiring
+
+---
+ Cargo.lock | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 563d99d5475..e2e143f7df3 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3514,6 +3514,10 @@ dependencies = [
+  "tracing",
+ ]
+ 
++[[package]]
++name = "rustc_abi_cxx"
++version = "0.0.0"
++
+ [[package]]
+ name = "rustc_apfloat"
+ version = "0.2.3+llvm-462a31f5a5ab"
+@@ -4691,6 +4695,7 @@ dependencies = [
+  "punycode",
+  "rustc-demangle",
+  "rustc_abi",
++ "rustc_abi_cxx",
+  "rustc_data_structures",
+  "rustc_hashes",
+  "rustc_hir",
+@@ -4798,6 +4803,7 @@ version = "0.0.0"
+ dependencies = [
+  "itertools",
+  "rustc_abi",
++ "rustc_abi_cxx",
+  "rustc_data_structures",
+  "rustc_errors",
+  "rustc_hashes",
+-- 
+2.50.1 (Apple Git-155)
+

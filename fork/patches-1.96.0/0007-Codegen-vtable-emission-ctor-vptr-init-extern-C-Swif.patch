@@ -1,0 +1,647 @@
+From 66293906425f033c968c3cc0c12f47eaf24f83c3 Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Tue, 21 Apr 2026 23:24:03 +0300
+Subject: [PATCH 07/42] Codegen: vtable emission + ctor vptr-init + extern
+ C++/Swift call lowering
+
+rustc_codegen_llvm gains a cxx_vtable module that emits _ZTV / _ZTI /
+_ZTS globals and walks inheritance chains to combine base + derived
+virtuals. MIR codegen grows a return-terminator hook that writes each
+class's vptr right before function return (required for derived ctors
+where the user body assigns a base subobject after entry). Call
+lowering threads extern "C++" and extern "Swift" through the matching
+calling convention attributes.
+---
+ compiler/rustc_codegen_llvm/src/abi.rs        |  12 +-
+ compiler/rustc_codegen_llvm/src/builder.rs    |  11 +
+ compiler/rustc_codegen_llvm/src/context.rs    |   8 +
+ compiler/rustc_codegen_llvm/src/cxx_vtable.rs | 313 ++++++++++++++++++
+ compiler/rustc_codegen_llvm/src/lib.rs        |   1 +
+ compiler/rustc_codegen_llvm/src/llvm/ffi.rs   |   1 +
+ compiler/rustc_codegen_llvm/src/mono_item.rs  | 110 ++++++
+ compiler/rustc_codegen_ssa/src/mir/block.rs   |  12 +
+ compiler/rustc_codegen_ssa/src/mir/mod.rs     |  12 +
+ .../rustc_codegen_ssa/src/traits/builder.rs   |  18 +
+ 10 files changed, 497 insertions(+), 1 deletion(-)
+ create mode 100644 compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+
+diff --git a/compiler/rustc_codegen_llvm/src/abi.rs b/compiler/rustc_codegen_llvm/src/abi.rs
+index a6e841e440a..3c59248b9b7 100644
+--- a/compiler/rustc_codegen_llvm/src/abi.rs
++++ b/compiler/rustc_codegen_llvm/src/abi.rs
+@@ -687,7 +687,17 @@ fn get_param(&mut self, index: usize) -> Self::Value {
+ /// ABI, for the current target.
+ pub(crate) fn to_llvm_calling_convention(sess: &Session, abi: CanonAbi) -> llvm::CallConv {
+     match abi {
+-        CanonAbi::C | CanonAbi::Rust => llvm::CCallConv,
++        // P09 scaffold: CanonAbi::Cpp shares the C calling
++        // convention at the LLVM level. Per-target Itanium
++        // divergence (sret for non-POD returns, etc.) is handled
++        // at the ABI-info layer, not here — LLVM's `CCallConv` is
++        // fine as long as the caller/callee agree on the shape.
++        CanonAbi::C | CanonAbi::Cpp | CanonAbi::Rust => llvm::CCallConv,
++        // P09.17: route `extern "Swift"` through LLVM's swiftcc
++        // so user-type ABI matches what `swiftc` emits (e.g.
++        // `Point` with two `Float`s is passed as two separate
++        // floats, not packed into one double).
++        CanonAbi::Swift => llvm::SwiftCallConv,
+         CanonAbi::RustCold => llvm::PreserveMost,
+         CanonAbi::RustPreserveNone => match &sess.target.arch {
+             Arch::X86_64 | Arch::AArch64 => llvm::PreserveNone,
+diff --git a/compiler/rustc_codegen_llvm/src/builder.rs b/compiler/rustc_codegen_llvm/src/builder.rs
+index 056a0763087..828c978294d 100644
+--- a/compiler/rustc_codegen_llvm/src/builder.rs
++++ b/compiler/rustc_codegen_llvm/src/builder.rs
+@@ -295,6 +295,17 @@ fn build(cx: &'a CodegenCx<'ll, 'tcx>, llbb: &'ll BasicBlock) -> Self {
+         bx
+     }
+ 
++    /// P09.25: override the default no-op to write the vtable
++    /// address point at offset 0 of `ret_place_ptr` when
++    /// `instance` is a ctor on a polymorphic `#[repr(cpp)]` class.
++    fn maybe_emit_cxx_ctor_vptr_init(
++        &mut self,
++        instance: rustc_middle::ty::Instance<'tcx>,
++        ret_place_ptr: &'ll Value,
++    ) {
++        crate::cxx_vtable::maybe_emit_vptr_init(self, instance, ret_place_ptr);
++    }
++
+     fn cx(&self) -> &CodegenCx<'ll, 'tcx> {
+         self.cx
+     }
+diff --git a/compiler/rustc_codegen_llvm/src/context.rs b/compiler/rustc_codegen_llvm/src/context.rs
+index 5b730b820b8..3d4a70ea2ba 100644
+--- a/compiler/rustc_codegen_llvm/src/context.rs
++++ b/compiler/rustc_codegen_llvm/src/context.rs
+@@ -156,6 +156,13 @@ pub(crate) struct FullCx<'ll, 'tcx> {
+     /// Cache of Objective-C class references
+     pub objc_classrefs: RefCell<FxHashMap<Symbol, &'ll Value>>,
+ 
++    /// P09.24: set of polymorphic `#[repr(cpp)]` classes (keyed by
++    /// the ADT `DefId`) whose vtable/typeinfo/typeinfo-name globals
++    /// have already been emitted in this CGU. Prevents dup-symbol
++    /// errors when multiple methods on the same class trigger the
++    /// emission hook in `predefine_fn`.
++    pub cxx_emitted_vtables: RefCell<rustc_data_structures::fx::FxHashSet<DefId>>,
++
+     /// Cache of Objective-C selector references
+     pub objc_selrefs: RefCell<FxHashMap<Symbol, &'ll Value>>,
+ 
+@@ -646,6 +653,7 @@ pub(crate) fn new(
+                 objc_class_t: Cell::new(None),
+                 objc_classrefs: Default::default(),
+                 objc_selrefs: Default::default(),
++                cxx_emitted_vtables: Default::default(),
+                 offload_globals: Default::default(),
+                 offload_kernel_cache: Default::default(),
+             },
+diff --git a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+new file mode 100644
+index 00000000000..027536007da
+--- /dev/null
++++ b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+@@ -0,0 +1,313 @@
++//! P09.24 — Emit Itanium vtable / typeinfo / typeinfo-name globals
++//! for `#[repr(cpp)]` classes that have at least one inherent method
++//! tagged `#[rustc_cxx_virtual]`.
++//!
++//! # Scope (v1)
++//!
++//! - Single-inheritance only. No virtual bases, no multi-inheritance.
++//! - No `dynamic_cast` edge cases; `typeid` works for direct types
++//!   but RTTI has not been exercised across inheritance.
++//! - Class must have a complete type visible in the crate being
++//!   codegen'd (so we can read its inherent impls to find the
++//!   virtual methods).
++//!
++//! # What gets emitted
++//!
++//! For class `Widget` with virtual methods `[foo, bar]`, we emit three
++//! `LinkOnceODR` globals (deduplicated across CGUs by comdat):
++//!
++//! ```text
++//! _ZTV6Widget (vtable): [ i64 offset_to_top,
++//!                         ptr  &_ZTI6Widget,
++//!                         ptr  &Widget::foo,
++//!                         ptr  &Widget::bar ]
++//! _ZTI6Widget (typeinfo): { ptr  &_ZTVN10__cxxabiv117__class_type_infoE + 2*ptr_bytes,
++//!                           ptr  &_ZTS6Widget }
++//! _ZTS6Widget (typeinfo name): "6Widget\0"
++//! ```
++//!
++//! The vtable's *address point* (what a `this->vptr` refers to) is at
++//! slot 2 — the first function pointer. That's the target any ctor
++//! must store into offset 0 of the object.
++//!
++//! # Why a function-granular trigger
++//!
++//! Vtables need to be emitted once per polymorphic class per CGU. We
++//! don't have a "walk all classes" hook — but every polymorphic class
++//! will have at least one method codegen'd when it's used. We trigger
++//! in `predefine_fn` for any associated fn on a polymorphic class,
++//! with a per-CGU `HashSet` to dedup.
++
++use rustc_codegen_ssa::traits::*;
++use rustc_hir::def::DefKind;
++use rustc_hir::def_id::DefId;
++use rustc_middle::bug;
++use rustc_middle::ty::{self, Instance, TyCtxt};
++use rustc_symbol_mangling::itanium as cxx_mangle;
++
++use crate::builder::Builder;
++use crate::context::CodegenCx;
++use crate::llvm::{self, Value};
++
++/// P09.25: store the Itanium vtable address point
++/// (`&_ZTV<class>[2]`) into offset 0 of `ret_place_ptr` if
++/// `instance` is a `#[rustc_cxx_ctor]` on a polymorphic
++/// `#[repr(cpp)]` class. Invoked from `codegen_mir` at the
++/// start of ctor bodies — before any MIR runs, so the vptr sits
++/// in the invisible leading `ptr_bytes` of the Self value.
++pub(crate) fn maybe_emit_vptr_init<'ll, 'tcx>(
++    bx: &mut Builder<'_, 'll, 'tcx>,
++    instance: Instance<'tcx>,
++    ret_place_ptr: &'ll Value,
++) {
++    let tcx = bx.tcx;
++    let def_id = instance.def_id();
++    if !cxx_mangle::has_cxx_ctor_attr(tcx, def_id) {
++        return;
++    }
++    let Some(adt_did) = cpp_class_of_method(tcx, def_id) else {
++        return;
++    };
++    if !cxx_mangle::is_polymorphic_cpp_class(tcx, adt_did) {
++        return;
++    }
++
++    // Reference the class's vtable by its Itanium mangled name. In
++    // the common case the vtable is defined in the same CGU
++    // (emitted by `emit_vtable` via `maybe_emit_class_metadata`),
++    // but declare-if-missing still produces the right result if
++    // ordering flips.
++    let vtable_sym = cxx_mangle::mangle_cxx_vtable_symbol(tcx, adt_did);
++    let ptr_ty = bx.type_ptr();
++    let vtable_base = bx.cx.declare_global(&vtable_sym, ptr_ty);
++
++    // The address point is at byte offset `2 * ptr_bytes` from
++    // the vtable's start (skipping offset-to-top and the RTTI
++    // pointer, per the Itanium single-inheritance convention).
++    let ptr_bytes = tcx.data_layout.pointer_size().bytes();
++    let byte_offset = bx.cx.const_usize(2 * ptr_bytes);
++    let addr_point = unsafe {
++        llvm::LLVMConstInBoundsGEP2(
++            bx.cx.type_i8(),
++            vtable_base,
++            &byte_offset,
++            1,
++        )
++    };
++
++    // `ret_place_ptr` points at byte 0 of the Self storage; that's
++    // the vptr slot reserved by the polymorphic layout path.
++    let ptr_align = tcx.data_layout.pointer_align().abi;
++    bx.store(addr_point, ret_place_ptr, ptr_align);
++}
++
++/// If `def_id` is an associated fn on a polymorphic `#[repr(cpp)]`
++/// class and this CGU hasn't already emitted that class's vtable
++/// globals, emit them now.
++pub(crate) fn maybe_emit_class_metadata<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    def_id: DefId,
++) {
++    let Some(adt_did) = cpp_class_of_method(cx.tcx, def_id) else {
++        return;
++    };
++    if !cxx_mangle::is_polymorphic_cpp_class(cx.tcx, adt_did) {
++        return;
++    }
++    // Per-CGU dedup. LinkOnceODR comdat deals with across-CGU
++    // collisions, but emitting twice in the same CGU is a hard
++    // error from LLVM.
++    if !cx.cxx_emitted_vtables.borrow_mut().insert(adt_did) {
++        return;
++    }
++    emit_class_metadata(cx, adt_did);
++}
++
++/// The class for which `def_id` is an inherent associated fn (or a
++/// `Drop::drop` trait impl). Returns `None` if `def_id` isn't a
++/// method on a `#[repr(cpp)]` ADT.
++fn cpp_class_of_method<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<DefId> {
++    if tcx.def_kind(def_id) != DefKind::AssocFn {
++        return None;
++    }
++    let impl_did = tcx.opt_parent(def_id)?;
++    if !matches!(tcx.def_kind(impl_did), DefKind::Impl { .. }) {
++        return None;
++    }
++    let self_ty = tcx.type_of(impl_did).skip_binder();
++    let ty::Adt(adt_def, _) = self_ty.kind() else {
++        return None;
++    };
++    if !adt_def.repr().cpp() {
++        return None;
++    }
++    Some(adt_def.did())
++}
++
++fn emit_class_metadata<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, adt_did: DefId) {
++    let tcx = cx.tcx;
++    let class_name = tcx.item_name(adt_did).to_string();
++    let class_name_mangled = mangled_class_ident(&class_name);
++
++    let vtable_sym = cxx_mangle::mangle_cxx_vtable_symbol(tcx, adt_did);
++    let typeinfo_sym = cxx_mangle::mangle_cxx_typeinfo_symbol(tcx, adt_did);
++    let typeinfo_name_sym =
++        cxx_mangle::mangle_cxx_typeinfo_name_symbol(tcx, adt_did);
++
++    // `_ZTS<class>`: null-terminated byte string of the mangled class
++    // name. For `Widget` that's "6Widget\0".
++    let typeinfo_name_gv =
++        emit_typeinfo_name(cx, &typeinfo_name_sym, &class_name_mangled);
++
++    // `_ZTI<class>`: 2 slots for a root polymorphic class
++    // (__class_type_info) or 3 slots for a derived class
++    // (__si_class_type_info — adds a pointer to the base's
++    // `_ZTI`). emit_typeinfo dispatches based on whether the
++    // class has a polymorphic base.
++    let typeinfo_gv = emit_typeinfo(cx, tcx, adt_did, &typeinfo_sym, typeinfo_name_gv);
++
++    // `_ZTV<class>`: array of pointers. Slot 0 is offset-to-top (i64
++    // zero, but stored as a pointer for uniform layout); slot 1 is
++    // the typeinfo pointer; slots 2+ are virtual method pointers in
++    // declaration order.
++    emit_vtable(cx, adt_did, &vtable_sym, typeinfo_gv);
++}
++
++/// Build `"<len><name>\0"` — the Itanium typeinfo-name form for a
++/// single-segment class at the global namespace. For nested classes
++/// the format is different (`N...E` bracketed), but v1 scope.
++fn mangled_class_ident(name: &str) -> String {
++    format!("{}{}", name.len(), name)
++}
++
++fn emit_typeinfo_name<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    symbol: &str,
++    mangled: &str,
++) -> &'ll Value {
++    let bytes_with_nul: Vec<u8> = mangled
++        .as_bytes()
++        .iter()
++        .copied()
++        .chain(std::iter::once(0u8))
++        .collect();
++    let initializer = cx.const_bytes(&bytes_with_nul);
++    let llty = cx.val_ty(initializer);
++    let gv = cx.define_global(symbol, llty).unwrap_or_else(|| {
++        bug!(
++            "cxx_vtable: symbol `{symbol}` already defined (typeinfo name)"
++        )
++    });
++    llvm::set_initializer(gv, initializer);
++    llvm::set_linkage(gv, llvm::Linkage::LinkOnceODRLinkage);
++    llvm::LLVMSetGlobalConstant(gv, llvm::TRUE);
++    if cx.tcx.sess.target.supports_comdat() {
++        llvm::SetUniqueComdat(cx.llmod, gv);
++    }
++    gv
++}
++
++fn emit_typeinfo<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    tcx: TyCtxt<'tcx>,
++    adt_did: DefId,
++    symbol: &str,
++    typeinfo_name: &'ll Value,
++) -> &'ll Value {
++    let ptr_ty = cx.type_ptr();
++    let ptr_bytes = tcx.data_layout.pointer_size().bytes();
++
++    // P09.35: pick the RTTI kind based on whether this class has
++    // a polymorphic base. Root classes use `__class_type_info`
++    // (2 slots); single-inheritance derived classes use
++    // `__si_class_type_info` (3 slots, last is base typeinfo).
++    let base_did = cxx_mangle::polymorphic_base_of_class(tcx, adt_did);
++    let rtti_vtable_sym = if base_did.is_some() {
++        "_ZTVN10__cxxabiv120__si_class_type_infoE"
++    } else {
++        "_ZTVN10__cxxabiv117__class_type_infoE"
++    };
++    let rtti_vtable_base = cx.declare_global(rtti_vtable_sym, ptr_ty);
++    let byte_offset = cx.const_usize(2 * ptr_bytes);
++    let rtti_vtable_addr_point = unsafe {
++        llvm::LLVMConstInBoundsGEP2(cx.type_i8(), rtti_vtable_base, &byte_offset, 1)
++    };
++
++    let initializer = if let Some(base_did) = base_did {
++        let base_typeinfo_sym = cxx_mangle::mangle_cxx_typeinfo_symbol(tcx, base_did);
++        let base_typeinfo_ref = cx.declare_global(&base_typeinfo_sym, ptr_ty);
++        cx.const_struct(
++            &[rtti_vtable_addr_point, typeinfo_name, base_typeinfo_ref],
++            false,
++        )
++    } else {
++        cx.const_struct(&[rtti_vtable_addr_point, typeinfo_name], false)
++    };
++
++    let llty = cx.val_ty(initializer);
++    let gv = cx.define_global(symbol, llty).unwrap_or_else(|| {
++        bug!("cxx_vtable: symbol `{symbol}` already defined (typeinfo)")
++    });
++    llvm::set_initializer(gv, initializer);
++    llvm::set_linkage(gv, llvm::Linkage::LinkOnceODRLinkage);
++    llvm::LLVMSetGlobalConstant(gv, llvm::TRUE);
++    if cx.tcx.sess.target.supports_comdat() {
++        llvm::SetUniqueComdat(cx.llmod, gv);
++    }
++    gv
++}
++
++fn emit_vtable<'ll, 'tcx>(
++    cx: &CodegenCx<'ll, 'tcx>,
++    adt_did: DefId,
++    symbol: &str,
++    typeinfo: &'ll Value,
++) {
++    let tcx = cx.tcx;
++    let ptr_ty = cx.type_ptr();
++    let isize_ty = cx.type_isize();
++
++    // Slot 0: offset_to_top. For the primary sub-table of the most-
++    // derived class (and we don't support multi-inheritance in v1)
++    // this is zero.
++    let offset_to_top = cx.const_int(isize_ty, 0);
++    // LLVM's const_struct wants all slots to have a consistent
++    // element type if it's an array; but a vtable is naturally a
++    // struct of mixed ptr + int. We use const_struct (packed=false)
++    // so LLVM lays out offset-to-top as a pointer-sized integer and
++    // the rest as pointers. Clang does the same — vtables are
++    // `{ i64, ptr, ptr, ... }` in its LLVM IR.
++    let mut slots: Vec<&'ll Value> = Vec::new();
++    slots.push(offset_to_top);
++    slots.push(typeinfo);
++
++    // Slots 2+: virtual method fn-pointers along the inheritance
++    // chain — base virtuals first, then derived-class virtuals.
++    // For v1 there's no override support, so base slots always
++    // point at base's own implementations; users must keep the
++    // C++ header's virtual order in sync.
++    let virtuals = cxx_mangle::virtuals_on_chain(tcx, adt_did);
++    for method_did in virtuals {
++        // Non-generic methods only in v1. If we hit a generic, the
++        // user should monomorphize it manually before the polymorphic
++        // use site. Here we synthesize an Instance with empty args
++        // and rely on the usual Rust monomorphization machinery to
++        // have already run.
++        let instance = Instance::mono(tcx, method_did);
++        let fn_val = cx.get_fn_addr(instance);
++        slots.push(fn_val);
++    }
++    let _ = ptr_ty; // (retained for readability; const_struct infers)
++
++    let initializer = cx.const_struct(&slots, false);
++    let llty = cx.val_ty(initializer);
++    let gv = cx.define_global(symbol, llty).unwrap_or_else(|| {
++        bug!("cxx_vtable: symbol `{symbol}` already defined (vtable)")
++    });
++    llvm::set_initializer(gv, initializer);
++    llvm::set_linkage(gv, llvm::Linkage::LinkOnceODRLinkage);
++    llvm::LLVMSetGlobalConstant(gv, llvm::TRUE);
++    if cx.tcx.sess.target.supports_comdat() {
++        llvm::SetUniqueComdat(cx.llmod, gv);
++    }
++}
+diff --git a/compiler/rustc_codegen_llvm/src/lib.rs b/compiler/rustc_codegen_llvm/src/lib.rs
+index ea802e96633..2e7daa96d31 100644
+--- a/compiler/rustc_codegen_llvm/src/lib.rs
++++ b/compiler/rustc_codegen_llvm/src/lib.rs
+@@ -59,6 +59,7 @@
+ mod consts;
+ mod context;
+ mod coverageinfo;
++mod cxx_vtable;
+ mod debuginfo;
+ mod declare;
+ mod errors;
+diff --git a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+index bc24f1692fc..0163802b9d8 100644
+--- a/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
++++ b/compiler/rustc_codegen_llvm/src/llvm/ffi.rs
+@@ -166,6 +166,7 @@ pub(crate) enum CallConv {
+     ColdCallConv = 9,
+     PreserveMost = 14,
+     PreserveAll = 15,
++    SwiftCallConv = 16,
+     Tail = 18,
+     PreserveNone = 21,
+     X86StdcallCallConv = 64,
+diff --git a/compiler/rustc_codegen_llvm/src/mono_item.rs b/compiler/rustc_codegen_llvm/src/mono_item.rs
+index 0783282bc6e..a38ed354837 100644
+--- a/compiler/rustc_codegen_llvm/src/mono_item.rs
++++ b/compiler/rustc_codegen_llvm/src/mono_item.rs
+@@ -71,6 +71,19 @@ fn predefine_fn(
+             self.predefine_without_aliases(instance, &attrs, linkage, visibility, symbol_name);
+         self.add_function_aliases(instance, lldecl, &attrs, &attrs.foreign_item_symbol_aliases);
+ 
++        // P09.15: emit D0 (deleting) and D2 (base-object) Itanium
++        // destructor variants as siblings of the D1 we just
++        // predefined. Required so virtual dispatch of `delete p`
++        // through a C++ base pointer lands in Rust's Drop impl.
++        self.maybe_add_cxx_dtor_variants(instance, lldecl, linkage, visibility);
++
++        // P09.24: if this fn is a method on a polymorphic
++        // `#[repr(cpp)]` class, emit the class's vtable / typeinfo /
++        // typeinfo-name globals. Per-CGU dedup via a hashset on
++        // `CodegenCx`; LinkOnceODR linkage handles across-CGU
++        // dedup at link time.
++        crate::cxx_vtable::maybe_emit_class_metadata(self, instance.def_id());
++
+         self.instances.borrow_mut().insert(instance, lldecl);
+     }
+ }
+@@ -151,6 +164,103 @@ fn add_static_aliases(&self, aliasee: &llvm::Value, aliases: &[(DefId, Linkage,
+         }
+     }
+ 
++    /// P09.15: For Rust `Drop` impls on `#[repr(cpp)]` types,
++    /// emit the Itanium D0 (deleting) and D2 (base-object)
++    /// destructor variants as trampolines alongside D1. Required
++    /// for virtual dispatch of `delete p` through a C++ base
++    /// pointer to land in Rust's Drop.
++    ///
++    /// - D2 is a plain forward to D1 (in single-inheritance
++    ///   without virtual bases, D1 and D2 run the same user code).
++    /// - D0 forwards to D1 then calls `operator delete(this)`
++    ///   (`_ZdlPv`), matching Clang's emission for
++    ///   `delete derived_obj`.
++    fn maybe_add_cxx_dtor_variants(
++        &self,
++        instance: Instance<'tcx>,
++        d1_decl: &'ll llvm::Value,
++        linkage: Linkage,
++        visibility: Visibility,
++    ) {
++        let def_id = instance.def_id();
++        if !rustc_symbol_mangling::itanium::is_cxx_drop_impl(self.tcx, def_id) {
++            return;
++        }
++        // P09.23: `#[rustc_cxx_drop_wrapper]` opts out of D0/D2
++        // trampoline emission. Used when the C++ side already
++        // defines the destructor and Rust's Drop body is just a
++        // forwarder — emitting trampolines would produce
++        // duplicate-symbol link errors against the C++ side.
++        if rustc_hir::find_attr!(self.tcx, def_id, RustcCxxDropWrapper(..)) {
++            return;
++        }
++
++        let fn_abi: &FnAbi<'tcx, Ty<'tcx>> =
++            self.fn_abi_of_instance(instance, ty::List::empty());
++        let fn_ty = fn_abi.llvm_type(self);
++        let attrs = self.tcx.codegen_instance_attrs(instance.def);
++
++        // Helper: emit a trampoline symbol named `name` whose body
++        // is `{ call D1(args); <tail>; ret }`. Returns the llvm
++        // decl so the caller can chain extra calls (for D0 which
++        // also calls `operator delete`).
++        let emit_trampoline = |name: &str, also_call_op_delete: bool| {
++            let trampoline = self.predefine_without_aliases(
++                instance, &attrs, linkage, visibility, name,
++            );
++            let start_llbb = Builder::append_block(self, trampoline, "start");
++            let mut bx = Builder::build(self, start_llbb);
++
++            let num_params = llvm::count_params(trampoline);
++            let mut args = Vec::with_capacity(num_params as usize);
++            for index in 0..num_params {
++                args.push(llvm::get_param(trampoline, index));
++            }
++
++            bx.call(
++                fn_ty, Some(&attrs), Some(fn_abi), d1_decl, &args, None, Some(instance),
++            );
++
++            if also_call_op_delete {
++                // Declare and call `operator delete(void*)` —
++                // `_ZdlPv`. Clang emits this in the D0 body when
++                // the dtor is virtual and `delete p` is reachable.
++                let op_delete_name = "_ZdlPv";
++                let void_ty = self.type_void();
++                let ptr_ty = self.type_ptr();
++                let op_delete_ty = self.type_func(&[ptr_ty], void_ty);
++                let op_delete = self.declare_cfn(
++                    op_delete_name,
++                    llvm::UnnamedAddr::Global,
++                    op_delete_ty,
++                );
++                // The first arg is `this` (a pointer). Rust's
++                // Drop fn's first arg is `&mut Self`, which has
++                // the same ABI — pass it through.
++                if !args.is_empty() {
++                    bx.call(
++                        op_delete_ty, None, None, op_delete, &args[..1], None, None,
++                    );
++                }
++            }
++
++            // Drop fns return `()`, so ret_void is correct
++            // regardless of which variant we're emitting.
++            bx.ret_void();
++        };
++
++        if let Some(d2_name) =
++            rustc_symbol_mangling::itanium::mangle_dtor_d2(self.tcx, def_id)
++        {
++            emit_trampoline(&d2_name, false);
++        }
++        if let Some(d0_name) =
++            rustc_symbol_mangling::itanium::mangle_dtor_d0(self.tcx, def_id)
++        {
++            emit_trampoline(&d0_name, true);
++        }
++    }
++
+     /// See [`add_static_aliases`](Self::add_static_aliases) for docs.
+     fn add_function_aliases(
+         &self,
+diff --git a/compiler/rustc_codegen_ssa/src/mir/block.rs b/compiler/rustc_codegen_ssa/src/mir/block.rs
+index 1b96be12f71..d89692283f5 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/block.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/block.rs
+@@ -519,6 +519,18 @@ fn codegen_switchint_terminator(
+     }
+ 
+     fn codegen_return_terminator(&mut self, bx: &mut Bx) {
++        // P09.35: polymorphic `#[repr(cpp)]` ctors need the
++        // derived class's vptr written to offset 0 of the return
++        // place AFTER user MIR has run (otherwise a `Self {
++        // __base: Base::new(...), ... }` literal would clobber
++        // the vptr by writing the base subobject with base's
++        // vptr). Hooking into every return terminator guarantees
++        // the derived vptr is the last write. For non-derived
++        // classes the extra store is redundant (identical value)
++        // but harmless.
++        if let LocalRef::Place(ret_place) = &self.locals[mir::RETURN_PLACE] {
++            bx.maybe_emit_cxx_ctor_vptr_init(self.instance, ret_place.val.llval);
++        }
+         // Call `va_end` if this is the definition of a C-variadic function.
+         if self.fn_abi.c_variadic {
+             // The `VaList` "spoofed" argument is just after all the real arguments.
+diff --git a/compiler/rustc_codegen_ssa/src/mir/mod.rs b/compiler/rustc_codegen_ssa/src/mir/mod.rs
+index 93da12107ba..10a35ef9e91 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/mod.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/mod.rs
+@@ -296,6 +296,18 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+     };
+     fx.initialize_locals(local_values);
+ 
++    // P09.25: if this function is a `#[rustc_cxx_ctor]` on a
++    // polymorphic `#[repr(cpp)]` class, inject a store of the
++    // vtable address point into offset 0 of the return place.
++    // The polymorphic-layout path in `cxx_bridge` reserves the
++    // first `ptr_bytes` of the class's memory for this vptr; user
++    // MIR's field stores use shifted offsets and don't touch it.
++    // Default impl of `maybe_emit_cxx_ctor_vptr_init` is a no-op;
++    // the LLVM backend overrides it in its Builder impl.
++    if let LocalRef::Place(ret_place) = fx.locals[mir::RETURN_PLACE] {
++        start_bx.maybe_emit_cxx_ctor_vptr_init(instance, ret_place.val.llval);
++    }
++
+     // Apply debuginfo to the newly allocated locals.
+     fx.debug_introduce_locals(&mut start_bx, consts_debug_info.unwrap_or_default());
+ 
+diff --git a/compiler/rustc_codegen_ssa/src/traits/builder.rs b/compiler/rustc_codegen_ssa/src/traits/builder.rs
+index c222aef4574..11e0e93d45f 100644
+--- a/compiler/rustc_codegen_ssa/src/traits/builder.rs
++++ b/compiler/rustc_codegen_ssa/src/traits/builder.rs
+@@ -62,6 +62,24 @@ pub trait BuilderMethods<'a, 'tcx>:
+ 
+     fn build(cx: &'a Self::CodegenCx, llbb: Self::BasicBlock) -> Self;
+ 
++    /// P09.25: if `instance` is a `#[rustc_cxx_ctor]` on a
++    /// polymorphic `#[repr(cpp)]` class, emit a store of the
++    /// Itanium vtable address point (`&_ZTV<class>[2]`) into
++    /// offset 0 of `ret_place_ptr`. Called once at the start
++    /// of function codegen, before any MIR runs — so the vptr
++    /// sits in the invisible leading `ptr_bytes` of the return
++    /// value's storage, and subsequent user field stores at
++    /// shifted offsets leave it intact.
++    ///
++    /// Default impl is a no-op for backends that don't support
++    /// the rustcc C++ ABI; LLVM overrides in its Builder impl.
++    fn maybe_emit_cxx_ctor_vptr_init(
++        &mut self,
++        _instance: Instance<'tcx>,
++        _ret_place_ptr: Self::Value,
++    ) {
++    }
++
+     fn cx(&self) -> &Self::CodegenCx;
+     fn llbb(&self) -> Self::BasicBlock;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

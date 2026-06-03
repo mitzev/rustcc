@@ -1,0 +1,646 @@
+From 4149321f036d0d26465ddb1c786ef403d10c8b7c Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 14:03:19 +0300
+Subject: [PATCH 35/42] P09.68-msvc: typed C++ catches on MSVC (1.13 throws
+ Phase 2D)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+MSVC SEH counterpart to the Itanium P09.68 typed catches.
+Runtime-validated end-to-end under Wine.
+
+User-facing:
+
+    extern "C++" {
+        #[rustc_cxx_throws]
+        #[rustc_cxx_throws_typeinfos     = "_ZTI11DomainError,_ZTI10RangeError"]
+        #[rustc_cxx_throws_msvc_typedescs = ".?AVDomainError@@,.?AVRangeError@@"]
+        fn maybe_throws_typed(x: i32) -> Result<i32, CxxRawError>;
+    }
+
+The Itanium typeinfos list and MSVC typedesc list are two
+separate attributes — they carry the same logical types
+mangled for two different C++ ABIs. The order must match so
+the user's `From<CxxRawError>` impl indexes the same way
+regardless of target.
+
+Smoke test (Wine, fork/tests/msvc_runtime_smoke/
+bin msvc_cxx_throws_typed):
+
+  maybe_throws_typed(5)  -> Ok(10)
+  maybe_throws_typed(-1) -> Err(kind = TYPED_BASE + 0)   ← DomainError
+  maybe_throws_typed(-2) -> Err(kind = TYPED_BASE + 1)   ← RangeError
+
+Three changes:
+
+1. Attribute parser + AttributeKind variant
+   `RustcCxxThrowsMsvcTypedescs`. Cross-crate encoded as Yes;
+   builtin_attrs.rs lists the attribute; CodegenFnAttrs gets
+   a new `cxx_throws_msvc_typedescs: Option<Symbol>` field.
+
+2. New trait method
+   `MiscCodegenMethods::cxx_typedesc_global_msvc(name)`
+   synthesizes a per-type TypeDescriptor global. LLVM impl
+   builds `{ vtable ??_7type_info@@6B@, null, mangled_name\\0 }`
+   with linkonce_odr + comdat (so multiple modules can each
+   define their own copy and the linker collapses by string
+   identity, matching what MSVC C++ frontends do). GCC stub
+   raises unimplemented! — the GCC backend doesn't target
+   Windows MSVC.
+
+3. `cxx_throws_catch_pad` on MSVC now emits one catchpad per
+   typedesc plus a final catch-all catchpad. Each typed
+   catchpad uses flags=8 (catch-by-reference) + a null slot
+   (we don't bind the caught object — just need to know which
+   clause fired). Each catchpad writes a hard-coded
+   `kind = CXX_EXC_TYPED_BASE + i` into raw_err_local before
+   catchret. The catch-all writes `CXX_EXC_UNKNOWN` like
+   before. The catch_switch dispatches based on RTTI match.
+
+The Itanium path is unchanged.
+
+GCC backend gets a stub.
+
+`msvc_cxx_throws` (catch-all) regression smoke still passes
+unchanged.
+---
+ .../src/attributes/codegen_attrs.rs           |  38 +++
+ compiler/rustc_attr_parsing/src/context.rs    |   1 +
+ compiler/rustc_codegen_gcc/src/context.rs     |   7 +
+ compiler/rustc_codegen_llvm/src/context.rs    |  47 ++++
+ .../rustc_codegen_ssa/src/codegen_attrs.rs    |   3 +
+ compiler/rustc_codegen_ssa/src/mir/block.rs   | 231 +++++++++---------
+ compiler/rustc_codegen_ssa/src/traits/misc.rs |  13 +
+ compiler/rustc_feature/src/builtin_attrs.rs   |   6 +
+ .../rustc_hir/src/attrs/data_structures.rs    |  12 +
+ .../rustc_hir/src/attrs/encode_cross_crate.rs |   1 +
+ .../src/middle/codegen_fn_attrs.rs            |   8 +
+ compiler/rustc_passes/src/check_attr.rs       |   1 +
+ compiler/rustc_span/src/symbol.rs             |   1 +
+ 13 files changed, 259 insertions(+), 110 deletions(-)
+
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+index 9145d07a535..ba92ba27186 100644
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -868,6 +868,44 @@ fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<Attrib
+     }
+ }
+ 
++/// P09.68-msvc / 1.13 throws Phase 2C:
++/// `#[rustc_cxx_throws_msvc_typedescs = ".?AVDomainError@@,.?AVRangeError@@"]`
++/// — MSVC counterpart to `rustc_cxx_throws_typeinfos`. The
++/// Microsoft C++ ABI uses TypeDescriptor structures (not
++/// Itanium `_ZTI<name>` symbols) for RTTI matching. Codegen
++/// synthesizes a TypeDescriptor global per entry —
++/// `{ vtable=??_7type_info@@6B@, null, "<name>\\0" }` — and
++/// uses them as catch_pad type descriptors on the SEH path.
++/// The order must match the Itanium typeinfos list so the
++/// user's `From<CxxRawError>` impl indexes the same way on
++/// both platforms.
++pub(crate) struct RustcCxxThrowsMsvcTypedescsParser;
++
++impl<S: Stage> SingleAttributeParser<S> for RustcCxxThrowsMsvcTypedescsParser {
++    const PATH: &[Symbol] = &[sym::rustc_cxx_throws_msvc_typedescs];
++    const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
++    const ALLOWED_TARGETS: AllowedTargets =
++        AllowedTargets::AllowList(&[Allow(Target::ForeignFn)]);
++    const TEMPLATE: AttributeTemplate =
++        template!(NameValueStr: ".?AVT1@@,.?AVT2@@");
++
++    fn convert(cx: &mut AcceptContext<'_, '_, S>, args: &ArgParser) -> Option<AttributeKind> {
++        let Some(nv) = args.name_value() else {
++            let attr_span = cx.attr_span;
++            cx.adcx().expected_name_value(attr_span, None);
++            return None;
++        };
++        let Some(typedescs) = nv.value_as_str() else {
++            cx.adcx().expected_string_literal(nv.value_span, Some(nv.value_as_lit()));
++            return None;
++        };
++        Some(AttributeKind::RustcCxxThrowsMsvcTypedescs {
++            typedescs,
++            span: cx.attr_span,
++        })
++    }
++}
++
+ /// P09.20: `#[rustc_cxx_operator = "Plus"]` — marks a method on
+ /// a `#[repr(cpp)]` impl as a C++ operator overload. The string
+ /// value names the operator kind (matches the variants of
+diff --git a/compiler/rustc_attr_parsing/src/context.rs b/compiler/rustc_attr_parsing/src/context.rs
+index 19a2c6a1b93..0de2e132dc2 100644
+--- a/compiler/rustc_attr_parsing/src/context.rs
++++ b/compiler/rustc_attr_parsing/src/context.rs
+@@ -333,6 +333,7 @@ mod late {
+         Single<WithoutArgs<RustcSwiftThrowsParser>>,
+         Single<WithoutArgs<RustcCxxThrowsParser>>,
+         Single<RustcCxxThrowsTypeinfosParser>,
++        Single<RustcCxxThrowsMsvcTypedescsParser>,
+         Single<WithoutArgs<RustcPreserveUbChecksParser>>,
+         Single<WithoutArgs<RustcProcMacroDeclsParser>>,
+         Single<WithoutArgs<RustcPubTransparentParser>>,
+diff --git a/compiler/rustc_codegen_gcc/src/context.rs b/compiler/rustc_codegen_gcc/src/context.rs
+index a80b9233626..bd4dc1a7abc 100644
+--- a/compiler/rustc_codegen_gcc/src/context.rs
++++ b/compiler/rustc_codegen_gcc/src/context.rs
+@@ -505,6 +505,13 @@ fn cxx_typeinfo_global(&self, _name: &str) -> Self::Value {
+         );
+     }
+ 
++    fn cxx_typedesc_global_msvc(&self, _name: &str) -> Self::Value {
++        unimplemented!(
++            "MSVC typed catches are LLVM-only for v1.13.0; \
++             GCC backend doesn't target MSVC"
++        );
++    }
++
+     fn cxx_typeinfo_personality(&self) -> Self::Function {
+         unimplemented!(
+             "cxx_throws typed catches are LLVM-only for v1.13.0; \
+diff --git a/compiler/rustc_codegen_llvm/src/context.rs b/compiler/rustc_codegen_llvm/src/context.rs
+index e94611a4f4c..16c617b0c85 100644
+--- a/compiler/rustc_codegen_llvm/src/context.rs
++++ b/compiler/rustc_codegen_llvm/src/context.rs
+@@ -1001,6 +1001,53 @@ fn cxx_typeinfo_personality(&self) -> &'ll Value {
+         self.declare_cfn(name, llvm::UnnamedAddr::Global, fty)
+     }
+ 
++    fn cxx_typedesc_global_msvc(&self, name: &str) -> &'ll Value {
++        // P09.68-msvc / 1.13 throws Phase 2C: synthesize an
++        // MSVC TypeDescriptor for the given mangled type name.
++        //
++        // Layout (matches what cl/clang-cl produce for C++
++        // RTTI on MSVC x64):
++        //
++        //   struct TypeDescriptor {
++        //     void* vtable;     // -> ??_7type_info@@6B@
++        //     void* decoration; // null spare
++        //     char  name[];     // mangled name + '\0'
++        //   };
++        //
++        // The MSVC runtime matches catch clauses by STRING
++        // comparing the `name` field across modules, so each
++        // module synthesizes its own TypeDescriptor copy. We
++        // give it linkonce_odr + comdat to collapse duplicates
++        // at link time but allow different modules to define
++        // their own. Symbol name encodes the mangled type to
++        // keep duplicates colliding correctly.
++        //
++        // Cache by name within the CGU so multiple catch
++        // clauses for the same type reuse one global.
++        let sym = format!("__rustcc_msvc_typedesc.{name}");
++        if let Some(existing) = self.get_declared_value(&sym) {
++            return existing;
++        }
++        let vtable = self.declare_global("??_7type_info@@6B@", self.type_ptr());
++        // Append '\0' to the mangled name so the C runtime's
++        // string compare terminates correctly.
++        let mut bytes = Vec::with_capacity(name.len() + 1);
++        bytes.extend_from_slice(name.as_bytes());
++        bytes.push(0);
++        let name_const = self.const_bytes(&bytes);
++        let typedesc = self.const_struct(
++            &[vtable, self.const_null(self.type_ptr()), name_const],
++            /* packed: */ false,
++        );
++        let tydesc_global = self.declare_global(&sym, self.val_ty(typedesc));
++        llvm::set_linkage(tydesc_global, llvm::Linkage::LinkOnceODRLinkage);
++        if self.tcx.sess.target.supports_comdat() {
++            llvm::SetUniqueComdat(self.llmod, tydesc_global);
++        }
++        llvm::set_initializer(tydesc_global, typedesc);
++        tydesc_global
++    }
++
+     fn cxx_typeinfo_global(&self, name: &str) -> &'ll Value {
+         // P09.68 / 1.13 throws Phase 2B: declare a Itanium
+         // typeinfo extern global. The C++ side defines these
+diff --git a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+index 2d9b5e11dd0..48ae0047f26 100644
+--- a/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
++++ b/compiler/rustc_codegen_ssa/src/codegen_attrs.rs
+@@ -195,6 +195,9 @@ fn process_builtin_attrs(
+             AttributeKind::RustcCxxThrowsTypeinfos { typeinfos, .. } => {
+                 codegen_fn_attrs.cxx_throws_typeinfos = Some(*typeinfos)
+             }
++            AttributeKind::RustcCxxThrowsMsvcTypedescs { typedescs, .. } => {
++                codegen_fn_attrs.cxx_throws_msvc_typedescs = Some(*typedescs)
++            }
+             AttributeKind::RustcStdInternalSymbol(_) => {
+                 codegen_fn_attrs.flags |= CodegenFnAttrFlags::RUSTC_STD_INTERNAL_SYMBOL
+             }
+diff --git a/compiler/rustc_codegen_ssa/src/mir/block.rs b/compiler/rustc_codegen_ssa/src/mir/block.rs
+index b97e2f2771f..8f84e5adc9a 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/block.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/block.rs
+@@ -224,7 +224,7 @@ fn do_call<Bx: BuilderMethods<'a, 'tcx>>(
+         // We detect CXX_THROWS off the callee `Instance` (when
+         // present — indirect calls through fn pointers skip this
+         // path because they don't carry per-callee attrs).
+-        let (callee_cxx_throws, callee_typeinfos_str) = instance
++        let (callee_cxx_throws, callee_typeinfos_str, callee_msvc_typedescs_str) = instance
+             .map(|inst| {
+                 let attrs = bx.tcx().codegen_fn_attrs(inst.def_id());
+                 (
+@@ -232,24 +232,34 @@ fn do_call<Bx: BuilderMethods<'a, 'tcx>>(
+                         rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::CXX_THROWS,
+                     ),
+                     attrs.cxx_throws_typeinfos,
++                    attrs.cxx_throws_msvc_typedescs,
+                 )
+             })
+-            .unwrap_or((false, None));
+-
+-        // P09.68 / 1.13 throws Phase 2B: parse the typeinfos
+-        // attribute into a Vec of trimmed symbol names. The
+-        // attribute is a comma-separated string. Empty list
+-        // means the callee uses Phase 1 catch-all semantics.
+-        let callee_typeinfos: Vec<&str> = callee_typeinfos_str
+-            .as_ref()
+-            .map(|s| {
+-                s.as_str()
+-                    .split(',')
+-                    .map(str::trim)
+-                    .filter(|s| !s.is_empty())
+-                    .collect()
+-            })
+-            .unwrap_or_default();
++            .unwrap_or((false, None, None));
++
++        // P09.68 / 1.13 throws Phase 2B+C: parse typeinfos
++        // attributes into Vecs of trimmed names. Both are
++        // comma-separated strings; the MSVC version is used
++        // for catch_pad TypeDescriptors and the Itanium
++        // version for landingpad `catch ptr @<symbol>` clauses.
++        // Empty lists mean the callee uses Phase 1 catch-all.
++        let parse_list = |s: Option<rustc_span::Symbol>| -> Vec<String> {
++            s.as_ref()
++                .map(|sym| {
++                    sym.as_str()
++                        .split(',')
++                        .map(|s| s.trim().to_string())
++                        .filter(|s| !s.is_empty())
++                        .collect()
++                })
++                .unwrap_or_default()
++        };
++        let callee_typeinfos: Vec<String> = parse_list(callee_typeinfos_str);
++        let callee_msvc_typedescs: Vec<String> = parse_list(callee_msvc_typedescs_str);
++        let callee_typeinfos_refs: Vec<&str> =
++            callee_typeinfos.iter().map(String::as_str).collect();
++        let callee_msvc_typedescs_refs: Vec<&str> =
++            callee_msvc_typedescs.iter().map(String::as_str).collect();
+ 
+         let unwind_block = if let mir::UnwindAction::CxxThrowsCleanup { bb, raw_err_local } =
+             unwind
+@@ -259,14 +269,24 @@ fn do_call<Bx: BuilderMethods<'a, 'tcx>>(
+             // err_wrap_bb (which constructs Result::Err) and
+             // the raw_err_local that codegen's catch BB must
+             // populate with the runtime helper's return value.
+-            Some(fx.cxx_throws_catch_pad(bx, Some((bb, raw_err_local)), &callee_typeinfos))
++            Some(fx.cxx_throws_catch_pad(
++                bx,
++                Some((bb, raw_err_local)),
++                &callee_typeinfos_refs,
++                &callee_msvc_typedescs_refs,
++            ))
+         } else if callee_cxx_throws {
+             // Fallback: callee is CXX_THROWS but the MIR pass
+             // didn't (or couldn't) rewrite this call. Use the
+             // legacy abort-after-catch path; the continuation
+             // target is wherever the call would have normally
+             // returned.
+-            Some(fx.cxx_throws_catch_pad(bx, None, &callee_typeinfos))
++            Some(fx.cxx_throws_catch_pad(
++                bx,
++                None,
++                &callee_typeinfos_refs,
++                &callee_msvc_typedescs_refs,
++            ))
+         } else { match unwind {
+             mir::UnwindAction::Cleanup(cleanup) => Some(self.llbb_with_cleanup(fx, cleanup)),
+             mir::UnwindAction::CxxThrowsCleanup { .. } => {
+@@ -2012,6 +2032,7 @@ fn cxx_throws_catch_pad(
+         _outer_bx: &mut Bx,
+         dest: Option<(mir::BasicBlock, mir::Local)>,
+         typeinfo_names: &[&str],
++        msvc_typedesc_names: &[&str],
+     ) -> Bx::BasicBlock {
+         let catch_llbb = Bx::append_block(self.cx, self.llfn, "cxx_throws_catch");
+         let mut catch_bx = Bx::build(self.cx, catch_llbb);
+@@ -2051,103 +2072,93 @@ fn cxx_throws_catch_pad(
+             // path doesn't, so we must set it ourselves.
+             catch_bx.set_personality_fn(self.cx.eh_personality());
+ 
+-            // catch_switch — single successor (the catch_pad).
+-            // Its returned token is the parent of the catch_pad
+-            // funclet — passing null here is a bug LLVM detects
+-            // late (getUnwindDestToken crash during inlining).
+-            let catchpad_bb = Bx::append_block(self.cx, self.llfn, "cxx_throws_catchpad");
+-            let cs = catch_bx.catch_switch(None, None, &[catchpad_bb]);
+-
+-            // Switch builders to emit into the catch_pad block.
+-            let mut pad_bx = Bx::build(self.cx, catchpad_bb);
+-            // typedesc=null + flags=64 (catch-all) + slot=null.
+-            //
+-            // The slot can't be a real alloca because for
+-            // catch-all (flags=64) the runtime doesn't bind
+-            // anything to it — passing an alloca causes the
+-            // inliner / SROA to confuse the slot with the
+-            // helper's sret return slot and ends up storing the
+-            // helper's result through the (uninitialized) slot
+-            // pointer instead of into raw_err_local. NULL slot
+-            // matches what libstd's foreign-panic catch BB
+-            // does. The cost is that we can't pass a real
+-            // exception pointer to the helper — pass null and
+-            // let the helper just synthesize a
+-            // `CxxRawError { kind: CXX_EXC_UNKNOWN, ... }`.
+-            let null = pad_bx.cx().const_null(pad_bx.cx().type_ptr());
+-            let flags_catch_all = pad_bx.cx().const_i32(64);
+-            let funclet = pad_bx.catch_pad(cs, &[null, flags_catch_all, null]);
+-
+-            // We don't call the runtime helper on MSVC: its
+-            // declared signature `(ptr) -> { i32, ptr }`
+-            // returns a 16-byte struct, which on Win64 ABI
+-            // requires an implicit sret pointer in RCX. The
+-            // external declaration we emit doesn't carry the
+-            // `sret` attribute, so LLVM lowers the call as
+-            // "ptr in RCX, no sret" — but the helper's actual
+-            // body (compiled by Rust with proper ABI lowering)
+-            // expects RCX = sret pointer. The mismatch shows
+-            // up as a null-pointer write at runtime when the
+-            // helper tries to populate its sret slot.
+-            //
+-            // Since the MSVC catch-all path can't pass a real
+-            // exception pointer anyway (catch_pad's slot is
+-            // unused with flags=64), we synthesize the
+-            // `CxxRawError` inline instead of calling out:
+-            //
+-            //   raw_err_local.kind    = CXX_EXC_UNKNOWN (2)
+-            //   raw_err_local.message = null
+-            //
+-            // The end result for the user is the same:
+-            // `Result::Err(CxxRawError { kind: UNKNOWN, .. })`.
+-            // Itanium gets the richer treatment because the
+-            // helper there returns by Pair (no sret involved).
+-            match dest {
+-                None => {
+-                    pad_bx.abort();
+-                    pad_bx.unreachable();
+-                }
+-                Some((err_wrap_mir_bb, raw_err_local)) => {
+-                    let place = match &self.locals[raw_err_local] {
+-                        LocalRef::Place(p) => *p,
+-                        LocalRef::Operand(_) | LocalRef::PendingOperand => {
+-                            bug!(
++            // Constants for the catchpad bodies.
++            const CXX_EXC_UNKNOWN: u64 = 2;
++            const CXX_EXC_TYPED_BASE: u64 = 16;
++
++            // We emit one catchpad per MSVC typedesc plus a
++            // final catch-all catchpad. With no typed entries
++            // (Phase 2B catch-all only), we still get a single
++            // catchpad with flags=64.
++            let num_pads = msvc_typedesc_names.len() + 1;
++            let pad_bbs: Vec<Bx::BasicBlock> = (0..num_pads)
++                .map(|_| Bx::append_block(self.cx, self.llfn, "cxx_throws_catchpad"))
++                .collect();
++            let pad_bb_refs: Vec<&Bx::BasicBlock> = pad_bbs.iter().collect();
++            // Catch_switch dispatches to whichever catchpad matches.
++            // We use copy() instead of as_slice() since we need a
++            // &[BasicBlock] (not &[&BasicBlock]).
++            let pad_bbs_owned: Vec<Bx::BasicBlock> = pad_bbs.iter().copied().collect();
++            let _ = pad_bb_refs; // shut up unused
++            let cs = catch_bx.catch_switch(None, None, &pad_bbs_owned);
++
++            // Helper closure for the catchpad body.
++            let emit_catchpad_body = |fx: &mut FunctionCx<'a, 'tcx, Bx>,
++                                      pad_bb: Bx::BasicBlock,
++                                      kind_value: u64,
++                                      catchpad_args: &[Bx::Value]| {
++                let mut pad_bx = Bx::build(fx.cx, pad_bb);
++                let funclet = pad_bx.catch_pad(cs, catchpad_args);
++                match dest {
++                    None => {
++                        pad_bx.abort();
++                        pad_bx.unreachable();
++                    }
++                    Some((err_wrap_mir_bb, raw_err_local)) => {
++                        let place = match &fx.locals[raw_err_local] {
++                            LocalRef::Place(p) => *p,
++                            _ => bug!(
+                                 "cxx_throws_catch_pad (MSVC): raw_err_local \
+                                  {:?} must be a Place",
+-                                raw_err_local,
+-                            );
+-                        }
+-                        LocalRef::UnsizedPlace(_) => {
+-                            bug!(
+-                                "cxx_throws_catch_pad (MSVC): raw_err_local \
+-                                 {:?} must be sized",
+                                 raw_err_local
+-                            );
+-                        }
+-                    };
+-                    // Build `CxxRawError { kind: 2, message: null }`
+-                    // and store into raw_err_local.
+-                    let i32_ty = pad_bx.cx().type_i32();
+-                    let ptr_ty = pad_bx.cx().type_ptr();
+-                    let kind_unknown = pad_bx.cx().const_uint(i32_ty, 2);
+-                    let null_msg = pad_bx.cx().const_null(ptr_ty);
+-                    // raw_err_local.kind = 2
+-                    pad_bx.store(kind_unknown, place.val.llval, place.val.align);
+-                    // raw_err_local.message = null  (offset +8,
+-                    // matching CxxRawError's repr(C) layout).
+-                    let i8_ty = pad_bx.cx().type_i8();
+-                    let i64_ty = pad_bx.cx().type_i64();
+-                    let eight = pad_bx.cx().const_uint(i64_ty, 8);
+-                    let msg_ptr = pad_bx.inbounds_gep(
+-                        i8_ty,
+-                        place.val.llval,
+-                        &[eight],
+-                    );
+-                    pad_bx.store(null_msg, msg_ptr, place.val.align);
+-                    pad_bx.catch_ret(&funclet, self.llbb(err_wrap_mir_bb));
++                            ),
++                        };
++                        // raw_err_local.kind = kind_value
++                        let i32_ty = pad_bx.cx().type_i32();
++                        let ptr_ty = pad_bx.cx().type_ptr();
++                        let kind_const = pad_bx.cx().const_uint(i32_ty, kind_value);
++                        let null_msg = pad_bx.cx().const_null(ptr_ty);
++                        pad_bx.store(kind_const, place.val.llval, place.val.align);
++                        // raw_err_local.message = null (offset +8).
++                        let i8_ty = pad_bx.cx().type_i8();
++                        let i64_ty = pad_bx.cx().type_i64();
++                        let eight = pad_bx.cx().const_uint(i64_ty, 8);
++                        let msg_ptr =
++                            pad_bx.inbounds_gep(i8_ty, place.val.llval, &[eight]);
++                        pad_bx.store(null_msg, msg_ptr, place.val.align);
++                        pad_bx.catch_ret(&funclet, fx.llbb(err_wrap_mir_bb));
++                    }
+                 }
++            };
++
++            // Per-typedesc catchpads. flags=8 = catch-by-reference,
++            // matching what `catch (const T&)` compiles to under
++            // the MSVC C++ ABI. The slot remains null because we
++            // don't bind the caught object — we just need to know
++            // which clause matched, then we encode that as the
++            // raw_err_local.kind value (CXX_EXC_TYPED_BASE + i).
++            for (i, name) in msvc_typedesc_names.iter().enumerate() {
++                let typedesc = self.cx.cxx_typedesc_global_msvc(name);
++                let flags_byref = self.cx.const_i32(8);
++                let null_slot = self.cx.const_null(self.cx.type_ptr());
++                emit_catchpad_body(
++                    self,
++                    pad_bbs[i],
++                    CXX_EXC_TYPED_BASE + i as u64,
++                    &[typedesc, flags_byref, null_slot],
++                );
+             }
+ 
++            // Final catch-all catchpad (flags=64).
++            let null = self.cx.const_null(self.cx.type_ptr());
++            let flags_catch_all = self.cx.const_i32(64);
++            emit_catchpad_body(
++                self,
++                pad_bbs[msvc_typedesc_names.len()],
++                CXX_EXC_UNKNOWN,
++                &[null, flags_catch_all, null],
++            );
++
+             return catch_llbb;
+         }
+ 
+diff --git a/compiler/rustc_codegen_ssa/src/traits/misc.rs b/compiler/rustc_codegen_ssa/src/traits/misc.rs
+index f5bcb07876a..57276a28a1d 100644
+--- a/compiler/rustc_codegen_ssa/src/traits/misc.rs
++++ b/compiler/rustc_codegen_ssa/src/traits/misc.rs
+@@ -55,6 +55,19 @@ fn apply_vcall_visibility_metadata(
+     /// Rust personality doesn't do typeinfo matching for C++
+     /// throws).
+     fn cxx_typeinfo_personality(&self) -> Self::Function;
++    /// P09.68-msvc / 1.13 throws Phase 2C: synthesize an MSVC
++    /// TypeDescriptor global for the given mangled type name.
++    /// MSVC C++ ABI matches catch clauses by string-comparing
++    /// each TypeDescriptor's name field rather than by pointer
++    /// equality, so each module synthesizes its own copies
++    /// (linkonce_odr + comdat collapses duplicates at link
++    /// time). The synthesized global has the LLVM type
++    /// `{ ptr, ptr, [<n+1> x i8] }` where the first ptr is the
++    /// vtable `??_7type_info@@6B@`, the second ptr is null
++    /// (decoration spare), and the byte array is the mangled
++    /// name + nul terminator. Returns a pointer to the
++    /// synthesized global, usable as a `catchpad` clause arg.
++    fn cxx_typedesc_global_msvc(&self, name: &str) -> Self::Value;
+     fn sess(&self) -> &Session;
+     fn set_frame_pointer_type(&self, llfn: Self::Function);
+     fn apply_target_cpu_attr(&self, llfn: Self::Function);
+diff --git a/compiler/rustc_feature/src/builtin_attrs.rs b/compiler/rustc_feature/src/builtin_attrs.rs
+index b0a21b9f16e..ecbfe6c2ac0 100644
+--- a/compiler/rustc_feature/src/builtin_attrs.rs
++++ b/compiler/rustc_feature/src/builtin_attrs.rs
+@@ -756,6 +756,12 @@ pub struct BuiltinAttribute {
+     // `catch ptr @<symbol>` per entry plus a final catch-all.
+     rustc_attr!(rustc_cxx_throws_typeinfos, "comma-separated list of C++ Itanium typeinfo symbols for typed catches on a `#[rustc_cxx_throws]` foreign fn"),
+ 
++    // P09.68-msvc / 1.13 throws Phase 2C — MSVC TypeDescriptor
++    // counterpart to rustc_cxx_throws_typeinfos. Carries
++    // Microsoft mangled type names; codegen synthesizes
++    // per-type TypeDescriptor globals + catchpad clauses.
++    rustc_attr!(rustc_cxx_throws_msvc_typedescs, "comma-separated list of MSVC mangled type names for typed catches on a `#[rustc_cxx_throws]` foreign fn"),
++
+     // Limits:
+     ungated!(
+         recursion_limit, CrateLevel,
+diff --git a/compiler/rustc_hir/src/attrs/data_structures.rs b/compiler/rustc_hir/src/attrs/data_structures.rs
+index 2d76b51ef28..79e066448e9 100644
+--- a/compiler/rustc_hir/src/attrs/data_structures.rs
++++ b/compiler/rustc_hir/src/attrs/data_structures.rs
+@@ -1619,6 +1619,18 @@ pub enum AttributeKind {
+     /// variant.
+     RustcCxxThrowsTypeinfos { typeinfos: Symbol, span: Span },
+ 
++    /// Represents `#[rustc_cxx_throws_msvc_typedescs = ".?AV...,.?AV..."]`
++    /// (P09.68-msvc / 1.13 throws Phase 2C) — MSVC counterpart
++    /// to `rustc_cxx_throws_typeinfos`. Carries a comma-separated
++    /// list of Microsoft mangled type names (e.g.,
++    /// `.?AVDomainError@@`) for typed catches on the MSVC SEH
++    /// path. Codegen synthesizes per-type TypeDescriptor globals
++    /// (`{ vtable=type_info, null, "<name>\\0" }`) and one
++    /// `catchpad` per entry, plus a catch-all `catchpad`.
++    /// The order must match the Itanium typeinfos list so the
++    /// user's `From<CxxRawError>` impl uses the same indexing.
++    RustcCxxThrowsMsvcTypedescs { typedescs: Symbol, span: Span },
++
+     /// Represents `#[rustc_swift_symbol = "ModuleName"]` — names
+     /// the Swift module hosting an `extern "Swift"` function so
+     /// the Swift mangler can produce `$s<module><name>...F`.
+diff --git a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+index 5d05610f1fe..0bc0ec0a424 100644
+--- a/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
++++ b/compiler/rustc_hir/src/attrs/encode_cross_crate.rs
+@@ -192,6 +192,7 @@ pub fn encode_cross_crate(&self) -> EncodeCrossCrate {
+             RustcSwiftThrows(..) => Yes,
+             RustcCxxThrows(..) => Yes,
+             RustcCxxThrowsTypeinfos { .. } => Yes,
++            RustcCxxThrowsMsvcTypedescs { .. } => Yes,
+             RustcPreserveUbChecks => No,
+             RustcProcMacroDecls => No,
+             RustcPubTransparent(..) => Yes,
+diff --git a/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs b/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
+index 8767786e0d3..28bb16baf92 100644
+--- a/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
++++ b/compiler/rustc_middle/src/middle/codegen_fn_attrs.rs
+@@ -117,6 +117,13 @@ pub struct CodegenFnAttrs {
+     /// one `catch ptr @<symbol>` per entry and a final
+     /// `catch ptr null` catch-all.
+     pub cxx_throws_typeinfos: Option<Symbol>,
++    /// The `#[rustc_cxx_throws_msvc_typedescs = ".?AV...,.?AV..."]`
++    /// attribute (P09.68-msvc / 1.13 throws Phase 2C). MSVC
++    /// counterpart to `cxx_throws_typeinfos` — carries
++    /// Microsoft mangled type names. Codegen synthesizes a
++    /// TypeDescriptor global per entry and emits one
++    /// `catch_pad` per entry plus a catch-all `catch_pad`.
++    pub cxx_throws_msvc_typedescs: Option<Symbol>,
+ }
+ 
+ #[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, HashStable, PartialEq, Eq)]
+@@ -264,6 +271,7 @@ pub const fn new() -> CodegenFnAttrs {
+             objc_class: None,
+             objc_selector: None,
+             cxx_throws_typeinfos: None,
++            cxx_throws_msvc_typedescs: None,
+         }
+     }
+ 
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+index b16ec4cbbe0..ac7abba4d44 100644
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -375,6 +375,7 @@ fn check_attributes(
+                     | AttributeKind::RustcSwiftThrows(..)
+                     | AttributeKind::RustcCxxThrows(..)
+                     | AttributeKind::RustcCxxThrowsTypeinfos { .. }
++                    | AttributeKind::RustcCxxThrowsMsvcTypedescs { .. }
+                     | AttributeKind::RustcPreserveUbChecks
+                     | AttributeKind::RustcProcMacroDecls
+                     | AttributeKind::RustcReallocator
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 828f35e66de..081008135f9 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -1734,6 +1734,7 @@
+         rustc_cxx_base,
+         rustc_cxx_drop_wrapper,
+         rustc_cxx_throws,
++        rustc_cxx_throws_msvc_typedescs,
+         rustc_cxx_throws_typeinfos,
+         rustc_cxx_wrapper,
+         rustc_deallocator,
+-- 
+2.50.1 (Apple Git-155)
+

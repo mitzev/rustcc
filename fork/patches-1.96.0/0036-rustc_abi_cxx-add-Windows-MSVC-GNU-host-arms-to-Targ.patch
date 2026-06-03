@@ -1,0 +1,74 @@
+From f776f30457dec2b1e692ce009b810a4fc5e5d012 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 18:36:44 +0300
+Subject: [PATCH 36/42] rustc_abi_cxx: add Windows MSVC + GNU host arms to
+ Target::host()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+GitHub Actions builds stage-1 ON the Windows runners
+(windows-latest / windows-11-arm), so the rustc driver itself
+runs as a Windows MSVC host. The existing `Target::host()`
+only had cfg arms for Linux x86_64/aarch64 and macOS
+x86_64/aarch64 — Windows MSVC builds hit the `compile_error!`
+fallback and bootstrap died with "rustcc host target not
+supported".
+
+Add the missing arms:
+- target_os = "windows" + target_arch = "x86_64" + target_env = "msvc"
+- target_os = "windows" + target_arch = "aarch64" + target_env = "msvc"
+- target_os = "windows" + target_arch = "x86_64" + target_env = "gnu"
+
+The corresponding `from_triple` constructors
+(`x86_64_pc_windows_msvc`, `aarch64_pc_windows_msvc`,
+`x86_64_pc_windows_gnu`) were already there from the
+v1.09.x MSVC work — only the host-side cfg arms were
+missing.
+
+Caught by the v1.13.0 release.yml run: aarch64-pc-windows-msvc
+failed at `Compiling rustc_abi_cxx` with the compile_error
+fallback.
+---
+ compiler/rustc_abi_cxx/src/target.rs | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/compiler/rustc_abi_cxx/src/target.rs b/compiler/rustc_abi_cxx/src/target.rs
+index b1afcc06d6d..8d04e192199 100644
+--- a/compiler/rustc_abi_cxx/src/target.rs
++++ b/compiler/rustc_abi_cxx/src/target.rs
+@@ -217,11 +217,31 @@ pub fn host() -> Self {
+         {
+             Self::aarch64_apple_darwin()
+         }
++        // v1.13.0 release-pipeline fix: GitHub Actions builds
++        // stage-1 ON the Windows runners (windows-latest /
++        // windows-11-arm), so the rustc driver itself runs as a
++        // Windows MSVC host. Without these arms the bootstrap
++        // hits the `compile_error!` below.
++        #[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"))]
++        {
++            Self::x86_64_pc_windows_msvc()
++        }
++        #[cfg(all(target_os = "windows", target_arch = "aarch64", target_env = "msvc"))]
++        {
++            Self::aarch64_pc_windows_msvc()
++        }
++        #[cfg(all(target_os = "windows", target_arch = "x86_64", target_env = "gnu"))]
++        {
++            Self::x86_64_pc_windows_gnu()
++        }
+         #[cfg(not(any(
+             all(target_os = "linux", target_arch = "x86_64"),
+             all(target_os = "linux", target_arch = "aarch64"),
+             all(target_os = "macos", target_arch = "x86_64"),
+             all(target_os = "macos", target_arch = "aarch64"),
++            all(target_os = "windows", target_arch = "x86_64", target_env = "msvc"),
++            all(target_os = "windows", target_arch = "aarch64", target_env = "msvc"),
++            all(target_os = "windows", target_arch = "x86_64", target_env = "gnu"),
+         )))]
+         {
+             compile_error!(
+-- 
+2.50.1 (Apple Git-155)
+

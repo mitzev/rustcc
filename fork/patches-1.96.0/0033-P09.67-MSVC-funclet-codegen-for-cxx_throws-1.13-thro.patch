@@ -1,0 +1,227 @@
+From d2e5c4bce88eb84d1365901450b81b683428beed Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 13:01:29 +0300
+Subject: [PATCH 33/42] P09.67: MSVC funclet codegen for cxx_throws (1.13
+ throws Phase 2C)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replaces the cleanup_pad-then-abort placeholder with a real
+catch_switch + catch_pad funclet on MSVC (`wants_new_eh_instructions`).
+Catches all C++ exceptions, calls the runtime helper, stores
+into raw_err_local, then catch_rets to the err_wrap_bb in
+the parent function.
+
+Funclet shape:
+
+  catch_llbb:                        (in parent)
+    %tok = catchswitch ... [catchpad_bb] unwind to caller
+  catchpad_bb:
+    %fnlet = catchpad %tok [null, 64, %slot]   ; flags=64 → catch-all
+    %exn = load ptr, %slot
+    %raw = call __rustcc_cxx_catch_unknown(%exn) [funclet=%fnlet]
+    store %raw, raw_err_local
+    catchret from %fnlet to err_wrap_bb
+
+Typed catches on MSVC are deferred to a follow-up
+(P09.68-msvc). MSVC uses Microsoft TypeDescriptors instead
+of Itanium's `_ZTI<name>` typeinfo symbols, with a different
+format (`?AVMyClass@@` mangled name + vtable pointer +
+type_info layout). The current
+`#[rustc_cxx_throws_typeinfos]` attribute carries
+Itanium-mangled names, which don't apply on MSVC. The catch
+falls back to catch-all on MSVC regardless of the attribute;
+the runtime helper returns CxxRawError with kind=UNKNOWN.
+
+New trait method BuilderMethods::catch_ret added so the
+codegen_ssa layer can emit `catchret` from MSVC funclets.
+LLVM impl wraps the existing inherent catch_ret; GCC stubbed.
+
+Code path is **untested locally** — no MSVC toolchain on
+the dev machine. Built via stage-1 compiler; runtime
+validation needs a Windows machine or Wine. Itanium smoke
+tests (smoke.rs, smoke_p2.rs, smoke_typed.rs) all still
+pass after this patch.
+---
+ compiler/rustc_codegen_gcc/src/builder.rs     |  8 ++
+ compiler/rustc_codegen_llvm/src/builder.rs    | 15 +++
+ compiler/rustc_codegen_ssa/src/mir/block.rs   | 99 +++++++++++++++++--
+ .../rustc_codegen_ssa/src/traits/builder.rs   |  6 ++
+ 4 files changed, 120 insertions(+), 8 deletions(-)
+
+diff --git a/compiler/rustc_codegen_gcc/src/builder.rs b/compiler/rustc_codegen_gcc/src/builder.rs
+index 4fb718e1edd..8ae7e2ec9f4 100644
+--- a/compiler/rustc_codegen_gcc/src/builder.rs
++++ b/compiler/rustc_codegen_gcc/src/builder.rs
+@@ -1682,6 +1682,14 @@ fn catch_switch(
+         unimplemented!();
+     }
+ 
++    fn catch_ret(
++        &mut self,
++        _funclet: &Funclet,
++        _target: Block<'gcc>,
++    ) -> RValue<'gcc> {
++        unimplemented!();
++    }
++
+     // Atomic Operations
+     fn atomic_cmpxchg(
+         &mut self,
+diff --git a/compiler/rustc_codegen_llvm/src/builder.rs b/compiler/rustc_codegen_llvm/src/builder.rs
+index 504d2f3e1c1..3e52dbcd904 100644
+--- a/compiler/rustc_codegen_llvm/src/builder.rs
++++ b/compiler/rustc_codegen_llvm/src/builder.rs
+@@ -1362,6 +1362,21 @@ fn catch_switch(
+         ret
+     }
+ 
++    fn catch_ret(
++        &mut self,
++        funclet: &Funclet<'ll>,
++        target: &'ll BasicBlock,
++    ) -> &'ll Value {
++        // Trait wrapper around the existing inherent
++        // `catch_ret` implementation. Added to the trait by
++        // P09.67 so the codegen_ssa layer can emit MSVC
++        // funclet catches for `#[rustc_cxx_throws]` calls.
++        let ret = unsafe {
++            llvm::LLVMBuildCatchRet(self.llbuilder, funclet.cleanuppad(), target)
++        };
++        ret.expect("LLVM does not have support for catchret")
++    }
++
+     // Atomic Operations
+     fn atomic_cmpxchg(
+         &mut self,
+diff --git a/compiler/rustc_codegen_ssa/src/mir/block.rs b/compiler/rustc_codegen_ssa/src/mir/block.rs
+index 5929d113458..e56ba3253d8 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/block.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/block.rs
+@@ -2017,14 +2017,97 @@ fn cxx_throws_catch_pad(
+         let mut catch_bx = Bx::build(self.cx, catch_llbb);
+ 
+         if base::wants_new_eh_instructions(self.cx.sess()) {
+-            // MSVC funclet path — synthesize a catch_switch /
+-            // catch_pad pair. For P09.63 we just emit a
+-            // cleanup_pad (no real catch semantics) and abort;
+-            // P09.67-msvc adds the real catch_pad + helper call.
+-            let funclet = catch_bx.cleanup_pad(None, &[]);
+-            let _ = funclet;
+-            catch_bx.abort();
+-            catch_bx.unreachable();
++            // P09.67 / 1.13 throws Phase 2C: MSVC funclet path.
++            // Synthesize a catch_switch + catch_pad pair that
++            // catches all C++ exceptions, calls the runtime
++            // helper, stores the result into raw_err_local (if
++            // any), then catch_rets to the err_wrap_bb in the
++            // parent function.
++            //
++            // Phase 2C MSVC supports the catch-all path only.
++            // Typed catches with `#[rustc_cxx_throws_typeinfos]`
++            // use Itanium-mangled `_ZTI<name>` symbols which
++            // don't exist on MSVC — that target uses Microsoft
++            // TypeDescriptors with a different format
++            // (`?AVMyClass@@` + a vtable). Typed catches on
++            // MSVC are queued as P09.68-msvc.
++            //
++            // Layout:
++            //   catch_llbb:
++            //     %catch_switch_tok = catchswitch ... [catchpad_bb] unwind to caller
++            //   catchpad_bb:
++            //     %fnlet = catchpad %catch_switch_tok
++            //                       [tydesc=null, flags=64, slot=alloca]
++            //     %exn_ptr = load i8*, %slot
++            //     %raw = call __rustcc_cxx_catch_unknown(%exn_ptr) [funclet=%fnlet]
++            //     store %raw, raw_err_local
++            //     catchret from %fnlet to err_wrap_bb
++            let exn_slot_align = self.cx.tcx().data_layout.pointer_align().abi;
++            let exn_slot_size = self.cx.tcx().data_layout.pointer_size();
++            let exn_slot = catch_bx.alloca(exn_slot_size, exn_slot_align);
++
++            // catch_switch — single successor (the catch_pad).
++            let catchpad_bb = Bx::append_block(self.cx, self.llfn, "cxx_throws_catchpad");
++            let cs = catch_bx.catch_switch(None, None, &[catchpad_bb]);
++            let _ = cs;
++
++            // Switch builders to emit into the catch_pad block.
++            let mut pad_bx = Bx::build(self.cx, catchpad_bb);
++            // typedesc=null + flags=64 (catch-all) + slot=our alloca
++            let null = pad_bx.cx().const_null(pad_bx.cx().type_ptr());
++            let flags_catch_all = pad_bx.cx().const_i32(64);
++            let funclet = pad_bx.catch_pad(
++                pad_bx.cx().const_null(pad_bx.cx().type_ptr()),
++                &[null, flags_catch_all, exn_slot],
++            );
++
++            // Load the captured exception pointer.
++            let ptr_ty = pad_bx.cx().type_ptr();
++            let exn_ptr = pad_bx.load(ptr_ty, exn_slot, exn_slot_align);
++
++            // Call the runtime helper (catch-all only on MSVC
++            // for v1.13.0). Helper signature: `(ptr) -> { i32, ptr }`.
++            let (helper_fn, helper_ty) = pad_bx.cx().cxx_throws_catch_fn();
++            let raw_err = pad_bx.call(
++                helper_ty,
++                /* fn_attrs: */ None,
++                /* fn_abi: */ None,
++                helper_fn,
++                &[exn_ptr],
++                Some(&funclet),
++                /* instance: */ None,
++            );
++
++            // Branch: either abort (legacy / no MIR pass) or
++            // store into raw_err_local + catch_ret to err_wrap_bb.
++            match dest {
++                None => {
++                    pad_bx.abort();
++                    pad_bx.unreachable();
++                }
++                Some((err_wrap_mir_bb, raw_err_local)) => {
++                    let place = match &self.locals[raw_err_local] {
++                        LocalRef::Place(p) => *p,
++                        LocalRef::Operand(_) | LocalRef::PendingOperand => {
++                            bug!(
++                                "cxx_throws_catch_pad (MSVC): raw_err_local \
++                                 {:?} must be a Place",
++                                raw_err_local,
++                            );
++                        }
++                        LocalRef::UnsizedPlace(_) => {
++                            bug!(
++                                "cxx_throws_catch_pad (MSVC): raw_err_local \
++                                 {:?} must be sized",
++                                raw_err_local
++                            );
++                        }
++                    };
++                    pad_bx.store(raw_err, place.val.llval, place.val.align);
++                    pad_bx.catch_ret(&funclet, self.llbb(err_wrap_mir_bb));
++                }
++            }
++
+             return catch_llbb;
+         }
+ 
+diff --git a/compiler/rustc_codegen_ssa/src/traits/builder.rs b/compiler/rustc_codegen_ssa/src/traits/builder.rs
+index feae8dbd976..3b94a10d810 100644
+--- a/compiler/rustc_codegen_ssa/src/traits/builder.rs
++++ b/compiler/rustc_codegen_ssa/src/traits/builder.rs
+@@ -611,6 +611,12 @@ fn cxx_catch_landing_pad(
+     fn cleanup_pad(&mut self, parent: Option<Self::Value>, args: &[Self::Value]) -> Self::Funclet;
+     fn cleanup_ret(&mut self, funclet: &Self::Funclet, unwind: Option<Self::BasicBlock>);
+     fn catch_pad(&mut self, parent: Self::Value, args: &[Self::Value]) -> Self::Funclet;
++    /// MSVC `catchret` instruction. Returns from a catch
++    /// funclet to the named basic block in the parent.
++    /// rustcc fork (P09.67 / 1.13 throws Phase 2C) added this
++    /// to the trait so the codegen_ssa layer can synthesize
++    /// MSVC funclet catches for `#[rustc_cxx_throws]` calls.
++    fn catch_ret(&mut self, funclet: &Self::Funclet, target: Self::BasicBlock) -> Self::Value;
+     fn catch_switch(
+         &mut self,
+         parent: Option<Self::Value>,
+-- 
+2.50.1 (Apple Git-155)
+

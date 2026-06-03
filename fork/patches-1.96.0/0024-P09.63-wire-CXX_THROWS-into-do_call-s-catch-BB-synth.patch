@@ -1,0 +1,166 @@
+From fd715ad83d0131e24946f86f19671a62975fdf97 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 10:16:14 +0300
+Subject: [PATCH 24/42] P09.63: wire CXX_THROWS into do_call's catch BB synth
+ (Phase 1C)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Third codegen patch in the Phase 1 series. Activates P09.61 +
+P09.62 by:
+
+1. Detecting `CodegenFnAttrFlags::CXX_THROWS` on the callee
+   `Instance` in `do_call`. When set, overrides the default
+   `UnwindAction`-derived `unwind_block` with a custom catch
+   BB.
+2. New `FunctionCx::cxx_throws_catch_pad` method that:
+   - Appends a `cxx_throws_catch` BB to the caller function.
+   - Itanium path: calls `cxx_catch_landing_pad` (P09.62), stores
+     the (exception_ptr, type_info_index) pair into the
+     function's personality slot, then aborts.
+   - MSVC path: emits a `cleanup_pad` (no real catch semantics
+     yet) + abort.
+
+This patch ships the **wiring** + the catch BB synthesis. The
+catch BB currently ends with `abort()` instead of constructing
+`Result::Err(CxxException)` — that's P09.64's work (needs the
+runtime-helper-symbol declaration API + the Result-slot
+layout query that the design doc Strategy B specifies).
+
+What this patch alone gives users:
+- `#[rustc_cxx_throws]` calls lower to `invoke` (per P09.61's
+  fn_can_unwind change).
+- The unwind path is a catch landingpad (per P09.62), not a
+  cleanup landingpad. Foreign exceptions are CAUGHT, not
+  re-raised.
+- The catch handler currently aborts cleanly instead of
+  propagating the exception further up the stack.
+
+This is a meaningful intermediate state — "catch + abort"
+is the contained-failure mode every other "panic on unrecognized
+exception" approach uses today. P09.64 turns it into
+"catch + Result::Err".
+
+Validation: structurally mirrors `landing_pad_for_uncached`
+exactly (the existing cleanup-landingpad synthesis), with
+`cxx_catch_landing_pad` swapped for `cleanup_landing_pad` and
+abort-unreachable replacing the br-to-target. Bootstrap may
+require fixes — speculative implementation without
+end-to-end iteration.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ compiler/rustc_codegen_ssa/src/mir/block.rs | 82 ++++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 2 deletions(-)
+
+diff --git a/compiler/rustc_codegen_ssa/src/mir/block.rs b/compiler/rustc_codegen_ssa/src/mir/block.rs
+index d89692283f5..f37dbab1e3e 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/block.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/block.rs
+@@ -209,7 +209,37 @@ fn do_call<Bx: BuilderMethods<'a, 'tcx>>(
+             unwind = mir::UnwindAction::Unreachable;
+         }
+ 
+-        let unwind_block = match unwind {
++        // P09.63 / 1.13 throws Phase 1C: when the callee has
++        // `CodegenFnAttrFlags::CXX_THROWS` (set by P09.60), force
++        // the call into the `invoke`-with-landingpad path AND
++        // synthesize a custom catch BB that uses
++        // `cxx_catch_landing_pad` (P09.62) instead of the default
++        // cleanup landing pad. The catch BB currently aborts
++        // after the landingpad — proves the catch mechanism +
++        // wiring. P09.64 will replace the abort with a call to
++        // `cxx::native_invoke::__rustcc_cxx_catch_unknown` +
++        // a Result::Err construction into the function's return
++        // slot.
++        //
++        // We detect CXX_THROWS off the callee `Instance` (when
++        // present — indirect calls through fn pointers skip this
++        // path because they don't carry per-callee attrs).
++        let callee_cxx_throws = instance
++            .map(|inst| {
++                bx.tcx()
++                    .codegen_fn_attrs(inst.def_id())
++                    .flags
++                    .contains(rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags::CXX_THROWS)
++            })
++            .unwrap_or(false);
++
++        let unwind_block = if callee_cxx_throws {
++            // Override the default unwind_block with our custom
++            // catch BB. The continuation target is wherever the
++            // call would have normally returned; the catch BB
++            // currently aborts after the landingpad.
++            Some(fx.cxx_throws_catch_pad(bx))
++        } else { match unwind {
+             mir::UnwindAction::Cleanup(cleanup) => Some(self.llbb_with_cleanup(fx, cleanup)),
+             mir::UnwindAction::Continue => None,
+             mir::UnwindAction::Unreachable => None,
+@@ -229,7 +259,7 @@ fn do_call<Bx: BuilderMethods<'a, 'tcx>>(
+                     Some(fx.terminate_block(reason))
+                 }
+             }
+-        };
++        } };
+ 
+         if kind == CallKind::Tail {
+             bx.tail_call(fn_ty, caller_attrs, fn_abi, fn_ptr, llargs, self.funclet(fx), instance);
+@@ -1860,6 +1890,54 @@ fn get_personality_slot(&mut self, bx: &mut Bx) -> PlaceRef<'tcx, Bx::Value> {
+         }
+     }
+ 
++    /// P09.63 / 1.13 throws Phase 1C: synthesize a catch BB
++    /// for a call to a `#[rustc_cxx_throws]` callee. Emits the
++    /// Itanium catch-all landingpad (via `cxx_catch_landing_pad`),
++    /// stores the personality slot, then aborts. P09.64 will
++    /// replace the abort with the runtime helper call +
++    /// Result::Err construction.
++    ///
++    /// MSVC funclets are out of scope this round — same as the
++    /// default cleanup-pad path, the funclet equivalent ships
++    /// in a follow-on patch via `catch_pad` / `catch_switch`.
++    fn cxx_throws_catch_pad(&mut self, _outer_bx: &mut Bx) -> Bx::BasicBlock {
++        let catch_llbb = Bx::append_block(self.cx, self.llfn, "cxx_throws_catch");
++        let mut catch_bx = Bx::build(self.cx, catch_llbb);
++
++        if base::wants_new_eh_instructions(self.cx.sess()) {
++            // MSVC funclet path — synthesize a catch_switch /
++            // catch_pad pair. For P09.63 we just emit a
++            // cleanup_pad (no real catch semantics) and abort;
++            // P09.64-msvc adds the real catch_pad + helper call.
++            let funclet = catch_bx.cleanup_pad(None, &[]);
++            let _ = funclet;
++            catch_bx.abort();
++            catch_bx.unreachable();
++            return catch_llbb;
++        }
++
++        // Itanium landingpad path: emit catch-all landingpad,
++        // store exception ptr + type-info index into the
++        // function's personality slot (so debuggers + future
++        // P09.64 work can recover them), then abort.
++        let llpersonality = self.cx.eh_personality();
++        let (exn0, exn1) = catch_bx.cxx_catch_landing_pad(llpersonality);
++
++        let slot = self.get_personality_slot(&mut catch_bx);
++        slot.storage_live(&mut catch_bx);
++        Pair(exn0, exn1).store(&mut catch_bx, slot);
++
++        // Placeholder: abort instead of building Result::Err.
++        // P09.64 replaces this with a call to
++        // `cxx::native_invoke::__rustcc_cxx_catch_unknown(exn0)`
++        // + a Result::Err construction into the call's return
++        // slot.
++        catch_bx.abort();
++        catch_bx.unreachable();
++
++        catch_llbb
++    }
++
+     /// Returns the landing/cleanup pad wrapper around the given basic block.
+     // FIXME(eddyb) rename this to `eh_pad_for`.
+     fn landing_pad_for(&mut self, bb: mir::BasicBlock) -> Bx::BasicBlock {
+-- 
+2.50.1 (Apple Git-155)
+

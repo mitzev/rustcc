@@ -1,0 +1,355 @@
+From c131e614d098fb6425763ea6c1cbbff1e770e352 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 11:42:20 +0300
+Subject: [PATCH 29/42] P09.65d: end-to-end runtime wiring for cxx_throws Phase
+ 1G
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Five fixes uncovered by a real-world smoke test that drove
+an extern fn with #[rustc_cxx_throws] returning
+Result<i32, CxxRawError> through the full compiler. Each
+issue was a missing connection between the new
+UnwindAction::CxxThrowsCleanup variant and existing MIR
+infrastructure that had only ever needed to consider
+UnwindAction::Cleanup.
+
+1. mir/terminator.rs: successors() / successors_mut() only
+   walked UnwindAction::Cleanup; CxxThrowsCleanup's bb was
+   invisible to successor analysis, so downstream passes
+   considered the err_wrap_bb unreachable and removed it,
+   leading to "encountered jump to invalid bb" ICEs in the
+   validator. Refactored both to use the new
+   cleanup_block() / cleanup_block_mut() accessors. Made
+   cleanup_block() pub.
+
+2. mir/syntax.rs / mir/terminator.rs: added the matching
+   cleanup_block_mut() accessor on UnwindAction so visitors
+   that need to remap block indices can do so uniformly.
+
+3. mir_transform/cxx_throws_wrap.rs: switched the err_wrap_bb
+   from is_cleanup=true to is_cleanup=false. The catch
+   terminates the unwind, so the err_wrap_bb is *not* part
+   of the cleanup chain — it flows back into normal control
+   on the assumption that the exception has been caught.
+
+4. mir_transform/validate.rs: special-cased CxxThrowsCleanup
+   edge-checking. Skip the standard
+   "unwind edge target must be is_cleanup=true" rule and
+   instead require the inverse — the target must be
+   is_cleanup=false, since the catch terminates the unwind.
+   This matches the semantics enforced by the codegen catch
+   BB which lands the exception then re-enters normal code.
+
+5. mir/visit.rs: super_terminator() for TerminatorKind::Call
+   now visits the raw_err_local inside CxxThrowsCleanup so
+   SimplifyLocals + LocalUpdater track use-counts and remap
+   it correctly. Without this, raw_err_local's index went
+   stale during SimplifyLocals + codegen indexed past the
+   end of fx.locals.
+
+6. mir/pretty.rs: fmt_successor_labels() now uses
+   cleanup_block() to detect both Cleanup and
+   CxxThrowsCleanup, so the successor-vs-label assertion
+   stays consistent when dumping MIR (-Zdump-mir).
+
+Verified end-to-end via:
+
+    #[rustc_cxx_throws]
+    fn maybe_throws(x: i32) -> Result<i32, CxxRawError>;
+    match maybe_throws(x) { Ok(v) => v, Err(_) => -1 }
+
+LLVM IR confirms:
+- `invoke void @maybe_throws(...)` on call
+- success → bb6 = Result::Ok wrap → match
+- unwind → cxx_throws_catch → landingpad catch ptr null
+- → __rustcc_cxx_catch_unknown(exn_ptr)
+- → store helper result into raw_err_local slot
+- → bb7 = Result::Err wrap → match
+
+Phase 1 of v1.13.0 throws is now runtime-validated on the
+Itanium codegen path (Linux + macOS). MSVC funclet path still
+needs P09.66 — currently emits cleanup_pad + abort like
+before this patch.
+---
+ compiler/rustc_middle/src/mir/pretty.rs       | 16 ++--
+ compiler/rustc_middle/src/mir/terminator.rs   | 74 ++++++++++++++-----
+ compiler/rustc_middle/src/mir/visit.rs        | 15 +++-
+ .../src/cxx_throws_wrap.rs                    |  7 +-
+ compiler/rustc_mir_transform/src/validate.rs  | 24 +++++-
+ 5 files changed, 108 insertions(+), 28 deletions(-)
+
+diff --git a/compiler/rustc_middle/src/mir/pretty.rs b/compiler/rustc_middle/src/mir/pretty.rs
+index 73b5b4f3cfe..ad464a053ed 100644
+--- a/compiler/rustc_middle/src/mir/pretty.rs
++++ b/compiler/rustc_middle/src/mir/pretty.rs
+@@ -1053,28 +1053,30 @@ pub fn fmt_successor_labels(&self) -> Vec<Cow<'static, str>> {
+                 .map(|&u| Cow::Owned(u.to_string()))
+                 .chain(iter::once("otherwise".into()))
+                 .collect(),
+-            Call { target: Some(_), unwind: UnwindAction::Cleanup(_), .. } => {
++            Call { target: Some(_), ref unwind, .. } if unwind.cleanup_block().is_some() => {
+                 vec!["return".into(), "unwind".into()]
+             }
+             Call { target: Some(_), unwind: _, .. } => vec!["return".into()],
+-            Call { target: None, unwind: UnwindAction::Cleanup(_), .. } => vec!["unwind".into()],
++            Call { target: None, ref unwind, .. } if unwind.cleanup_block().is_some() => {
++                vec!["unwind".into()]
++            }
+             Call { target: None, unwind: _, .. } => vec![],
+             Yield { drop: Some(_), .. } => vec!["resume".into(), "drop".into()],
+             Yield { drop: None, .. } => vec!["resume".into()],
+-            Drop { unwind: UnwindAction::Cleanup(_), drop: Some(_), .. } => {
++            Drop { ref unwind, drop: Some(_), .. } if unwind.cleanup_block().is_some() => {
+                 vec!["return".into(), "unwind".into(), "drop".into()]
+             }
+-            Drop { unwind: UnwindAction::Cleanup(_), drop: None, .. } => {
++            Drop { ref unwind, drop: None, .. } if unwind.cleanup_block().is_some() => {
+                 vec!["return".into(), "unwind".into()]
+             }
+             Drop { unwind: _, drop: Some(_), .. } => vec!["return".into(), "drop".into()],
+             Drop { unwind: _, .. } => vec!["return".into()],
+-            Assert { unwind: UnwindAction::Cleanup(_), .. } => {
++            Assert { ref unwind, .. } if unwind.cleanup_block().is_some() => {
+                 vec!["success".into(), "unwind".into()]
+             }
+             Assert { unwind: _, .. } => vec!["success".into()],
+             FalseEdge { .. } => vec!["real".into(), "imaginary".into()],
+-            FalseUnwind { unwind: UnwindAction::Cleanup(_), .. } => {
++            FalseUnwind { ref unwind, .. } if unwind.cleanup_block().is_some() => {
+                 vec!["real".into(), "unwind".into()]
+             }
+             FalseUnwind { unwind: _, .. } => vec!["real".into()],
+@@ -1085,7 +1087,7 @@ pub fn fmt_successor_labels(&self) -> Vec<Cow<'static, str>> {
+                 }
+                 vec.resize(targets.len(), "label".into());
+ 
+-                if let UnwindAction::Cleanup(_) = unwind {
++                if unwind.cleanup_block().is_some() {
+                     vec.push("unwind".into());
+                 }
+ 
+diff --git a/compiler/rustc_middle/src/mir/terminator.rs b/compiler/rustc_middle/src/mir/terminator.rs
+index 83c205fcd2f..ff03c4567d6 100644
+--- a/compiler/rustc_middle/src/mir/terminator.rs
++++ b/compiler/rustc_middle/src/mir/terminator.rs
+@@ -126,7 +126,20 @@ fn size_hint(&self) -> (usize, Option<usize>) {
+ impl<'a> ExactSizeIterator for SwitchTargetsIter<'a> {}
+ 
+ impl UnwindAction {
+-    fn cleanup_block(self) -> Option<BasicBlock> {
++    /// Returns the cleanup basic block this action would unwind
++    /// to, if any. Covers both `Cleanup` and `CxxThrowsCleanup`.
++    pub fn cleanup_block(self) -> Option<BasicBlock> {
++        match self {
++            UnwindAction::Cleanup(bb) | UnwindAction::CxxThrowsCleanup { bb, .. } => Some(bb),
++            UnwindAction::Continue | UnwindAction::Unreachable | UnwindAction::Terminate(_) => None,
++        }
++    }
++
++    /// Returns a mutable reference to the cleanup basic block
++    /// stored inside this action, if any. Useful for visitors
++    /// that need to rewrite block indices (inlining,
++    /// `successors_mut`, etc.).
++    pub fn cleanup_block_mut(&mut self) -> Option<&mut BasicBlock> {
+         match self {
+             UnwindAction::Cleanup(bb) | UnwindAction::CxxThrowsCleanup { bb, .. } => Some(bb),
+             UnwindAction::Continue | UnwindAction::Unreachable | UnwindAction::Terminate(_) => None,
+@@ -507,21 +520,44 @@ pub fn successors(&self) -> Successors<'_> {
+             use self::TerminatorKind::*;
+             match *self {
+                 // 3-successors for async drop: target, unwind, dropline (parent coroutine drop)
+-                Drop { target: ref t, unwind: UnwindAction::Cleanup(u), drop: Some(d), .. } => {
+-                    mk_successors(slice::from_ref(t), Some(u), Some(d))
++                Drop { target: ref t, ref unwind, drop: Some(d), .. }
++                    if unwind.cleanup_block().is_some() =>
++                {
++                    mk_successors(slice::from_ref(t), unwind.cleanup_block(), Some(d))
++                }
++                // 2-successors: structural target + unwind cleanup
++                Call { target: Some(ref t), ref unwind, .. }
++                    if unwind.cleanup_block().is_some() =>
++                {
++                    mk_successors(slice::from_ref(t), unwind.cleanup_block(), None)
+                 }
+-                // 2-successors
+-                Call { target: Some(ref t), unwind: UnwindAction::Cleanup(u), .. }
+-                | Yield { resume: ref t, drop: Some(u), .. }
+-                | Drop { target: ref t, unwind: UnwindAction::Cleanup(u), drop: None, .. }
+-                | Drop { target: ref t, unwind: _, drop: Some(u), .. }
+-                | Assert { target: ref t, unwind: UnwindAction::Cleanup(u), .. }
+-                | FalseUnwind { real_target: ref t, unwind: UnwindAction::Cleanup(u) } => {
++                Yield { resume: ref t, drop: Some(u), .. } => {
+                     mk_successors(slice::from_ref(t), Some(u), None)
+                 }
+-                // single successor
++                Drop { target: ref t, ref unwind, drop: None, .. }
++                    if unwind.cleanup_block().is_some() =>
++                {
++                    mk_successors(slice::from_ref(t), unwind.cleanup_block(), None)
++                }
++                Drop { target: ref t, unwind: _, drop: Some(u), .. } => {
++                    mk_successors(slice::from_ref(t), Some(u), None)
++                }
++                Assert { target: ref t, ref unwind, .. }
++                    if unwind.cleanup_block().is_some() =>
++                {
++                    mk_successors(slice::from_ref(t), unwind.cleanup_block(), None)
++                }
++                FalseUnwind { real_target: ref t, ref unwind }
++                    if unwind.cleanup_block().is_some() =>
++                {
++                    mk_successors(slice::from_ref(t), unwind.cleanup_block(), None)
++                }
++                // single successor — diverging call with cleanup BB
++                Call { target: None, ref unwind, .. } if unwind.cleanup_block().is_some() => {
++                    mk_successors(&[], unwind.cleanup_block(), None)
++                }
++                // single successor — structural only
+                 Goto { target: ref t }
+-                | Call { target: None, unwind: UnwindAction::Cleanup(ref t), .. }
+                 | Call { target: Some(ref t), unwind: _, .. }
+                 | Yield { resume: ref t, drop: None, .. }
+                 | Drop { target: ref t, unwind: _, .. }
+@@ -538,8 +574,10 @@ pub fn successors(&self) -> Successors<'_> {
+                 | TailCall { .. }
+                 | Call { target: None, unwind: _, .. } => mk_successors(&[], None, None),
+                 // Multiple successors
+-                InlineAsm { ref targets, unwind: UnwindAction::Cleanup(u), .. } => {
+-                    mk_successors(targets, Some(u), None)
++                InlineAsm { ref targets, ref unwind, .. }
++                    if unwind.cleanup_block().is_some() =>
++                {
++                    mk_successors(targets, unwind.cleanup_block(), None)
+                 }
+                 InlineAsm { ref targets, unwind: _, .. } => mk_successors(targets, None, None),
+                 SwitchInt { ref targets, .. } => mk_successors(&targets.targets, None, None),
+@@ -556,7 +594,7 @@ pub fn successors_mut<'a>(&'a mut self, mut f: impl FnMut(&'a mut BasicBlock)) {
+             match self {
+                 Drop { target, unwind, drop, .. } => {
+                     f(target);
+-                    if let UnwindAction::Cleanup(u) = unwind {
++                    if let Some(u) = unwind.cleanup_block_mut() {
+                         f(u)
+                     }
+                     if let Some(d) = drop {
+@@ -567,7 +605,7 @@ pub fn successors_mut<'a>(&'a mut self, mut f: impl FnMut(&'a mut BasicBlock)) {
+                     if let Some(target) = target {
+                         f(target);
+                     }
+-                    if let UnwindAction::Cleanup(u) = unwind {
++                    if let Some(u) = unwind.cleanup_block_mut() {
+                         f(u)
+                     }
+                 }
+@@ -579,7 +617,7 @@ pub fn successors_mut<'a>(&'a mut self, mut f: impl FnMut(&'a mut BasicBlock)) {
+                 }
+                 Assert { target, unwind, .. } | FalseUnwind { real_target: target, unwind } => {
+                     f(target);
+-                    if let UnwindAction::Cleanup(u) = unwind {
++                    if let Some(u) = unwind.cleanup_block_mut() {
+                         f(u)
+                     }
+                 }
+@@ -596,7 +634,7 @@ pub fn successors_mut<'a>(&'a mut self, mut f: impl FnMut(&'a mut BasicBlock)) {
+                     for target in targets {
+                         f(target);
+                     }
+-                    if let UnwindAction::Cleanup(u) = unwind {
++                    if let Some(u) = unwind.cleanup_block_mut() {
+                         f(u)
+                     }
+                 }
+diff --git a/compiler/rustc_middle/src/mir/visit.rs b/compiler/rustc_middle/src/mir/visit.rs
+index 16a8743a6d6..541c35f74e8 100644
+--- a/compiler/rustc_middle/src/mir/visit.rs
++++ b/compiler/rustc_middle/src/mir/visit.rs
+@@ -588,7 +588,7 @@ fn super_terminator(
+                         args,
+                         destination,
+                         target: _,
+-                        unwind: _,
++                        unwind,
+                         call_source: _,
+                         fn_span,
+                     } => {
+@@ -602,6 +602,19 @@ fn super_terminator(
+                             PlaceContext::MutatingUse(MutatingUseContext::Call),
+                             location
+                         );
++                        // P09.65c / 1.13 throws Phase 1G:
++                        // UnwindAction::CxxThrowsCleanup carries a Local
++                        // (raw_err_local) that downstream passes need to
++                        // see for use-tracking + remapping. Visit it so
++                        // SimplifyLocals etc. don't drop or stale-index
++                        // it.
++                        if let UnwindAction::CxxThrowsCleanup { raw_err_local, .. } = unwind {
++                            self.visit_local(
++                                $(& $mutability)? *raw_err_local,
++                                PlaceContext::MutatingUse(MutatingUseContext::Store),
++                                location,
++                            );
++                        }
+                     }
+ 
+                     TerminatorKind::TailCall { func, args, fn_span } => {
+diff --git a/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs b/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+index a5cab3f65ed..769b4031c0f 100644
+--- a/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
++++ b/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+@@ -217,10 +217,15 @@ fn rewrite_call<'tcx>(
+         source_info,
+         kind: TerminatorKind::Goto { target: orig_target },
+     };
++    // is_cleanup = false: the catch terminates the unwind, so
++    // the err_wrap_bb is regular code that flows back into the
++    // normal CFG. This requires a corresponding validator
++    // relaxation for the CxxThrowsCleanup unwind edge (see
++    // validate.rs).
+     let err_wrap_bb_data = BasicBlockData::new_stmts(
+         vec![err_stmt],
+         Some(err_terminator),
+-        /* is_cleanup: */ true,
++        /* is_cleanup: */ false,
+     );
+     let err_wrap_bb = basic_blocks.push(err_wrap_bb_data);
+ 
+diff --git a/compiler/rustc_mir_transform/src/validate.rs b/compiler/rustc_mir_transform/src/validate.rs
+index 9de622ba150..90c2327c033 100644
+--- a/compiler/rustc_mir_transform/src/validate.rs
++++ b/compiler/rustc_mir_transform/src/validate.rs
+@@ -261,7 +261,29 @@ fn check_unwind_edge(&mut self, location: Location, unwind: UnwindAction) {
+                 if is_cleanup {
+                     self.fail(location, "`UnwindAction::CxxThrowsCleanup` in cleanup block");
+                 }
+-                self.check_edge(location, bb, EdgeKind::Unwind);
++                // Semantics: this edge transitions from an
++                // unwinding state back into normal execution
++                // (the catch BB terminates the unwind). So
++                // the target is a regular non-cleanup block.
++                // We bypass the standard "unwind edge must
++                // target a cleanup block" check and verify
++                // the target is non-cleanup directly.
++                if let Some(target) = self.body.basic_blocks.get(bb) {
++                    if target.is_cleanup {
++                        self.fail(
++                            location,
++                            format!(
++                                "`UnwindAction::CxxThrowsCleanup` target {bb:?} must be a \
++                                 non-cleanup block (catch terminates the unwind)",
++                            ),
++                        );
++                    }
++                } else {
++                    self.fail(
++                        location,
++                        format!("encountered jump to invalid basic block {bb:?}"),
++                    );
++                }
+             }
+             UnwindAction::Continue => {
+                 if is_cleanup {
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,1350 @@
+From 1ce2012c3bbc2ad6da27479c457fee4fb9bb8706 Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Tue, 21 Apr 2026 23:23:47 +0300
+Subject: [PATCH 06/42] Symbol mangling: Itanium + Swift dispatch modules
+
+Adds itanium.rs and swift.rs to rustc_symbol_mangling; the library's
+symbol_name path now routes ExternAbi::Cpp / ExternAbi::Swift items to
+the matching ABI's mangler (Itanium via rustc_abi_cxx::mangle; Swift's
+own runtime mangling for class and struct descriptors).
+---
+ compiler/rustc_symbol_mangling/Cargo.toml     |   1 +
+ compiler/rustc_symbol_mangling/src/itanium.rs | 750 ++++++++++++++++++
+ compiler/rustc_symbol_mangling/src/lib.rs     |  35 +
+ compiler/rustc_symbol_mangling/src/swift.rs   | 502 ++++++++++++
+ 4 files changed, 1288 insertions(+)
+ create mode 100644 compiler/rustc_symbol_mangling/src/itanium.rs
+ create mode 100644 compiler/rustc_symbol_mangling/src/swift.rs
+
+diff --git a/compiler/rustc_symbol_mangling/Cargo.toml b/compiler/rustc_symbol_mangling/Cargo.toml
+index 1df8d641a4c..c9eb2dc4b83 100644
+--- a/compiler/rustc_symbol_mangling/Cargo.toml
++++ b/compiler/rustc_symbol_mangling/Cargo.toml
+@@ -8,6 +8,7 @@ edition = "2024"
+ punycode = "0.4.0"
+ rustc-demangle = "0.1.27"
+ rustc_abi = { path = "../rustc_abi" }
++rustc_abi_cxx = { path = "../rustc_abi_cxx" }
+ rustc_data_structures = { path = "../rustc_data_structures" }
+ rustc_hashes = { path = "../rustc_hashes" }
+ rustc_hir = { path = "../rustc_hir" }
+diff --git a/compiler/rustc_symbol_mangling/src/itanium.rs b/compiler/rustc_symbol_mangling/src/itanium.rs
+new file mode 100644
+index 00000000000..85ccb8308ed
+--- /dev/null
++++ b/compiler/rustc_symbol_mangling/src/itanium.rs
+@@ -0,0 +1,750 @@
++//! P08b — Itanium C++ ABI symbol mangling for `extern "C++"` items.
++//!
++//! Routes `extern "C++"` fn declarations and, later, methods on
++//! `#[repr(cpp)]` types through `rustc_abi_cxx::mangle` so their
++//! link names match what Clang produces for the corresponding C++
++//! declarations.
++//!
++//! Scope for v1:
++//!
++//! - Free functions (`extern "C++" { fn foo(...) -> ...; }`) at
++//!   any module scope. Module nesting is currently discarded —
++//!   everything mangles as if at the global namespace. Growing
++//!   this to mirror Rust module paths into Itanium namespaces
++//!   is a follow-up once the basic linkage works.
++//! - Parameter / return types: scalar builtins (i8..i128, u8..u128,
++//!   bool, f32, f64), `()`, and raw pointers. Records (record-by-
++//!   value across the boundary), references, and fn types are
++//!   not supported yet — the mangler falls back to the default
++//!   rustc symbol for unsupported shapes so the build stays
++//!   green (at the cost of the caller not being Itanium-ABI-
++//!   compatible).
++//!
++//! Why a conservative fallback rather than an ICE: the compiler
++//! encounters `extern "C++"` items in user code only where
++//! `#[repr(cpp)]` sits upstream in the compile graph, so the
++//! failure surface is already narrow. Falling back lets users
++//! mix the supported subset with unsupported corners without
++//! a hard error.
++
++use rustc_abi::ExternAbi;
++use rustc_abi_cxx::{
++    ClassDef, ClassId, CtorVariant, CvQual, CxxType, CxxTypeCtx, DtorVariant, FloatKind,
++    FnSig as CxxFnSig, Ident, IntWidth, MethodName, NameSegment, NestedName,
++    OperatorKind, RecordKind, RefKind, Symbol as CxxSymbol, Target as CxxTarget, TypeId,
++};
++use rustc_hir::def::DefKind;
++use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
++use rustc_span::def_id::DefId;
++
++/// Collect the Rust module path leading up to `def_id`
++/// (excluding the crate root and `def_id` itself), as a vector of
++/// `NameSegment::Namespace` entries suitable for prefixing a
++/// `NestedName`. An item at crate root yields an empty vec.
++///
++/// Example: `def_id` points to a struct `mymod::inner::Widget` →
++/// `[Namespace("mymod"), Namespace("inner")]`.
++fn cxx_namespace_path<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Vec<NameSegment> {
++    let mut segs = Vec::new();
++    let mut cur = tcx.opt_parent(def_id);
++    while let Some(parent) = cur {
++        // `opt_parent(parent).is_some()` skips the crate root,
++        // which we don't want to mirror as a C++ namespace (the
++        // user declares types in their own namespace on the C++
++        // side, not one named after the Rust crate).
++        if tcx.opt_parent(parent).is_some() && tcx.def_kind(parent) == DefKind::Mod {
++            let name = tcx.item_name(parent).to_string();
++            if !name.is_empty() {
++                segs.push(NameSegment::Namespace(Ident(name)));
++            }
++        }
++        cur = tcx.opt_parent(parent);
++    }
++    segs.reverse();
++    segs
++}
++
++/// True if `def_id` carries `#[rustc_cxx_ctor]`. The attribute
++/// opts a method on a `#[repr(cpp)]` impl into C++-ctor mangling
++/// (`_ZN<class>C1E<args>`) instead of the regular member-fn form.
++pub fn has_cxx_ctor_attr<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
++    rustc_hir::find_attr!(tcx, def_id, RustcCxxCtor(..))
++}
++
++/// If `def_id` is a foreign fn inside `extern "C++" { ... }`
++/// carrying `#[rustc_cxx_ctor]` and returning a `#[repr(cpp)]`
++/// ADT by value, returns that ADT's `DefId`. The return type
++/// directly names the class being constructed.
++///
++/// P09.22: this mirrors the Rust-impl ctor path
++/// (`impl Widget { #[rustc_cxx_ctor] fn new() -> Self }`)
++/// for foreign declarations, unifying the ctor emission so the
++/// `cxx_class!` macro can drop its sret-trampoline workaround.
++fn cxx_foreign_ctor_class<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<DefId> {
++    if tcx.def_kind(def_id) != DefKind::Fn {
++        return None;
++    }
++    let parent = tcx.opt_parent(def_id)?;
++    if tcx.def_kind(parent) != DefKind::ForeignMod {
++        return None;
++    }
++    if !has_cxx_ctor_attr(tcx, def_id) {
++        return None;
++    }
++    let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
++    let ty::Adt(adt_def, _) = sig.output().kind() else {
++        return None;
++    };
++    if !adt_def.repr().cpp() {
++        return None;
++    }
++    Some(adt_def.did())
++}
++
++/// If `def_id` carries `#[rustc_cxx_operator = "Kind"]`, parse
++/// the kind string into an `OperatorKind` so the mangler emits
++/// the operator-specific name (e.g. `pl` for `Plus`) instead of
++/// a member-fn source name.
++fn cxx_operator_kind<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<OperatorKind> {
++    let kind_sym: rustc_span::Symbol =
++        rustc_hir::find_attr!(tcx, def_id, RustcCxxOperator { kind, .. } => *kind)?;
++    match kind_sym.as_str() {
++        "Plus" => Some(OperatorKind::Plus),
++        "Minus" => Some(OperatorKind::Minus),
++        "Mul" => Some(OperatorKind::Mul),
++        "Div" => Some(OperatorKind::Div),
++        "Mod" => Some(OperatorKind::Mod),
++        "Assign" => Some(OperatorKind::Assign),
++        "PlusAssign" => Some(OperatorKind::PlusAssign),
++        "Eq" => Some(OperatorKind::Eq),
++        "Ne" => Some(OperatorKind::Ne),
++        "Lt" => Some(OperatorKind::Lt),
++        "Le" => Some(OperatorKind::Le),
++        "Gt" => Some(OperatorKind::Gt),
++        "Ge" => Some(OperatorKind::Ge),
++        "Call" => Some(OperatorKind::Call),
++        "Index" => Some(OperatorKind::Index),
++        "Deref" => Some(OperatorKind::Deref),
++        "PreIncr" => Some(OperatorKind::PreIncr),
++        "PreDecr" => Some(OperatorKind::PreDecr),
++        // Unknown kind — silently fall through to regular method
++        // mangling. The attribute parser already rejected most
++        // malformed values; this is a sanity net.
++        _ => None,
++    }
++}
++
++/// Mangle `_ZN<class>D0Ev` — the deleting destructor variant —
++/// for the `Drop` impl at `def_id`.
++pub fn mangle_dtor_d0<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<String> {
++    mangle_dtor_variant(tcx, def_id, DtorVariant::D0)
++}
++
++/// Mangle `_ZN<class>D2Ev` — the base-object destructor variant.
++pub fn mangle_dtor_d2<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<String> {
++    mangle_dtor_variant(tcx, def_id, DtorVariant::D2)
++}
++
++/// Mangle a destructor variant for the class reached via the
++/// `Drop` impl at `def_id`. Shared between the normal mangling
++/// path (D1 for the drop body) and the codegen path that emits
++/// extra D0 (deleting) and D2 (base-object) thunks so virtual
++/// dispatch through a C++ base pointer works.
++pub(crate) fn mangle_dtor_variant<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    def_id: DefId,
++    variant: DtorVariant,
++) -> Option<String> {
++    let impl_did = tcx.parent(def_id);
++    let trait_ref = tcx.impl_trait_ref(impl_did).skip_binder();
++    let ty::Adt(adt_def, _) = trait_ref.self_ty().kind() else {
++        return None;
++    };
++    let class_name = tcx.item_name(adt_def.did()).to_string();
++    let mut path = cxx_namespace_path(tcx, adt_def.did());
++    path.push(NameSegment::Class(Ident(class_name)));
++    let mut ctx = CxxTypeCtx::new(CxxTarget::from_rustc_triple(
++        tcx.sess.opts.target_triple.tuple(),
++        tcx.sess.target.pointer_width as u32,
++    ));
++    let class_id = ctx.define_class(ClassDef {
++        name: NestedName(path),
++        bases: Vec::new(),
++        fields: Vec::new(),
++        methods: Vec::new(),
++        kind: RecordKind::Struct,
++        is_polymorphic: false,
++        is_final: false,
++        source_alignment: None,
++    });
++    Some(ctx.mangle(&CxxSymbol::Dtor { class: class_id, variant }))
++}
++
++/// P09.24 / P09.35: true if `adt_did` (a `#[repr(cpp)]` ADT)
++/// declares any virtual methods OR inherits from a polymorphic
++/// class (single-inheritance chain, marked by
++/// `#[rustc_cxx_base]` on the first field).
++pub fn is_polymorphic_cpp_class<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> bool {
++    if !virtual_methods_on_class(tcx, adt_did).is_empty() {
++        return true;
++    }
++    polymorphic_base_of_class(tcx, adt_did).is_some()
++}
++
++/// P09.35: if `adt_did` is a derived class (its first field
++/// carries `#[rustc_cxx_base]`), returns the base ADT's DefId.
++/// Otherwise returns None. Chains: calling this repeatedly walks
++/// the inheritance chain up toward the root.
++pub fn polymorphic_base_of_class<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    adt_did: DefId,
++) -> Option<DefId> {
++    let adt = tcx.adt_def(adt_did);
++    let variant = adt.variants().iter().next()?;
++    let first = variant.fields.raw.first()?;
++    if !rustc_hir::find_attr!(tcx, first.did, RustcCxxBase(..)) {
++        return None;
++    }
++    let field_ty = tcx.type_of(first.did).skip_binder();
++    match field_ty.kind() {
++        ty::Adt(base_adt, _) => Some(base_adt.did()),
++        _ => None,
++    }
++}
++
++/// P09.35: walk the inheritance chain and collect virtual
++/// methods in C++ vtable order — base's virtuals first (by
++/// recursion through `polymorphic_base_of_class`), then the
++/// derived class's own new virtuals. v1 assumes no derived
++/// class overrides a base virtual (the entries for base's
++/// virtuals point at base's methods).
++pub fn virtuals_on_chain<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> Vec<DefId> {
++    let mut out: Vec<DefId> = Vec::new();
++    if let Some(base_did) = polymorphic_base_of_class(tcx, adt_did) {
++        out.extend(virtuals_on_chain(tcx, base_did));
++    }
++    // P09.34: when a derived class declares a virtual whose name
++    // matches a base virtual already in the chain, REPLACE the
++    // base's slot rather than appending a new one. That's what
++    // gives us override semantics: C++ callers going through the
++    // base slot land in the derived's implementation because the
++    // slot now holds the derived method's DefId.
++    //
++    // Matching is by method name only (v1). Same name with a
++    // different signature is user error — diagnosed by C++'s
++    // own header declarations at the link site. A lint that
++    // requires signature compatibility is future work.
++    for derived_did in virtual_methods_on_class(tcx, adt_did) {
++        let derived_name = tcx.item_name(derived_did);
++        let mut replaced = false;
++        for slot in out.iter_mut() {
++            if tcx.item_name(*slot) == derived_name {
++                *slot = derived_did;
++                replaced = true;
++                break;
++            }
++        }
++        if !replaced {
++            out.push(derived_did);
++        }
++    }
++    out
++}
++
++/// P09.24: Itanium-mangled name for the class's vtable
++/// (`_ZTV<class>`), typeinfo (`_ZTI<class>`), or typeinfo-name
++/// (`_ZTS<class>`). Uses the same namespace-prefix logic as
++/// regular method mangling so nested modules produce
++/// `_ZTVN3gfx6WidgetE`-style names.
++pub fn mangle_cxx_vtable_symbol<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> String {
++    mangle_cxx_class_symbol(tcx, adt_did, CxxSymbol::VTable)
++}
++pub fn mangle_cxx_typeinfo_symbol<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> String {
++    mangle_cxx_class_symbol(tcx, adt_did, CxxSymbol::TypeInfo)
++}
++pub fn mangle_cxx_typeinfo_name_symbol<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> String {
++    mangle_cxx_class_symbol(tcx, adt_did, CxxSymbol::TypeInfoName)
++}
++fn mangle_cxx_class_symbol<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    adt_did: DefId,
++    which: fn(ClassId) -> CxxSymbol,
++) -> String {
++    let class_name = tcx.item_name(adt_did).to_string();
++    let mut path = cxx_namespace_path(tcx, adt_did);
++    path.push(NameSegment::Class(Ident(class_name)));
++    let mut ctx = CxxTypeCtx::new(CxxTarget::from_rustc_triple(
++        tcx.sess.opts.target_triple.tuple(),
++        tcx.sess.target.pointer_width as u32,
++    ));
++    let class_id = ctx.define_class(ClassDef {
++        name: NestedName(path),
++        bases: Vec::new(),
++        fields: Vec::new(),
++        methods: Vec::new(),
++        kind: RecordKind::Struct,
++        is_polymorphic: true,
++        is_final: false,
++        source_alignment: None,
++    });
++    ctx.mangle(&which(class_id))
++}
++
++/// P09.24: collect the `DefId`s of inherent methods on `adt_did`
++/// that carry `#[rustc_cxx_virtual]`, in a deterministic order
++/// (impl DefId order, then method DefId order within each impl).
++/// This is the declaration-order the vtable slots must match; the
++/// user is responsible for keeping their C++ header's virtual
++/// method order in sync.
++pub fn virtual_methods_on_class<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    adt_did: DefId,
++) -> Vec<DefId> {
++    let mut out = Vec::new();
++    let impls = tcx.inherent_impls(adt_did);
++    let mut impl_ids: Vec<DefId> = impls.iter().copied().collect();
++    impl_ids.sort_by_key(|d| (d.krate, d.index));
++    for impl_did in impl_ids {
++        let mut methods: Vec<DefId> = tcx
++            .associated_item_def_ids(impl_did)
++            .iter()
++            .copied()
++            .filter(|m| tcx.def_kind(*m) == DefKind::AssocFn)
++            .filter(|m| rustc_hir::find_attr!(tcx, *m, RustcCxxVirtual(..)))
++            .collect();
++        methods.sort_by_key(|d| (d.krate, d.index));
++        out.extend(methods);
++    }
++    out
++}
++
++/// True if `def_id` is the `drop` method of an `impl Drop for T`
++/// where `T` is a `#[repr(cpp)]` ADT. Such methods mangle as
++/// `_ZN<class>D1Ev` (complete-object destructor).
++pub fn is_cxx_drop_impl<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
++    if tcx.def_kind(def_id) != DefKind::AssocFn {
++        return false;
++    }
++    let Some(impl_did) = tcx.opt_parent(def_id) else { return false };
++    let DefKind::Impl { of_trait: true } = tcx.def_kind(impl_did) else {
++        return false;
++    };
++    let trait_ref = tcx.impl_trait_ref(impl_did).skip_binder();
++    if Some(trait_ref.def_id) != tcx.lang_items().drop_trait() {
++        return false;
++    }
++    let ty::Adt(adt_def, _) = trait_ref.self_ty().kind() else {
++        return false;
++    };
++    adt_def.repr().cpp()
++}
++
++/// If `def_id` names an associated fn on an `impl` block whose
++/// self-type is a `#[repr(cpp)]` ADT, returns that ADT's `DefId`.
++/// The caller uses this both to route through the Itanium ABI
++/// ([`is_cpp_abi`]) and to mangle the fn as a member function
++/// ([`mangle`]).
++pub(crate) fn cxx_impl_class<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<DefId> {
++    if tcx.def_kind(def_id) != DefKind::AssocFn {
++        return None;
++    }
++    let impl_did = tcx.opt_parent(def_id)?;
++    if !matches!(tcx.def_kind(impl_did), DefKind::Impl { .. }) {
++        return None;
++    }
++    let self_ty = tcx.type_of(impl_did).skip_binder();
++    let ty::Adt(adt_def, _) = self_ty.kind() else {
++        return None;
++    };
++    if !adt_def.repr().cpp() {
++        return None;
++    }
++    Some(adt_def.did())
++}
++
++/// True when `def_id` refers to a fn item that should be routed
++/// through the Itanium mangler. Two paths qualify:
++///
++/// - the fn sig's ABI is `ExternAbi::Cpp` (explicit `extern "C++"`);
++/// - the fn is an assoc fn on an `impl` whose self-type is a
++///   `#[repr(cpp)]` ADT (inferred — Tier 1 methods).
++///
++/// P09.22: methods tagged `#[rustc_cxx_wrapper]` are skipped —
++/// they are thin forwarders to an `extern "C++"` decl of the
++/// same method, and auto-mangling them would collide with the
++/// decl's link name (and also produce self-recursive calls via
++/// P09.3's auto-export).
++pub(crate) fn is_cpp_abi<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
++    if !matches!(
++        tcx.def_kind(def_id),
++        DefKind::Fn | DefKind::AssocFn
++    ) {
++        return false;
++    }
++    let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
++    if matches!(sig.abi(), ExternAbi::Cpp { .. }) {
++        return true;
++    }
++    if cxx_impl_class(tcx, def_id).is_some() {
++        if rustc_hir::find_attr!(tcx, def_id, RustcCxxWrapper(..)) {
++            return false;
++        }
++        // P09.23: `#[rustc_cxx_drop_wrapper]` opts a `Drop::drop`
++        // on `#[repr(cpp)]` out of the Itanium mangler. Used by
++        // `cxx_class_native!` when the C++ side already defines
++        // the destructor (D0/D1/D2) and the Rust drop body is a
++        // thin forwarder to an `extern "C++"` decl.
++        if rustc_hir::find_attr!(tcx, def_id, RustcCxxDropWrapper(..)) {
++            return false;
++        }
++        // P09.34: generic methods on a `#[repr(cpp)]` class can't
++        // be C++-mangled — Itanium has no expression for Rust
++        // type parameters, and each monomorphization would need a
++        // distinct symbol. Fall back to Rust mangling. The check
++        // covers both (a) the impl itself having generics (so the
++        // Self type is `Foo<A, B>` with free params) and (b) the
++        // method itself being generic (`fn map<T>(...)`). For
++        // fully-concrete inherent methods on a concrete
++        // `#[repr(cpp)]` class this branch does nothing.
++        let impl_did = tcx.parent(def_id);
++        let impl_generics = tcx.generics_of(impl_did);
++        let fn_generics = tcx.generics_of(def_id);
++        if impl_generics.own_params.iter().any(|p| !p.kind.is_synthetic())
++            || fn_generics.own_params.iter().any(|p| !p.kind.is_synthetic())
++        {
++            return false;
++        }
++        return true;
++    }
++    // `Drop::drop` on a `#[repr(cpp)]` type is a C++ destructor.
++    is_cxx_drop_impl(tcx, def_id)
++}
++
++/// Mangle `instance` as an Itanium C++ symbol. Returns `None` if
++/// the signature shape isn't supported — a hard error is emitted
++/// first, so the build will fail.
++///
++/// Why emit here rather than let the caller fall back to default
++/// mangling: silent fallback produces a Rust-mangled symbol that
++/// no C++ linker will find, yielding an opaque "undefined symbol
++/// `_RNvCs...`" diagnostic at link time with no hint that the
++/// root cause was an unsupported type in an `extern "C++"` sig.
++/// Emitting a span-pointed error up front tells the user
++/// exactly which type was the problem.
++pub(crate) fn mangle<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    instance: Instance<'tcx>,
++) -> Option<String> {
++    let def_id = instance.def_id();
++    let poly_sig = tcx.fn_sig(def_id).skip_binder();
++    let fn_sig = poly_sig.skip_binder();
++
++    let mut ctx = CxxTypeCtx::new(CxxTarget::from_rustc_triple(
++        tcx.sess.opts.target_triple.tuple(),
++        tcx.sess.target.pointer_width as u32,
++    ));
++
++    let impl_class = cxx_impl_class(tcx, def_id);
++    let foreign_ctor_class = cxx_foreign_ctor_class(tcx, def_id);
++    let is_dtor = is_cxx_drop_impl(tcx, def_id);
++    // Ctor fires from either (a) an `impl` method tagged
++    // `#[rustc_cxx_ctor]`, or (b) a foreign fn inside
++    // `extern "C++"` tagged `#[rustc_cxx_ctor]` whose return type
++    // names the class. The foreign-fn path is the one
++    // `cxx_class!` will use after P09.22 — it lets the macro drop
++    // its sret-trampoline and `#[link_name]` workaround.
++    let is_ctor =
++        (impl_class.is_some() && has_cxx_ctor_attr(tcx, def_id)) || foreign_ctor_class.is_some();
++    let class_adt = impl_class.or(foreign_ctor_class);
++
++    // For dtors: the C++ destructor mangles as `_ZN<class>D1Ev`
++    // with no params or return type — everything is implicit in
++    // the `D1` designator. Bail early to the dtor-specific path.
++    if is_dtor {
++        return mangle_dtor_variant(tcx, def_id, DtorVariant::D1);
++    }
++
++    // Methods: Itanium omits the implicit `this` from the param
++    // list (it's implicit in the NestedName). Ctors have no
++    // explicit self either — `fn new(...) -> Self` already
++    // excludes a self param. Free fns also skip nothing.
++    //
++    // P09.29: skip arg 0 only when the fn actually has a self
++    // param. Previously we skipped for any inherent-method-on-cpp
++    // shape, which mis-mangled static methods with args as
++    // zero-arg (void) — their first user arg was being stripped.
++    // Ctors never have Rust self, so `is_ctor` still short-
++    // circuits the check. For foreign-fn ctor signatures
++    // (`#[rustc_cxx_ctor]` on an `extern "C++" fn new(v: i32) -> Widget`)
++    // there's also no self, and `is_ctor` handles them.
++    let has_self = class_adt.is_some()
++        && tcx.def_kind(def_id) == DefKind::AssocFn
++        && tcx.associated_item(def_id).is_method();
++    let input_skip = if has_self && !is_ctor { 1 } else { 0 };
++    let mut params = Vec::with_capacity(fn_sig.inputs().len().saturating_sub(input_skip));
++    for ty in fn_sig.inputs().iter().skip(input_skip) {
++        match rustc_ty_to_cxx(tcx, &mut ctx, *ty) {
++            Ok(id) => params.push(id),
++            Err(bad) => {
++                emit_unsupported_type_error(tcx, def_id, bad);
++                return None;
++            }
++        }
++    }
++    // Return type is part of the mangling for free fns and
++    // regular methods, but NOT for ctors (which conceptually
++    // return their class, but that's implicit in `<class>C1`).
++    // We still need a placeholder so `CxxFnSig { ret, .. }` can
++    // be constructed; `Void` is harmless since it won't be emitted
++    // for the Ctor symbol.
++    let ret = if is_ctor {
++        ctx.intern_type(CxxType::Void)
++    } else {
++        match rustc_ty_to_cxx(tcx, &mut ctx, fn_sig.output()) {
++            Ok(id) => id,
++            Err(bad) => {
++                emit_unsupported_type_error(tcx, def_id, bad);
++                return None;
++            }
++        }
++    };
++
++    let name = tcx.item_name(def_id).to_string();
++    if name.is_empty() {
++        return None;
++    }
++
++    let cv = if class_adt.is_some() && !is_ctor {
++        // Regular member fn: derive const-this from `&self` vs
++        // `&mut self` / `self`. By-value `self` → no CV qualifier.
++        // Ctors have no `this` in the Rust sig, so no cv derivation.
++        match fn_sig.inputs().first().map(|t| t.kind()) {
++            Some(ty::Ref(_, _, rustc_hir::Mutability::Not)) => {
++                CvQual { is_const: true, is_volatile: false }
++            }
++            _ => CvQual::default(),
++        }
++    } else {
++        CvQual::default()
++    };
++
++    let sig = CxxFnSig {
++        params,
++        ret,
++        cv,
++        ref_q: None,
++        variadic: fn_sig.c_variadic(),
++        // `extern "C++"` without `-unwind` is `noexcept`; with it,
++        // not. For inferred methods the fn sig carries Rust ABI,
++        // so fall through to `false` — linkage-wise this is a
++        // don't-care (Itanium doesn't encode noexcept for regular
++        // free/member function symbols).
++        noexcept: matches!(fn_sig.abi(), ExternAbi::Cpp { unwind: false }),
++    };
++
++    let sym = if let Some(class_did) = class_adt {
++        let class_name = tcx.item_name(class_did).to_string();
++        let mut path = cxx_namespace_path(tcx, class_did);
++        path.push(NameSegment::Class(Ident(class_name)));
++        let class_id = ctx.define_class(ClassDef {
++            name: NestedName(path),
++            bases: Vec::new(),
++            fields: Vec::new(),
++            methods: Vec::new(),
++            kind: RecordKind::Struct,
++            is_polymorphic: false,
++            is_final: false,
++            source_alignment: None,
++        });
++        if is_ctor {
++            // Complete-object constructor (`C1`) — the variant
++            // called for normal `new T()` expressions on the C++
++            // side. The base-object (`C2`) and allocating (`C3`)
++            // variants are distinct symbols Clang emits for
++            // inheritance / `operator new` scenarios; not modeled
++            // in Rust yet.
++            CxxSymbol::Ctor { class: class_id, variant: CtorVariant::C1, sig }
++        } else if let Some(op) = cxx_operator_kind(tcx, def_id) {
++            // P09.20: operator overload — emit as
++            // `MethodName::Operator(...)` so the mangler picks
++            // the Itanium short code (`pl` for `+`, `eq` for
++            // `==`, etc.) rather than a named source ident.
++            CxxSymbol::Method {
++                class: class_id,
++                name: MethodName::Operator(op),
++                sig,
++            }
++        } else {
++            CxxSymbol::Method {
++                class: class_id,
++                name: MethodName::Ident(Ident(name)),
++                sig,
++            }
++        }
++    } else {
++        // Free fns mirror their Rust `mod` path as a sequence of
++        // C++ namespaces. `mod foo { extern "C++" { fn bar() } }`
++        // mangles as `_ZN3foo3barEv` ≡ `::foo::bar`.
++        CxxSymbol::Function {
++            scope: NestedName(cxx_namespace_path(tcx, def_id)),
++            name: Ident(name),
++            sig,
++        }
++    };
++
++    Some(ctx.mangle(&sym))
++}
++
++/// Emit a hard error for an Itanium signature that contains a
++/// type we can't translate. The span points at the fn item.
++fn emit_unsupported_type_error<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId, bad: Ty<'tcx>) {
++    let span = tcx.def_span(def_id);
++    tcx.dcx().span_err(
++        span,
++        format!(
++            "type `{bad}` cannot appear in an `extern \"C++\"` signature \
++             (or an inferred-C++ method on a `#[repr(cpp)]` type) — no \
++             corresponding Itanium mangling is defined"
++        ),
++    );
++}
++
++/// Convert a rustc `Ty` to a `rustc_abi_cxx::CxxType` and intern
++/// it in `ctx`. Returns `Err(ty)` for shapes we don't handle —
++/// the `Err` carries the offending type so the caller can emit
++/// a pointed error.
++fn rustc_ty_to_cxx<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    ctx: &mut CxxTypeCtx,
++    ty: Ty<'tcx>,
++) -> Result<TypeId, Ty<'tcx>> {
++    // Handle records specially — they need a full ClassDef
++    // registered in the context, because Itanium mangling of a
++    // record-typed parameter is the class's nested name, not a
++    // scalar code. Field types don't appear in the mangling of
++    // a *parameter* so a minimal ClassDef (name + no fields) is
++    // enough; rustc_abi_cxx's mangler walks the NestedName to
++    // produce `N<len><name>E`.
++    if let ty::Adt(def, _) = ty.kind() {
++        if !def.repr().cpp() {
++            return Err(ty);
++        }
++        let name = tcx.item_name(def.did()).to_string();
++        let mut path = cxx_namespace_path(tcx, def.did());
++
++        // Enum: mangle as `CxxType::Enum` with the declared
++        // primitive as the underlying type. `#[repr(cpp, I)]`
++        // requires an integer hint — without one we don't know
++        // what C++ integer `enum class` to back it with, so we
++        // error.
++        if def.is_enum() {
++            path.push(NameSegment::Enum(Ident(name)));
++            let underlying_int = def.repr().int.ok_or(ty)?;
++            let (signed, width) = {
++                use rustc_abi::{Integer, IntegerType};
++                let (int, signed) = match underlying_int {
++                    IntegerType::Fixed(i, s) => (i, s),
++                    IntegerType::Pointer(s) => {
++                        // `#[repr(cpp, isize)]` — target-dependent;
++                        // same reason we reject isize/usize.
++                        let _ = s;
++                        return Err(ty);
++                    }
++                };
++                let w = match int {
++                    Integer::I8 => IntWidth::I8,
++                    Integer::I16 => IntWidth::I16,
++                    Integer::I32 => IntWidth::I32,
++                    Integer::I64 => IntWidth::I64,
++                    Integer::I128 => IntWidth::I128,
++                };
++                (signed, w)
++            };
++            let underlying = ctx.intern_type(CxxType::Int { signed, width });
++            // Q6 answer: "scoped" by default — matches Rust enum
++            // scoping and modern C++ `enum class`.
++            return Ok(ctx.intern_type(CxxType::Enum {
++                name: NestedName(path),
++                underlying,
++                scoped: true,
++            }));
++        }
++
++        path.push(NameSegment::Class(Ident(name)));
++        let class_id = ctx.define_class(ClassDef {
++            name: NestedName(path),
++            bases: Vec::new(),
++            fields: Vec::new(),
++            methods: Vec::new(),
++            kind: RecordKind::Struct,
++            is_polymorphic: false,
++            is_final: false,
++            source_alignment: None,
++        });
++        return Ok(ctx.intern_type(CxxType::Record(class_id)));
++    }
++
++    let cxx_ty = match ty.kind() {
++        ty::Bool => CxxType::Bool,
++        ty::Int(int_ty) => {
++            use ty::IntTy;
++            let width = match int_ty {
++                IntTy::I8 => IntWidth::I8,
++                IntTy::I16 => IntWidth::I16,
++                IntTy::I32 => IntWidth::I32,
++                IntTy::I64 => IntWidth::I64,
++                IntTy::I128 => IntWidth::I128,
++                // See the file-level note: target-dependent types
++                // like `isize` / `usize` aren't mapped yet.
++                IntTy::Isize => return Err(ty),
++            };
++            CxxType::Int { signed: true, width }
++        }
++        ty::Uint(uint_ty) => {
++            use ty::UintTy;
++            let width = match uint_ty {
++                UintTy::U8 => IntWidth::I8,
++                UintTy::U16 => IntWidth::I16,
++                UintTy::U32 => IntWidth::I32,
++                UintTy::U64 => IntWidth::I64,
++                UintTy::U128 => IntWidth::I128,
++                UintTy::Usize => return Err(ty),
++            };
++            CxxType::Int { signed: false, width }
++        }
++        ty::Float(float_ty) => {
++            use ty::FloatTy;
++            let kind = match float_ty {
++                FloatTy::F32 => FloatKind::F32,
++                FloatTy::F64 => FloatKind::F64,
++                _ => return Err(ty),
++            };
++            CxxType::Float { kind }
++        }
++        ty::Char => CxxType::Int { signed: false, width: IntWidth::I32 },
++        ty::Tuple(tys) if tys.is_empty() => CxxType::Void,
++        ty::RawPtr(pointee, mutbl) => {
++            let inner = rustc_ty_to_cxx(tcx, ctx, *pointee)?;
++            let cv = CvQual {
++                is_const: matches!(mutbl, rustc_hir::Mutability::Not),
++                is_volatile: false,
++            };
++            CxxType::Ptr { pointee: inner, cv }
++        }
++        ty::Ref(_region, pointee, mutbl) => {
++            let inner = rustc_ty_to_cxx(tcx, ctx, *pointee)?;
++            let cv = CvQual {
++                is_const: matches!(mutbl, rustc_hir::Mutability::Not),
++                is_volatile: false,
++            };
++            CxxType::Ref { pointee: inner, kind: RefKind::Lvalue, cv }
++        }
++        ty::Array(elem_ty, len) => {
++            let elem = rustc_ty_to_cxx(tcx, ctx, *elem_ty)?;
++            let len = len.try_to_target_usize(tcx).ok_or(ty)?;
++            CxxType::Array { elem, len }
++        }
++        _ => return Err(ty),
++    };
++    Ok(ctx.intern_type(cxx_ty))
++}
+diff --git a/compiler/rustc_symbol_mangling/src/lib.rs b/compiler/rustc_symbol_mangling/src/lib.rs
+index f513163878a..185a3f5cc4e 100644
+--- a/compiler/rustc_symbol_mangling/src/lib.rs
++++ b/compiler/rustc_symbol_mangling/src/lib.rs
+@@ -102,6 +102,8 @@
+ 
+ mod export;
+ mod hashed;
++pub mod itanium;
++mod swift;
+ mod legacy;
+ mod v0;
+ 
+@@ -204,6 +206,39 @@ fn compute_symbol_name<'tcx>(
+         return v0::mangle_internal_symbol(tcx, name.as_str());
+     }
+ 
++    // P08b / P09.22: `extern "C++"` items get Itanium-mangled
++    // names via the rustcc mangler. BUT an explicit
++    // `#[link_name]` or `#[export_name]` takes precedence so
++    // users can override per-item (e.g. a C++ fn exposed under
++    // a non-Itanium name, or an internal rename). The previous
++    // ordering ran the Itanium path unconditionally, silently
++    // swallowing `#[link_name]` on `extern "C++"` fns — that
++    // broke `cxx_class_native!`'s method-wrapper pattern.
++    //
++    // Runs before the wasm/NO_MANGLE early returns because
++    // foreign items in extern blocks look like NO_MANGLE from
++    // the default codegen's perspective. Falls back to the
++    // default path if the signature uses a type the Itanium
++    // translator doesn't yet handle.
++    if itanium::is_cpp_abi(tcx, def_id) {
++        if let Some(name) = attrs.symbol_name {
++            return name.to_string();
++        }
++        if let Some(mangled) = itanium::mangle(tcx, instance) {
++            return mangled;
++        }
++    }
++
++    // P09.16: `extern "Swift"` foreign items with a
++    // `#[rustc_swift_symbol = "Module"]` attribute route through
++    // the Swift mangler to produce `$s...F` link names matching
++    // what `swiftc -emit-library -module-name Module` emits.
++    if swift::is_swift_abi(tcx, def_id) {
++        if let Some(mangled) = swift::mangle(tcx, instance) {
++            return mangled;
++        }
++    }
++
+     let wasm_import_module_exception_force_mangling = {
+         // * On the wasm32 targets there is a bug (or feature) in LLD [1] where the
+         //   same-named symbol when imported from different wasm modules will get
+diff --git a/compiler/rustc_symbol_mangling/src/swift.rs b/compiler/rustc_symbol_mangling/src/swift.rs
+new file mode 100644
+index 00000000000..b51f01cd3d6
+--- /dev/null
++++ b/compiler/rustc_symbol_mangling/src/swift.rs
+@@ -0,0 +1,502 @@
++//! P09.16 / P09.17 — Swift ABI symbol mangling for `extern "Swift"`
++//! items.
++//!
++//! Routes `extern "Swift"` fn declarations through a Swift mangler
++//! so link names match what `swiftc` produces for functions in a
++//! named Swift module.
++//!
++//! # Phase 1b (scalar subset, P09.16)
++//!
++//! Free functions with scalar param/return types. Module name
++//! from `#[rustc_swift_symbol = "..."]`. All labels unnamed.
++//!
++//! # Phase 2a (user types + labels, P09.17)
++//!
++//! Adds:
++//!
++//! - **User Swift value types** via `#[rustc_swift_type =
++//!   "Module.TypeName"]` on the Rust struct. Emitted as
++//!   `AA<len><name>V` (when the type lives in the same module
++//!   the current fn resolves to) or `s<len><name>V` (for stdlib
++//!   types).
++//! - **Back-references** for types that reappear in a signature.
++//!   Each type emitted in full form consumes three substitution
++//!   slots (identifier, nominal context, value type); back-refs
++//!   target the value-type slot as `A<letter>` where
++//!   `A=0, B=1, ..., Z=25`. Values >25 require multi-char
++//!   encoding (deferred to Phase 2b).
++//! - **Parameter labels** via `#[rustc_swift_labels = "_, by"]`.
++//!   Tokens are comma-separated; `_` is unnamed, anything else
++//!   is a named label `<len><name>`. Omit the attribute for
++//!   all-unnamed (emits `y`).
++//!
++//! # Grammar (validated against `swiftc` 6.2 + `swift-demangle`)
++//!
++//! ```text
++//! MangledSymbol := $s <Module> <Name> <Labels>? <Sig> F
++//! Labels        := y                            // all unnamed
++//!                | LabelSpec+                   // one per param
++//! LabelSpec     := _ | <Len><Chars>
++//! Sig           := <RetType> <Params>
++//! RetType       := <Type>                       // y = Void
++//! Params        := y                            // ()
++//!                | <Type>                       // single, no tuple
++//!                | <T1>_<T2>[_<T3>...]t         // 2+ tuple
++//! Type          := Si | Su | Sd | Sf | Sb | y
++//!                | <FullForm>                   // on first occurrence
++//!                | A<letter>                    // back-ref to earlier type
++//! FullForm      := AA<Len><Name>V               // same-module value type
++//!                | s<Len><Name>V                // stdlib value type
++//! ```
++//!
++//! Scalar compression: 2+ consecutive identical single-letter
++//! stdlib types collapse to `S<N><letter>`. Phase 2a limitations:
++//! multi-char substitution indices (>25 distinct types in one
++//! signature) and run-length compression of back-refs (3+
++//! consecutive identical user types) are deferred.
++
++use rustc_abi::ExternAbi;
++use rustc_hir::def::DefKind;
++use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
++use rustc_span::Symbol;
++use rustc_span::def_id::DefId;
++
++/// True when `def_id` is a fn item inside an `extern "Swift"`
++/// block with a `#[rustc_swift_symbol = "..."]` attribute.
++pub(crate) fn is_swift_abi<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
++    if !matches!(tcx.def_kind(def_id), DefKind::Fn | DefKind::AssocFn) {
++        return false;
++    }
++    let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
++    matches!(sig.abi(), ExternAbi::Swift { .. })
++        && swift_module_name(tcx, def_id).is_some()
++}
++
++fn swift_module_name<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<Symbol> {
++    rustc_hir::find_attr!(
++        tcx, def_id, RustcSwiftSymbol { module, .. } => *module
++    )
++}
++
++fn swift_labels<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<Symbol> {
++    rustc_hir::find_attr!(
++        tcx, def_id, RustcSwiftLabels { labels, .. } => *labels
++    )
++}
++
++/// Swift binding for a Rust ADT: `module`, `type_name`, kind.
++/// `is_class` is true for reference-type classes (mangle as `C`
++/// suffix), false for value-type structs/enums (`V` suffix).
++fn swift_type_binding<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    adt_did: DefId,
++) -> Option<(Symbol, Symbol, bool)> {
++    rustc_hir::find_attr!(
++        tcx, adt_did, RustcSwiftType { module, name, is_class, .. } => (*module, *name, *is_class)
++    )
++}
++
++/// Representation of a mangleable Swift type, in a form we can
++/// canonicalize for back-reference tracking.
++#[derive(Clone, PartialEq, Eq, Hash)]
++enum SwiftType {
++    /// Void / empty tuple.
++    Void,
++    /// Single-letter stdlib scalar: "Si", "Sd", etc.
++    Scalar(&'static str),
++    /// User value type in a module: (module, name).
++    UserValue(Symbol, Symbol),
++    /// User class (reference type) in a module: (module, name).
++    /// Mangles as `AA<len><name>C` instead of `...V`.
++    UserClass(Symbol, Symbol),
++}
++
++struct Mangler {
++    out: String,
++    /// Substitution slots. Slot 0 is the current module. Each
++    /// full-form user or stdlib type emission appends 3 slots
++    /// (identifier, nominal context, value type). Back-refs
++    /// target the index stored here.
++    ///
++    /// We don't need the actual slot contents — just the count —
++    /// to compute the next back-ref index for a newly-seen type.
++    slots: usize,
++    /// Canonical-name → slot-index (of the value-type slot) for
++    /// types already emitted in the current signature.
++    known: Vec<(SwiftType, usize)>,
++}
++
++impl Mangler {
++    fn new() -> Self {
++        // Slot 0 = current module. It's emitted as `$s<len><mod>`
++        // in the mangled-name prefix, but occupies slot 0 in the
++        // substitution table.
++        Self { out: String::new(), slots: 1, known: Vec::new() }
++    }
++
++    /// Emit a type, using a back-ref if it's been seen before.
++    ///
++    /// Scalar types (`Si`, `Sd`, `Sf`, `Sb`, `y`) are pre-registered
++    /// Swift shortcuts and don't consume substitution slots —
++    /// they emit in full each time (and get `S<N><t>` compression
++    /// for consecutive runs via `compress_consecutive`). Only
++    /// user-defined types participate in back-reference
++    /// substitution.
++    fn emit(&mut self, ty: &SwiftType) {
++        match ty {
++            SwiftType::Void => {
++                self.out.push('y');
++                return;
++            }
++            SwiftType::Scalar(code) => {
++                self.out.push_str(code);
++                return;
++            }
++            SwiftType::UserValue(_module, name) | SwiftType::UserClass(_module, name) => {
++                if let Some(&(_, idx)) = self.known.iter().find(|(t, _)| t == ty) {
++                    if let Some(letter) = idx_to_letter(idx) {
++                        self.out.push('A');
++                        self.out.push(letter);
++                        return;
++                    }
++                    // idx > 25 — fall through to full form.
++                }
++                let n = name.as_str();
++                let kind = if matches!(ty, SwiftType::UserClass(..)) { 'C' } else { 'V' };
++                // `AA<len><name><kind>`: `AA` = back-ref to slot 0
++                // (current module) + same-module marker; `<len>
++                // <name>` is the identifier; `<kind>` is `V` for
++                // value type, `C` for class. Consumes 3 slots.
++                self.out.push('A');
++                self.out.push('A');
++                self.out.push_str(&n.len().to_string());
++                self.out.push_str(n);
++                self.out.push(kind);
++                self.known.push((ty.clone(), self.slots + 2));
++                self.slots += 3;
++            }
++        }
++    }
++}
++
++/// Encode an index as a single letter A-Z (0-25). Returns None
++/// for indices that need multi-char encoding (Phase 2b).
++fn idx_to_letter(idx: usize) -> Option<char> {
++    if idx <= 25 { Some((b'A' + idx as u8) as char) } else { None }
++}
++
++/// Mangle `instance` as a Swift symbol. Returns `None` if the
++/// signature uses a type the mangler can't encode.
++pub(crate) fn mangle<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    instance: Instance<'tcx>,
++) -> Option<String> {
++    let def_id = instance.def_id();
++    let module = swift_module_name(tcx, def_id)?;
++    let name = tcx.item_name(def_id);
++
++    let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
++
++    // Translate Rust types to SwiftType descriptions.
++    let ret_ty = ty_to_swift(tcx, sig.output())?;
++    let param_tys: Vec<SwiftType> = sig
++        .inputs()
++        .iter()
++        .map(|ty| ty_to_swift(tcx, *ty))
++        .collect::<Option<Vec<_>>>()?;
++
++    // Labels encoding: emit `y` when labels attribute says
++    // all-unnamed (or none given), else emit the tokenized
++    // label list. BUT: when the function has no params, Swift
++    // omits the labels slot entirely — `make_counter() ->
++    // Counter` mangles as `...AA7CounterCyF` (labels elided)
++    // not `...yAA7CounterCyF`.
++    let labels_str = swift_labels(tcx, def_id)
++        .map(|s| s.as_str().to_string());
++    let labels = if param_tys.is_empty() {
++        String::new()
++    } else {
++        match &labels_str {
++            None => "y".to_string(),
++            Some(s) if all_unnamed(s) => "y".to_string(),
++            Some(s) => encode_labels(s),
++        }
++    };
++
++    // Build signature. Return type first, then params (with
++    // back-ref tracking for repeats).
++    let mut m = Mangler::new();
++    m.emit(&ret_ty);
++    match param_tys.len() {
++        0 => m.out.push('y'),
++        1 => m.emit(&param_tys[0]),
++        _ => {
++            for (i, p) in param_tys.iter().enumerate() {
++                if i > 0 {
++                    m.out.push('_');
++                }
++                m.emit(p);
++            }
++            m.out.push('t');
++        }
++    }
++
++    // Scalar run-length compression (`SiSi` → `S2i`). Only
++    // applies to the compressed stdlib-scalar portion — user
++    // types use `A<letter>` back-refs which use a separate
++    // run-length scheme below.
++    let compressed = compress_consecutive(&m.out);
++
++    // Back-ref run-length compression: runs of 3+ consecutive
++    // identical `A<letter>` back-refs compress to `<first>_A<N>
++    // <letter>` — the first instance stays standalone, the
++    // remaining N ≥ 2 collapse into one `A<N><letter>` token
++    // (no internal `_` separators). Matches Swift's output for
++    // signatures like `func f(A, A, A, A) -> A` where the
++    // return-type full-form seeds the substitution and the four
++    // identical params emit as `AX_A3X`.
++    let compressed = compress_backref_runs(&compressed);
++
++    let module_str = module.as_str();
++    let name_str = name.as_str();
++    Some(format!(
++        "$s{mlen}{m}{nlen}{n}{labels}{sig}F",
++        mlen = module_str.len(),
++        m = module_str,
++        nlen = name_str.len(),
++        n = name_str,
++        labels = labels,
++        sig = compressed,
++    ))
++}
++
++fn all_unnamed(labels: &str) -> bool {
++    labels.split(',').all(|t| t.trim() == "_")
++}
++
++fn encode_labels(labels: &str) -> String {
++    let mut out = String::new();
++    for tok in labels.split(',') {
++        let t = tok.trim();
++        if t == "_" {
++            out.push('_');
++        } else {
++            out.push_str(&t.len().to_string());
++            out.push_str(t);
++        }
++    }
++    out
++}
++
++/// Map a rustc `Ty` to its SwiftType description. Returns
++/// `None` for unsupported types.
++fn ty_to_swift<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<SwiftType> {
++    match ty.kind() {
++        ty::Tuple(tys) if tys.is_empty() => Some(SwiftType::Void),
++        ty::Bool => Some(SwiftType::Scalar("Sb")),
++        ty::Int(int_ty) => match int_ty {
++            ty::IntTy::I64 => Some(SwiftType::Scalar("Si")),
++            _ => None,
++        },
++        ty::Uint(uint_ty) => match uint_ty {
++            ty::UintTy::U64 => Some(SwiftType::Scalar("Su")),
++            _ => None,
++        },
++        ty::Float(float_ty) => match float_ty {
++            ty::FloatTy::F32 => Some(SwiftType::Scalar("Sf")),
++            ty::FloatTy::F64 => Some(SwiftType::Scalar("Sd")),
++            _ => None,
++        },
++        ty::Ref(_, pointee, _) => {
++            // Rust `&T` for Swift value types: Swift's ABI
++            // passes values by inline copy (for POD) or via
++            // its own indirection scheme (for non-trivial).
++            // Phase 2a only supports pass-by-value of trivial
++            // types — dereference the ref and recurse.
++            ty_to_swift(tcx, *pointee)
++        }
++        ty::Adt(def, _) => {
++            // Phase 2a requires both `#[repr(swift)]` (gating
++            // marker) and `#[rustc_swift_type]` (binding to the
++            // Swift-side qualified name). Missing either is
++            // caller responsibility — fall back to None so the
++            // mangler surfaces a type it can't encode.
++            if !def.repr().swift() {
++                return None;
++            }
++            let (module, name, is_class) = swift_type_binding(tcx, def.did())?;
++            Some(if is_class {
++                SwiftType::UserClass(module, name)
++            } else {
++                SwiftType::UserValue(module, name)
++            })
++        }
++        _ => None,
++    }
++}
++
++/// Fold consecutive identical stdlib-scalar codes into
++/// `S<N><letter>`. Preserves `_` and `t` separators.
++fn compress_consecutive(input: &str) -> String {
++    let bytes = input.as_bytes();
++    let mut out = String::with_capacity(input.len());
++    let mut i = 0;
++    while i < bytes.len() {
++        if i + 1 < bytes.len() && bytes[i] == b'S' && (bytes[i + 1] as char).is_ascii_lowercase() {
++            let letter = bytes[i + 1];
++            let mut count = 1;
++            let mut j = i + 2;
++            while j + 1 < bytes.len() && bytes[j] == b'S' && bytes[j + 1] == letter {
++                count += 1;
++                j += 2;
++            }
++            if count >= 2 {
++                out.push('S');
++                out.push_str(&count.to_string());
++                out.push(letter as char);
++                i = j;
++                continue;
++            }
++        }
++        out.push(bytes[i] as char);
++        i += 1;
++    }
++    out
++}
++
++/// Run-length compress consecutive identical `A<letter>`
++/// back-refs. Input: a string fragment that may contain
++/// `A<letter>(_A<same-letter>)+` patterns. Output: the same
++/// semantic form with runs of 3+ collapsed to
++/// `<first>_A<count-minus-1><letter>`.
++///
++/// Matches Swift's behavior: the first instance of a repeated
++/// back-ref in a tuple stays standalone; the remaining N ≥ 2
++/// identical back-refs compress. For N = 1 follower we leave
++/// the pair uncompressed (`AX_AX`) because the compressed form
++/// `AX_A1X` is the same length.
++fn compress_backref_runs(input: &str) -> String {
++    let bytes = input.as_bytes();
++    let mut out = String::with_capacity(input.len());
++    let mut i = 0;
++    while i < bytes.len() {
++        // Detect `A<uppercase>` at position i.
++        if bytes[i] == b'A'
++            && i + 1 < bytes.len()
++            && (bytes[i + 1] as char).is_ascii_uppercase()
++        {
++            let letter = bytes[i + 1];
++            // Count `_A<letter>` follow-ups at i+2, i+5, i+8, ...
++            let mut followups = 0;
++            let mut j = i + 2;
++            while j + 2 < bytes.len()
++                && bytes[j] == b'_'
++                && bytes[j + 1] == b'A'
++                && bytes[j + 2] == letter
++            {
++                followups += 1;
++                j += 3;
++            }
++            // Also handle the case where bytes[j..j+3] is the
++            // final three bytes of the string (j + 2 == len - 1).
++            if j + 2 == bytes.len()
++                && bytes[j] == b'_'
++                && bytes[j + 1] == b'A'
++                && bytes[j + 2] == letter
++            {
++                followups += 1;
++                j += 3;
++            }
++            if followups >= 2 {
++                // Emit first, then separator, then compressed run.
++                out.push('A');
++                out.push(letter as char);
++                out.push('_');
++                out.push('A');
++                out.push_str(&followups.to_string());
++                out.push(letter as char);
++                i = j;
++                continue;
++            }
++        }
++        out.push(bytes[i] as char);
++        i += 1;
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{compress_backref_runs, compress_consecutive};
++
++    #[test]
++    fn compresses_pairs() {
++        assert_eq!(compress_consecutive("SiSi"), "S2i");
++        assert_eq!(compress_consecutive("SdSd"), "S2d");
++        assert_eq!(compress_consecutive("SfSfSf"), "S3f");
++    }
++
++    #[test]
++    fn preserves_underscores_and_t() {
++        assert_eq!(compress_consecutive("SiSi_Sit"), "S2i_Sit");
++        assert_eq!(compress_consecutive("SiSi_SdSd"), "S2i_S2d");
++    }
++
++    #[test]
++    fn leaves_singletons_alone() {
++        assert_eq!(compress_consecutive("Si"), "Si");
++        assert_eq!(compress_consecutive("y"), "y");
++    }
++
++    #[test]
++    fn mixed_runs() {
++        assert_eq!(compress_consecutive("SiSdSd_Si"), "SiS2d_Si");
++    }
++
++    #[test]
++    fn does_not_compress_backrefs() {
++        // Back-refs like `AD` shouldn't get "compressed" by the
++        // stdlib-scalar compressor.
++        assert_eq!(compress_consecutive("AD_AD"), "AD_AD");
++    }
++
++    #[test]
++    fn backref_runs_compresses_triples() {
++        // Three identical back-refs: first standalone, then
++        // `_A2D` for the two follow-ups.
++        assert_eq!(compress_backref_runs("AD_AD_AD"), "AD_A2D");
++    }
++
++    #[test]
++    fn backref_runs_compresses_quads() {
++        // Four identical: matches Swift's
++        // `$s1B4intsys4Int8VAD_A3DtF` pattern (param tuple).
++        assert_eq!(compress_backref_runs("AD_AD_AD_AD"), "AD_A3D");
++    }
++
++    #[test]
++    fn backref_runs_leaves_pairs() {
++        // Two identical don't compress — `AD_A1D` and `AD_AD`
++        // are the same length, so no savings.
++        assert_eq!(compress_backref_runs("AD_AD"), "AD_AD");
++    }
++
++    #[test]
++    fn backref_runs_with_tuple_terminator() {
++        // Tuple form — `t` after the last element. The `t`
++        // stays untouched.
++        assert_eq!(compress_backref_runs("AD_AD_AD_ADt"), "AD_A3Dt");
++    }
++
++    #[test]
++    fn backref_runs_handles_different_letters() {
++        // AD then AE — different letters don't form a run.
++        assert_eq!(compress_backref_runs("AD_AE_AD"), "AD_AE_AD");
++    }
++
++    #[test]
++    fn backref_runs_ignores_non_backrefs() {
++        // Plain text without back-refs is unchanged.
++        assert_eq!(compress_backref_runs("s4Int8V"), "s4Int8V");
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

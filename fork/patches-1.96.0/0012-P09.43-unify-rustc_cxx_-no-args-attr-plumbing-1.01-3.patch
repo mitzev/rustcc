@@ -1,0 +1,189 @@
+From fa45940a78eef6be0e8aed7fe3ed3c9feb59cdb6 Mon Sep 17 00:00:00 2001
+From: mitzev <ogi@kunasystems.com>
+Date: Fri, 24 Apr 2026 21:48:34 +0300
+Subject: [PATCH 12/42] P09.43: unify rustc_cxx_* no-args attr plumbing (1.01
+ #3)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Collapses five fork-only `NoArgsAttributeParser` impls in
+codegen_attrs.rs into invocations of a new `rustcc_noargs_attr!`
+macro. Each `#[rustc_cxx_*]` / `#[cpp_virtual]` /
+`#[constructor]` attr only varies in its symbol path, target
+allow-list, and AttributeKind variant; the struct + impl shell
+was mechanical.
+
+Parsers collapsed:
+- RustcCxxCtorParser (constructor)
+- RustcCxxWrapperParser (rustc_cxx_wrapper)
+- RustcCxxDropWrapperParser (rustc_cxx_drop_wrapper)
+- RustcCxxVirtualParser (cpp_virtual)
+- RustcCxxBaseParser (rustc_cxx_base)
+
+Net: about 30 LOC down. No semantic change — `cargo check` +
+stage-1 build clean; the fork's five in-tree probes (basic,
+inheritance, type/const generics, swift_nonpod) all still pass.
+---
+ .../src/attributes/codegen_attrs.rs           | 143 ++++++++++--------
+ 1 file changed, 76 insertions(+), 67 deletions(-)
+
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+index c93e58d231e..dc972259202 100644
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -722,75 +722,84 @@ impl<S: Stage> NoArgsAttributeParser<S> for RustcPassIndirectlyInNonRusticAbisPa
+     const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcPassIndirectlyInNonRusticAbis;
+ }
+ 
+-/// P09 Tier 3: `#[rustc_cxx_ctor]` — marks a method on a
+-/// `#[repr(cpp)]` impl as a C++ constructor. Mangling routes
+-/// through `Symbol::Ctor` producing `_ZN<class>C1E<args>`.
+-pub(crate) struct RustcCxxCtorParser;
+-
+-impl<S: Stage> NoArgsAttributeParser<S> for RustcCxxCtorParser {
+-    const PATH: &[Symbol] = &[sym::constructor];
+-    // P09.22: also allow on `ForeignFn`. Lets `cxx_class!` and
+-    // hand-written `extern "C++" { #[rustc_cxx_ctor] fn new(...) -> Self; }`
+-    // share a single ctor-mangling path, retiring the macro's
+-    // sret trampoline + manual `#[link_name]`.
+-    const ALLOWED_TARGETS: AllowedTargets = AllowedTargets::AllowList(&[
+-        Allow(Target::Method(MethodKind::Inherent)),
+-        Allow(Target::ForeignFn),
+-    ]);
+-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcCxxCtor;
+-}
+-
+-/// P09.22: `#[rustc_cxx_wrapper]` — opts an inherent method on a
+-/// `#[repr(cpp)]` type out of P09.3's auto-export path. Used for
+-/// thin wrappers that forward to an `extern "C++"` decl of the
+-/// same method.
+-pub(crate) struct RustcCxxWrapperParser;
+-
+-impl<S: Stage> NoArgsAttributeParser<S> for RustcCxxWrapperParser {
+-    const PATH: &[Symbol] = &[sym::rustc_cxx_wrapper];
+-    const ALLOWED_TARGETS: AllowedTargets =
+-        AllowedTargets::AllowList(&[Allow(Target::Method(MethodKind::Inherent))]);
+-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcCxxWrapper;
+-}
+-
+-/// P09.23: `#[rustc_cxx_drop_wrapper]` — trait-impl analogue of
+-/// `#[rustc_cxx_wrapper]`. Applied to `Drop::drop` in an
+-/// `impl Drop for T` where `T` is `#[repr(cpp)]`, opts that method
+-/// out of P09.15's D0/D1/D2 auto-emission. Used by
+-/// `cxx_class_native!` when the C++ side already defines the
+-/// destructor and the Rust Drop body is a thin forwarder to an
+-/// `extern "C++"` decl.
+-pub(crate) struct RustcCxxDropWrapperParser;
+-
+-impl<S: Stage> NoArgsAttributeParser<S> for RustcCxxDropWrapperParser {
+-    const PATH: &[Symbol] = &[sym::rustc_cxx_drop_wrapper];
+-    const ALLOWED_TARGETS: AllowedTargets =
+-        AllowedTargets::AllowList(&[Allow(Target::Method(MethodKind::TraitImpl))]);
+-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcCxxDropWrapper;
+-}
+-
+-/// P09.24: `#[rustc_cxx_virtual]` — marks an inherent method on a
+-/// `#[repr(cpp)]` type as a virtual member function. Drives
+-/// vtable/typeinfo emission and ctor vptr init.
+-pub(crate) struct RustcCxxVirtualParser;
+-
+-impl<S: Stage> NoArgsAttributeParser<S> for RustcCxxVirtualParser {
+-    const PATH: &[Symbol] = &[sym::cpp_virtual];
+-    const ALLOWED_TARGETS: AllowedTargets =
+-        AllowedTargets::AllowList(&[Allow(Target::Method(MethodKind::Inherent))]);
+-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcCxxVirtual;
++// P09.43 (1.01 #3): compress the five fork-only no-args attribute
++// parsers into one declarative macro. Each `#[rustc_cxx_*]` attr
++// only varies in its symbol, target allow-list, and attribute-
++// kind variant; the struct + impl boilerplate is mechanical.
++macro_rules! rustcc_noargs_attr {
++    (
++        $parser:ident,
++        $sym:ident,
++        $kind:ident,
++        [$($target:expr),+ $(,)?]
++    ) => {
++        pub(crate) struct $parser;
++
++        impl<S: Stage> NoArgsAttributeParser<S> for $parser {
++            const PATH: &[Symbol] = &[sym::$sym];
++            const ALLOWED_TARGETS: AllowedTargets =
++                AllowedTargets::AllowList(&[$(Allow($target)),+]);
++            const CREATE: fn(Span) -> AttributeKind = AttributeKind::$kind;
++        }
++    };
+ }
+ 
+-/// P09.35: `#[rustc_cxx_base]` — marks a struct field as the
+-/// polymorphic base subobject of a derived class.
+-pub(crate) struct RustcCxxBaseParser;
+-
+-impl<S: Stage> NoArgsAttributeParser<S> for RustcCxxBaseParser {
+-    const PATH: &[Symbol] = &[sym::rustc_cxx_base];
+-    const ALLOWED_TARGETS: AllowedTargets =
+-        AllowedTargets::AllowList(&[Allow(Target::Field)]);
+-    const CREATE: fn(Span) -> AttributeKind = AttributeKind::RustcCxxBase;
+-}
++// `#[rustc_cxx_ctor]` / `#[constructor]` — P09 Tier 3. Marks a
++// method on a `#[repr(cpp)]` impl as a C++ constructor; routes
++// mangling through `Symbol::Ctor` → `_ZN<class>C1E<args>`. Also
++// allowed on `ForeignFn` (P09.22) so `cxx_class!` and hand-written
++// `extern "C++"` ctor decls share one mangling path.
++rustcc_noargs_attr!(
++    RustcCxxCtorParser,
++    constructor,
++    RustcCxxCtor,
++    [
++        Target::Method(MethodKind::Inherent),
++        Target::ForeignFn,
++    ]
++);
++
++// `#[rustc_cxx_wrapper]` (P09.22) — opts an inherent method on a
++// `#[repr(cpp)]` type out of P09.3's auto-export path. Used for
++// thin wrappers that forward to an `extern "C++"` decl of the
++// same method.
++rustcc_noargs_attr!(
++    RustcCxxWrapperParser,
++    rustc_cxx_wrapper,
++    RustcCxxWrapper,
++    [Target::Method(MethodKind::Inherent)]
++);
++
++// `#[rustc_cxx_drop_wrapper]` (P09.23) — trait-impl analogue of
++// `#[rustc_cxx_wrapper]`. Applied to `Drop::drop` in
++// `impl Drop for T` where `T` is `#[repr(cpp)]`, opting that
++// method out of P09.15's D0/D1/D2 auto-emission.
++rustcc_noargs_attr!(
++    RustcCxxDropWrapperParser,
++    rustc_cxx_drop_wrapper,
++    RustcCxxDropWrapper,
++    [Target::Method(MethodKind::TraitImpl)]
++);
++
++// `#[cpp_virtual]` (P09.24) — marks an inherent method on a
++// `#[repr(cpp)]` type as a virtual member function. Drives
++// vtable/typeinfo emission and ctor vptr init.
++rustcc_noargs_attr!(
++    RustcCxxVirtualParser,
++    cpp_virtual,
++    RustcCxxVirtual,
++    [Target::Method(MethodKind::Inherent)]
++);
++
++// `#[rustc_cxx_base]` (P09.35) — marks a struct field as the
++// polymorphic base subobject of a derived class. Set
++// automatically by the `class D : B` parser sugar.
++rustcc_noargs_attr!(
++    RustcCxxBaseParser,
++    rustc_cxx_base,
++    RustcCxxBase,
++    [Target::Field]
++);
+ 
+ /// P09.20: `#[rustc_cxx_operator = "Plus"]` — marks a method on
+ /// a `#[repr(cpp)]` impl as a C++ operator overload. The string
+-- 
+2.50.1 (Apple Git-155)
+

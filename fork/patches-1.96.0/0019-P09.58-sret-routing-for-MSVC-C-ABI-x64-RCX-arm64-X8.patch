@@ -1,0 +1,143 @@
+From d7b01362bebaf9d9ac163d37c9e2b35fd8ab678e Mon Sep 17 00:00:00 2001
+From: Ognian Mitzev <OgiMitzev@gmail.com>
+Date: Sat, 23 May 2026 00:52:28 +0300
+Subject: [PATCH 19/42] P09.58: sret routing for MSVC C++ ABI (x64 RCX, arm64
+ X8)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Previously `ExternAbi::Cpp { .. }` on Windows targets fell
+through to the bare Win64 C-path lowering, which doesn't apply
+the Itanium-style force-indirect override on non-trivial
+returns. The result was that an `#[repr(cpp)]` ADT return from
+an `extern "C++"` fn would come back in RAX while the C++
+caller wrote to RCX (or vice versa) — garbage.
+
+Two architectures, slightly different fix:
+
+**x86_64-pc-windows-msvc**: new `x86_64::compute_cxx_abi_info_msvc`
+mirrors the existing Itanium function but starts from
+`x86_win64::compute_abi_info` rather than the SysV C path. Same
+force-indirect override on non-trivial-for-calls returns and
+plain ADT returns. The lower x86_win64 layer routes the
+implicit sret pointer to RCX with `this`/args shifting one slot
+right.
+
+**aarch64-pc-windows-msvc**: removes the
+`!is_like_windows` guard from the existing
+`compute_cxx_abi_info` dispatcher. Inside that function,
+`kind == AbiKind::Win64` already triggers the ARM64 Win64
+lowering which routes sret to X8 (ARM64's dedicated sret
+register, distinct from the regular argument stream). Apply
+the same force-indirect overlay on top.
+
+After this patch:
+- `extern "C++"` fn returning Vec<int> on x64-msvc: sret in RCX.
+- `extern "C++"` fn returning Vec<int> on arm64-msvc: sret in X8.
+- Itanium targets: behavior unchanged (the Itanium overlay still
+  runs via the same code path, branching on the cv-flavor before
+  the force-indirect block).
+
+Validated with `./x.py check --stage 1 compiler/rustc_target` —
+full type-check passes.
+
+This is the combined 19 + 19b patch from fork/MSVC-PATCHES.md.
+ARM64 HFA detection (19c) is deferred to a follow-up; the
+sret-via-X8 path covers the most common record-return case.
+---
+ compiler/rustc_target/src/callconv/mod.rs    | 27 ++++++++++++-----
+ compiler/rustc_target/src/callconv/x86_64.rs | 31 ++++++++++++++++++++
+ 2 files changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/compiler/rustc_target/src/callconv/mod.rs b/compiler/rustc_target/src/callconv/mod.rs
+index d41526d2a81..2f7d9600b0a 100644
+--- a/compiler/rustc_target/src/callconv/mod.rs
++++ b/compiler/rustc_target/src/callconv/mod.rs
+@@ -709,10 +709,21 @@ pub fn adjust_for_foreign_abi<C>(&mut self, cx: &C, abi: ExternAbi)
+                 // plus Itanium-specific overrides (sret for non-
+                 // trivial-for-calls returns, caller-destroys for
+                 // non-trivial params).
++                //
++                // P09.58: MSVC targets now route to a parallel
++                // `compute_cxx_abi_info_msvc` that applies the
++                // same force-indirect rules on top of the Win64
++                // C-path lowering. Lower layers take care of
++                // routing the implicit sret pointer to RCX (vs
++                // Itanium's RDI).
+                 ExternAbi::Cpp { .. } => {
+-                    if cx.target_spec().is_like_windows {
+-                        // MSVC ABI is a separate animal — out of
+-                        // scope for the Itanium fork.
++                    if cx.target_spec().is_like_msvc {
++                        x86_64::compute_cxx_abi_info_msvc(cx, self)
++                    } else if cx.target_spec().is_like_windows {
++                        // mingw-w64: Itanium ABI in Win64 dress.
++                        // Use the Win64 C lowering for now;
++                        // refining mingw-specific quirks is
++                        // future work.
+                         x86_win64::compute_abi_info(cx, self)
+                     } else {
+                         x86_64::compute_cxx_abi_info(cx, self)
+@@ -741,10 +752,12 @@ pub fn adjust_for_foreign_abi<C>(&mut self, cx: &C, abi: ExternAbi)
+                     aarch64::AbiKind::AAPCS
+                 };
+                 // P09.6: Itanium overlay for non-Windows aarch64.
+-                // Windows arm64 uses the MSVC ABI — out of scope
+-                // for the Itanium fork (matches the x86_64
+-                // stance).
+-                if matches!(abi, ExternAbi::Cpp { .. }) && !cx.target_spec().is_like_windows {
++                // P09.58: extended to Windows ARM64 too — the
++                // `kind == Win64` path inside `compute_cxx_abi_info`
++                // already lowers via the Win64 layer that routes
++                // sret to X8 (ARM64's dedicated sret register),
++                // so the same force-indirect override applies.
++                if matches!(abi, ExternAbi::Cpp { .. }) {
+                     aarch64::compute_cxx_abi_info(cx, self, kind)
+                 } else {
+                     aarch64::compute_abi_info(cx, self, kind)
+diff --git a/compiler/rustc_target/src/callconv/x86_64.rs b/compiler/rustc_target/src/callconv/x86_64.rs
+index 1e423568715..5cf5a943187 100644
+--- a/compiler/rustc_target/src/callconv/x86_64.rs
++++ b/compiler/rustc_target/src/callconv/x86_64.rs
+@@ -320,6 +320,37 @@ pub(crate) fn compute_swift_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, T
+     }
+ }
+ 
++/// P09.58: MSVC C++ ABI variant of `compute_cxx_abi_info`. Same
++/// sret-promotion rule as Itanium (non-trivial-for-calls returns
++/// + plain ADT returns go indirect), but starts from the
++/// x86_win64 C-path lowering so the lower layers route the
++/// implicit pointer to RCX (with `this`/args shifting one slot
++/// right) instead of Itanium's RDI.
++pub(crate) fn compute_cxx_abi_info_msvc<'a, Ty, C>(
++    cx: &C,
++    fn_abi: &mut FnAbi<'a, Ty>,
++) where
++    Ty: TyAbiInterface<'a, C> + Copy,
++    C: HasDataLayout + HasTargetSpec,
++{
++    super::x86_win64::compute_abi_info(cx, fn_abi);
++
++    if !fn_abi.ret.is_ignore()
++        && (fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
++            || fn_abi.ret.layout.is_adt())
++    {
++        fn_abi.ret.force_indirect();
++    }
++    for arg in fn_abi.args.iter_mut() {
++        if arg.is_ignore() {
++            continue;
++        }
++        if arg.layout.is_cxx_non_trivial_for_calls(cx) {
++            arg.force_indirect();
++        }
++    }
++}
++
+ pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
+ where
+     Ty: TyAbiInterface<'a, C> + Copy,
+-- 
+2.50.1 (Apple Git-155)
+

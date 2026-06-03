@@ -1,0 +1,149 @@
+From 3b88f6ad7c1c25f5e6e9b9d46d759ae5ee56e064 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Wed, 3 Jun 2026 15:04:03 +0300
+Subject: [PATCH 42/42] =?UTF-8?q?rustcc:=20rebase=20onto=20Rust=201.96.0?=
+ =?UTF-8?q?=20=E2=80=94=20API-drift=20fixes?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Build-time fixes adapting the fork to 1.96.0 internals (the fork was
+authored against 1.97-dev master). Conflict resolutions for the
+attribute table (2-arg rustc_attr! shim), ty_utils/abi.rs (FnSig fields)
+and check_attr.rs are folded into their originating patches; this commit
+carries the remaining drift fixes:
+
+- rustc_attr_parsing codegen_attrs.rs: `rustcc_noargs_attr!` adds
+  `ON_DUPLICATE = OnDuplicate::Error` (1.96.0's NoArgsAttributeParser
+  requires it; defaulted away after 1.96).
+- rustc_symbol_mangling itanium.rs/swift.rs: `FnSig::abi`/`c_variadic`
+  are fields in 1.96.0 (method-call forms are 1.97-isms).
+- rustc_codegen_ssa mir/block.rs: `mk_fn_sig` is 5-arg and `FnSig`
+  exposes c_variadic/safety/abi fields (1.97 bundled them into
+  `fn_sig_kind` + a 3-arg ctor).
+- rustc_mir_transform cxx_throws_wrap.rs: resolve the `From` trait via
+  `get_diagnostic_item(sym::From)` (it's a diagnostic item in 1.96.0;
+  became `LangItem::From` later); drop the now-unused LangItem import.
+
+Validated: stage1 builds, all 9 fork probes pass, and
+examples/subclass_cpp_base (subclass + virtual destructor) runs green
+on the 1.96.0 toolchain.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ .../rustc_attr_parsing/src/attributes/codegen_attrs.rs   | 5 +++++
+ compiler/rustc_codegen_ssa/src/mir/block.rs              | 9 ++++++++-
+ compiler/rustc_mir_transform/src/cxx_throws_wrap.rs      | 7 ++++---
+ compiler/rustc_symbol_mangling/src/itanium.rs            | 6 +++---
+ compiler/rustc_symbol_mangling/src/swift.rs              | 2 +-
+ 5 files changed, 21 insertions(+), 8 deletions(-)
+
+diff --git a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+index ff56eaa612b..ea773c6bb94 100644
+--- a/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
++++ b/compiler/rustc_attr_parsing/src/attributes/codegen_attrs.rs
+@@ -737,6 +737,11 @@ macro_rules! rustcc_noargs_attr {
+ 
+         impl<S: Stage> NoArgsAttributeParser<S> for $parser {
+             const PATH: &[Symbol] = &[sym::$sym];
++            // 1.96.0: `NoArgsAttributeParser` requires `ON_DUPLICATE`
++            // (defaulted away after 1.96). These internal fork attrs are
++            // single-use markers; error on a duplicate, like other
++            // no-args parsers.
++            const ON_DUPLICATE: OnDuplicate<S> = OnDuplicate::Error;
+             const ALLOWED_TARGETS: AllowedTargets =
+                 AllowedTargets::AllowList(&[$(Allow($target)),+]);
+             const CREATE: fn(Span) -> AttributeKind = AttributeKind::$kind;
+diff --git a/compiler/rustc_codegen_ssa/src/mir/block.rs b/compiler/rustc_codegen_ssa/src/mir/block.rs
+index 8f84e5adc9a..4d3b05ce0fc 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/block.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/block.rs
+@@ -1249,10 +1249,17 @@ fn codegen_call_terminator(
+             let original_ret_ty = self.monomorphize(sig.output().skip_binder());
+             if bridged_ret_ty != original_ret_ty {
+                 let sig_inner = sig.skip_binder();
++                // 1.96.0: `mk_fn_sig` is 5-arg and `FnSig` exposes
++                // `c_variadic`/`safety`/`abi` as fields (1.97 bundled
++                // them into `fn_sig_kind` + a 3-arg ctor). Preserve the
++                // original sig's variadic/safety/abi, only swapping the
++                // (Result-unwrapped) return type.
+                 let new_sig_inner = bx.tcx().mk_fn_sig(
+                     sig_inner.inputs().iter().copied(),
+                     bridged_ret_ty,
+-                    sig_inner.fn_sig_kind,
++                    sig_inner.c_variadic,
++                    sig_inner.safety,
++                    sig_inner.abi,
+                 );
+                 let bridged_sig = sig.rebind(new_sig_inner);
+                 let bridged = bx.fn_abi_of_fn_ptr(bridged_sig, extra_args);
+diff --git a/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs b/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+index 3306bb60fe1..fb5b4aaa673 100644
+--- a/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
++++ b/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+@@ -43,7 +43,6 @@
+ //!    then branches to bb_err_wrap. The MIR-level conversion
+ //!    (if any) runs as regular code thereafter.
+ 
+-use rustc_hir::LangItem;
+ use rustc_index::IndexVec;
+ use rustc_middle::mir::*;
+ use rustc_middle::ty::{self, Ty, TyCtxt};
+@@ -405,8 +404,10 @@ fn resolve_from_cxx_raw_error_impl<'tcx>(
+     err_ty: Ty<'tcx>,
+     raw_err_ty: Ty<'tcx>,
+ ) -> Option<ty::Instance<'tcx>> {
+-    // Build the trait ref `E: From<CxxRawError>`.
+-    let from_trait_did = tcx.lang_items().get(LangItem::From)?;
++    // Build the trait ref `E: From<CxxRawError>`. On 1.96.0 `From` is a
++    // diagnostic item (it became a lang item later), so resolve it that
++    // way rather than via `LangItem::From`.
++    let from_trait_did = tcx.get_diagnostic_item(sym::From)?;
+     let trait_ref = ty::TraitRef::new(tcx, from_trait_did, [err_ty, raw_err_ty]);
+ 
+     // Select the impl.
+diff --git a/compiler/rustc_symbol_mangling/src/itanium.rs b/compiler/rustc_symbol_mangling/src/itanium.rs
+index 81f9a82744a..fa56e8ab730 100644
+--- a/compiler/rustc_symbol_mangling/src/itanium.rs
++++ b/compiler/rustc_symbol_mangling/src/itanium.rs
+@@ -606,7 +606,7 @@ pub(crate) fn is_cpp_abi<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+         return false;
+     }
+     let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
+-    if matches!(sig.abi(), ExternAbi::Cpp { .. }) {
++    if matches!(sig.abi, ExternAbi::Cpp { .. }) {
+         return true;
+     }
+     if cxx_impl_class(tcx, def_id).is_some() {
+@@ -757,13 +757,13 @@ pub(crate) fn mangle<'tcx>(
+         ret,
+         cv,
+         ref_q: None,
+-        variadic: fn_sig.c_variadic(),
++        variadic: fn_sig.c_variadic,
+         // `extern "C++"` without `-unwind` is `noexcept`; with it,
+         // not. For inferred methods the fn sig carries Rust ABI,
+         // so fall through to `false` — linkage-wise this is a
+         // don't-care (Itanium doesn't encode noexcept for regular
+         // free/member function symbols).
+-        noexcept: matches!(fn_sig.abi(), ExternAbi::Cpp { unwind: false }),
++        noexcept: matches!(fn_sig.abi, ExternAbi::Cpp { unwind: false }),
+     };
+ 
+     let sym = if let Some(class_did) = class_adt {
+diff --git a/compiler/rustc_symbol_mangling/src/swift.rs b/compiler/rustc_symbol_mangling/src/swift.rs
+index b51f01cd3d6..b241e5e93c6 100644
+--- a/compiler/rustc_symbol_mangling/src/swift.rs
++++ b/compiler/rustc_symbol_mangling/src/swift.rs
+@@ -68,7 +68,7 @@ pub(crate) fn is_swift_abi<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> bool {
+         return false;
+     }
+     let sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
+-    matches!(sig.abi(), ExternAbi::Swift { .. })
++    matches!(sig.abi, ExternAbi::Swift { .. })
+         && swift_module_name(tcx, def_id).is_some()
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,88 @@
+From d64fc1e137d4543ce5682d419816a81abc53ad86 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 10:05:07 +0300
+Subject: [PATCH 22/42] P09.61: fn_can_unwind respects CXX_THROWS (1.13 throws
+ Phase 1A)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+First codegen-side patch in the Phase 1 throws series. Makes
+functions marked `#[rustc_cxx_throws]` (P09.60) appear as
+can-unwind regardless of the declared ABI's `unwind` field,
+which forces call sites in `rustc_codegen_ssa::mir::block` to
+take the `invoke`-with-landingpad path instead of a direct
+`call`.
+
+The attribute is gated at the parser level (P09.60) to
+`extern "C++"` foreign-fn decls, so this only fires on
+cross-language catch boundaries — never on Rust-defined
+functions. Specifically, the check returns true BEFORE the
+panic-strategy and ABI checks below, so `-C panic=abort`
+doesn't suppress the unwind path on CXX_THROWS callees.
+
+What this patch alone does NOT do (queued):
+
+- **P09.62**: Replace the default cleanup landingpad with a
+  custom catch landingpad that calls the v1.12.5 runtime
+  helper `cxx::native_invoke::__rustcc_cxx_catch_unknown`
+  to convert the caught C++ exception into a `CxxRawError`.
+  Without P09.62 the existing cleanup landingpad re-raises
+  through `rust_eh_personality`, which propagates the
+  exception further up — useful as a stepping stone but not
+  yet "catch + return Err".
+- **P09.63**: MIR-level return-type rewriting so the
+  caller's Rust source sees `Result<T, CxxException>` instead
+  of `T`. Today the bindings emitter does this rewriting at
+  the source level via the Phase 0 shim wrapper — Phase 1
+  moves it to the codegen layer.
+
+Patch scope: one file, 14 added lines. Self-contained.
+
+Validation: I can't bootstrap fork rustc end-to-end in this
+chunk, but the diff structure mirrors P09.48's
+`rustc_swift_throws` plumbing (also a CodegenFnAttrFlags
+check inside fn_can_unwind's prelude), which has shipped
+across 4 release cycles. Bootstrap validation lands in
+v1.13.1 alongside P09.62.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ compiler/rustc_middle/src/ty/layout.rs | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/compiler/rustc_middle/src/ty/layout.rs b/compiler/rustc_middle/src/ty/layout.rs
+index 8ac65ea4b56..be234d7c018 100644
+--- a/compiler/rustc_middle/src/ty/layout.rs
++++ b/compiler/rustc_middle/src/ty/layout.rs
+@@ -1257,6 +1257,27 @@ pub fn fn_can_unwind(tcx: TyCtxt<'_>, fn_def_id: Option<DefId>, abi: ExternAbi)
+             return false;
+         }
+ 
++        // P09.61 / 1.13 throws Phase 1: functions marked
++        // `#[rustc_cxx_throws]` ALWAYS unwind regardless of the
++        // declared ABI's `unwind` field. The attribute is
++        // restricted by P09.60 to `extern "C++"` foreign-fn
++        // decls, so this only fires on cross-language catch
++        // boundaries — never on Rust-defined functions.
++        //
++        // This forces call sites of CXX_THROWS callees into the
++        // `invoke`-with-landingpad codegen path even when the
++        // user wrote plain `extern "C++"` (not
++        // `extern "C++-unwind"`). The synthesized landingpad
++        // then converts the caught C++ exception into a
++        // `Result::Err(CxxException)` via the Phase 1 runtime
++        // helper (`cxx::native_invoke::__rustcc_cxx_catch_unknown`),
++        // matching the Rust-source-visible return type the
++        // bindings emitter produced — see P09.62 (custom catch
++        // landingpad) and P09.63 (MIR return-type rewriting).
++        if tcx.codegen_fn_attrs(did).flags.contains(CodegenFnAttrFlags::CXX_THROWS) {
++            return true;
++        }
++
+         // With `-C panic=abort`, all non-FFI functions are required to not unwind.
+         //
+         // Note that this is true regardless ABI specified on the function -- a `extern "C-unwind"`
+-- 
+2.50.1 (Apple Git-155)
+

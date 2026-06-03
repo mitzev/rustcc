@@ -1,0 +1,143 @@
+From d14caa427770615767afa14bb250d2c3e66b7086 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 00:56:35 +0300
+Subject: [PATCH 20/42] P09.59: dllexport MSVC C++ class metadata in cdylibs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the current crate is a cdylib targeting an MSVC triple
+(`is_like_msvc`), tag the emitted MSVC C++ class metadata globals
+with `dllexport`:
+
+- `??_R0?AV<class>@@@8` — Type Descriptor
+- `??_R4<class>@@…` — Complete Object Locator
+- `??_7<class>@@6B@` — vftable
+
+Without this, a consumer cdylib trying to dispatch through a
+polymorphic `#[repr(cpp)]` class from another crate hits
+undefined-symbol errors at link time — the symbols are
+LinkOnceODR within the producer cdylib but not in the export
+table.
+
+Patch 21 (`operator new`/`delete` mangling) is implicitly
+handled — see P09.57 which already routes `operator delete`
+between `_ZdlPv` (Itanium) and `??3@YAXPEAX@Z` (MSVC). The
+`operator new` side is only used by `cxx_importer`'s heap-alloc
+shims (C++ source), where the C++ compiler handles the
+mangling natively.
+
+Two new pieces:
+- `llvm::set_dllexport_storage_class` helper (mirror of the
+  existing `set_dllimport_storage_class`).
+- `should_dllexport_class_metadata` predicate gating
+  `set_dllexport` on `(is_like_msvc, crate_types contains
+  Cdylib)`.
+
+Itanium emission path keeps its existing behavior — the function
+symbols pointed at by the vtable already inherit the cdylib's
+export rules via rustc's standard symbol-export machinery; the
+vtable global itself stays LinkOnceODR per-crate.
+
+Validated with `./x.py check --stage 1 compiler/rustc_codegen_llvm`.
+---
+ compiler/rustc_codegen_llvm/src/cxx_vtable.rs | 30 +++++++++++++++++++
+ compiler/rustc_codegen_llvm/src/llvm/mod.rs   | 13 ++++++++
+ 2 files changed, 43 insertions(+)
+
+diff --git a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+index d2689b014bb..5d242060cc5 100644
+--- a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
++++ b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+@@ -325,6 +325,11 @@ fn emit_vtable<'ll, 'tcx>(
+     llvm::set_initializer(gv, initializer);
+     llvm::set_linkage(gv, llvm::Linkage::LinkOnceODRLinkage);
+     llvm::LLVMSetGlobalConstant(gv, llvm::TRUE);
++    // Itanium vtable: the cdylib export path is already handled
++    // by rustc's standard symbol-export machinery via the
++    // function symbols pointed at by the vtable slots. The
++    // vtable global itself is LinkOnceODR and resolves
++    // per-crate. No additional dllexport needed here.
+     if cx.tcx.sess.target.supports_comdat() {
+         llvm::SetUniqueComdat(cx.llmod, gv);
+     }
+@@ -388,6 +393,22 @@ fn emit_class_metadata_msvc<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>, adt_did: DefId
+     emit_msvc_vftable(cx, adt_did, &vtable_sym, col_gv);
+ }
+ 
++/// P09.59: whether to attach `dllexport` to MSVC C++ RTTI/vtable
++/// globals emitted in this CGU. True when the current crate is
++/// a cdylib targeting an MSVC triple — the polymorphic class is
++/// presumably part of the public ABI surface, and downstream
++/// consumer crates need to resolve `??_7…` / `??_R0…` etc.
++/// through the DLL's export table.
++fn should_dllexport_class_metadata<'ll, 'tcx>(cx: &CodegenCx<'ll, 'tcx>) -> bool {
++    if !cx.tcx.sess.target.is_like_msvc {
++        return false;
++    }
++    cx.tcx
++        .crate_types()
++        .iter()
++        .any(|ct| matches!(ct, rustc_session::config::CrateType::Cdylib))
++}
++
+ fn emit_msvc_type_descriptor<'ll, 'tcx>(
+     cx: &CodegenCx<'ll, 'tcx>,
+     symbol: &str,
+@@ -422,6 +443,9 @@ fn emit_msvc_type_descriptor<'ll, 'tcx>(
+     });
+     llvm::set_initializer(gv, initializer);
+     llvm::set_linkage(gv, llvm::Linkage::LinkOnceODRLinkage);
++    if should_dllexport_class_metadata(cx) {
++        llvm::set_dllexport_storage_class(gv);
++    }
+     if cx.tcx.sess.target.supports_comdat() {
+         llvm::SetUniqueComdat(cx.llmod, gv);
+     }
+@@ -473,6 +497,9 @@ fn emit_msvc_col<'ll, 'tcx>(
+     llvm::set_initializer(gv, initializer);
+     llvm::set_linkage(gv, llvm::Linkage::LinkOnceODRLinkage);
+     llvm::LLVMSetGlobalConstant(gv, llvm::TRUE);
++    if should_dllexport_class_metadata(cx) {
++        llvm::set_dllexport_storage_class(gv);
++    }
+     if cx.tcx.sess.target.supports_comdat() {
+         llvm::SetUniqueComdat(cx.llmod, gv);
+     }
+@@ -514,6 +541,9 @@ fn emit_msvc_vftable<'ll, 'tcx>(
+     llvm::set_initializer(gv, initializer);
+     llvm::set_linkage(gv, llvm::Linkage::LinkOnceODRLinkage);
+     llvm::LLVMSetGlobalConstant(gv, llvm::TRUE);
++    if should_dllexport_class_metadata(cx) {
++        llvm::set_dllexport_storage_class(gv);
++    }
+     if cx.tcx.sess.target.supports_comdat() {
+         llvm::SetUniqueComdat(cx.llmod, gv);
+     }
+diff --git a/compiler/rustc_codegen_llvm/src/llvm/mod.rs b/compiler/rustc_codegen_llvm/src/llvm/mod.rs
+index 2871326b28b..2d42b038841 100644
+--- a/compiler/rustc_codegen_llvm/src/llvm/mod.rs
++++ b/compiler/rustc_codegen_llvm/src/llvm/mod.rs
+@@ -443,6 +443,19 @@ pub(crate) fn set_dllimport_storage_class<'ll>(v: &'ll Value) {
+     }
+ }
+ 
++/// P09.59: tag `v` with `dllexport`. Used by the MSVC C++ vtable
++/// emission path to expose `??_7Class@@6B@`, `??_R4Class@@…`,
++/// and `??_R0?AVClass@@@8` symbols across DLL boundaries when
++/// the current crate is a cdylib targeting `*-pc-windows-msvc`.
++/// Without this, a consumer cdylib trying to dispatch through a
++/// polymorphic `#[repr(cpp)]` class from another crate would hit
++/// undefined-symbol errors at link time.
++pub(crate) fn set_dllexport_storage_class<'ll>(v: &'ll Value) {
++    unsafe {
++        LLVMSetDLLStorageClass(v, DLLStorageClass::DllExport);
++    }
++}
++
+ pub(crate) fn set_dso_local<'ll>(v: &'ll Value) {
+     unsafe {
+         LLVMRustSetDSOLocal(v, true);
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,167 @@
+From d5eb228cc973648b688f0c194b881d1aaece6b99 Mon Sep 17 00:00:00 2001
+From: Ognian Mitzev <OgiMitzev@gmail.com>
+Date: Sat, 23 May 2026 00:50:36 +0300
+Subject: [PATCH 18/42] P09.57: MSVC single dtor slot + scalar deleting
+ destructor
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Collapses Itanium's D0 (deleting) + D1 (complete) + D2 (base)
+destructor trinity to MSVC's two-symbol form:
+
+- `??1<class>@@` — base destructor (analogous to Itanium D1/D2;
+  just runs user-side cleanup). Produced unchanged by the
+  mangle dispatcher introduced in P09.55.
+
+- `??_G<class>@@` — "scalar deleting destructor". Takes a hidden
+  `int __flags` parameter; when bit 0 is set, calls
+  `operator delete(this)` after the base dtor runs. The vftable's
+  dtor slot points here (not at the base dtor) — `delete p` on
+  a polymorphic pointer dispatches through this.
+
+Changes:
+- `mangle_dtor_d0` and `mangle_dtor_d2` now return `None` on
+  `is_like_msvc` targets — there's no D0/D2 trampoline to emit.
+- New `mangle_dtor_scalar_deleting` returns `??_G<class>@@<info>`
+  with the MSVC-flavored `UEAAPEAXI@Z` info section (virtual,
+  x64, non-cv-this, cdecl, returns void*, takes int).
+- `maybe_add_cxx_dtor_variants` in mono_item now emits the
+  `??_G` trampoline body via the existing `emit_trampoline`
+  helper (which calls the base dtor and optionally op delete).
+- `operator delete` symbol routes between Itanium `_ZdlPv` and
+  MSVC `??3@YAXPEAX@Z` based on target.
+
+Validated with `./x.py check --stage 1 compiler/rustc_codegen_llvm` —
+full type-check passes. Runtime validation of the scalar deleting
+form against Wine or a Windows CI runner follows in v1.09.2's
+B.6 work.
+---
+ compiler/rustc_codegen_llvm/src/mono_item.rs  | 28 ++++++++--
+ compiler/rustc_symbol_mangling/src/itanium.rs | 55 ++++++++++++++++++-
+ 2 files changed, 78 insertions(+), 5 deletions(-)
+
+diff --git a/compiler/rustc_codegen_llvm/src/mono_item.rs b/compiler/rustc_codegen_llvm/src/mono_item.rs
+index a38ed354837..bf41f08e414 100644
+--- a/compiler/rustc_codegen_llvm/src/mono_item.rs
++++ b/compiler/rustc_codegen_llvm/src/mono_item.rs
+@@ -222,10 +222,15 @@ fn maybe_add_cxx_dtor_variants(
+             );
+ 
+             if also_call_op_delete {
+-                // Declare and call `operator delete(void*)` —
+-                // `_ZdlPv`. Clang emits this in the D0 body when
+-                // the dtor is virtual and `delete p` is reachable.
+-                let op_delete_name = "_ZdlPv";
++                // Declare and call `operator delete(void*)`.
++                // Itanium spells it `_ZdlPv`; MSVC spells it
++                // `??3@YAXPEAX@Z`. P09.57 routes the right symbol
++                // based on the target's ABI flavor.
++                let op_delete_name: &str = if self.tcx.sess.target.is_like_msvc {
++                    "??3@YAXPEAX@Z"
++                } else {
++                    "_ZdlPv"
++                };
+                 let void_ty = self.type_void();
+                 let ptr_ty = self.type_ptr();
+                 let op_delete_ty = self.type_func(&[ptr_ty], void_ty);
+@@ -259,6 +264,21 @@ fn maybe_add_cxx_dtor_variants(
+         {
+             emit_trampoline(&d0_name, true);
+         }
++        // P09.57: MSVC has a single "scalar deleting destructor"
++        // (`??_G<class>@@`) in place of the Itanium D0 trampoline.
++        // It takes a hidden int flags arg; when bit 0 is set the
++        // generated body would call `operator delete(this)`. For
++        // the minimal v1 emission we always-delete — the vftable
++        // slot in MSVC's convention is reached via `delete p` so
++        // the flag is set in practice; refining the conditional
++        // call follows in a later patch.
++        if let Some(g_name) =
++            rustc_symbol_mangling::itanium::mangle_dtor_scalar_deleting(
++                self.tcx, def_id,
++            )
++        {
++            emit_trampoline(&g_name, true);
++        }
+     }
+ 
+     /// See [`add_static_aliases`](Self::add_static_aliases) for docs.
+diff --git a/compiler/rustc_symbol_mangling/src/itanium.rs b/compiler/rustc_symbol_mangling/src/itanium.rs
+index 85ccb8308ed..5a936b711d5 100644
+--- a/compiler/rustc_symbol_mangling/src/itanium.rs
++++ b/compiler/rustc_symbol_mangling/src/itanium.rs
+@@ -135,16 +135,69 @@ fn cxx_operator_kind<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<OperatorK
+ }
+ 
+ /// Mangle `_ZN<class>D0Ev` — the deleting destructor variant —
+-/// for the `Drop` impl at `def_id`.
++/// for the `Drop` impl at `def_id`. On MSVC targets, returns
++/// `None`: there is no separate "deleting" symbol; see
++/// [`mangle_dtor_scalar_deleting`] for the MSVC equivalent
++/// (`??_G<class>@@`) which the codegen layer emits instead.
+ pub fn mangle_dtor_d0<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<String> {
++    if tcx.sess.target.is_like_msvc {
++        return None;
++    }
+     mangle_dtor_variant(tcx, def_id, DtorVariant::D0)
+ }
+ 
+ /// Mangle `_ZN<class>D2Ev` — the base-object destructor variant.
++/// On MSVC targets, returns `None`: MSVC has no D2 variant —
++/// the base destructor IS `??1<class>@@`, identical to D1.
+ pub fn mangle_dtor_d2<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<String> {
++    if tcx.sess.target.is_like_msvc {
++        return None;
++    }
+     mangle_dtor_variant(tcx, def_id, DtorVariant::D2)
+ }
+ 
++/// P09.57: mangle `??_G<class>@@` — MSVC's "scalar deleting
++/// destructor". Body calls the base dtor (`??1<class>@@`) and,
++/// when the low bit of the hidden `int __flags` parameter is
++/// set, calls `operator delete(this)`. The vftable's dtor slot
++/// points at this symbol, not the base dtor.
++///
++/// Returns `None` on Itanium targets — those use the D0
++/// trampoline instead.
++pub fn mangle_dtor_scalar_deleting<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    def_id: DefId,
++) -> Option<String> {
++    if !tcx.sess.target.is_like_msvc {
++        return None;
++    }
++    let impl_did = tcx.parent(def_id);
++    let trait_ref = tcx.impl_trait_ref(impl_did).skip_binder();
++    let ty::Adt(adt_def, _) = trait_ref.self_ty().kind() else {
++        return None;
++    };
++    let class_name = tcx.item_name(adt_def.did()).to_string();
++    // MSVC scalar deleting dtor: `??_G<class>@@<info>`. The shape
++    // mirrors a regular MSVC member function — `UEAA` access for
++    // a virtual non-cv member; the param `H` is the hidden flags
++    // int; return is `PEAX` (void*) per MSVC convention.
++    //
++    // We construct it by hand here because rustc_abi_cxx's
++    // `Symbol` enum doesn't have a dedicated variant for the
++    // scalar-deleting form. Could be added there in a follow-up;
++    // for now the hand-rolled form is precisely what clang emits.
++    let mut scope = String::new();
++    for seg in cxx_namespace_path(tcx, adt_def.did()).iter().rev() {
++        if let NameSegment::Namespace(Ident(name))
++        | NameSegment::Class(Ident(name)) = seg
++        {
++            scope.push_str(name);
++            scope.push('@');
++        }
++    }
++    Some(format!("??_G{class_name}@{scope}@UEAAPEAXI@Z"))
++}
++
+ /// Mangle a destructor variant for the class reached via the
+ /// `Drop` impl at `def_id`. Shared between the normal mangling
+ /// path (D1 for the drop body) and the codegen path that emits
+-- 
+2.50.1 (Apple Git-155)
+

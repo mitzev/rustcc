@@ -1,0 +1,186 @@
+From 99efff2960d13b5be65e373d446259923d79f7c2 Mon Sep 17 00:00:00 2001
+From: test <test@local>
+Date: Sat, 23 May 2026 10:55:36 +0300
+Subject: [PATCH 26/42] P09.65a: MIR-pass scaffold for cxx_throws Result
+ wrapping (Phase 1E)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Fifth codegen patch in the Phase 1 series. Lands the MIR
+transform pass that will eventually rewrite Call terminators
+targeting #[rustc_cxx_throws] callees to wrap the call's
+return in `Result<T, E>` (per Strategy 2A from
+`fork/CXX-THROW-P09.65-DESIGN.md`).
+
+This patch is the **scaffold** — the pass identifies the right
+Call terminators but performs no rewriting yet. The actual
+Place rewriting + Ok/Err wrapper BB synthesis ships in P09.65b
+once this scaffold's registration plumbing is bootstrap-
+validated.
+
+Why the split:
+- Registering a new MIR pass touches `lib.rs`'s `declare_passes!`
+  + the optimization pipeline order. Both can fail at
+  bootstrap if wiring is wrong.
+- Iterating the actual MIR manipulation against a known-good
+  registration is much faster than iterating both at once.
+
+P09.65a delivers:
+- New file `compiler/rustc_mir_transform/src/cxx_throws_wrap.rs`
+  with the `CxxThrowsWrap` pass type + scan logic that picks
+  out `CodegenFnAttrFlags::CXX_THROWS` Call terminators.
+- `mod cxx_throws_wrap : CxxThrowsWrap;` in `lib.rs`'s
+  `declare_passes!` block.
+- Pass scheduled in the optimization pipeline immediately after
+  `AbortUnwindingCalls` (which is the natural neighbor — same
+  conceptual layer: cross-language exception flow rewriting).
+- `is_required` returns true so the pass runs unconditionally.
+
+Validation:
+- Compiles clean on stage-1 rustc (10s incremental rebuild).
+- One iteration needed to add the missing `is_required` method
+  required by the `MirPass` trait.
+
+Next: P09.65b adds the actual MIR manipulation — allocate
+`Result<T, E>` local, rewrite Call destination to Ok payload
+offset, synthesize Ok/Err wrapper BBs.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../src/cxx_throws_wrap.rs                    | 98 +++++++++++++++++++
+ compiler/rustc_mir_transform/src/lib.rs       |  6 ++
+ 2 files changed, 104 insertions(+)
+ create mode 100644 compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+
+diff --git a/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs b/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+new file mode 100644
+index 00000000000..767e14e8d7f
+--- /dev/null
++++ b/compiler/rustc_mir_transform/src/cxx_throws_wrap.rs
+@@ -0,0 +1,98 @@
++//! P09.65 / 1.13 throws Phase 1E: MIR-level Result wrapping for
++//! `#[rustc_cxx_throws]` calls.
++//!
++//! User writes:
++//!
++//! ```rust,ignore
++//! extern "C++" {
++//!     #[rustc_cxx_throws]
++//!     fn foo(x: i32) -> Result<*mut Bar, ::cxx::CxxRawError>;
++//! }
++//!
++//! let r: Result<*mut Bar, ::cxx::CxxRawError> = unsafe { foo(42) };
++//! ```
++//!
++//! At the IR level, the actual extern symbol `foo` has signature
++//! `fn(x) -> *mut Bar` (no Result — that's the C++ side's view).
++//! The MIR pass bridges the gap:
++//!
++//! 1. For each Call to a `#[rustc_cxx_throws]` callee, the
++//!    destination Place must have type `Result<T, E>`. We
++//!    decompose: `T` is the IR-level return; `E` is the
++//!    catch-path payload (typically `cxx::CxxRawError` for
++//!    Phase 1; user can pick any 2-word type matching the
++//!    runtime helper's return).
++//! 2. Allocate a fresh local of type `T`. Rewrite the Call
++//!    terminator's destination to this local. The IR-level
++//!    extern signature now matches: `fn foo() -> T`.
++//! 3. Insert a new `ok_wrap_bb` between the Call and its
++//!    original target. The wrap block does
++//!    `dest = Result::Ok(local)` and branches to the original
++//!    target.
++//! 4. The catch path (UnwindAction::Cleanup) goes to a new
++//!    `err_wrap_bb`. That block constructs
++//!    `Result::Err(catch_helper())` and branches to the
++//!    original target.
++//!
++//! The codegen catch BB in P09.64 doesn't need to change yet —
++//! P09.65b (separate patch) rewires it to recognize the MIR
++//! pass's err_wrap_bb and route through it. For now, P09.65a
++//! ships the pass without changing P09.64's abort behavior;
++//! the next bootstrap cycle lights the wiring up.
++
++use rustc_middle::mir::*;
++use rustc_middle::ty::{self, TyCtxt};
++use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
++
++pub(super) struct CxxThrowsWrap;
++
++impl<'tcx> crate::MirPass<'tcx> for CxxThrowsWrap {
++    fn is_required(&self) -> bool {
++        // Required: changes program semantics for #[rustc_cxx_throws]
++        // calls (currently a no-op scaffold, but the wiring needs
++        // to be in place so P09.65b's MIR rewriting lands cleanly).
++        true
++    }
++
++    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
++        let def_id = body.source.def_id();
++        let kind = tcx.def_kind(def_id);
++        if !kind.is_fn_like() {
++            return;
++        }
++
++        // First pass: identify Call terminators targeting a
++        // CXX_THROWS callee. Collect the basic block indices
++        // separately so we can mutate the body without
++        // borrow-conflict pain.
++        let mut targets: Vec<BasicBlock> = Vec::new();
++        for (bb, bbdata) in body.basic_blocks.iter_enumerated() {
++            let Some(terminator) = &bbdata.terminator else { continue };
++            let TerminatorKind::Call { func, .. } = &terminator.kind else { continue };
++            let ty = func.ty(&body.local_decls, tcx);
++            let &ty::FnDef(callee_def_id, _) = ty.kind() else { continue };
++            if !tcx
++                .codegen_fn_attrs(callee_def_id)
++                .flags
++                .contains(CodegenFnAttrFlags::CXX_THROWS)
++            {
++                continue;
++            }
++            targets.push(bb);
++        }
++
++        // P09.65a stops here — just identifying the call sites.
++        // P09.65b (next iteration) does the actual Place
++        // rewriting + Ok/Err wrapper BB synthesis. Splitting
++        // the work this way means the bootstrap can validate
++        // the pass-registration plumbing in isolation before
++        // we touch MIR construction.
++        //
++        // Without the rewriting, the pass is a no-op for now —
++        // P09.64's "catch + helper call + abort" behavior is
++        // preserved. The pass exists so the registration in
++        // `lib.rs` lands cleanly + future P09.65b iterations
++        // have a place to land their MIR manipulation.
++        let _ = targets;
++    }
++}
+diff --git a/compiler/rustc_mir_transform/src/lib.rs b/compiler/rustc_mir_transform/src/lib.rs
+index d3673c193e3..17f5b253cb7 100644
+--- a/compiler/rustc_mir_transform/src/lib.rs
++++ b/compiler/rustc_mir_transform/src/lib.rs
+@@ -121,6 +121,7 @@ macro_rules! pass_names {
+ 
+ declare_passes! {
+     mod abort_unwinding_calls : AbortUnwindingCalls;
++    mod cxx_throws_wrap : CxxThrowsWrap;
+     mod add_call_guards : AddCallGuards { AllCallEdges, CriticalCallEdges };
+     mod add_moves_for_packed_drops : AddMovesForPackedDrops;
+     mod add_retag : AddRetag;
+@@ -645,6 +646,11 @@ fn run_runtime_lowering_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+         // necessary as well as forcing any call in a non-unwinding
+         // function calling a possibly-unwinding function to abort the process.
+         &abort_unwinding_calls::AbortUnwindingCalls,
++        // P09.65 / 1.13 throws Phase 1E: MIR-level Result wrapping
++        // for #[rustc_cxx_throws] calls. Currently a no-op scaffold
++        // (identifies call sites only); P09.65b will add the Place
++        // rewriting + Ok/Err wrapper BB synthesis.
++        &cxx_throws_wrap::CxxThrowsWrap,
+         // AddMovesForPackedDrops needs to run after drop
+         // elaboration.
+         &add_moves_for_packed_drops::AddMovesForPackedDrops,
+-- 
+2.50.1 (Apple Git-155)
+
