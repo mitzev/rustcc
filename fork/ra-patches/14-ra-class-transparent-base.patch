@@ -1,0 +1,334 @@
+From d800dec3ca9159eadffaaec4e7b213324e9952b7 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Wed, 3 Jun 2026 02:30:57 +0300
+Subject: [PATCH] P09.x (1.13.6 RA parity): transparent base-member resolution
+ for `class`
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The fork rustc gives a derived `class D : B` transparent base-member
+access by synthesizing `impl Deref for D { type Target = B; ... }`. RA
+models `class` natively (no synthetic impl), so this teaches RA's
+field resolution + completion to walk the `#[rustc_cxx_base]` base
+chain directly, matching the compiler.
+
+- `hir_ty::lower::class_base_ty` (new, re-exported): lowers a class's
+  base type ref in its generic context, returning `EarlyBinder<Ty>`.
+  Instantiated with the derived class's args, it yields the concrete
+  base type — so multi-level chains and generic bases substitute
+  correctly.
+- Field resolution (`InferenceContext::lookup_field`, ClassId arm) now
+  walks the base chain via `resolve_class_field_chain`: if a field
+  isn't declared directly on the class, recurse into the base type and
+  resolve there, returning the base `FieldId` with the base's subst.
+  A field declared on the derived class wins over a same-named base
+  field (C++ name-hiding), since the derived class is checked first.
+- `hir::Type::fields` appends base-class fields (deduped by name) so
+  base fields show up in dot-completion. Method resolution + method
+  completion already walked the base (`base_class_of` in the probe),
+  so `self.base_method()` was already fine.
+
+Tests: `class_inherited_field_access`, `class_multilevel_field_access`,
+`class_generic_base_field_access`, `class_derived_shadows_base_field`
+(hir-ty inference); `completes_inherited_class_fields_via_dot`
+(ide-completion). hir-ty (976) + ide-completion (730) suites green.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ crates/hir-ty/src/infer/expr.rs              | 45 ++++++++++-
+ crates/hir-ty/src/lib.rs                     |  2 +-
+ crates/hir-ty/src/lower.rs                   | 27 +++++++
+ crates/hir-ty/src/tests/method_resolution.rs | 80 ++++++++++++++++++++
+ crates/hir/src/lib.rs                        | 25 +++++-
+ crates/ide-completion/src/tests/special.rs   | 25 ++++++
+ 6 files changed, 197 insertions(+), 7 deletions(-)
+
+diff --git a/crates/hir-ty/src/infer/expr.rs b/crates/hir-ty/src/infer/expr.rs
+index 7e72afbca..b9644d10b 100644
+--- a/crates/hir-ty/src/infer/expr.rs
++++ b/crates/hir-ty/src/infer/expr.rs
+@@ -32,7 +32,7 @@ use crate::{
+     lower::lower_mutability,
+     method_resolution::{self, CandidateId, MethodCallee, MethodError},
+     next_solver::{
+-        ClauseKind, FnSig, GenericArg, GenericArgs, Ty, TyKind, TypeError,
++        ClauseKind, DbInterner, FnSig, GenericArg, GenericArgs, Ty, TyKind, TypeError,
+         infer::{
+             BoundRegionConversionTime, InferOk,
+             traits::{Obligation, ObligationCause},
+@@ -52,6 +52,38 @@ pub(crate) enum ExprIsRead {
+     No,
+ }
+ 
++/// rustcc 1.13.6 (RA parity): resolve a field `name` on a `class`,
++/// walking the `#[rustc_cxx_base]` base chain when it isn't declared
++/// directly on `class_id`. Returns the resolved `FieldId` together
++/// with the generic args of the (possibly base) class that declares
++/// it, so the caller instantiates the field type with the correct
++/// substitution. This mirrors the compiler's transparent base-member
++/// access (auto-Deref to the `__base` subobject): RA models `class`
++/// natively with no synthetic Deref impl, so we walk the chain here.
++/// A field declared directly wins over a base field of the same name
++/// (C++ name-hiding), since we check the derived class first.
++fn resolve_class_field_chain<'db>(
++    db: &'db dyn crate::db::HirDatabase,
++    interner: DbInterner<'db>,
++    class_id: hir_def::ClassId,
++    parameters: GenericArgs<'db>,
++    name: &Name,
++) -> Option<(FieldId, GenericArgs<'db>)> {
++    if let Some(local_id) = class_id.fields(db).field(name) {
++        return Some((FieldId { parent: class_id.into(), local_id }, parameters));
++    }
++    let base_ty = crate::lower::class_base_ty(db, class_id)?.instantiate(interner, parameters);
++    match base_ty.kind() {
++        TyKind::Adt(base_adt, base_args) => match base_adt.def_id().0 {
++            hir_def::AdtId::ClassId(base_c) => {
++                resolve_class_field_chain(db, interner, base_c, base_args, name)
++            }
++            _ => None,
++        },
++        _ => None,
++    }
++}
++
+ impl<'db> InferenceContext<'_, 'db> {
+     pub(crate) fn infer_expr(
+         &mut self,
+@@ -1637,10 +1669,15 @@ impl<'db> InferenceContext<'_, 'db> {
+                     hir_def::AdtId::EnumId(_) => return None,
+                     // rustcc Phase 2 (B.4): record-shaped class field
+                     // access mirrors struct field access.
++                    // rustcc 1.13.6 (RA parity): if the field isn't
++                    // declared directly on the class, walk the
++                    // `#[rustc_cxx_base]` base chain so base members are
++                    // reachable transparently (`self.base_field`) —
++                    // mirroring the compiler's auto-Deref. The base type
++                    // is lowered + substituted per level so generic
++                    // bases resolve correctly.
+                     hir_def::AdtId::ClassId(c) => {
+-                        let local_id = c.fields(self.db).field(name)?;
+-                        let field = FieldId { parent: c.into(), local_id };
+-                        (field, parameters)
++                        resolve_class_field_chain(self.db, interner, c, parameters, name)?
+                     }
+                 },
+                 _ => return None,
+diff --git a/crates/hir-ty/src/lib.rs b/crates/hir-ty/src/lib.rs
+index 4433dd642..7f55aafff 100644
+--- a/crates/hir-ty/src/lib.rs
++++ b/crates/hir-ty/src/lib.rs
+@@ -106,7 +106,7 @@ pub use infer::{
+ };
+ pub use lower::{
+     GenericPredicates, ImplTraits, LifetimeElisionKind, TyDefId, TyLoweringContext, ValueTyDefId,
+-    diagnostics::*,
++    class_base_ty, diagnostics::*,
+ };
+ pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
+ pub use target_feature::TargetFeatures;
+diff --git a/crates/hir-ty/src/lower.rs b/crates/hir-ty/src/lower.rs
+index 9b552ef1f..ee3971c4a 100644
+--- a/crates/hir-ty/src/lower.rs
++++ b/crates/hir-ty/src/lower.rs
+@@ -1650,6 +1650,33 @@ pub(crate) fn field_types_query(
+     &db.field_types_with_diagnostics(variant_id).0
+ }
+ 
++/// rustcc (1.13.6 RA parity): the base type of a `class D : B { ... }`,
++/// lowered in `D`'s generic context (so its generic args reference
++/// `D`'s parameters). `None` for a root class. The fork rustc gives a
++/// derived class transparent base-member access by synthesizing
++/// `impl Deref for D { type Target = B; ... }`; RA models `class`
++/// natively (no synthetic impl), so field resolution instead walks the
++/// base chain via this helper — instantiate the returned binder with
++/// the derived class's args to get the concrete base type, then look
++/// the member up there.
++pub fn class_base_ty<'db>(
++    db: &'db dyn HirDatabase,
++    class_id: ClassId,
++) -> Option<EarlyBinder<'db, Ty<'db>>> {
++    use hir_def::signatures::ClassSignature;
++    let sig = ClassSignature::of(db, class_id);
++    let base_ref = sig.base?;
++    let resolver = class_id.resolver(db);
++    let mut ctx = TyLoweringContext::new(
++        db,
++        &resolver,
++        &sig.store,
++        AdtId::ClassId(class_id).into(),
++        LifetimeElisionKind::AnonymousReportError,
++    );
++    Some(EarlyBinder::bind(ctx.lower_ty(base_ref)))
++}
++
+ /// Build the type of all specific fields of a struct or enum variant.
+ #[salsa::tracked(returns(ref))]
+ pub(crate) fn field_types_with_diagnostics_query<'db>(
+diff --git a/crates/hir-ty/src/tests/method_resolution.rs b/crates/hir-ty/src/tests/method_resolution.rs
+index 2ed33ba3c..d41f0c6f9 100644
+--- a/crates/hir-ty/src/tests/method_resolution.rs
++++ b/crates/hir-ty/src/tests/method_resolution.rs
+@@ -2319,3 +2319,83 @@ fn use_dog(d: Dog) {
+ "#,
+     );
+ }
++
++// rustcc 1.13.6 (RA parity): transparent base-FIELD access. The fork
++// compiler gives a derived class auto-Deref to its base subobject, so
++// `self.base_field` resolves; RA walks the `#[rustc_cxx_base]` chain in
++// field resolution to match.
++#[test]
++fn class_inherited_field_access() {
++    check_types(
++        r#"
++class Animal {
++    legs: u32,
++    fn walk(&self) {}
++}
++class Dog : Animal {
++    tail: bool,
++}
++fn use_dog(d: Dog) {
++    let a = d.legs;
++      //^ u32
++    let b = d.tail;
++      //^ bool
++}
++"#,
++    );
++}
++
++// Grandparent field reached through a two-level chain.
++#[test]
++fn class_multilevel_field_access() {
++    check_types(
++        r#"
++class A { a: u32 }
++class B : A { b: u64 }
++class C : B { c: i8 }
++fn use_c(c: C) {
++    let x = c.a;
++      //^ u32
++    let y = c.b;
++      //^ u64
++    let z = c.c;
++      //^ i8
++}
++"#,
++    );
++}
++
++// Generic base: the base field type must be substituted with the
++// derived class's args (`G<T>`'s `v: T` becomes `u32` for `D<u32>`).
++#[test]
++fn class_generic_base_field_access() {
++    check_types(
++        r#"
++class G<T> { v: T }
++class D<T> : G<T> { extra: T }
++fn use_d(d: D<u32>) {
++    let x = d.v;
++      //^ u32
++    let y = d.extra;
++      //^ u32
++}
++"#,
++    );
++}
++
++// A derived field shadows a same-named base field (C++ name-hiding):
++// the derived one wins because field lookup checks the derived class
++// before walking to the base.
++#[test]
++fn class_derived_shadows_base_field() {
++    check_types(
++        r#"
++class A { x: u32 }
++class B : A { x: u64 }
++fn use_b(b: B) {
++    let v = b.x;
++      //^ u64
++}
++"#,
++    );
++}
+diff --git a/crates/hir/src/lib.rs b/crates/hir/src/lib.rs
+index f02dab799..61e229960 100644
+--- a/crates/hir/src/lib.rs
++++ b/crates/hir/src/lib.rs
+@@ -6135,14 +6135,35 @@ impl<'db> Type<'db> {
+             _ => return Vec::new(),
+         };
+ 
+-        db.field_types(variant_id)
++        let mut fields: Vec<(Field, Self)> = db
++            .field_types(variant_id)
+             .iter()
+             .map(|(local_id, ty)| {
+                 let def = Field { parent: variant_id.into(), id: local_id };
+                 let ty = ty.get().instantiate(interner, substs);
+                 (def, self.derived(ty))
+             })
+-            .collect()
++            .collect();
++
++        // rustcc 1.13.6 (RA parity): for a `class D : B`, also surface
++        // base-class fields so they appear in dot-completion (matching
++        // the compiler's transparent base access). Recurse on the base
++        // type — which is concrete here, so multi-level chains and
++        // generic bases substitute correctly — and dedup by name so a
++        // derived field hides a same-named base field (C++ name-hiding).
++        if let VariantId::ClassId(class_id) = variant_id
++            && let Some(base_binder) = hir_ty::class_base_ty(db, class_id)
++        {
++            let base_ty = base_binder.instantiate(interner, substs);
++            for (bf, bty) in self.derived(base_ty).fields(db) {
++                let bname = bf.name(db);
++                if !fields.iter().any(|(f, _)| f.name(db) == bname) {
++                    fields.push((bf, bty));
++                }
++            }
++        }
++
++        fields
+     }
+ 
+     pub fn tuple_fields(&self, _db: &'db dyn HirDatabase) -> Vec<Self> {
+diff --git a/crates/ide-completion/src/tests/special.rs b/crates/ide-completion/src/tests/special.rs
+index aa9e606b7..3f6ca2199 100644
+--- a/crates/ide-completion/src/tests/special.rs
++++ b/crates/ide-completion/src/tests/special.rs
+@@ -1812,3 +1812,28 @@ fn use_dog(d: Dog) {
+         "#]],
+     );
+ }
++
++// rustcc 1.13.6 (RA parity): base-class FIELDS also appear in
++// dot-completion on a derived receiver (transparent base access).
++#[test]
++fn completes_inherited_class_fields_via_dot() {
++    check_no_kw(
++        r#"
++class Animal {
++    legs: u32,
++    fn walk(&self) {}
++}
++class Dog : Animal {
++    tail: bool,
++}
++fn use_dog(d: Dog) {
++    d.$0
++}
++"#,
++        expect![[r#"
++            fd legs         u32
++            fd tail        bool
++            me walk() fn(&self)
++        "#]],
++    );
++}
+-- 
+2.50.1 (Apple Git-155)
+

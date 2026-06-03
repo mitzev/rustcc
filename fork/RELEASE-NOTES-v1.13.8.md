@@ -22,7 +22,7 @@ source). See `fork/MIGRATION-1.96.0.md` for the
 3 conflict resolutions + 5 small API-drift fixes (notably the
 `rustc_attr!` 2-arg shim, `FnSig` field-vs-method, `mk_fn_sig` arity,
 and `From` diagnostic-item). All 42 patches apply cleanly via
-`git am --3way`; stage1 builds; `./fork/tests/run.sh` is 9/9.
+`git am --3way`; stage1 builds; `./fork/tests/run.sh` is 11/11.
 
 ### B. Deep (multi-level) inheritance for subclassing imported C++ bases
 
@@ -53,7 +53,21 @@ dtor (`D2`), which clang doesn't emit for a Rust-only subclass. Add a
 one-line C++ force-dtor stub (a concrete subclass overriding the pure
 virtuals) until the importer emits one. Dispatch itself is unaffected.
 
-### C. Carried from v1.13.7
+### C. Folded-in v1.13.5 / v1.13.6 editor parity + regression probes
+
+The compiler features for v1.13.5 (class-body method-modifier keywords
+`virtual` / `override` / `constructor`) and v1.13.6 (transparent
+base-member access via auto-Deref) shipped in v1.13.7, but their
+rust-analyzer editor parity and regression probes had been left on
+unmerged feature branches. v1.13.8 brings them onto the release line:
+- **RA editor patches** `13-ra-class-method-keywords` and
+  `14-ra-class-transparent-base` — so the shipped rust-analyzer plugin
+  parses the keyword surface and resolves inherited members in the
+  editor without an explicit `__base.` qualifier.
+- **Regression probes** `keyword_modifiers` and `base_member_access`
+  added to `fork/tests/run.sh` (now 11 probes, was 9).
+
+### D. Carried from v1.13.7
 
 Subclass an imported C++ class with cross-boundary virtual dispatch
 (concrete + pure overrides) and a virtual destructor; MSVC vftable
@@ -61,7 +75,7 @@ support; ARM + Intel (Itanium) validation.
 
 ## Verification
 
-- `aarch64-apple-darwin`: stage1 builds; 9/9 probes; `subclass_cpp_base`
+- `aarch64-apple-darwin`: stage1 builds; 11/11 probes; `subclass_cpp_base`
   (shallow) and a 3-level deep chain both green.
 - **Bare-metal**: a heap-free `no_std` subclass compiles for
   `thumbv7m-none-eabi` and emits a correct `_ZTV…`/`_ZTI…` vtable in an

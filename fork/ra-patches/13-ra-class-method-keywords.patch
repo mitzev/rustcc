@@ -1,0 +1,174 @@
+From 57d4ac9dc0e01237e569f96825f363def58ba934 Mon Sep 17 00:00:00 2001
+From: rustcc-build <rustcc@localhost>
+Date: Wed, 3 Jun 2026 00:59:14 +0300
+Subject: [PATCH] P09.x (1.13.5): parse class-body method-modifier keywords
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Teach the class-body parser the C++-style method modifiers added to
+the fork rustc in v1.13.5:
+
+    (pub)? (virtual | override | constructor)* fn …
+
+`virtual` / `override` are reserved Rust keywords (VIRTUAL_KW /
+OVERRIDE_KW already exist); `constructor` is a new contextual keyword
+(CONSTRUCTOR_KW) so a field literally named `constructor` still parses
+as a field. In `opt_item` the modifier run is consumed as leading fn
+modifiers — only when a `fn` (possibly after more modifiers) follows —
+so the class-keyword surface no longer shows false parse errors in the
+editor. The modifiers carry no extra semantics in RA (the fork rustc
+desugars them to #[cpp_virtual] / #[constructor] /
+#[rustc_cxx_override]); RA just needs to accept them.
+
+Adds a `syntax` regression test asserting the keyword forms parse with
+zero errors, including a field named `constructor`.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ crates/parser/src/grammar/items.rs         | 27 ++++++++++++++++
+ crates/parser/src/syntax_kind/generated.rs |  6 ++++
+ crates/syntax/src/tests.rs                 | 37 ++++++++++++++++++++++
+ 3 files changed, 70 insertions(+)
+
+diff --git a/crates/parser/src/grammar/items.rs b/crates/parser/src/grammar/items.rs
+index a7e0cbca7..48886d9c7 100644
+--- a/crates/parser/src/grammar/items.rs
++++ b/crates/parser/src/grammar/items.rs
+@@ -138,6 +138,33 @@ pub(super) fn opt_item(p: &mut Parser<'_>, m: Marker, is_in_extern: bool) -> Res
+         has_mods = true;
+     }
+ 
++    // rustcc fork (v1.13.5): C++-style method modifiers inside a
++    // `class` body — `(virtual | override | constructor)* fn`.
++    // `virtual` / `override` are reserved keywords; `constructor` is
++    // contextual. The fork rustc desugars them to
++    // #[cpp_virtual] / #[constructor] / #[rustc_cxx_override]; here we
++    // just consume them as leading fn modifiers so the editor doesn't
++    // flag the class-keyword surface. Each is only a modifier when a
++    // `fn` (possibly after more modifiers) follows — so a field
++    // literally named `constructor` is never mis-parsed.
++    while p.at(T![virtual]) || p.at(T![override]) || p.at_contextual_kw(T![constructor]) {
++        let followed_by_fn_or_mod = p.nth_at(1, T![fn])
++            || p.nth_at(1, T![virtual])
++            || p.nth_at(1, T![override])
++            || p.nth_at_contextual_kw(1, T![constructor]);
++        if !followed_by_fn_or_mod {
++            break;
++        }
++        if p.at(T![virtual]) {
++            p.bump(T![virtual]);
++        } else if p.at(T![override]) {
++            p.bump(T![override]);
++        } else {
++            p.bump_remap(T![constructor]);
++        }
++        has_mods = true;
++    }
++
+     // modifiers
+     if p.at(T![const]) && p.nth(1) != T!['{'] {
+         p.eat(T![const]);
+diff --git a/crates/parser/src/syntax_kind/generated.rs b/crates/parser/src/syntax_kind/generated.rs
+index 3610e0eb1..924f3dd50 100644
+--- a/crates/parser/src/syntax_kind/generated.rs
++++ b/crates/parser/src/syntax_kind/generated.rs
+@@ -120,6 +120,7 @@ pub enum SyntaxKind {
+     CFG_KW,
+     CLASS_KW,
+     CLOBBER_ABI_KW,
++    CONSTRUCTOR_KW,
+     DEFAULT_KW,
+     DYN_KW,
+     FORMAT_ARGS_KW,
+@@ -632,6 +633,7 @@ impl SyntaxKind {
+             CFG_ATTR_KW => "cfg_attr",
+             CLASS_KW => "class",
+             CLOBBER_ABI_KW => "clobber_abi",
++            CONSTRUCTOR_KW => "constructor",
+             DEFAULT_KW => "default",
+             DYN_KW => "dyn",
+             FORMAT_ARGS_KW => "format_args",
+@@ -738,6 +740,7 @@ impl SyntaxKind {
+             CFG_ATTR_KW => true,
+             CLASS_KW => true,
+             CLOBBER_ABI_KW => true,
++            CONSTRUCTOR_KW => true,
+             DEFAULT_KW => true,
+             DYN_KW if edition < Edition::Edition2018 => true,
+             FORMAT_ARGS_KW => true,
+@@ -832,6 +835,7 @@ impl SyntaxKind {
+             CFG_ATTR_KW => true,
+             CLASS_KW => true,
+             CLOBBER_ABI_KW => true,
++            CONSTRUCTOR_KW => true,
+             DEFAULT_KW => true,
+             DYN_KW if edition < Edition::Edition2018 => true,
+             FORMAT_ARGS_KW => true,
+@@ -989,6 +993,7 @@ impl SyntaxKind {
+             "cfg_attr" => CFG_ATTR_KW,
+             "class" => CLASS_KW,
+             "clobber_abi" => CLOBBER_ABI_KW,
++            "constructor" => CONSTRUCTOR_KW,
+             "default" => DEFAULT_KW,
+             "dyn" if edition < Edition::Edition2018 => DYN_KW,
+             "format_args" => FORMAT_ARGS_KW,
+@@ -1164,6 +1169,7 @@ macro_rules ! T_ {
+     [cfg_attr] => { $ crate :: SyntaxKind :: CFG_ATTR_KW };
+     [class] => { $ crate :: SyntaxKind :: CLASS_KW };
+     [clobber_abi] => { $ crate :: SyntaxKind :: CLOBBER_ABI_KW };
++    [constructor] => { $ crate :: SyntaxKind :: CONSTRUCTOR_KW };
+     [default] => { $ crate :: SyntaxKind :: DEFAULT_KW };
+     [dyn] => { $ crate :: SyntaxKind :: DYN_KW };
+     [format_args] => { $ crate :: SyntaxKind :: FORMAT_ARGS_KW };
+diff --git a/crates/syntax/src/tests.rs b/crates/syntax/src/tests.rs
+index e5beb44f4..2207ea11d 100644
+--- a/crates/syntax/src/tests.rs
++++ b/crates/syntax/src/tests.rs
+@@ -25,6 +25,43 @@ fn main() {
+     assert!(parse.ok().is_ok());
+ }
+ 
++#[test]
++fn rustcc_class_method_modifiers_parse_clean() {
++    // rustcc fork (v1.13.5): C++-style method-modifier keywords inside
++    // a `class` body — `(pub)? (virtual | override | constructor)* fn`.
++    // `virtual` / `override` are reserved keywords; `constructor` is
++    // contextual, so a field literally named `constructor` must still
++    // parse as a field. None of these should produce parse errors.
++    let code = r#"
++pub class Base {
++    constructor: i32,
++    val: i32,
++
++    constructor fn new(v: i32) -> Self { Self { constructor: 0, val: v } }
++
++    virtual fn poke(&self) -> i32 { self.val }
++
++    pub virtual fn doubled(&self) -> i32 { self.val * 2 }
++}
++
++pub class Derived : Base {
++    extra: i32,
++
++    constructor fn new(v: i32, e: i32) -> Self {
++        Self { __base: Base::new(v), extra: e }
++    }
++
++    pub override fn poke(&self) -> i32 { self.__base.val + self.extra }
++}
++"#;
++    let parse = SourceFile::parse(code, Edition::CURRENT);
++    let errors = parse.errors();
++    assert!(
++        errors.is_empty(),
++        "expected no parse errors for class method-modifier keywords, got: {errors:?}"
++    );
++}
++
+ #[test]
+ fn benchmark_parser() {
+     if std::env::var("RUN_SLOW_BENCHES").is_err() {
+-- 
+2.50.1 (Apple Git-155)
+

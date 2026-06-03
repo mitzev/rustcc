@@ -1,0 +1,10 @@
+[package]
+name = "class_keyword_keyword_modifiers"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "class_keyword_keyword_modifiers"
+path = "src/main.rs"
+
+[workspace]
