@@ -61,7 +61,7 @@ Cumulative across the v1.0x–v1.13x line. Everything below is shipped.
 | Copy / move special members | copy ctor → `impl Clone`; move ctor → `move_from`; `operator=` → `copy_assign`/`move_assign` |
 | C++ operator overloading | `#[operator = "Plus"]` and friends |
 | Parser-level `class` keyword | weak keyword, desugars to `#[repr(cpp)]` struct + impl |
-| **Subclass an imported C++ class** | `class D : CppBase` over a `cxx_importer`-imported base: override concrete + pure virtuals and the virtual destructor; C++ dispatches through `CppBase*` into the Rust `override`, `delete` runs Rust `Drop` (v1.13.7, single inheritance) |
+| **Subclass an imported C++ class** | `class D : CppBase` over a `cxx_importer`-imported base: override concrete + pure virtuals and the virtual destructor; C++ dispatches through `CppBase*` into the Rust `override`, `delete` runs Rust `Drop` (v1.13.7, single inheritance; validated on Itanium ARM/Intel + Linux + MSVC). The virtual-destructor path uses `operator new`/`delete`, so it needs a heap — not for bare-metal `no_std` |
 | Cross-crate polymorphic classes | ctor / wrapper / virtual attributes encode across crates |
 | **Windows MSVC C++ ABI** | vftables, scalar-deleting dtor, SEH funclets, sret-via-RCX/X8, dllexport; Wine-validated |
 
@@ -122,11 +122,19 @@ Honest list of what is **not** yet implemented:
 - **Swift inheritance** — you can *call* Swift and hold/retain Swift
   class instances, but a Rust type cannot *subclass* a Swift class or
   override its methods. See the Swift section below.
-- **Deep / multiple-inheritance C++ bases for Rust subclasses** —
-  subclassing an imported C++ class (above) is single-inheritance from a
-  *root* polymorphic base; deeper chains (e.g. FLTK's
-  `Fl_Text_Editor → … → Fl_Widget`) and multiple/virtual inheritance of
-  the base are future work.
+- **Deep / multi-level C++ bases for Rust subclasses** — subclassing an
+  imported C++ class (above) is single-inheritance from a *root*
+  polymorphic base. Deeper **multi-level** single-inheritance chains —
+  e.g. FLTK's `Fl_Text_Editor → Fl_Text_Display → Fl_Group → Fl_Widget`
+  (FLTK's widget hierarchy is deep but single-inheritance) — and
+  multiple/virtual inheritance of the base are future work.
+- **Bare-metal subclassing is unvalidated.** The heap-free override path
+  (override virtuals, statically-allocated object, no virtual dtor) is
+  target-agnostic codegen and *should* work on Cortex-M (cf. the general
+  `no_std` C++ support, P09.36), but the v1.13.7 subclass feature has not
+  been exercised on a bare-metal target; the CI matrix is hosted triples
+  only. The cross-boundary virtual *destructor* relies on `operator new`/
+  `operator delete`, so that part is inapplicable without a heap.
 - **Member pointers** (partial), **covariant-return thunks**, and
   **GCC-backend `cxx_throws`** (the catch path is Itanium/MSVC LLVM).
 - **Recursive STL import** — a user type that *derives from* a system
