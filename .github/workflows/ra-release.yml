@@ -39,8 +39,15 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
+          # x86_64-apple-darwin (Intel mac) is intentionally dropped:
+          # GitHub's `macos-13` runners are heavily contended and this
+          # job routinely queues for hours (6h+ observed on v1.13.7),
+          # stalling the whole RA release. The toolchain release
+          # (release.yml) already drops Intel-mac for the same reason,
+          # so the RA plugin matrix now matches the shipped toolchain
+          # platforms. Re-enable if/when Intel-mac runners free up.
+          # - os: macos-13
+          #   target: x86_64-apple-darwin
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
