@@ -1045,12 +1045,13 @@ fn render_namespace_tree(
 /// and `<rust_name>` is the disambiguated Rust method name a derived
 /// `override fn <rust_name>` matches against.
 ///
-/// Returns `None` when the class is non-polymorphic (`ctx.vtable`
-/// yields `None`), or when the vtable carries a virtual *destructor*
-/// slot. Running the Rust drop when an object is `delete`d through a
-/// base pointer needs vtable dtor slots this landing doesn't emit, so
-/// a virtual-destructor base isn't subclassable yet (documented
-/// limitation — e.g. a real `Fl_Widget`, whose destructor is virtual).
+/// A virtual *destructor* is encoded as a `vdtor=1` record (the two
+/// leading Itanium dtor slots are not listed individually); the derived
+/// Rust class supplies its own `D1`/`D0` there, so `delete (Base*)d`
+/// runs the Rust `Drop` and frees (P09.x / 1.13.7).
+///
+/// Returns `None` only when the class is non-polymorphic (`ctx.vtable`
+/// yields `None`) or contributes no extendable slots.
 /// True iff the class is abstract — its primary vtable has an
 /// unoverridden pure-virtual slot (`__cxa_pure_virtual`). An abstract
 /// class has no complete-object constructor (`C1`) emitted by clang
@@ -1082,14 +1083,20 @@ fn build_imported_vtable_attr(
     let primary = vtable.sub_tables.first()?;
 
     let mut slots: Vec<String> = Vec::new();
+    let mut has_vdtor = false;
     for entry in &primary.entries {
         let VTableEntry::FunctionPointer { mangled_target, method } = entry else {
             continue;
         };
         let m_idx = method.as_index();
-        // A virtual destructor slot → not yet subclassable (see above).
+        // Virtual destructor slots (Itanium emits the complete `D1` and
+        // deleting `D0` pair at the front). Record the flag and skip them
+        // — a derived Rust class supplies its own `D1`/`D0` in those
+        // leading slots (P09.x / 1.13.7); `delete (Base*)derived` then
+        // runs the Rust `Drop`, destroys the base subobject, and frees.
         if methods.get(m_idx).is_some_and(|m| matches!(m.special, Some(SpecialMember::Dtor))) {
-            return None;
+            has_vdtor = true;
+            continue;
         }
         // The resolved Rust name is what a derived `override fn <name>`
         // matches. Skip a slot we can't name (e.g. an inherited base
@@ -1101,13 +1108,17 @@ fn build_imported_vtable_attr(
         }
         slots.push(format!("slot={name},{mangled_target}"));
     }
-    if slots.is_empty() {
+    // Nothing to extend (not polymorphic in a useful way) → no attribute.
+    if slots.is_empty() && !has_vdtor {
         return None;
     }
 
     let ztv = ctx.mangle(&Symbol::VTable(class_id));
     let zti = ctx.mangle(&Symbol::TypeInfo(class_id));
     let mut spec = format!("ztv={ztv};zti={zti}");
+    if has_vdtor {
+        spec.push_str(";vdtor=1");
+    }
     for slot in slots {
         spec.push(';');
         spec.push_str(&slot);
@@ -2454,10 +2465,23 @@ fn classify_for_direct_extern(
             });
         }
         Some(SpecialMember::Dtor) => {
-            let link = ctx.mangle(&Symbol::Dtor {
-                class: class_id,
-                variant: DtorVariant::D1,
-            });
+            // P09.x (1.13.7): for a polymorphic class (a subclassable
+            // base), the Rust `Drop` destroys the base *subobject* of a
+            // derived object, so it must call the base-object destructor
+            // (`D2`), NOT the complete-object destructor (`D1`). Calling
+            // `D1` on a base subobject is UB — and an abstract base's
+            // `D1` traps (a complete abstract object can never exist).
+            // The importer rejects virtual inheritance, so `D2` performs
+            // exactly the member/base destruction a polymorphic base
+            // needs, and is equally correct for a standalone value.
+            // Non-polymorphic classes keep `D1` (the complete-object
+            // dtor used when Rust owns a whole C++ value).
+            let variant = if ctx.class(class_id).is_polymorphic {
+                DtorVariant::D2
+            } else {
+                DtorVariant::D1
+            };
+            let link = ctx.mangle(&Symbol::Dtor { class: class_id, variant });
             return Ok(MethodEmission {
                 kind: EmissionKind::Dtor,
                 rust_name: resolved_rust_name.to_string(),
