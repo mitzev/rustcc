@@ -31,3 +31,4 @@ examples/fltk_text_editor/target/
 
 # fork/tests/msvc_runtime_smoke build output
 fork/tests/msvc_runtime_smoke/target/
+*.o

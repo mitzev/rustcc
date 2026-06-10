@@ -1,7 +1,6 @@
 #![no_std]
-#![feature(rustc_attrs)]
-#![allow(dead_code)]
-#![allow(internal_features)] // class/ctor/virtual attrs ride rustc_attrs
+// v1.14: the fork's class/ctor/virtual attributes are ungated — no
+// feature gates or allow attributes needed.
 
 //! Bare-metal ARM Cortex-M (STM32) example.
 //!

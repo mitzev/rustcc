@@ -11,7 +11,9 @@ typedef __SIZE_TYPE__ size_t;  // compiler built-in — correct per target
 inline void* operator new(size_t, void* p) noexcept { return p; }
 
 struct Widget {
-    virtual int32_t foo();
+    // const matches Rust's `fn foo(&self)` — mangles `_ZNK…`
+    // (v1.13.10 signature-carrying slots).
+    virtual int32_t foo() const;
     int32_t v;
 
     Widget(int32_t v);   // Rust-defined ctor
