@@ -864,15 +864,14 @@ impl<'a> Importer<'a> {
         }
         let name = match entity.get_name() {
             Some(n) if !n.is_empty() && !is_synthetic_anonymous_name(&n) => n,
-            // Anonymous enums (`enum { Red, Green };`) — for v0
-            // we drop them; the variants leak as integer
-            // constants in the source but Rust has nowhere
-            // to hang them as a distinct named enum. Some
-            // libclang builds report anonymous enums with a
-            // synthetic name like
-            // `(unnamed enum at /.../foo.h:42:1)` instead of
-            // an empty string, so filter those too.
-            _ => return Ok(()),
+            // Anonymous enums (`enum { WRAP_NONE, … };`). v1.14: keep
+            // them with an EMPTY name sentinel — the emitter renders
+            // their members as plain `pub const <Parent>_<MEMBER>`
+            // constants (FLTK uses this idiom heavily for class-scope
+            // constant groups, e.g. Fl_Text_Display's wrap modes).
+            // Some libclang builds report a synthetic
+            // `(unnamed enum at …)` name instead of an empty string.
+            _ => String::new(),
         };
         let underlying_ty = match entity.get_enum_underlying_type() {
             Some(t) => t,

@@ -46,12 +46,13 @@ const MOD_CTRL: i32 = FL_CTRL as i32;
 const MOD_META: i32 = FL_META as i32; // FL_COMMAND on macOS
 const MOD_SHIFT: i32 = FL_SHIFT as i32;
 const KEY_ENTER: i32 = FL_Enter as i32;
-// Fl_Native_File_Chooser::Type (class-scope enum → ints)
-const CHOOSER_OPEN: i32 = 0; // BROWSE_FILE
-const CHOOSER_SAVE: i32 = 4; // BROWSE_SAVE_FILE
-// Fl_Text_Display wrap modes
-const WRAP_NONE: i32 = 0;
-const WRAP_AT_BOUNDS: i32 = 3;
+// Class-scope enums — generated bindings (v1.14): named nested enums
+// emit as transparent structs with assoc consts; anonymous ones as
+// prefixed plain consts.
+const CHOOSER_OPEN: i32 = Fl_Native_File_Chooser_Type::BROWSE_FILE.0 as i32;
+const CHOOSER_SAVE: i32 = Fl_Native_File_Chooser_Type::BROWSE_SAVE_FILE.0 as i32;
+const WRAP_NONE: i32 = Fl_Text_Display_WRAP_NONE as i32;
+const WRAP_AT_BOUNDS: i32 = Fl_Text_Display_WRAP_AT_BOUNDS as i32;
 
 // Menu action ids (passed through the menu callback's user_data).
 const ACT_NEW: usize = 1;

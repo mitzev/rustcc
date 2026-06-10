@@ -325,3 +325,29 @@ struct Counter {\n\
         "out-of-line method must keep the direct symbol:\n{out}"
     );
 }
+
+/// v1.14: ANONYMOUS class-scope enums (`enum { WRAP_NONE, … };` —
+/// FLTK's constant-group idiom) emit as `pub const <Class>_<MEMBER>`
+/// plain constants. A wrapper type per anonymous enum would collide
+/// (Fl_Text_Display alone has several). Named nested enums keep the
+/// flattened transparent-struct shape.
+#[test]
+fn anonymous_class_enums_emit_prefixed_consts() {
+    let src = "\
+struct Disp {\n\
+  int x;\n\
+  explicit Disp(int v);\n\
+  enum { WRAP_NONE, WRAP_AT_COLUMN = 7 };\n\
+  enum { CURSOR_A = 2, CURSOR_B };\n\
+  enum Named { N_ONE = 1 };\n\
+};\n";
+    let out = emit(src, "anonenum");
+    assert!(out.contains("pub const Disp_WRAP_NONE: "), "{out}");
+    assert!(out.contains("pub const Disp_WRAP_AT_COLUMN: ") && out.contains("= 7;"), "{out}");
+    assert!(out.contains("pub const Disp_CURSOR_B: ") && out.contains("= 3;"), "{out}");
+    assert!(out.contains("pub struct Disp_Named("), "named nested enum keeps its type:\n{out}");
+    assert!(
+        !out.contains("pub struct Disp_("),
+        "anonymous enums must not synthesize colliding wrapper types:\n{out}"
+    );
+}

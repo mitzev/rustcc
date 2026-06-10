@@ -876,13 +876,17 @@ fn build_namespace_tree_full(
             node = node.children.entry(key.clone()).or_default();
         }
         let mut def = enum_def.clone();
-        if !name_prefix.is_empty() {
+        if !name_prefix.is_empty() && !def.name.0.is_empty() {
             // Re-name the enum so the flattened binding emits as
             // `<Parent>_<Original>`. Variants keep their source
             // names — they're only reachable through the new
             // type name anyway.
             def.name = rustc_abi_cxx::Ident(format!("{name_prefix}{}", def.name.0));
         }
+        // ANONYMOUS enums keep the empty-name sentinel: the renderer
+        // emits their members as `pub const <Prefix><MEMBER>` plain
+        // constants (a wrapper type per anonymous enum would collide
+        // — FLTK's Fl_Text_Display alone has several).
         node.enums.push(def);
     }
     // M11.b: same routing for free functions.
@@ -5760,6 +5764,33 @@ fn render_cxx_enum(
         }
     };
     let int_repr = int_rust(signed, width);
+
+    // v1.14: ANONYMOUS enums (`enum { WRAP_NONE, … };` — the FLTK
+    // class-scope constant-group idiom) have no type to hang a
+    // wrapper on; render each member as a plain prefixed constant
+    // (`pub const Fl_Text_Display_WRAP_NONE: i32 = 0;`). The prefix
+    // is the enclosing class/namespace path, '_'-joined.
+    if def.name.0.is_empty() {
+        let mut prefix = String::new();
+        for seg in &def.parent {
+            let s = match seg {
+                NameSegment::Class(i) | NameSegment::Namespace(i) => &i.0,
+                _ => continue,
+            };
+            prefix.push_str(s);
+            prefix.push('_');
+        }
+        let mut out = String::new();
+        for v in &def.variants {
+            let lit = render_enum_discriminant(v.value, signed);
+            let _ = writeln!(
+                out,
+                "{indent}pub const {prefix}{}: {int_repr} = {lit};",
+                v.name,
+            );
+        }
+        return Ok(out);
+    }
 
     // Detect duplicate discriminants. Aliasing happens often
     // enough in real headers that we always check.
