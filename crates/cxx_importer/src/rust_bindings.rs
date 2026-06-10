@@ -5159,6 +5159,37 @@ fn render_rust_type_with_opts(
                 }
             }
         }
+        // v1.14 phase 1: pointer-to-member-function renders as the
+        // two-word `::cxx::CxxMemberFnPtr<Class>` (Itanium {ptr, adj}
+        // pair). Pass-through capable: Rust can receive, store, and
+        // hand these back to C++; constructing one that targets a
+        // C++ method still happens on the C++ side.
+        CxxType::MemberPtr { class, pointee } => {
+            if !matches!(ctx.type_of(*pointee), CxxType::Fn(_)) {
+                return Err(BindingsError::UnsupportedType {
+                    where_: where_.into(),
+                    kind: "pointer to data member".into(),
+                });
+            }
+            let class = ctx.class(*class);
+            let class_nested = class.name.0.len() > 1
+                && class.name.0[..class.name.0.len() - 1]
+                    .iter()
+                    .any(|s| matches!(s, NameSegment::Class(_)));
+            if class_nested {
+                return Err(BindingsError::UnsupportedType {
+                    where_: where_.into(),
+                    kind: "member pointer into class-nested record".into(),
+                });
+            }
+            let name = ident_of_class_with_ctx(class, Some(ctx)).ok_or_else(|| {
+                BindingsError::UnsupportedType {
+                    where_: where_.into(),
+                    kind: "member pointer into anonymous record".into(),
+                }
+            })?;
+            format!("::cxx::CxxMemberFnPtr<{name}>")
+        }
         // M15: function pointer / bare function type. Both render
         // as Rust function-pointer types (`extern "C" fn(...) -> ret`).
         // Variadic C functions render with `...` which Rust supports
@@ -5918,6 +5949,9 @@ fn synthesize_default_literal(ctx: &CxxTypeCtx, ty: TypeId) -> Option<String> {
             FloatKind::F64 => Some("0.0_f64".to_string()),
             FloatKind::LongDouble => None,
         },
+        CxxType::MemberPtr { .. } => {
+            Some("::cxx::CxxMemberFnPtr::null()".to_string())
+        }
         CxxType::Ptr { pointee, cv } => {
             // Pointer-to-function renders as `Option<fn>` (see
             // render_rust_type), so its null default is `None`.
@@ -5976,7 +6010,6 @@ fn synthesize_default_literal(ctx: &CxxTypeCtx, ty: TypeId) -> Option<String> {
         | CxxType::Record(_)
         | CxxType::Fn(_)
         | CxxType::Array { .. }
-        | CxxType::MemberPtr { .. }
         | CxxType::Void => None,
     }
 }

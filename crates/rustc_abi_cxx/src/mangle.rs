@@ -470,7 +470,32 @@ impl<'a> Mangler<'a> {
                 }
                 self.out.push('E');
             }
-            CxxType::MemberPtr { .. } => self.out.push_str("M??"),
+            // Pointer-to-member (Itanium §5.1.5): `M <class> <member type>`.
+            // For member FUNCTIONS the ref-qualifier-free cv of the
+            // member function sits between the class and the `F…E`
+            // function type (`int (X::*)(int) const` = `M1XKFiiE`).
+            // Pinned against clang in tests/mangle_corpus.rs. Was a
+            // literal `M??` placeholder.
+            CxxType::MemberPtr { class, pointee } => {
+                self.out.push('M');
+                let path = self.ctx.class(class).name.0.clone();
+                if path.len() > 1 {
+                    self.out.push('N');
+                }
+                self.emit_nested_prefix(&path);
+                if path.len() > 1 {
+                    self.out.push('E');
+                }
+                if let CxxType::Fn(sig) = self.ctx.type_of(pointee) {
+                    if sig.cv.is_volatile {
+                        self.out.push('V');
+                    }
+                    if sig.cv.is_const {
+                        self.out.push('K');
+                    }
+                }
+                self.emit_type(pointee);
+            }
         }
     }
 

@@ -2278,6 +2278,55 @@ impl<'a> Importer<'a> {
             TypeKind::FunctionPrototype | TypeKind::FunctionNoPrototype => {
                 self.import_function_proto(ty, where_)?
             }
+            // v1.14 phase 1: pointer-to-member. Member FUNCTION
+            // pointers lower to `MemberPtr { class, pointee: Fn }`
+            // (rendered as ::cxx::CxxMemberFnPtr<Class>, mangled
+            // `M<class>F…E`). Pointers to data members are rejected
+            // (rare; no Rust surface yet) via the per-method skip.
+            TypeKind::MemberPointer => {
+                let pointee = ty.get_pointee_type().ok_or_else(|| {
+                    ImportError::UnsupportedFeature {
+                        what: "member pointer with no pointee",
+                        where_: where_.to_string(),
+                        span: None,
+                    }
+                })?;
+                if !matches!(
+                    pointee.get_kind(),
+                    TypeKind::FunctionPrototype | TypeKind::FunctionNoPrototype,
+                ) {
+                    return Err(ImportError::UnsupportedFeature {
+                        what: "pointer to data member",
+                        where_: where_.to_string(),
+                        span: None,
+                    });
+                }
+                let class_ty = ty.get_class_type().ok_or_else(|| {
+                    ImportError::UnsupportedFeature {
+                        what: "member pointer with no class",
+                        where_: where_.to_string(),
+                        span: None,
+                    }
+                })?;
+                let class_lowered = self.import_type(class_ty, where_)?;
+                let class_id = match self.ctx.type_of(class_lowered) {
+                    CxxType::Record(id) => *id,
+                    _ => {
+                        return Err(ImportError::UnsupportedFeature {
+                            what: "member pointer class is not a record",
+                            where_: where_.to_string(),
+                            span: None,
+                        });
+                    }
+                };
+                let fn_id = {
+                    let lowered = self.import_type(pointee, where_)?;
+                    // import_type wraps bare fn protos faithfully only
+                    // under Ptr; here the proto arrives bare.
+                    lowered
+                };
+                CxxType::MemberPtr { class: class_id, pointee: fn_id }
+            }
             TypeKind::LValueReference => {
                 let pointee = ty.get_pointee_type().ok_or_else(|| {
                     ImportError::UnsupportedFeature {

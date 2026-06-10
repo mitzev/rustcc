@@ -82,7 +82,7 @@ bases) is a C++ ambiguity → reject with a diagnostic.
 | Phase | Deliverable | Est. |
 |---|---|---|
 | 0 ✅ | Importer MI guard (shipped v1.13.10 branch) | done |
-| 1 | Member fn pointers end to end + probe | ~1 wk |
+| 1 ✅ | Member fn pointers end to end + probe (`examples/member_fn_ptr`; incl. the ABI triviality exemption — patch 0044) | done |
 | 2 | Model: full base-graph slots + corpus vs clang | 3–5 d |
 | 3 | Attr v4 + importer emission | 2–3 d |
 | 4 | Fork: layout, vtable group, N-vptr init, thunks, `__vmi` | 1.5–2.5 wk |

@@ -260,3 +260,36 @@ struct Single : A { virtual int fs(); };\n";
         "single-inheritance sibling must still get its attr:\n{out}"
     );
 }
+
+/// v1.14 phase 1: member-function-pointer params/returns lower, render
+/// as `::cxx::CxxMemberFnPtr<Class>`, and methods carrying them are no
+/// longer skipped. The mangled link_names carry `M<class>F…E`.
+#[test]
+fn member_fn_pointers_render_and_mangle() {
+    let src = "\
+struct Receiver {\n\
+  int base;\n\
+  explicit Receiver(int b);\n\
+  int add(int v);\n\
+  virtual int vadd(int v);\n\
+};\n\
+typedef int (Receiver::*AddFn)(int);\n\
+struct Caller {\n\
+  int dummy;\n\
+  static int invoke(Receiver* r, AddFn f, int v);\n\
+  static AddFn get_add();\n\
+};\n";
+    let out = emit(src, "memfnptr");
+    assert!(
+        out.contains("::cxx::CxxMemberFnPtr<Receiver>"),
+        "member-ptr params must render as CxxMemberFnPtr<Receiver>:\n{out}"
+    );
+    assert!(
+        out.contains("MS0_FiiE"),
+        "link_names must carry the Itanium M-encoding (substituted class ref):\n{out}"
+    );
+    assert!(
+        out.contains("pub fn invoke(") && out.contains("pub fn get_add("),
+        "member-ptr-taking/returning methods must not be skipped:\n{out}"
+    );
+}

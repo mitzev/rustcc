@@ -885,3 +885,52 @@ fn fn_pointer_params_match_clang() {
     });
     assert_eq!(sym2, "_ZN1M3addEPKciPFvP9Fl_WidgetPvES4_i");
 }
+
+/// v1.14 phase 1: pointer-to-member-function params mangle as
+/// `M<class>[K]F…E` (Itanium §5.1.5) with substitution — pinned against
+/// clang (`take(AddFn)` / const member fn / repeated param).
+#[test]
+fn member_fn_pointer_params_match_clang() {
+    use rustc_abi_cxx::{
+        ClassDef, CvQual, CxxType, CxxTypeCtx, FnSig, Ident, IntWidth,
+        MethodName, NameSegment, NestedName, RecordKind, Symbol, Target,
+    };
+    let _ = MethodName::ident_name; // keep import shape uniform
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let void = ctx.intern_type(CxxType::Void);
+    let int = ctx.intern_type(CxxType::Int { signed: true, width: IntWidth::I32 });
+    let recv = ctx.define_class(ClassDef {
+        name: NestedName(vec![NameSegment::Class(Ident("Receiver".into()))]),
+        bases: vec![],
+        fields: vec![],
+        methods: vec![],
+        kind: RecordKind::Struct,
+        is_polymorphic: false,
+        is_final: false,
+        source_alignment: None,
+    });
+    let memfn = |ctx: &mut CxxTypeCtx, is_const: bool| {
+        let f = ctx.intern_type(CxxType::Fn(FnSig {
+            params: vec![int],
+            ret: int,
+            cv: CvQual { is_const, is_volatile: false },
+            ref_q: None,
+            variadic: false,
+            noexcept: false,
+        }));
+        ctx.intern_type(CxxType::MemberPtr { class: recv, pointee: f })
+    };
+    let mp = memfn(&mut ctx, false);
+    let mp_c = memfn(&mut ctx, true);
+    let free = |name: &str, params: Vec<rustc_abi_cxx::TypeId>| Symbol::Function {
+        scope: NestedName(vec![]),
+        name: Ident(name.into()),
+        sig: FnSig { params, ret: void, cv: CvQual::default(), ref_q: None, variadic: false, noexcept: false },
+    };
+    // void take(int (Receiver::*)(int))        -> _Z4takeM8ReceiverFiiE
+    assert_eq!(ctx.mangle_itanium(&free("take", vec![mp])), "_Z4takeM8ReceiverFiiE");
+    // void take_c(int (Receiver::*)(int) const) -> _Z6take_cM8ReceiverKFiiE
+    assert_eq!(ctx.mangle_itanium(&free("take_c", vec![mp_c])), "_Z6take_cM8ReceiverKFiiE");
+    // void take2(AddFn, AddFn)                  -> _Z5take2M8ReceiverFiiES1_
+    assert_eq!(ctx.mangle_itanium(&free("take2", vec![mp, mp])), "_Z5take2M8ReceiverFiiES1_");
+}

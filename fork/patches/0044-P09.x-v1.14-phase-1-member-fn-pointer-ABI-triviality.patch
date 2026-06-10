@@ -1,0 +1,132 @@
+From 869994562b32fe73f08fd7f5ee5eecc97b8f4f1e Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 10 Jun 2026 19:46:29 +0300
+Subject: [PATCH] P09.x (v1.14 phase 1): member-fn-pointer ABI triviality
+ exemption
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The extern "C++" Itanium overlay force-indirects every ADT return
+(matching the hpp emitter's non-trivial-for-calls declaration of
+Rust-origin classes). A pointer-to-member-function pair is TRIVIALLY
+COPYABLE though — clang returns it in x0/x1 — so sret made the Rust
+side read garbage (bus error, found by examples/member_fn_ptr).
+
+New TyAbiInterface::is_cxx_member_fn_ptr keyed on the cxx runtime's
+CxxMemberFnPtr diagnostic item; the aarch64 + x86_64 overlays exempt
+it from the blanket force-indirect return rule.
+---
+ compiler/rustc_abi/src/layout/ty.rs           | 18 ++++++++++++++++++
+ compiler/rustc_middle/src/ty/layout.rs        |  9 +++++++++
+ compiler/rustc_span/src/symbol.rs             |  4 ++++
+ compiler/rustc_target/src/callconv/aarch64.rs |  5 +++++
+ compiler/rustc_target/src/callconv/x86_64.rs  |  5 +++++
+ 5 files changed, 41 insertions(+)
+
+diff --git a/compiler/rustc_abi/src/layout/ty.rs b/compiler/rustc_abi/src/layout/ty.rs
+index 9027e3131c9..8ce053acc2c 100644
+--- a/compiler/rustc_abi/src/layout/ty.rs
++++ b/compiler/rustc_abi/src/layout/ty.rs
+@@ -136,6 +136,14 @@ fn is_cxx_non_trivial_for_calls(
+     /// the Swift-specific ABI overlay which spreads small POD
+     /// structs across separate registers rather than packing.
+     fn is_swift_repr(this: TyAndLayout<'a, Self>) -> bool;
++
++    /// v1.14 phase 1: true when this type is the `cxx` runtime's
++    /// `CxxMemberFnPtr` (diagnostic item) — an Itanium pointer-to-
++    /// member-function `{ptr, adj}` pair. TRIVIALLY COPYABLE per the
++    /// C++ ABI, so it is exempt from the extern "C++" overlay's
++    /// blanket force-indirect ADT-return rule (clang returns it in
++    /// registers; sret here read garbage).
++    fn is_cxx_member_fn_ptr(this: TyAndLayout<'a, Self>, cx: &C) -> bool;
+ }
+ 
+ impl<'a, Ty> TyAndLayout<'a, Ty> {
+@@ -278,6 +286,16 @@ pub fn is_swift_repr<C>(self) -> bool
+         Ty::is_swift_repr(self)
+     }
+ 
++    /// True when the underlying type is the `cxx` runtime's
++    /// trivially-copyable member-function-pointer pair. See
++    /// [`TyAbiInterface::is_cxx_member_fn_ptr`].
++    pub fn is_cxx_member_fn_ptr<C>(self, cx: &C) -> bool
++    where
++        Ty: TyAbiInterface<'a, C> + Copy,
++    {
++        Ty::is_cxx_member_fn_ptr(self, cx)
++    }
++
+     /// Recursively peel away transparent wrappers, returning the inner value.
+     ///
+     /// The return value is not `repr(transparent)` and/or does
+diff --git a/compiler/rustc_middle/src/ty/layout.rs b/compiler/rustc_middle/src/ty/layout.rs
+index be234d7c018..ce0cf0b8836 100644
+--- a/compiler/rustc_middle/src/ty/layout.rs
++++ b/compiler/rustc_middle/src/ty/layout.rs
+@@ -1206,6 +1206,15 @@ fn is_swift_repr(this: TyAndLayout<'tcx>) -> bool {
+             _ => false,
+         }
+     }
++
++    fn is_cxx_member_fn_ptr(this: TyAndLayout<'tcx>, cx: &C) -> bool {
++        match this.ty.kind() {
++            ty::Adt(def, _) => {
++                cx.tcx().is_diagnostic_item(sym::CxxMemberFnPtr, def.did())
++            }
++            _ => false,
++        }
++    }
+ }
+ 
+ /// Calculates whether a function's ABI can unwind or not.
+diff --git a/compiler/rustc_span/src/symbol.rs b/compiler/rustc_span/src/symbol.rs
+index 981eb74e623..f1a84e04c7e 100644
+--- a/compiler/rustc_span/src/symbol.rs
++++ b/compiler/rustc_span/src/symbol.rs
+@@ -209,6 +209,10 @@
+         // raw_err_local in the right shape, then resolves
+         // `From<CxxRawError>::from` if the user's Err payload
+         // type differs.
++        // rustcc fork (v1.14 phase 1): diagnostic item for the
++        // runtime's trivially-copyable member-fn-pointer pair —
++        // exempts it from the extern "C++" force-indirect rule.
++        CxxMemberFnPtr,
+         CxxRawError,
+         Debug,
+         Default,
+diff --git a/compiler/rustc_target/src/callconv/aarch64.rs b/compiler/rustc_target/src/callconv/aarch64.rs
+index 1f11d63d90b..20a1fca5ce5 100644
+--- a/compiler/rustc_target/src/callconv/aarch64.rs
++++ b/compiler/rustc_target/src/callconv/aarch64.rs
+@@ -210,6 +210,11 @@ pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>
+     if !fn_abi.ret.is_ignore()
+         && (fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
+             || fn_abi.ret.layout.is_adt())
++        // v1.14 phase 1: pointer-to-member-function pairs are
++        // TRIVIALLY COPYABLE — clang returns them in registers, so
++        // forcing sret here made the Rust side read garbage (found
++        // by examples/member_fn_ptr's bus error).
++        && !fn_abi.ret.layout.is_cxx_member_fn_ptr(cx)
+     {
+         fn_abi.ret.force_indirect();
+     }
+diff --git a/compiler/rustc_target/src/callconv/x86_64.rs b/compiler/rustc_target/src/callconv/x86_64.rs
+index 5cf5a943187..428c6add8df 100644
+--- a/compiler/rustc_target/src/callconv/x86_64.rs
++++ b/compiler/rustc_target/src/callconv/x86_64.rs
+@@ -338,6 +338,11 @@ pub(crate) fn compute_cxx_abi_info_msvc<'a, Ty, C>(
+     if !fn_abi.ret.is_ignore()
+         && (fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
+             || fn_abi.ret.layout.is_adt())
++        // v1.14 phase 1: pointer-to-member-function pairs are
++        // TRIVIALLY COPYABLE — clang returns them in registers, so
++        // forcing sret here made the Rust side read garbage (found
++        // by examples/member_fn_ptr's bus error).
++        && !fn_abi.ret.layout.is_cxx_member_fn_ptr(cx)
+     {
+         fn_abi.ret.force_indirect();
+     }
+-- 
+2.50.1 (Apple Git-155)
+

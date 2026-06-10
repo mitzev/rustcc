@@ -13,6 +13,7 @@
 
 mod base;
 mod boxed;
+mod member_ptr;
 mod callback;
 mod exception;
 mod heap;
@@ -24,6 +25,7 @@ mod stack;
 mod string;
 
 pub use base::CxxBase;
+pub use member_ptr::CxxMemberFnPtr;
 pub use boxed::CxxBox;
 pub use callback::CxxCallback;
 pub use exception::{
