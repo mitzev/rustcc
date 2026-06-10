@@ -53,6 +53,7 @@ pub struct CxxTypeCtx {
     /// can still distinguish `static Fl::run()` from instance
     /// methods.
     static_methods: HashSet<(ClassId, usize)>,
+    inline_methods: HashSet<(ClassId, usize)>,
     /// M18: per-method count of trailing parameters that have C++
     /// default values. The bindings emitter renders this as an
     /// informational doc comment so users know which arguments
@@ -111,6 +112,7 @@ impl CxxTypeCtx {
             class_origin: Vec::new(),
             poison_reason: HashMap::new(),
             static_methods: HashSet::new(),
+            inline_methods: HashSet::new(),
             default_arg_counts: HashMap::new(),
             default_arg_values: HashMap::new(),
             bitfield_widths: HashMap::new(),
@@ -171,6 +173,21 @@ impl CxxTypeCtx {
     /// [`Self::mark_method_static`].
     pub fn is_method_static(&self, class: ClassId, method_idx: usize) -> bool {
         self.static_methods.contains(&(class, method_idx))
+    }
+
+    /// v1.14: record that `class.methods[method_idx]`'s definition
+    /// lives in the header (in-class body / `inline` keyword). Such
+    /// methods often have NO out-of-line symbol to link against —
+    /// the bindings emitter routes them through the
+    /// `__rustcc_shim_<mangled>` trampolines instead, which the shim
+    /// TU instantiates by calling the inline definition.
+    pub fn mark_method_inline(&mut self, class: ClassId, method_idx: usize) {
+        self.inline_methods.insert((class, method_idx));
+    }
+
+    /// True when [`Self::mark_method_inline`] flagged the method.
+    pub fn is_method_inline(&self, class: ClassId, method_idx: usize) -> bool {
+        self.inline_methods.contains(&(class, method_idx))
     }
 
     /// M18: record that `class.methods[method_idx]` has `count`

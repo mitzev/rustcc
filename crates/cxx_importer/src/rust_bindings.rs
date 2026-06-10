@@ -1427,6 +1427,33 @@ fn render_direct_extern_class(
             }
             Err(other) => return Err(other),
         };
+        let mut emission = emission;
+        // v1.14: header-inline methods have no out-of-line symbol —
+        // route them through the `__rustcc_shim_<mangled>` trampoline
+        // the shim TU already emits for every non-virtual method (the
+        // shim CALLS the inline definition, instantiating it).
+        // Eligibility: plain ident-named instance methods only (the
+        // trampoline takes `self` first; statics don't pass one), no
+        // by-value class params/returns (the extern "C" boundary
+        // would disagree with the C++ ABI's non-trivial rules), not
+        // virtual (vtable-dispatched), not throws (already routed).
+        if !emission.throws
+            && matches!(emission.kind, EmissionKind::Instance)
+            && matches!(method.name, MethodName::Ident(_))
+            && method.special.is_none()
+            && ctx.is_method_inline(class_id, method_idx)
+            && !ctx.is_method_static(class_id, method_idx)
+        {
+            let by_value_record = |t: TypeId| {
+                matches!(ctx.type_of(t), CxxType::Record(_))
+            };
+            let eligible = !by_value_record(method.sig.ret)
+                && !method.sig.params.iter().copied().any(by_value_record);
+            if eligible {
+                emission.link_name = format!("__rustcc_shim_{}", emission.link_name);
+                emission.via_shim = true;
+            }
+        }
         if matches!(emission.kind, EmissionKind::Dtor) {
             has_user_dtor = true;
         }
@@ -1461,7 +1488,7 @@ fn render_direct_extern_class(
         // `extern "C"` block (Phase 0 catch shim — see top of
         // function), not the in-progress `extern "C++"` block.
         if !matches!(emission.kind, EmissionKind::Virtual { .. }) {
-            if emission.throws {
+            if emission.throws || emission.via_shim {
                 throws_extern_lines.push(format!(
                     "{indent}    #[link_name = \"{}\"]",
                     emission.link_name,
@@ -2170,6 +2197,10 @@ struct MethodEmission {
     extern_ident: String,
     /// Symbol passed in `#[link_name = "…"]` — Itanium-mangled.
     link_name: String,
+    /// v1.14: true when this method routes through the
+    /// `__rustcc_shim_` trampoline (header-inline methods with no
+    /// out-of-line symbol). Declared in the `extern "C"` block.
+    via_shim: bool,
     /// Extern decl param list, including the implicit `this:
     /// *const/*mut Self` slot for instance methods + ctors + dtors.
     extern_decl_params: String,
@@ -2622,6 +2653,7 @@ fn classify_for_direct_extern(
                 rust_name: resolved_rust_name.to_string(),
                 extern_ident: format!("__cxx_{class_name}_{resolved_rust_name}"),
                 link_name: link,
+        via_shim: false,
                 extern_decl_params: decl.join(", "),
                 extern_return_clause: extern_ret_clause,
                 wrapper_receiver: WrapperReceiver::Ctor,
@@ -2661,6 +2693,7 @@ fn classify_for_direct_extern(
                 rust_name: resolved_rust_name.to_string(),
                 extern_ident: format!("__cxx_{class_name}_dtor"),
                 link_name: link,
+        via_shim: false,
                 extern_decl_params: format!("this: *mut {class_name}"),
                 extern_return_clause: String::new(),
                 wrapper_receiver: WrapperReceiver::SelfMut,
@@ -2701,6 +2734,7 @@ fn classify_for_direct_extern(
                 rust_name: "clone".into(),
                 extern_ident: format!("__cxx_{class_name}_copy_ctor"),
                 link_name: link,
+        via_shim: false,
                 extern_decl_params: format!(
                     "dst: *mut {class_name}, src: *const {class_name}"
                 ),
@@ -2739,6 +2773,7 @@ fn classify_for_direct_extern(
                 rust_name: "move_from".into(),
                 extern_ident: format!("__cxx_{class_name}_move_ctor"),
                 link_name: link,
+        via_shim: false,
                 extern_decl_params: format!(
                     "dst: *mut {class_name}, src: *mut {class_name}"
                 ),
@@ -2787,6 +2822,7 @@ fn classify_for_direct_extern(
                 rust_name: rust_name.into(),
                 extern_ident: format!("__cxx_{class_name}_{ext_suffix}"),
                 link_name: link,
+        via_shim: false,
                 extern_decl_params: format!("this: *mut {class_name}, {src_decl}"),
                 extern_return_clause: String::new(),
                 wrapper_receiver: WrapperReceiver::SelfMut,
@@ -2958,6 +2994,7 @@ fn classify_for_direct_extern(
         rust_name: method_name.clone(),
         extern_ident: format!("__cxx_{class_name}_{method_name}"),
         link_name: link,
+        via_shim: false,
         extern_decl_params: effective_extern_decl,
         extern_return_clause: effective_extern_ret_clause,
         wrapper_receiver: final_receiver,

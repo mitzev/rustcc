@@ -293,3 +293,35 @@ struct Caller {\n\
         "member-ptr-taking/returning methods must not be skipped:\n{out}"
     );
 }
+
+/// v1.14: header-INLINE methods (in-class bodies, `inline` keyword)
+/// have no out-of-line symbol — they bind through the
+/// `__rustcc_shim_<mangled>` trampolines the shim TU emits (calling
+/// the inline definition instantiates it). Out-of-line methods keep
+/// their direct mangled link_names. (FLTK: 441 methods incl.
+/// `Fl_Widget::callback` gained working bindings from this.)
+#[test]
+fn header_inline_methods_route_through_shims() {
+    let src = "\
+struct Counter {\n\
+  int n;\n\
+  explicit Counter(int s) : n(s) {}\n\
+  int bump(int by) { n += by; return n; }\n\
+  int peek() const { return n; }\n\
+  int outline(int v);\n\
+};\n";
+    let out = emit(src, "inline_shim");
+    assert!(
+        out.contains("#[link_name = \"__rustcc_shim__ZN7Counter4bumpEi\"]"),
+        "inline method must bind the shim symbol:\n{out}"
+    );
+    assert!(
+        out.contains("#[link_name = \"__rustcc_shim__ZNK7Counter4peekEv\"]"),
+        "const inline method must bind the shim symbol:\n{out}"
+    );
+    assert!(
+        out.contains("#[link_name = \"_ZN7Counter7outlineEi\"]")
+            && !out.contains("__rustcc_shim__ZN7Counter7outlineEi\""),
+        "out-of-line method must keep the direct symbol:\n{out}"
+    );
+}

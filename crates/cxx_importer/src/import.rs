@@ -1296,6 +1296,7 @@ impl<'a> Importer<'a> {
         let mut fields = Vec::new();
         let mut methods = Vec::new();
         let mut pending_static_marks: Vec<usize> = Vec::new();
+        let mut pending_inline_marks: Vec<usize> = Vec::new();
         // M18: per-method (method_idx, default_count) pairs for
         // recording on the ctx after the class body is assigned.
         // Same deferral pattern as `pending_static_marks`.
@@ -1422,6 +1423,11 @@ impl<'a> Importer<'a> {
                     // path.
                     let is_static = matches!(child.get_kind(), EntityKind::Method)
                         && child.is_static_method();
+                    // v1.14: header-inline methods (in-class body or
+                    // `inline` keyword) usually have no out-of-line
+                    // symbol; the emitter routes them via the
+                    // __rustcc_shim_ trampolines.
+                    let is_inline = child.is_inline_function();
                     // M18: capture before `lower_method` is called
                     // again on the next sibling (which would clobber
                     // the scratch slots).
@@ -1437,6 +1443,9 @@ impl<'a> Importer<'a> {
                         // Indices captured now are stable because
                         // we only push in this loop.
                         pending_static_marks.push(method_idx);
+                    }
+                    if is_inline {
+                        pending_inline_marks.push(method_idx);
                     }
                     if default_count > 0 {
                         pending_default_arg_marks
@@ -1587,6 +1596,7 @@ impl<'a> Importer<'a> {
                                 child.get_kind(),
                                 EntityKind::Method
                             ) && child.is_static_method();
+                            let is_inline = child.is_inline_function();
                             let default_count =
                                 self.last_method_default_count;
                             let default_values = std::mem::take(
@@ -1596,6 +1606,9 @@ impl<'a> Importer<'a> {
                             methods.push(m);
                             if is_static {
                                 pending_static_marks.push(method_idx);
+                            }
+                            if is_inline {
+                                pending_inline_marks.push(method_idx);
                             }
                             if default_count > 0 {
                                 pending_default_arg_marks
@@ -1646,6 +1659,9 @@ impl<'a> Importer<'a> {
         // captured during the child walk match the final
         // positions in `class.methods` because we only push
         // (never insert mid-vec) in that loop.
+        for idx in &pending_inline_marks {
+            self.ctx.mark_method_inline(id, *idx);
+        }
         for idx in &pending_static_marks {
             self.ctx.mark_method_static(id, *idx);
         }
