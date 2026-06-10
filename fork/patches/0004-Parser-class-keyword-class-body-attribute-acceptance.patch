@@ -1,4 +1,4 @@
-From fb46148e52249d4e8f1b6fd780ad96053c9b48c1 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:23:24 +0300
 Subject: [PATCH] Parser: class keyword + class-body attribute acceptance
@@ -387,6 +387,3 @@ index 8c1c3c7025f..46ec68d4eca 100644
  
  /// Stores span information about a closure.
  #[derive(Clone, Debug)]
--- 
-2.50.1 (Apple Git-155)
-

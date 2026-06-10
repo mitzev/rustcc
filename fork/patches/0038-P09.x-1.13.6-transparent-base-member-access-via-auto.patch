@@ -1,4 +1,4 @@
-From 426be42c4b9c7a4d757c8204b3560725d6eb852c Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: rustcc-build <rustcc@localhost>
 Date: Wed, 3 Jun 2026 02:10:49 +0300
 Subject: [PATCH] P09.x (1.13.6): transparent base-member access via auto-Deref
@@ -572,6 +572,3 @@ index 30136684713..85092169dcd 100644
  }
  
  /// Shift every field offset in `Arbitrary` layouts by `ptr_bytes`,
--- 
-2.50.1 (Apple Git-155)
-

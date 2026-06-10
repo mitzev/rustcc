@@ -1,4 +1,4 @@
-From a59cb6a07b819793c8698a58fbf9b67bc714ca0e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:22:22 +0300
 Subject: [PATCH] Vendor rustc_abi_cxx crate: Itanium layout, mangling, vtable
@@ -2412,6 +2412,3 @@ index 00000000000..bfcebdcc75f
 +        method,
 +    }
 +}
--- 
-2.50.1 (Apple Git-155)
-

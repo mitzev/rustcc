@@ -1,4 +1,4 @@
-From de59426bcdc7593d1867d618381accc0eeb8ed26 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 08:43:43 +0300
 Subject: [PATCH] P09.60: #[rustc_cxx_throws] attribute scaffolding (1.12
@@ -236,6 +236,3 @@ index 28ef4fd2e71..394d86c09dc 100644
          rustc_cxx_wrapper,
          rustc_deallocator,
          rustc_default_body_unstable,
--- 
-2.50.1 (Apple Git-155)
-

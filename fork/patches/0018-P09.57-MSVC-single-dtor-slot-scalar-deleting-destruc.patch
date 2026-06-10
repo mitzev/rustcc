@@ -1,4 +1,4 @@
-From d5eb228cc973648b688f0c194b881d1aaece6b99 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ognian Mitzev <OgiMitzev@gmail.com>
 Date: Sat, 23 May 2026 00:50:36 +0300
 Subject: [PATCH] P09.57: MSVC single dtor slot + scalar deleting destructor
@@ -161,6 +161,3 @@ index 85ccb8308ed..5a936b711d5 100644
  /// Mangle a destructor variant for the class reached via the
  /// `Drop` impl at `def_id`. Shared between the normal mangling
  /// path (D1 for the drop body) and the codegen path that emits
--- 
-2.50.1 (Apple Git-155)
-

@@ -1,4 +1,4 @@
-From 4de34ff3569eb9415abf4fd92acf7d87900332a6 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 10 Jun 2026 23:38:04 +0300
 Subject: [PATCH] P09.x (v1.14): ungate fork attrs + never internalize vtable
@@ -141,6 +141,3 @@ index 6f9795fb3bf..ea840e22a72 100644
  fn internalize_symbols<'tcx>(
      cx: &PartitioningCx<'_, 'tcx>,
      codegen_units: &mut [CodegenUnit<'tcx>],
--- 
-2.50.1 (Apple Git-155)
-

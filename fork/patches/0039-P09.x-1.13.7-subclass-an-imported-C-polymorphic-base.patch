@@ -1,4 +1,4 @@
-From 196eb6b20a8b53f7a82b21a96b9ccc44f5566743 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: rustcc-build <rustcc@localhost>
 Date: Wed, 3 Jun 2026 06:33:35 +0300
 Subject: [PATCH] P09.x (1.13.7): subclass an imported C++ polymorphic base
@@ -521,6 +521,3 @@ index 85092169dcd..81d50db6961 100644
      for &impl_did in tcx.inherent_impls(adt_did).iter() {
          for &assoc in tcx.associated_item_def_ids(impl_did).iter() {
              if tcx.def_kind(assoc) != rustc_hir::def::DefKind::AssocFn {
--- 
-2.50.1 (Apple Git-155)
-

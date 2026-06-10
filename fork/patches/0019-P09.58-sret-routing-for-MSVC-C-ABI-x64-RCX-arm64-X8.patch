@@ -1,4 +1,4 @@
-From d7b01362bebaf9d9ac163d37c9e2b35fd8ab678e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ognian Mitzev <OgiMitzev@gmail.com>
 Date: Sat, 23 May 2026 00:52:28 +0300
 Subject: [PATCH] P09.58: sret routing for MSVC C++ ABI (x64 RCX, arm64 X8)
@@ -137,6 +137,3 @@ index 1e423568715..5cf5a943187 100644
  pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
  where
      Ty: TyAbiInterface<'a, C> + Copy,
--- 
-2.50.1 (Apple Git-155)
-

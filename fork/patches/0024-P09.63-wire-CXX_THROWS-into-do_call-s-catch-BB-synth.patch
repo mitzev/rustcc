@@ -1,4 +1,4 @@
-From fd715ad83d0131e24946f86f19671a62975fdf97 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 10:16:14 +0300
 Subject: [PATCH] P09.63: wire CXX_THROWS into do_call's catch BB synth (Phase
@@ -161,6 +161,3 @@ index d89692283f5..f37dbab1e3e 100644
      /// Returns the landing/cleanup pad wrapper around the given basic block.
      // FIXME(eddyb) rename this to `eh_pad_for`.
      fn landing_pad_for(&mut self, bb: mir::BasicBlock) -> Bx::BasicBlock {
--- 
-2.50.1 (Apple Git-155)
-

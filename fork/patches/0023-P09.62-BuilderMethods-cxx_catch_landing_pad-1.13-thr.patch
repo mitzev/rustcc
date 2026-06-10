@@ -1,4 +1,4 @@
-From 22873f16f130c2779e1afb5d7e1682a8c85f5e80 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 10:08:32 +0300
 Subject: [PATCH] P09.62: BuilderMethods::cxx_catch_landing_pad (1.13 throws
@@ -142,6 +142,3 @@ index 11e0e93d45f..c4200b7daed 100644
  
      // These are used only by msvc
      fn cleanup_pad(&mut self, parent: Option<Self::Value>, args: &[Self::Value]) -> Self::Funclet;
--- 
-2.50.1 (Apple Git-155)
-

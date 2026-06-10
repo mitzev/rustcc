@@ -1,4 +1,4 @@
-From 3b88f6ad7c1c25f5e6e9b9d46d759ae5ee56e064 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: rustcc-build <rustcc@localhost>
 Date: Wed, 3 Jun 2026 15:04:03 +0300
 Subject: [PATCH] =?UTF-8?q?rustcc:=20rebase=20onto=20Rust=201.96.0=20?=
@@ -144,6 +144,3 @@ index b51f01cd3d6..b241e5e93c6 100644
          && swift_module_name(tcx, def_id).is_some()
  }
  
--- 
-2.50.1 (Apple Git-155)
-

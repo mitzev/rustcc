@@ -1,4 +1,4 @@
-From d2a6a8ae6350ab1605f780f0bc88e4c82e7fb1e7 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 10:24:39 +0300
 Subject: [PATCH] P09.64: call __rustcc_cxx_catch_unknown from catch BB (Phase
@@ -225,6 +225,3 @@ index 6a0f8898334..2c02a594182 100644
      fn sess(&self) -> &Session;
      fn set_frame_pointer_type(&self, llfn: Self::Function);
      fn apply_target_cpu_attr(&self, llfn: Self::Function);
--- 
-2.50.1 (Apple Git-155)
-

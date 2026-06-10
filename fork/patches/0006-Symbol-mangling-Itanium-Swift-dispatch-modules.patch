@@ -1,4 +1,4 @@
-From 1ce2012c3bbc2ad6da27479c457fee4fb9bb8706 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:23:47 +0300
 Subject: [PATCH] Symbol mangling: Itanium + Swift dispatch modules
@@ -1345,6 +1345,3 @@ index 00000000000..b51f01cd3d6
 +        assert_eq!(compress_backref_runs("s4Int8V"), "s4Int8V");
 +    }
 +}
--- 
-2.50.1 (Apple Git-155)
-

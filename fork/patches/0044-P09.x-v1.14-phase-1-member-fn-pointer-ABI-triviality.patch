@@ -1,4 +1,4 @@
-From 869994562b32fe73f08fd7f5ee5eecc97b8f4f1e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 10 Jun 2026 19:46:29 +0300
 Subject: [PATCH] P09.x (v1.14 phase 1): member-fn-pointer ABI triviality
@@ -127,6 +127,3 @@ index 5cf5a943187..428c6add8df 100644
      {
          fn_abi.ret.force_indirect();
      }
--- 
-2.50.1 (Apple Git-155)
-

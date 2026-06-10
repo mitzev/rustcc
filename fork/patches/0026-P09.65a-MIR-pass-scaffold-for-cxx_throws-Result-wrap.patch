@@ -1,4 +1,4 @@
-From 99efff2960d13b5be65e373d446259923d79f7c2 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 10:55:36 +0300
 Subject: [PATCH] P09.65a: MIR-pass scaffold for cxx_throws Result wrapping
@@ -181,6 +181,3 @@ index d3673c193e3..17f5b253cb7 100644
          // AddMovesForPackedDrops needs to run after drop
          // elaboration.
          &add_moves_for_packed_drops::AddMovesForPackedDrops,
--- 
-2.50.1 (Apple Git-155)
-

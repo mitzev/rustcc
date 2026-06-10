@@ -1,4 +1,4 @@
-From f776f30457dec2b1e692ce009b810a4fc5e5d012 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 18:36:44 +0300
 Subject: [PATCH] rustc_abi_cxx: add Windows MSVC + GNU host arms to
@@ -69,6 +69,3 @@ index b1afcc06d6d..8d04e192199 100644
          )))]
          {
              compile_error!(
--- 
-2.50.1 (Apple Git-155)
-

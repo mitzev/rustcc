@@ -1,4 +1,4 @@
-From 54f8e70e57e055a68d5ab75fbf0e067e89ac661b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ognian Mitzev <OgiMitzev@gmail.com>
 Date: Sat, 23 May 2026 00:48:16 +0300
 Subject: [PATCH] P09.56: MSVC vtable + RTTI emission
@@ -312,6 +312,3 @@ index 027536007da..d2689b014bb 100644
 +        llvm::SetUniqueComdat(cx.llmod, gv);
 +    }
 +}
--- 
-2.50.1 (Apple Git-155)
-

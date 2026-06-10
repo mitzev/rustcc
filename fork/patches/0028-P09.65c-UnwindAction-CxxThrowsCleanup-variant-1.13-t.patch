@@ -1,4 +1,4 @@
-From 8dcccb92c2918a495232d2c63fa5d751b52061c2 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 11:27:59 +0300
 Subject: [PATCH] P09.65c: UnwindAction::CxxThrowsCleanup variant (1.13 throws
@@ -643,6 +643,3 @@ index 0d04053aab7..3199d9d42bc 100644
          }
      }
  }
--- 
-2.50.1 (Apple Git-155)
-

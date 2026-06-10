@@ -1,4 +1,4 @@
-From 5f29ed6461ef6a19d6bb965045657890460f915e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Wed, 22 Apr 2026 16:05:29 +0300
 Subject: [PATCH] RISC-V Itanium C++ ABI overlay
@@ -112,6 +112,3 @@ index bc81ec95c86..28924ac5b0f 100644
  pub(crate) fn compute_rust_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>)
  where
      Ty: TyAbiInterface<'a, C> + Copy,
--- 
-2.50.1 (Apple Git-155)
-

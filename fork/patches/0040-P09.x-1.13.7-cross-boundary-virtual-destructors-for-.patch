@@ -1,4 +1,4 @@
-From 6c81f0eef42478084ee4902a7ef011142b69921c Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: rustcc-build <rustcc@localhost>
 Date: Wed, 3 Jun 2026 09:42:13 +0300
 Subject: [PATCH] P09.x (1.13.7): cross-boundary virtual destructors for Rust
@@ -324,6 +324,3 @@ index a8cefe575fa..81f9a82744a 100644
  /// P09.35: if `adt_did` is a derived class (its first field
  /// carries `#[rustc_cxx_base]`), returns the base ADT's DefId.
  /// Otherwise returns None. Chains: calling this repeatedly walks
--- 
-2.50.1 (Apple Git-155)
-

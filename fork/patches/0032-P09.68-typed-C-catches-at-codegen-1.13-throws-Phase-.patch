@@ -1,4 +1,4 @@
-From 1dce86d2094a9ec3f25da3323e3df48dc3af6ca6 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 12:55:37 +0300
 Subject: [PATCH] P09.68: typed C++ catches at codegen (1.13 throws Phase 2B)
@@ -735,6 +735,3 @@ index 2a06effcb43..828f35e66de 100644
          rustc_cxx_wrapper,
          rustc_deallocator,
          rustc_default_body_unstable,
--- 
-2.50.1 (Apple Git-155)
-

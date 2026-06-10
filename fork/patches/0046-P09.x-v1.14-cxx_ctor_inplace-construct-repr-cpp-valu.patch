@@ -1,0 +1,625 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 11 Jun 2026 01:24:51 +0300
+Subject: [PATCH] =?UTF-8?q?P09.x=20(v1.14):=20cxx=5Fctor=5Finplace=20?=
+ =?UTF-8?q?=E2=80=94=20construct=20#[repr(cpp)]=20values=20in=20place?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+C++ constructors observe `this` (FLTK widgets self-register children
+holding back-pointers), so Rust's construct-then-bitwise-move protocol
+left dangling self-references. Three cooperating MIR rewrites remove
+every temporary on the construction path:
+
+- shape 1 (CxxCtorInplace, post-inline; registered both after
+  RemoveUnneededDrops and after SimplifyLocals::Final): collapses
+  `tmp = call ctor(); place = (move|copy) tmp` into a direct call
+  destination when tmp is a single-def/single-use local and the final
+  place is rooted at _0 or at a Deref of a stable pointer local —
+  this folds `p.write(D::new(..))` into `(*p) = call D::new(..)`.
+
+- shape 2 (CxxCtorInplaceEarly, pre-inline): rewrites the importer's
+  by-value binding `new` (MaybeUninit slot + as_mut_ptr + extern ctor
+  + assume_init) so the C++ constructor writes the sret return slot
+  directly (`&raw mut _0`). Gated on #[repr(cpp)] or
+  #[rustc_cxx_imported_vtable] return types; structure re-verified
+  (use counts, MaybeUninit<T> == ret).
+
+- shape 3 (shape3_deaggregate, pre-inline): a #[constructor] body's
+  `tmp = call Base::new(); _0 = Self { __base: move tmp, .. }`
+  becomes `(_0.__base) = call Base::new(..)` plus per-field stores;
+  tolerant of ElaborateDrops drop-flag interposition.
+
+End to end the chain `ed.write(RustEditor::new(..))` →
+`Self { __base: Fl_Text_Editor::new(..) }` → extern C++ ctor now
+constructs at the final heap address: the advanced-editor self-test's
+children-parent-pointer probe flips from DANGLED to VALID with no
+re-parent fix-up.
+---
+ .../src/cxx_ctor_inplace.rs                   | 528 ++++++++++++++++++
+ compiler/rustc_mir_transform/src/lib.rs       |  15 +
+ 2 files changed, 543 insertions(+)
+ create mode 100644 compiler/rustc_mir_transform/src/cxx_ctor_inplace.rs
+
+diff --git a/compiler/rustc_mir_transform/src/cxx_ctor_inplace.rs b/compiler/rustc_mir_transform/src/cxx_ctor_inplace.rs
+new file mode 100644
+index 00000000000..8978dd1703b
+--- /dev/null
++++ b/compiler/rustc_mir_transform/src/cxx_ctor_inplace.rs
+@@ -0,0 +1,528 @@
++//! rustcc v1.14: construct `#[repr(cpp)]` values in place.
++//!
++//! C++ constructors observe `this` (self-registration, internal
++//! children holding back-pointers — FLTK widgets), so the Rust
++//! pattern `tmp = call ctor(); place = move tmp` leaves dangling
++//! self-references: the C++ ctor ran at `tmp`, not `place`.
++//!
++//! This pass collapses that pair: when a Call's destination is a
++//! plain temporary whose ONLY other use is an immediately-following
++//! whole-value move into a stable place, the call writes the final
++//! place directly. Combined with the C++-ABI sret return of
++//! `#[constructor]` fns, this chains: `*p = D::new(..)` (via
++//! `ptr::write`'s inlined `write_via_move`) constructs at `*p`, and
++//! inside `D::new` the field assign `_0.__base = call Base::new(..)`
++//! constructs the base subobject at its final offset.
++//!
++//! Conservative legality (all required):
++//! - the temporary is a projection-free local, defined exactly once
++//!   (the call) and used exactly once (the move);
++//! - the move is the first non-storage statement of the call's
++//!   target block;
++//! - the final place is rooted either at `_0` (the return slot —
++//!   live for the whole body) or at a `Deref` of an untouched
++//!   function argument (live at entry), with only field projections
++//!   on top — places whose address cannot change between the call
++//!   and the move;
++//! - the moved type is a `#[repr(cpp)]` ADT (the only types whose
++//!   constructors observe `this`; everything else keeps the smaller
++//!   temporaries the optimizer prefers).
++//!
++//! Runs AFTER inlining so `ptr::write` has dissolved into
++//! `write_via_move` (a plain no-drop `(*dst) = move src`).
++
++use rustc_middle::mir::visit::{PlaceContext, Visitor};
++use rustc_middle::mir::*;
++use rustc_middle::ty::TyCtxt;
++
++pub(super) struct CxxCtorInplace;
++
++impl<'tcx> crate::MirPass<'tcx> for CxxCtorInplace {
++    fn is_enabled(&self, _sess: &rustc_session::Session) -> bool {
++        true
++    }
++
++    fn run_pass(&self, _tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
++        let mut rewrites: Vec<(BasicBlock, Place<'tcx>)> = Vec::new();
++
++        for (bb, data) in body.basic_blocks.iter_enumerated() {
++            let TerminatorKind::Call { destination, target: Some(target), .. } =
++                &data.terminator().kind
++            else {
++                continue;
++            };
++            // Projection-free temporary local.
++            let Some(tmp) = destination.as_local() else { continue };
++            if tmp == RETURN_PLACE {
++                continue;
++            }
++            // The moved type must be a repr(cpp) ADT.
++            let ty = body.local_decls[tmp].ty;
++            let is_cpp = ty
++                .ty_adt_def()
++                .is_some_and(|adt| adt.repr().cpp());
++            if !is_cpp {
++                continue;
++            }
++            // First non-storage statement of the target block must be
++            // `final_place = move tmp`.
++            let tgt = &body.basic_blocks[*target];
++            let Some(stmt) = tgt.statements.iter().find(|s| {
++                !matches!(
++                    s.kind,
++                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop
++                )
++            }) else {
++                continue;
++            };
++            // Move OR copy: optimization passes demote moves of
++            // Copy-able byte blobs to copies; with the temporary
++            // dead afterwards (enforced below) they're equivalent.
++            let StatementKind::Assign(box (
++                final_place,
++                Rvalue::Use(Operand::Move(src) | Operand::Copy(src)),
++            )) = &stmt.kind
++            else {
++                continue;
++            };
++            if src.as_local() != Some(tmp) {
++                continue;
++            }
++            // Final place: rooted at _0, or a Deref of a pointer
++            // local with at most ONE def (an argument: zero defs; a
++            // computed pointer like `operator new`'s result: one) —
++            // its value cannot change between the call and the move
++            // (the move is the first statement of the call's target).
++            // Root: _0 itself, or a Deref-rooted place through a
++            // pointer local with at most one def (its value can't
++            // change between the call and the immediately-following
++            // move). `(*_0)` — make_widget-style fns returning the
++            // raw pointer — takes the Deref arm.
++            let starts_with_deref =
++                matches!(final_place.projection.first(), Some(ProjectionElem::Deref));
++            let root_ok = (final_place.local == RETURN_PLACE && !starts_with_deref)
++                || (starts_with_deref && {
++                    let mut defs = DefCounter { local: final_place.local, defs: 0 };
++                    defs.visit_body(body);
++                    // The deref-write itself registers as a mutating
++                    // use of the base local in some visitor versions;
++                    // allow def-count 1 (the pointer assignment) plus
++                    // that artifact.
++                    defs.defs <= 2
++                });
++            if !root_ok {
++                continue;
++            }
++            if final_place
++                .projection
++                .iter()
++                .skip(if starts_with_deref { 1 } else { 0 })
++                .any(|e| !matches!(e, ProjectionElem::Field(..)))
++            {
++                continue;
++            }
++            // The temporary must have no OTHER uses anywhere.
++            let mut counter = UseCounter { local: tmp, uses: 0 };
++            counter.visit_body(body);
++            // Exactly: 1 def (call dest) + 1 move (the statement).
++            if counter.uses != 2 {
++                continue;
++            }
++            // The final place's root must not be modified between the
++            // call and the move — the move is the first real statement
++            // of the immediate successor, so only the call itself sits
++            // in between; its args may READ the root but the
++            // destination write happens after argument evaluation.
++            rewrites.push((bb, *final_place));
++        }
++
++        for (bb, final_place) in rewrites {
++            // Redirect the call destination.
++            let target = {
++                let TerminatorKind::Call { destination, target, .. } =
++                    &mut body.basic_blocks_mut()[bb].terminator_mut().kind
++                else {
++                    unreachable!()
++                };
++                let t = target.unwrap();
++                *destination = final_place;
++                t
++            };
++            // Nop the move.
++            let tgt = &mut body.basic_blocks_mut()[target];
++            for s in tgt.statements.iter_mut() {
++                if matches!(
++                    s.kind,
++                    StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop
++                ) {
++                    continue;
++                }
++                s.make_nop(true);
++                break;
++            }
++        }
++    }
++
++    fn is_required(&self) -> bool {
++        false
++    }
++}
++
++struct UseCounter {
++    local: Local,
++    uses: usize,
++}
++
++impl<'tcx> Visitor<'tcx> for UseCounter {
++    fn visit_local(&mut self, local: Local, ctx: PlaceContext, _loc: Location) {
++        if local != self.local {
++            return;
++        }
++        match ctx {
++            PlaceContext::NonUse(_) => {}
++            _ => self.uses += 1,
++        }
++    }
++}
++
++/// Shape 2 (pre-inline): rewrite the importer-emitted by-value `new`
++/// so the extern C++ constructor writes the RETURN SLOT directly.
++///
++/// The cxx_importer binding body is exactly:
++/// ```text
++/// bb0: _slot = MaybeUninit::<T>::uninit() -> bb1
++/// bb1: _r5 = &mut _slot; _p = as_mut_ptr(move _r5) -> bb2
++/// bb2: _u = ext_ctor(move _p, args…) -> bb3
++/// bb3: _t = move _slot; _0 = assume_init(move _t) -> bb4
++/// ```
++/// The C++ ctor runs at `_slot` — a LOCAL — and the result is then
++/// bitwise-moved to `_0`, dangling any self-references the ctor
++/// stored (FLTK window drivers, group children back-pointers).
++/// Rewritten:
++/// ```text
++/// bb1: nop; _p = &raw mut _0 -> goto bb2
++/// bb3: nop; goto bb4                  (ext_ctor already filled _0)
++/// ```
++/// Legality is carried by the emitter contract, re-verified
++/// structurally: `_slot`'s only uses are the three above, `_0`'s only
++/// def is the assume_init, and the types line up (T repr(cpp)).
++/// Must run BEFORE inlining so callers inherit the fixed body.
++pub(super) struct CxxCtorInplaceEarly;
++
++impl<'tcx> crate::MirPass<'tcx> for CxxCtorInplaceEarly {
++    fn is_enabled(&self, _sess: &rustc_session::Session) -> bool {
++        true
++    }
++
++    fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
++        use rustc_middle::ty;
++
++        shape3_deaggregate(tcx, body);
++
++        let ret_ty = body.local_decls[RETURN_PLACE].ty;
++        let Some(adt) = ret_ty.ty_adt_def() else { return };
++        // Rust-defined classes are #[repr(cpp)]; IMPORTED classes are
++        // #[repr(C)] opaques carrying #[rustc_cxx_imported_vtable] —
++        // those are exactly the binding `new` bodies this shape
++        // exists for (their C++ ctors self-register `this`).
++        let is_imported_cpp = rustc_hir::find_attr!(
++            tcx,
++            adt.did(),
++            rustc_hir::attrs::AttributeKind::RustcCxxImportedVtable { .. }
++        );
++        if !adt.repr().cpp() && !is_imported_cpp {
++            return;
++        }
++
++        // Locate the assume_init call: dest is plain `_0`, callee path
++        // ends with `assume_init`, single by-move arg of MaybeUninit<T>.
++        let mut assume_bb = None;
++        let mut as_mut_ptr_bb = None;
++        let mut slot_local = None;
++        let mut ptr_local = None;
++
++        for (bb, data) in body.basic_blocks.iter_enumerated() {
++            let TerminatorKind::Call { func, args, destination, target: Some(_), .. } =
++                &data.terminator().kind
++            else {
++                continue;
++            };
++            let Some((def_id, _)) = func.const_fn_def() else { continue };
++            // `def_path_str` is diagnostics-only (ICEs via
++            // trimmed_def_paths in normal compilation) — use the bare
++            // item name; the structural type checks below pin the
++            // owner to MaybeUninit<T>.
++            let name = tcx.item_name(def_id);
++            if name.as_str() == "assume_init" && destination.as_local() == Some(RETURN_PLACE) {
++                // Preceding statement: `_t = move _slot`.
++                let Some(stmt) = data.statements.last() else { continue };
++                let StatementKind::Assign(box (t_place, Rvalue::Use(Operand::Move(slot)))) =
++                    &stmt.kind
++                else {
++                    continue;
++                };
++                let (Some(t), Some(s)) = (t_place.as_local(), slot.as_local()) else { continue };
++                // arg is `move _t`.
++                if args.len() == 1
++                    && matches!(&args[0].node, Operand::Move(p) if p.as_local() == Some(t))
++                {
++                    assume_bb = Some(bb);
++                    slot_local = Some(s);
++                }
++            } else if name.as_str() == "as_mut_ptr" {
++                let Some(d) = destination.as_local() else { continue };
++                as_mut_ptr_bb = Some(bb);
++                ptr_local = Some(d);
++            }
++        }
++
++        let (Some(assume_bb), Some(as_mut_ptr_bb), Some(slot), Some(_p)) =
++            (assume_bb, as_mut_ptr_bb, slot_local, ptr_local)
++        else {
++            return;
++        };
++
++        // `_slot` must be MaybeUninit<T> with T == ret_ty.
++        let slot_ty = body.local_decls[slot].ty;
++        let ty::Adt(slot_adt, slot_args) = slot_ty.kind() else { return };
++        // MaybeUninit carries no diagnostic item on this base — match
++        // structurally: a core union named MaybeUninit whose type
++        // param is exactly the return type.
++        if !slot_adt.is_union()
++            || tcx.item_name(slot_adt.did()).as_str() != "MaybeUninit"
++        {
++            return;
++        }
++        if slot_args.type_at(0) != ret_ty {
++            return;
++        }
++        // `_0` defined exactly once (the assume_init).
++        let mut ret_uses = UseCounter { local: RETURN_PLACE, uses: 0 };
++        ret_uses.visit_body(body);
++        // 2 = the assume_init def + the implicit read at `Return`.
++        if ret_uses.uses != 2 {
++            return;
++        }
++        // `_slot` used exactly: uninit dest + `&mut _slot` + the move.
++        let mut slot_uses = UseCounter { local: slot, uses: 0 };
++        slot_uses.visit_body(body);
++        if slot_uses.uses != 3 {
++            return;
++        }
++        // The as_mut_ptr block's last statement must be `_r = &mut _slot`.
++        {
++            let data = &body.basic_blocks[as_mut_ptr_bb];
++            let Some(stmt) = data.statements.last() else { return };
++            let StatementKind::Assign(box (_, Rvalue::Ref(_, BorrowKind::Mut { .. }, refd))) =
++                &stmt.kind
++            else {
++                return;
++            };
++            if refd.as_local() != Some(slot) {
++                return;
++            }
++        }
++
++        // ---- rewrite ----
++        // as_mut_ptr block: nop the `&mut _slot`, replace the call with
++        // `_p = &raw mut _0; goto`.
++        {
++            let (dest, tgt) = {
++                let TerminatorKind::Call { destination, target, .. } =
++                    &body.basic_blocks[as_mut_ptr_bb].terminator().kind
++                else {
++                    unreachable!()
++                };
++                (*destination, target.unwrap())
++            };
++            let source_info = body.basic_blocks[as_mut_ptr_bb].terminator().source_info;
++            let data = &mut body.basic_blocks_mut()[as_mut_ptr_bb];
++            if let Some(stmt) = data.statements.last_mut() {
++                stmt.make_nop(true);
++            }
++            data.statements.push(Statement::new(
++                source_info,
++                StatementKind::Assign(Box::new((
++                    dest,
++                    Rvalue::RawPtr(RawPtrKind::Mut, Place::from(RETURN_PLACE)),
++                ))),
++            ));
++            data.terminator_mut().kind = TerminatorKind::Goto { target: tgt };
++        }
++        // assume_init block: nop the slot move, replace call with goto.
++        {
++            let tgt = {
++                let TerminatorKind::Call { target, .. } =
++                    &body.basic_blocks[assume_bb].terminator().kind
++                else {
++                    unreachable!()
++                };
++                target.unwrap()
++            };
++            let data = &mut body.basic_blocks_mut()[assume_bb];
++            if let Some(stmt) = data.statements.last_mut() {
++                stmt.make_nop(true);
++            }
++            data.terminator_mut().kind = TerminatorKind::Goto { target: tgt };
++        }
++    }
++
++    fn is_required(&self) -> bool {
++        false
++    }
++}
++
++/// Shape 3 (pre-inline): the `#[constructor]` body `Self { __base:
++/// Base::new(..), f: v }` builds an AGGREGATE from a call temporary —
++/// `tmp = call Base::new(); _0 = Self { __base: move tmp, .. }` —
++/// which bitwise-moves the freshly C++-constructed base subobject.
++/// De-aggregate: redirect the call destination to `_0.__base` and
++/// lower the remaining operands to per-field stores.
++fn shape3_deaggregate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
++    let ret_ty = body.local_decls[RETURN_PLACE].ty;
++    let Some(adt) = ret_ty.ty_adt_def() else { return };
++    if !adt.repr().cpp() || !adt.is_struct() {
++        return;
++    }
++
++    // Find `_0 = Aggregate(Adt, ops)` as the FIRST real statement of a
++    // block targeted by a call whose plain-local dest is moved by one
++    // of the operands.
++    let mut plan: Option<(BasicBlock, BasicBlock, usize)> = None;
++    'outer: for (bb, data) in body.basic_blocks.iter_enumerated() {
++        let TerminatorKind::Call { destination, target: Some(target), .. } =
++            &data.terminator().kind
++        else {
++            continue;
++        };
++        let Some(tmp) = destination.as_local() else { continue };
++        if tmp == RETURN_PLACE {
++            continue;
++        }
++        let tgt = &body.basic_blocks[*target];
++        for (si, stmt) in tgt.statements.iter().enumerate() {
++            // Skip statements that touch neither the temp nor _0 —
++            // ElaborateDrops interposes drop-flag assigns
++            // (`_f = const false`) before the aggregate when the
++            // class or its base has a Drop impl.
++            let touches = |l: Local| {
++                let mut c = UseCounter { local: l, uses: 0 };
++                c.visit_statement(stmt, Location { block: *target, statement_index: si });
++                c.uses > 0
++            };
++            match &stmt.kind {
++                StatementKind::StorageLive(_) | StatementKind::StorageDead(_) | StatementKind::Nop => {}
++                StatementKind::Assign(box (place, Rvalue::Aggregate(kind, ops)))
++                    if place.as_local() == Some(RETURN_PLACE) =>
++                {
++                    let rustc_middle::mir::AggregateKind::Adt(did, ..) = **kind else {
++                        continue 'outer;
++                    };
++                    if Some(did) != ret_ty.ty_adt_def().map(|a| a.did()) {
++                        continue 'outer;
++                    }
++                    // exactly one operand moves `tmp`?
++                    let mut hit = None;
++                    for (i, op) in ops.iter().enumerate() {
++                        if matches!(op, Operand::Move(p) if p.as_local() == Some(tmp)) {
++                            hit = Some(i);
++                        }
++                    }
++                    if let Some(i) = hit {
++                        // tmp must have exactly def+move uses.
++                        let mut c = UseCounter { local: tmp, uses: 0 };
++                        c.visit_body(body);
++                        if c.uses == 2 {
++                            plan = Some((bb, *target, i));
++                        }
++                    }
++                    break 'outer;
++                }
++                _ => {
++                    if touches(tmp) || touches(RETURN_PLACE) {
++                        continue 'outer;
++                    }
++                }
++            }
++        }
++    }
++    let Some((call_bb, agg_bb, fold_idx)) = plan else { return };
++
++    // Pull the aggregate apart.
++    let (source_info, ops) = {
++        let tgt = &body.basic_blocks[agg_bb];
++        let stmt = tgt
++            .statements
++            .iter()
++            .find(|s| {
++                matches!(
++                    s.kind,
++                    StatementKind::Assign(box (_, Rvalue::Aggregate(..)))
++                )
++            })
++            .unwrap();
++        let StatementKind::Assign(box (_, Rvalue::Aggregate(_, ops))) = &stmt.kind else {
++            unreachable!()
++        };
++        (stmt.source_info, ops.clone())
++    };
++
++    // Redirect the call destination to `_0.<fold_idx>`.
++    let fold_field_ty = ops[rustc_abi::FieldIdx::from_usize(fold_idx)].ty(&body.local_decls, tcx);
++    {
++        let TerminatorKind::Call { destination, .. } =
++            &mut body.basic_blocks_mut()[call_bb].terminator_mut().kind
++        else {
++            unreachable!()
++        };
++        *destination = tcx.mk_place_field(
++            Place::from(RETURN_PLACE),
++            rustc_abi::FieldIdx::from_usize(fold_idx),
++            fold_field_ty,
++        );
++    }
++    // Replace the aggregate statement with per-field stores of the
++    // remaining operands.
++    {
++        let mut new_stmts: Vec<Statement<'tcx>> = Vec::new();
++        for (i, op) in ops.iter_enumerated() {
++            if i.as_usize() == fold_idx {
++                continue;
++            }
++            let fty = op.ty(&body.local_decls, tcx);
++            let place = tcx.mk_place_field(Place::from(RETURN_PLACE), i, fty);
++            new_stmts.push(Statement::new(
++                source_info,
++                StatementKind::Assign(Box::new((place, Rvalue::Use(op.clone())))),
++            ));
++        }
++        let tgt = &mut body.basic_blocks_mut()[agg_bb];
++        let pos = tgt
++            .statements
++            .iter()
++            .position(|s| {
++                matches!(
++                    s.kind,
++                    StatementKind::Assign(box (_, Rvalue::Aggregate(..)))
++                )
++            })
++            .unwrap();
++        tgt.statements.splice(pos..=pos, new_stmts);
++    }
++}
++
++struct DefCounter {
++    local: Local,
++    defs: usize,
++}
++
++impl<'tcx> Visitor<'tcx> for DefCounter {
++    fn visit_local(&mut self, local: Local, ctx: PlaceContext, _loc: Location) {
++        if local != self.local {
++            return;
++        }
++        if matches!(ctx, PlaceContext::MutatingUse(_)) {
++            self.defs += 1;
++        }
++    }
++}
+diff --git a/compiler/rustc_mir_transform/src/lib.rs b/compiler/rustc_mir_transform/src/lib.rs
+index 9476ec7dba9..cb6df692239 100644
+--- a/compiler/rustc_mir_transform/src/lib.rs
++++ b/compiler/rustc_mir_transform/src/lib.rs
+@@ -121,6 +121,7 @@ macro_rules! pass_names {
+ 
+ declare_passes! {
+     mod abort_unwinding_calls : AbortUnwindingCalls;
++    mod cxx_ctor_inplace : CxxCtorInplace, CxxCtorInplaceEarly;
+     mod cxx_throws_wrap : CxxThrowsWrap;
+     mod add_call_guards : AddCallGuards { AllCallEdges, CriticalCallEdges };
+     mod add_moves_for_packed_drops : AddMovesForPackedDrops;
+@@ -654,6 +655,10 @@ fn run_runtime_lowering_passes<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
+         // with UnwindAction::CxxThrowsCleanup threading the
+         // raw_err_local through to codegen.
+         &cxx_throws_wrap::CxxThrowsWrap,
++        // rustcc v1.14 (shape 2, PRE-inline): rewrite the importer's
++        // by-value `new` so the extern C++ ctor constructs the return
++        // slot directly — callers then inherit the in-place body.
++        &cxx_ctor_inplace::CxxCtorInplaceEarly,
+         // AddMovesForPackedDrops needs to run after drop
+         // elaboration.
+         &add_moves_for_packed_drops::AddMovesForPackedDrops,
+@@ -734,6 +739,11 @@ fn o1<T>(x: T) -> WithMinOptLevel<T> {
+             // Inlining and instantiation may introduce ZST and useless drops.
+             &remove_zsts::RemoveZsts,
+             &remove_unneeded_drops::RemoveUnneededDrops,
++            // rustcc v1.14: construct repr(cpp) values in place —
++            // collapse `tmp = call ctor(); place = move tmp` so C++
++            // constructors run at the final address (after inlining,
++            // so ptr::write has dissolved into write_via_move).
++            &cxx_ctor_inplace::CxxCtorInplace,
+             // Type instantiation may create uninhabited enums.
+             // Also eliminates some unreachable branches based on variants of enums.
+             &unreachable_enum_branching::UnreachableEnumBranching,
+@@ -778,6 +788,11 @@ fn o1<T>(x: T) -> WithMinOptLevel<T> {
+             &dead_store_elimination::DeadStoreElimination::Final,
+             &dest_prop::DestinationPropagation,
+             &simplify::SimplifyLocals::Final,
++            // rustcc v1.14: final-shape pass of the in-place ctor
++            // collapse — GVN/DestProp/SimplifyLocals form the
++            // `tmp = call ctor(); (*p) = copy tmp` shape only here at
++            // the pipeline tail.
++            &cxx_ctor_inplace::CxxCtorInplace,
+             &multiple_return_terminators::MultipleReturnTerminators,
+             &large_enums::EnumSizeOpt { discrepancy: 128 },
+             // Some cleanup necessary at least for LLVM and potentially other codegen backends.

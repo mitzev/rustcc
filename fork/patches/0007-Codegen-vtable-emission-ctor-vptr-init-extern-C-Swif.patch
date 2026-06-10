@@ -1,4 +1,4 @@
-From 66293906425f033c968c3cc0c12f47eaf24f83c3 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:24:03 +0300
 Subject: [PATCH] Codegen: vtable emission + ctor vptr-init + extern C++/Swift
@@ -642,6 +642,3 @@ index c222aef4574..11e0e93d45f 100644
      fn cx(&self) -> &Self::CodegenCx;
      fn llbb(&self) -> Self::BasicBlock;
  
--- 
-2.50.1 (Apple Git-155)
-

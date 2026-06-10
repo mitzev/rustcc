@@ -1,4 +1,4 @@
-From a881a770138598213c6d8b1955ee1618c5117ee5 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Sat, 25 Apr 2026 01:02:33 +0300
 Subject: [PATCH] P09.46: built-in attribute macro for #[swift_value] (1.02 #2)
@@ -555,6 +555,3 @@ index aeefec8b9e0..ef945528b89 100644
  #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
  #[doc(no_inline)]
  pub use core::prelude::v1::derive;
--- 
-2.50.1 (Apple Git-155)
-

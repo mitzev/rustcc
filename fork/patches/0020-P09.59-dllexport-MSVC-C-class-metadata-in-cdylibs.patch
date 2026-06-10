@@ -1,4 +1,4 @@
-From d14caa427770615767afa14bb250d2c3e66b7086 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 00:56:35 +0300
 Subject: [PATCH] P09.59: dllexport MSVC C++ class metadata in cdylibs
@@ -138,6 +138,3 @@ index 2871326b28b..2d42b038841 100644
  pub(crate) fn set_dso_local<'ll>(v: &'ll Value) {
      unsafe {
          LLVMRustSetDSOLocal(v, true);
--- 
-2.50.1 (Apple Git-155)
-

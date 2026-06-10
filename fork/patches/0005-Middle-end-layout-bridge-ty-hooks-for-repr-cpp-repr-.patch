@@ -1,4 +1,4 @@
-From e0cabc0d83c603252bd409725d010f387f043b32 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:23:34 +0300
 Subject: [PATCH] Middle-end: layout bridge + ty hooks for repr(cpp) /
@@ -559,6 +559,3 @@ index 00000000000..30136684713
 +        ctx.intern_type(CxxType::Int { signed: false, width: IntWidth::I8 });
 +    ctx.intern_type(CxxType::Array { elem: u8_ty, len: size })
 +}
--- 
-2.50.1 (Apple Git-155)
-

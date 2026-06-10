@@ -1,4 +1,4 @@
-From 3a5fac422ef6cf4d2a0535f41f12558893845a2e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:23:04 +0300
 Subject: [PATCH] ABI plumbing: ExternAbi::Cpp + callconv + stable-rustc bridge
@@ -546,6 +546,3 @@ index c0fdd946778..4d913cce1f3 100644
              (ExternAbi::Rust | ExternAbi::RustCall, _) => CanonAbi::Rust,
              (ExternAbi::Unadjusted, _) => CanonAbi::C,
  
--- 
-2.50.1 (Apple Git-155)
-

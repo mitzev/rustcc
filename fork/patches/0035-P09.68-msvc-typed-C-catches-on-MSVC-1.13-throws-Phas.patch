@@ -1,4 +1,4 @@
-From 4149321f036d0d26465ddb1c786ef403d10c8b7c Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 14:03:19 +0300
 Subject: [PATCH] P09.68-msvc: typed C++ catches on MSVC (1.13 throws Phase 2D)
@@ -640,6 +640,3 @@ index 828f35e66de..081008135f9 100644
          rustc_cxx_throws_typeinfos,
          rustc_cxx_wrapper,
          rustc_deallocator,
--- 
-2.50.1 (Apple Git-155)
-

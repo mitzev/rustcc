@@ -1,4 +1,4 @@
-From d64fc1e137d4543ce5682d419816a81abc53ad86 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 10:05:07 +0300
 Subject: [PATCH] P09.61: fn_can_unwind respects CXX_THROWS (1.13 throws Phase
@@ -83,6 +83,3 @@ index 8ac65ea4b56..be234d7c018 100644
          // With `-C panic=abort`, all non-FFI functions are required to not unwind.
          //
          // Note that this is true regardless ABI specified on the function -- a `extern "C-unwind"`
--- 
-2.50.1 (Apple Git-155)
-

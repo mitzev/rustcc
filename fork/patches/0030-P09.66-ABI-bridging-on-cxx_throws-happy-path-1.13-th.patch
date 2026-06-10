@@ -1,4 +1,4 @@
-From 1cca004298ef0e3376baa19196e04fff3fc6d9b0 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 11:58:24 +0300
 Subject: [PATCH] P09.66: ABI bridging on cxx_throws happy path (1.13 throws
@@ -139,6 +139,3 @@ index ed50f9498a6..dcc5ac82ed5 100644
          // The arguments we'll be passing. Plus one to account for outptr, if used.
          let arg_count = fn_abi.args.len() + fn_abi.ret.is_indirect() as usize;
  
--- 
-2.50.1 (Apple Git-155)
-

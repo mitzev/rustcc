@@ -1,4 +1,4 @@
-From cb170e346e4be1510c0b937a66049a1bb7a531fb Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 11:01:56 +0300
 Subject: [PATCH] P09.65b: MIR pass wraps happy path in Result::Ok (Phase 1F)
@@ -239,6 +239,3 @@ index 767e14e8d7f..7fa7467e8b5 100644
 +    *destination = Place::from(raw_local);
 +    *target = Some(ok_wrap_bb);
  }
--- 
-2.50.1 (Apple Git-155)
-

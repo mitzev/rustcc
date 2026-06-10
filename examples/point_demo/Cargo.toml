@@ -13,6 +13,8 @@
 # under `examples/` rather than being a workspace member: workspace
 # members go through a plain `cargo build`.
 
+[workspace]
+
 [package]
 name = "point_demo"
 version = "0.1.0"

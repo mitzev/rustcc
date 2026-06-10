@@ -1,4 +1,4 @@
-From 63f4fab04289db6111909438071c5732612bcbdf Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: x <x@x>
 Date: Wed, 10 Jun 2026 10:37:54 +0300
 Subject: [PATCH] P09.x (1.13.10): dtor position, sig-checked overrides, O3
@@ -607,6 +607,3 @@ index fa56e8ab730..720753058be 100644
  /// P09.24: Itanium-mangled name for the class's vtable
  /// (`_ZTV<class>`), typeinfo (`_ZTI<class>`), or typeinfo-name
  /// (`_ZTS<class>`). Uses the same namespace-prefix logic as
--- 
-2.50.1 (Apple Git-155)
-

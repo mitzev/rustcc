@@ -1,4 +1,4 @@
-From d2e5c4bce88eb84d1365901450b81b683428beed Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 13:01:29 +0300
 Subject: [PATCH] P09.67: MSVC funclet codegen for cxx_throws (1.13 throws
@@ -222,6 +222,3 @@ index feae8dbd976..3b94a10d810 100644
      fn catch_switch(
          &mut self,
          parent: Option<Self::Value>,
--- 
-2.50.1 (Apple Git-155)
-

@@ -1,4 +1,4 @@
-From ca8e84b766e85f37e1e2d956f53fd11abb4478e1 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Sat, 25 Apr 2026 02:06:26 +0300
 Subject: [PATCH] =?UTF-8?q?P09.48:=20#[rustc=5Fswift=5Fthrows]=20+=20Swift?=
@@ -424,6 +424,3 @@ index 7bbac77b7ba..7819bce259b 100644
      };
      fn_abi_adjust_for_abi(cx, &mut fn_abi, effective_abi);
      debug!("fn_abi_new_uncached = {:?}", fn_abi);
--- 
-2.50.1 (Apple Git-155)
-
