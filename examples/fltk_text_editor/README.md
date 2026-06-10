@@ -1,21 +1,21 @@
-# fltk_text_editor
+# fltk_text_editor — a TextEdit-style editor in Rust-subclassed FLTK
 
-A minimal FLTK text editor in Rust. End-to-end smoke test for rustcc's cxx_importer + Itanium ABI fork.
+A Mac-TextEdit-equivalent plain-text editor and the fork's broadest
+application testbed: menu bar with shortcuts (File/Edit/Format), native
+open/save dialogs, undo/redo, find bar, word wrap, font sizing, and an
+"— Edited" dirty title — built on THREE Rust `class` subclasses
+(`RustEditor : Fl_Text_Editor`, `FindBar : Fl_Input`) plus C++→Rust
+function-pointer callbacks (menu dispatch, buffer modify callback).
 
-## What this exercises
-
-- **Multi-inheritance import** — Fl_Window → Fl_Group → Fl_Widget. M22 cross-base accessors (`window.as_fl_group_mut()`).
-- **Itanium ctor / dtor mangling** — `Fl_Text_Buffer::new` calls `_ZN14Fl_Text_BufferC1Eii`; `Drop` runs the matching D1 dtor.
-- **Virtual dispatch** — clicking into the editor triggers `Fl_Text_Editor::handle()` through the vtable that `populate_vtable_indices` walked when it imported the class.
-- **cstr ergonomics (M20.b/c)** — `c"…"` literals via `new_cstr`, `&str` via `text_const_i8_str`.
-- **Abstract-class detection** — Fl_Menu_, Fl_Input_, Fl_Device_Plugin (transitively pulled in by Fl_Menu_Bar.H) all have pure virtuals; the importer skips ctor-shim emission for them so the C++ shims compile.
-- **The fork's `extern "C++"` ABI** — every shim call goes through `__rustcc_shim_<mangled>` trampolines that the rustcc fork accepts as legitimate C++ entry points.
-
-## Prereqs
-
-- macOS / Linux with libclang available to `clang-sys` (`brew install llvm`, `apt install libclang-dev`).
-- FLTK 1.4.x installed system-wide. macOS: `brew install fltk`. The build helper expects FLTK at `/opt/homebrew/include` and `/opt/homebrew/Cellar/fltk/1.4.5/lib`; edit `gen_bindings.rs` if your install lives elsewhere.
-- The rustcc fork toolchain to actually run the editor — `extern "C++"` is a fork extension. Build it with `./fork/build.sh` from this repo's root (then `rustup toolchain link rustcc …/build/host/stage1`), or grab a prebuilt toolchain from the [releases page](https://github.com/mitzev/rustcc/releases). See `fork/INSTALL.md` for the full setup.
+Building it surfaced and fixed four fork/importer bugs (v1.13.10+):
+the Itanium `PF…E` function-type mangling (63 unlinkable callback
+symbols), the `Ptr{Fn}` model collapse that dropped the `P` from
+fn-pointer-typedef params, `Option<fn>` default-arg synthesis, and —
+found by `Fl_Window::show()` silently no-oping — the construct-then-
+move hazard on window drivers, solved with the `new_at` placement
+constructors. Known limitation it documents: header-INLINE C++ methods
+(e.g. `Fl_Widget::callback`) have no out-of-line symbol for
+DirectExternCpp to bind — the `FindBar` subclass routes around it.
 
 ## Build + run
 
