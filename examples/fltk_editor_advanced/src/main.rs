@@ -445,22 +445,6 @@ unsafe fn run_gui() -> i32 {
     }
 }
 
-/// Forces collection of the two classes' `drop_in_place` glue. The
-/// fork's C++ vtable deleting-dtor thunks reference the glue symbol,
-/// but that reference is created at CODEGEN time — under `-C
-/// opt-level=3` the collector's root for it resolves to a `LocalCopy`
-/// instantiation that never materializes, and the link fails with an
-/// undefined `drop_in_place<RustEditor>`. A `#[no_mangle]` root with a
-/// real MIR-level use guarantees emission. (Known fork limitation —
-/// see the project bug review; harmless dead code otherwise.)
-#[no_mangle]
-pub unsafe extern "C" fn __rde_force_drop_glue(a: *mut RustEditor, b: *mut StatusBox) {
-    unsafe {
-        ::core::ptr::drop_in_place(a);
-        ::core::ptr::drop_in_place(b);
-    }
-}
-
 fn main() {
     let wants_self_test = std::env::args().any(|a| a == "--self-test");
     let rc = unsafe {

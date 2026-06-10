@@ -132,11 +132,19 @@ How it works:
 - `cxx_importer` emits `#[rustc_cxx_imported_vtable = "<spec>"]` on the
   imported base's `#[repr(C)]` struct. The spec lists the base's
   primary-vtable function-pointer slots in C++ order
-  (`zti=…;[vdtor=1;]slot=<name>,<symbol>;…`); pure virtuals carry
-  `__cxa_pure_virtual`, and `vdtor=1` flags a virtual destructor.
+  (`zti=…;[vdtor=1;]slot=<name>,<symbol>[,<psig>];…`); pure virtuals
+  carry `__cxa_pure_virtual`, and `vdtor=1` flags a virtual destructor.
+  v1.13.10 additions: the destructor pair appears as a positional
+  `slot=~dtor,~` record at its DECLARATION position (Itanium §2.5.2 —
+  not necessarily first); operator/conversion virtuals hold their slot
+  index via `~op<N>` placeholders; and each named slot's third field is
+  the Itanium parameter encoding at its declaring class.
 - The chain-walk (`virtuals_on_chain`) seeds the derived vtable from
-  those slots. A Rust `override fn` matched by name takes over a slot;
-  a non-overridden slot points directly at the real C++ symbol. The
+  those slots. A Rust `override fn` is matched by **name + parameter
+  signature** (v1.13.10): overloaded base virtuals route to the right
+  slot, and an override whose parameters match no overload is a compile
+  error rather than a silently ABI-mismatched slot. A non-overridden
+  slot points directly at the real C++ symbol. The
   derived's vtable shares the base vptr at offset 0, and `_ZTI<Derived>`
   chains to the external base `_ZTI` (`__si_class_type_info`). The
   imported base never emits its own `_ZTV`/`_ZTI`/`_ZTS` (C++ owns them).

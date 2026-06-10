@@ -29,12 +29,4 @@ cxx = { path = "../../crates/cxx" }
 [build-dependencies]
 cc = "1"
 
-# Single codegen unit: the fork's collector roots a Rust class's
-# drop-in-place glue (referenced by its vtable's deleting-dtor thunk)
-# only in the class's defining CGU; with the default 16 release CGUs
-# the cross-CGU reference comes out undefined at link time. Known fork
-# limitation — see the project bug review.
-[profile.release]
-codegen-units = 1
-
 [workspace]

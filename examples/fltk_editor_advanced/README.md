@@ -66,12 +66,13 @@ widgets are heap-placed via `operator new` (C++ deletes them) and the
 window's implicit group capture is cleared before constructing Rust
 widgets.
 
-Two more workarounds this example documents:
+One more build note: FLTK is linked as the **static archive by
+absolute path** — the Homebrew dylib hides inline symbols (e.g.
+`~Fl_Text_Editor()`), and `-lfltk` would pick the dylib.
 
-- `__rde_force_drop_glue`: at `-C opt-level=3` the collector's root for
-  the classes' `drop_in_place` (referenced by the vtable's deleting-dtor
-  thunk) fails to materialize; an exported function with a real use
-  forces it.
-- FLTK is linked as the **static archive by absolute path**: the
-  Homebrew dylib hides inline symbols (e.g. `~Fl_Text_Editor()`), and
-  `-lfltk` would pick the dylib.
+(v1.13.10 removed two earlier workarounds: the drop-glue force
+function — the collector now emits vtable-referenced `drop_in_place`
+at every opt level — and the `codegen-units = 1` pin. For imported
+classes whose constructors escape `this`, the bindings now also offer
+`new_at` placement constructors; the Rust-`class` ctor protocol itself
+still constructs-then-moves, which the self-test detects and repairs.)
