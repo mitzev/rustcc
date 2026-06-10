@@ -39,7 +39,7 @@ fn build_simple_class(ctx: &mut CxxTypeCtx) -> rustc_abi_cxx::ClassId {
         fields: vec![],
         methods: vec![
             // Default ctor (Foo(int x))
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("Foo".into())),
                 sig: FnSig {
                     params: vec![i],
@@ -54,7 +54,7 @@ fn build_simple_class(ctx: &mut CxxTypeCtx) -> rustc_abi_cxx::ClassId {
                 special: Some(SpecialMember::OtherCtor),
             },
             // Destructor
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("~Foo".into())),
                 sig: FnSig {
                     params: vec![],
@@ -69,7 +69,7 @@ fn build_simple_class(ctx: &mut CxxTypeCtx) -> rustc_abi_cxx::ClassId {
                 special: Some(SpecialMember::Dtor),
             },
             // int get() const
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("get".into())),
                 sig: FnSig {
                     params: vec![],

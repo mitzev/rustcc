@@ -51,7 +51,7 @@ fn emits_header_and_exception_include() {
         name: NestedName(vec![NameSegment::Class(Ident("Widget".into()))]),
         bases: Vec::new(),
         fields: Vec::new(),
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("tick".into())),
             sig: sig(vec![int_], void, false),
             virtuality: Virtuality::NonVirtual,
@@ -86,7 +86,7 @@ fn emits_extern_c_noexcept_trampoline_for_nonvirtual_method() {
         name: NestedName(vec![NameSegment::Class(Ident("Widget".into()))]),
         bases: Vec::new(),
         fields: Vec::new(),
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("compute".into())),
             sig: sig(vec![int_], int_, true),
             virtuality: Virtuality::NonVirtual,
@@ -131,7 +131,7 @@ fn void_return_omits_return_keyword_in_body() {
         name: NestedName(vec![NameSegment::Class(Ident("Widget".into()))]),
         bases: Vec::new(),
         fields: Vec::new(),
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("tick".into())),
             sig: sig(Vec::new(), void, false),
             virtuality: Virtuality::NonVirtual,
@@ -169,7 +169,7 @@ fn uses_mangled_symbol_in_shim_name() {
         name: NestedName(vec![NameSegment::Class(Ident("Widget".into()))]),
         bases: Vec::new(),
         fields: Vec::new(),
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("compute".into())),
             sig: sig(vec![int_], int_, true),
             virtuality: Virtuality::NonVirtual,
@@ -209,21 +209,21 @@ fn skips_virtual_and_special_methods() {
         bases: Vec::new(),
         fields: Vec::new(),
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("vcall".into())),
                 sig: sig(Vec::new(), void, false),
                 virtuality: Virtuality::Virtual,
                 vtable_index: Some(0),
                 special: None,
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("~Widget".into())),
                 sig: sig(Vec::new(), void, false),
                 virtuality: Virtuality::NonVirtual,
                 vtable_index: None,
                 special: Some(SpecialMember::Dtor),
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("compute".into())),
                 sig: sig(vec![int_], int_, true),
                 virtuality: Virtuality::NonVirtual,
@@ -278,7 +278,7 @@ fn renders_reference_and_record_params() {
         },
     });
 
-    ctx.class_mut(widget).methods.push(MethodDef {
+    ctx.class_mut(widget).methods.push(MethodDef { access: Default::default(),
         name: MethodName::Operator(OperatorKind::Eq),
         sig: sig(vec![widget_const_ref], bool_, true),
         virtuality: Virtuality::NonVirtual,
@@ -316,7 +316,7 @@ fn renders_namespaced_class_in_self_param() {
         ]),
         bases: Vec::new(),
         fields: Vec::new(),
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("ping".into())),
             sig: sig(Vec::new(), void, false),
             virtuality: Virtuality::NonVirtual,

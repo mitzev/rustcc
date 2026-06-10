@@ -93,21 +93,21 @@ fn build_base(ctx: &mut CxxTypeCtx) -> ClassId {
         bases: Vec::new(),
         fields: Vec::new(),
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("~Base"))),
                 sig: sig_no_args(void, CvQual::default(), true),
                 virtuality: Virtuality::Virtual,
                 vtable_index: None,
                 special: Some(SpecialMember::Dtor),
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("render"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::Virtual,
                 vtable_index: None,
                 special: None,
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("area"))),
                 sig: sig_no_args(
                     int,
@@ -137,14 +137,14 @@ fn build_abstract(ctx: &mut CxxTypeCtx) -> ClassId {
         bases: Vec::new(),
         fields: Vec::new(),
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("~Abstract"))),
                 sig: sig_no_args(void, CvQual::default(), true),
                 virtuality: Virtuality::Virtual,
                 vtable_index: None,
                 special: Some(SpecialMember::Dtor),
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("compute"))),
                 sig: sig_no_args(
                     int,
@@ -158,7 +158,7 @@ fn build_abstract(ctx: &mut CxxTypeCtx) -> ClassId {
                 vtable_index: None,
                 special: None,
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("render"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::PureVirtual,
@@ -182,14 +182,14 @@ fn build_middle(ctx: &mut CxxTypeCtx) -> ClassId {
         bases: Vec::new(),
         fields: Vec::new(),
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("~Root"))),
                 sig: sig_no_args(void, CvQual::default(), true),
                 virtuality: Virtuality::Virtual,
                 vtable_index: None,
                 special: Some(SpecialMember::Dtor),
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("a"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::Virtual,
@@ -211,14 +211,14 @@ fn build_middle(ctx: &mut CxxTypeCtx) -> ClassId {
         }],
         fields: Vec::new(),
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("a"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::Virtual,
                 vtable_index: None,
                 special: None,
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("b"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::Virtual,
@@ -240,14 +240,14 @@ fn build_leaf_chain(ctx: &mut CxxTypeCtx) -> ClassId {
         bases: Vec::new(),
         fields: Vec::new(),
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("~Root"))),
                 sig: sig_no_args(void, CvQual::default(), true),
                 virtuality: Virtuality::Virtual,
                 vtable_index: None,
                 special: Some(SpecialMember::Dtor),
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("a"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::Virtual,
@@ -269,14 +269,14 @@ fn build_leaf_chain(ctx: &mut CxxTypeCtx) -> ClassId {
         }],
         fields: Vec::new(),
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("a"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::Virtual,
                 vtable_index: None,
                 special: None,
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("b"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::Virtual,
@@ -298,21 +298,21 @@ fn build_leaf_chain(ctx: &mut CxxTypeCtx) -> ClassId {
         }],
         fields: Vec::new(),
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("a"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::Virtual,
                 vtable_index: None,
                 special: None,
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("b"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::Virtual,
                 vtable_index: None,
                 special: None,
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("c"))),
                 sig: sig_no_args(void, CvQual::default(), false),
                 virtuality: Virtuality::Virtual,
@@ -343,7 +343,7 @@ fn build_base_and_derived(ctx: &mut CxxTypeCtx) -> ClassId {
             ty: int,
             explicit_align: None,
         }],
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident(String::from("render"))),
             sig: sig_no_args(void, CvQual::default(), false),
             virtuality: Virtuality::Virtual,

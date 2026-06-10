@@ -184,7 +184,7 @@ fn msvc_vtable_simple_matches_clang() {
     let i = c.intern_type(CxxType::Int { signed: true, width: IntWidth::I32 });
     let v = c.intern_type(CxxType::Void);
 
-    let f_method = MethodDef {
+    let f_method = MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("f".into())),
         sig: FnSig {
             params: vec![],
@@ -198,7 +198,7 @@ fn msvc_vtable_simple_matches_clang() {
         vtable_index: None,
         special: None,
     };
-    let g_method = MethodDef {
+    let g_method = MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("g".into())),
         sig: FnSig {
             params: vec![i],
@@ -212,7 +212,7 @@ fn msvc_vtable_simple_matches_clang() {
         vtable_index: None,
         special: None,
     };
-    let dtor_a = MethodDef {
+    let dtor_a = MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("~A".into())),
         sig: FnSig {
             params: vec![],
@@ -252,7 +252,7 @@ fn msvc_vtable_inherit_matches_clang() {
     let v = c.intern_type(CxxType::Void);
 
     // A
-    let f_a = MethodDef {
+    let f_a = MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("f".into())),
         sig: FnSig {
             params: vec![],
@@ -266,7 +266,7 @@ fn msvc_vtable_inherit_matches_clang() {
         vtable_index: None,
         special: None,
     };
-    let g_a = MethodDef {
+    let g_a = MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("g".into())),
         sig: FnSig {
             params: vec![i],
@@ -280,7 +280,7 @@ fn msvc_vtable_inherit_matches_clang() {
         vtable_index: None,
         special: None,
     };
-    let dtor_a = MethodDef {
+    let dtor_a = MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("~A".into())),
         sig: FnSig {
             params: vec![],
@@ -307,14 +307,14 @@ fn msvc_vtable_inherit_matches_clang() {
     assert_vtable_matches(&c, a, by_name["A"]);
 
     // B : A. Methods: g override, h new virtual, ~B virtual.
-    let g_b = MethodDef {
+    let g_b = MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("g".into())),
         sig: g_a.sig.clone(),
         virtuality: Virtuality::Virtual,
         vtable_index: None,
         special: None,
     };
-    let h_b = MethodDef {
+    let h_b = MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("h".into())),
         sig: FnSig {
             params: vec![],
@@ -328,7 +328,7 @@ fn msvc_vtable_inherit_matches_clang() {
         vtable_index: None,
         special: None,
     };
-    let dtor_b = MethodDef {
+    let dtor_b = MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("~B".into())),
         sig: FnSig {
             params: vec![],

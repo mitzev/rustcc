@@ -641,7 +641,7 @@ fn msvc_inherit_matches_clang_virtual_access_letter() {
     let i = intern_int(&mut c, true, IntWidth::I32);
 
     // struct Base { virtual void f(int); virtual int g() const; virtual ~Base(); };
-    let f_method = rustc_abi_cxx::MethodDef {
+    let f_method = rustc_abi_cxx::MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("f".into())),
         sig: FnSig {
             params: vec![i],
@@ -655,7 +655,7 @@ fn msvc_inherit_matches_clang_virtual_access_letter() {
         vtable_index: None,
         special: None,
     };
-    let g_method = rustc_abi_cxx::MethodDef {
+    let g_method = rustc_abi_cxx::MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("g".into())),
         sig: FnSig {
             params: vec![],
@@ -669,7 +669,7 @@ fn msvc_inherit_matches_clang_virtual_access_letter() {
         vtable_index: None,
         special: None,
     };
-    let dtor_method = rustc_abi_cxx::MethodDef {
+    let dtor_method = rustc_abi_cxx::MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("~Base".into())),
         sig: FnSig {
             params: vec![],
@@ -724,7 +724,7 @@ fn msvc_inherit_matches_clang_virtual_access_letter() {
     );
 
     // struct Derived : Base — its dtor is implicitly virtual.
-    let dtor_d = rustc_abi_cxx::MethodDef {
+    let dtor_d = rustc_abi_cxx::MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("~Derived".into())),
         sig: FnSig {
             params: vec![],

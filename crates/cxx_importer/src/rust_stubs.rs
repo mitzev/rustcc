@@ -373,7 +373,7 @@ mod tests {
             ],
             methods: vec![
                 // User ctor Foo(i32, i32)
-                MethodDef {
+                MethodDef { access: Default::default(),
                     name: MethodName::Ident(Ident("Point".into())),
                     sig: FnSig {
                         params: vec![i32_, i32_],
@@ -387,7 +387,7 @@ mod tests {
                     vtable_index: None,
                     special: Some(SpecialMember::OtherCtor),
                 },
-                MethodDef {
+                MethodDef { access: Default::default(),
                     name: MethodName::Ident(Ident("magnitude_sq".into())),
                     sig: FnSig {
                         params: vec![],
@@ -451,7 +451,7 @@ mod tests {
             ]),
             bases: vec![],
             fields: vec![],
-            methods: vec![MethodDef {
+            methods: vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("tick".into())),
                 sig: FnSig {
                     params: vec![],
@@ -488,7 +488,7 @@ mod tests {
             name: NestedName(vec![NameSegment::Class(Ident("Imported".into()))]),
             bases: vec![],
             fields: vec![FieldDef { name: Ident("x".into()), ty: i32_, explicit_align: None }],
-            methods: vec![MethodDef {
+            methods: vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("m".into())),
                 sig: FnSig {
                     params: vec![],

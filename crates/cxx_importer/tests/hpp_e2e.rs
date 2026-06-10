@@ -78,14 +78,14 @@ fn generated_header_compiles_and_models_layout_faithfully() {
             FieldDef { name: Ident("c".into()), ty: int_, explicit_align: None },
         ],
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("compute".into())),
                 sig: sig(vec![int_], int_, true),
                 virtuality: Virtuality::NonVirtual,
                 vtable_index: None,
                 special: None,
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("tick".into())),
                 sig: sig(Vec::new(), void, false),
                 virtuality: Virtuality::NonVirtual,

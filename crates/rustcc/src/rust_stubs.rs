@@ -109,7 +109,7 @@ mod tests {
                 ty: i32_,
                 explicit_align: None,
             }],
-            methods: vec![MethodDef {
+            methods: vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("Point".into())),
                 sig: FnSig {
                     params: vec![],

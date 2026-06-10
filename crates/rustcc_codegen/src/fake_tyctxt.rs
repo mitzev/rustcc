@@ -239,7 +239,7 @@ mod tests {
             }],
             methods: vec![
                 // Ctor Counter(i32)
-                MethodDef {
+                MethodDef { access: Default::default(),
                     name: MethodName::Ident(Ident("Counter".into())),
                     sig: sig(vec![i32_], void_, false),
                     virtuality: Virtuality::NonVirtual,
@@ -247,7 +247,7 @@ mod tests {
                     special: Some(SpecialMember::OtherCtor),
                 },
                 // Static fn Counter::zero() -> Counter { ... }
-                MethodDef {
+                MethodDef { access: Default::default(),
                     name: MethodName::Ident(Ident("default_count".into())),
                     sig: sig(vec![], i32_, false),
                     virtuality: Virtuality::NonVirtual,
@@ -255,7 +255,7 @@ mod tests {
                     special: None,
                 },
                 // Instance method i32 Counter::get() const
-                MethodDef {
+                MethodDef { access: Default::default(),
                     name: MethodName::Ident(Ident("get".into())),
                     sig: sig(vec![], i32_, true),
                     virtuality: Virtuality::NonVirtual,
@@ -263,7 +263,7 @@ mod tests {
                     special: None,
                 },
                 // Instance method void Counter::bump(i32)
-                MethodDef {
+                MethodDef { access: Default::default(),
                     name: MethodName::Ident(Ident("bump".into())),
                     sig: sig(vec![i32_], void_, false),
                     virtuality: Virtuality::NonVirtual,

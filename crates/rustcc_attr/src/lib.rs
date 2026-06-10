@@ -1176,7 +1176,7 @@ fn inject_dtor(ctx: &mut CxxTypeCtx, class_id: ClassId) {
         return;
     }
     let void = ctx.intern_type(CxxType::Void);
-    let dtor = MethodDef {
+    let dtor = MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident(format!("~{cname}"))),
         sig: FnSig {
             params: vec![],
@@ -1330,7 +1330,7 @@ fn lower_method_def(
     } else {
         None
     };
-    Ok(MethodDef {
+    Ok(MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident(m.cpp_name.clone())),
         sig,
         virtuality: Virtuality::NonVirtual,

@@ -356,7 +356,7 @@ mod tests {
     fn polymorphic_class_has_one_subtable_with_col_leading() {
         let mut c = ctx();
         let v = c.intern_type(crate::ty::CxxType::Void);
-        let m = MethodDef {
+        let m = MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("f".into())),
             sig: FnSig {
                 params: vec![],

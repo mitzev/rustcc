@@ -47,7 +47,7 @@ fn hpp_plus_stubs_compile_link_and_abort_on_call() {
             explicit_align: None,
         }],
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("Counter".into())),
                 sig: FnSig {
                     params: vec![],
@@ -61,7 +61,7 @@ fn hpp_plus_stubs_compile_link_and_abort_on_call() {
                 vtable_index: None,
                 special: Some(rustc_abi_cxx::SpecialMember::DefaultCtor),
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("bump".into())),
                 sig: FnSig {
                     params: vec![],

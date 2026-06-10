@@ -272,7 +272,7 @@ mod tests {
         ctx.intern_type(CxxType::Void)
     }
     fn virt_method(name: &str, ret: TypeId) -> MethodDef {
-        MethodDef {
+        MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident(name.into())),
             sig: FnSig {
                 params: vec![],

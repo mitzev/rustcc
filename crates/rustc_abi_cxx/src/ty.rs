@@ -125,6 +125,14 @@ pub struct MethodDef {
     pub virtuality: Virtuality,
     pub vtable_index: Option<u32>,
     pub special: Option<SpecialMember>,
+    /// C++ member access. Access does NOT affect vtable layout —
+    /// protected/private virtuals occupy slots and drive final-overrider
+    /// resolution exactly like public ones (e.g. FLTK's protected
+    /// `Fl_Text_Display::draw()` overriding the pure `Fl_Widget::draw()`).
+    /// Emitters use this to suppress callable wrappers/shims, which a
+    /// free C trampoline could not legally name.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub access: Access,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -163,9 +171,10 @@ pub enum Virtuality {
     PureVirtual,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Access {
+    #[default]
     Public,
     Protected,
     Private,

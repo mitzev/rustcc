@@ -104,7 +104,7 @@ fn forwarders_compile_with_rustc_and_export_itanium_symbols() {
             },
         ],
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("new".into())),
                 sig: FnSig {
                     params: vec![i32_, i32_],
@@ -118,7 +118,7 @@ fn forwarders_compile_with_rustc_and_export_itanium_symbols() {
                 vtable_index: None,
                 special: Some(SpecialMember::OtherCtor),
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("get_x".into())),
                 sig: FnSig {
                     params: vec![],
@@ -135,7 +135,7 @@ fn forwarders_compile_with_rustc_and_export_itanium_symbols() {
                 vtable_index: None,
                 special: None,
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("translate".into())),
                 sig: FnSig {
                     params: vec![i32_, i32_],
@@ -295,7 +295,7 @@ fn record_returned_by_value_roundtrips_across_cxx_boundary() {
         source_alignment: None,
     });
     let point_ty = ctx.intern_type(CxxType::Record(point_id));
-    ctx.class_mut(point_id).methods.push(MethodDef {
+    ctx.class_mut(point_id).methods.push(MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("new".into())),
         sig: FnSig {
             params: vec![i32_, i32_],
@@ -309,7 +309,7 @@ fn record_returned_by_value_roundtrips_across_cxx_boundary() {
         vtable_index: None,
         special: Some(SpecialMember::OtherCtor),
     });
-    ctx.class_mut(point_id).methods.push(MethodDef {
+    ctx.class_mut(point_id).methods.push(MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("translated".into())),
         sig: FnSig {
             params: vec![i32_, i32_],
@@ -503,7 +503,7 @@ fn record_passed_by_value_roundtrips_across_cxx_boundary() {
     });
     let point_ty = ctx.intern_type(CxxType::Record(point_id));
     // `Point::new(i32, i32) -> Self`
-    ctx.class_mut(point_id).methods.push(MethodDef {
+    ctx.class_mut(point_id).methods.push(MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("new".into())),
         sig: FnSig {
             params: vec![i32_, i32_],
@@ -520,7 +520,7 @@ fn record_passed_by_value_roundtrips_across_cxx_boundary() {
     // `Point::sum_coords(&self, other: Point) -> i32`
     //   computes self.x + self.y + other.x + other.y
     // Exercises: record-by-value param (`other`) and scalar return.
-    ctx.class_mut(point_id).methods.push(MethodDef {
+    ctx.class_mut(point_id).methods.push(MethodDef { access: Default::default(),
         name: MethodName::Ident(Ident("sum_coords".into())),
         sig: FnSig {
             params: vec![point_ty],
@@ -675,7 +675,7 @@ fn panicking_rust_method_aborts_instead_of_unwinding_through_cxx() {
         }],
         methods: vec![
             // `new()` → Self; makes a default-constructed Boom.
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("new".into())),
                 sig: FnSig {
                     params: vec![],
@@ -690,7 +690,7 @@ fn panicking_rust_method_aborts_instead_of_unwinding_through_cxx() {
                 special: Some(SpecialMember::DefaultCtor),
             },
             // `boom(&self)` — body panics in the user crate.
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("boom".into())),
                 sig: FnSig {
                     params: vec![],

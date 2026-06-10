@@ -52,7 +52,7 @@ fn emits_class_with_opaque_storage_sized_from_layout() {
             FieldDef { name: Ident("b".into()), ty: int_, explicit_align: None },
             FieldDef { name: Ident("c".into()), ty: int_, explicit_align: None },
         ],
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("tick".into())),
             sig: sig(Vec::new(), void, false),
             virtuality: Virtuality::NonVirtual,
@@ -117,7 +117,7 @@ fn const_method_emits_const_qualifier() {
             ty: int_,
             explicit_align: None,
         }],
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("compute".into())),
             sig: sig(vec![int_], int_, true),
             virtuality: Virtuality::NonVirtual,
@@ -155,7 +155,7 @@ fn user_ctor_appears_before_special_members() {
         name: NestedName(vec![NameSegment::Class(Ident("Widget".into()))]),
         bases: Vec::new(),
         fields: Vec::new(),
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("Widget".into())),
             sig: sig(vec![int_], void, false),
             virtuality: Virtuality::NonVirtual,
@@ -201,7 +201,7 @@ fn skips_virtual_and_user_copy_move_dtor_in_favor_of_canonical() {
             explicit_align: None,
         }],
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("vcall".into())),
                 sig: sig(Vec::new(), void, false),
                 virtuality: Virtuality::Virtual,
@@ -209,14 +209,14 @@ fn skips_virtual_and_user_copy_move_dtor_in_favor_of_canonical() {
                 special: None,
             },
             // User-declared copy ctor → swallowed; we always emit `= delete`.
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("Widget".into())),
                 sig: sig(Vec::new(), void, false),
                 virtuality: Virtuality::NonVirtual,
                 vtable_index: None,
                 special: Some(SpecialMember::CopyCtor),
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("compute".into())),
                 sig: sig(vec![int_], int_, true),
                 virtuality: Virtuality::NonVirtual,

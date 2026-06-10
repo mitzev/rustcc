@@ -592,7 +592,7 @@ mod tests {
                 },
             ],
             methods: vec![
-                MethodDef {
+                MethodDef { access: Default::default(),
                     name: MethodName::Ident(Ident("new".into())),
                     sig: FnSig {
                         params: vec![i32_, i32_],
@@ -606,7 +606,7 @@ mod tests {
                     vtable_index: None,
                     special: Some(rustc_abi_cxx::SpecialMember::OtherCtor),
                 },
-                MethodDef {
+                MethodDef { access: Default::default(),
                     name: MethodName::Ident(Ident("magnitude_sq".into())),
                     sig: FnSig {
                         params: vec![],
@@ -620,7 +620,7 @@ mod tests {
                     vtable_index: None,
                     special: None,
                 },
-                MethodDef {
+                MethodDef { access: Default::default(),
                     name: MethodName::Ident(Ident("translate".into())),
                     sig: FnSig {
                         params: vec![i32_, i32_],
@@ -774,7 +774,7 @@ mod tests {
         // `make` is not a ctor (no `new`/`OtherCtor` special), so it
         // exercises the record-return path rather than the ctor
         // `ptr::write` path.
-        ctx.class_mut(point_id).methods.push(MethodDef {
+        ctx.class_mut(point_id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("make".into())),
             sig: FnSig {
                 params: vec![i32_, i32_],
@@ -855,7 +855,7 @@ mod tests {
             source_alignment: None,
         });
         let point_ty = ctx.intern_type(CxxType::Record(point_id));
-        ctx.class_mut(point_id).methods.push(MethodDef {
+        ctx.class_mut(point_id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("absorb".into())),
             sig: FnSig {
                 params: vec![point_ty],
@@ -906,7 +906,7 @@ mod tests {
                 ty: i32_,
                 explicit_align: None,
             }],
-            methods: vec![MethodDef {
+            methods: vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("~Widget".into())),
                 sig: FnSig {
                     params: vec![],
@@ -928,7 +928,7 @@ mod tests {
         let widget_ty = ctx.intern_type(CxxType::Record(widget_id));
         // `consume(Widget)` would force the ptr::read double-destroy
         // path.
-        ctx.class_mut(widget_id).methods.push(MethodDef {
+        ctx.class_mut(widget_id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("consume".into())),
             sig: FnSig {
                 params: vec![widget_ty],

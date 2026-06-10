@@ -589,7 +589,7 @@ mod tests {
             &mut ctx,
             "Calc",
             vec![],
-            vec![MethodDef {
+            vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("add".into())),
                 sig: sig(vec![i32_, i32_], i32_, false),
                 virtuality: Virtuality::NonVirtual,
@@ -649,7 +649,7 @@ mod tests {
             &mut ctx,
             "Factory",
             vec![],
-            vec![MethodDef {
+            vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("build".into())),
                 sig: sig(vec![], record_ty, false),
                 virtuality: Virtuality::NonVirtual,
@@ -681,7 +681,7 @@ mod tests {
             &mut ctx,
             "Factory",
             vec![],
-            vec![MethodDef {
+            vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("build".into())),
                 sig: sig(vec![], record_ty, false),
                 virtuality: Virtuality::NonVirtual,
@@ -718,7 +718,7 @@ mod tests {
                 ty: i32_,
                 explicit_align: None,
             }],
-            vec![MethodDef {
+            vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("Handle".into())),
                 sig: sig(vec![i32_], void_, false),
                 virtuality: Virtuality::NonVirtual,
@@ -731,7 +731,7 @@ mod tests {
             &mut ctx,
             "Factory",
             vec![],
-            vec![MethodDef {
+            vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("build".into())),
                 sig: sig(vec![], record_ty, false),
                 virtuality: Virtuality::NonVirtual,
@@ -756,7 +756,7 @@ mod tests {
             &mut ctx,
             "Animal",
             vec![],
-            vec![MethodDef {
+            vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("speak".into())),
                 sig: sig(vec![], void, false),
                 virtuality: Virtuality::Virtual,
@@ -788,7 +788,7 @@ mod tests {
             &mut ctx,
             "Widget",
             vec![],
-            vec![MethodDef {
+            vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("Widget".into())),
                 sig: sig(vec![i32_], void, false),
                 virtuality: Virtuality::NonVirtual,
@@ -840,7 +840,7 @@ mod tests {
             &mut ctx,
             "Math",
             vec![],
-            vec![MethodDef {
+            vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("pi_times".into())),
                 sig: sig(vec![i32_], i32_, false),
                 virtuality: Virtuality::NonVirtual,
@@ -864,7 +864,7 @@ mod tests {
             &mut ctx,
             "Widget",
             vec![],
-            vec![MethodDef {
+            vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("Widget".into())),
                 sig: sig(vec![i32_, i32_], void, false),
                 virtuality: Virtuality::NonVirtual,
@@ -898,7 +898,7 @@ mod tests {
             &mut ctx,
             "Widget",
             vec![],
-            vec![MethodDef {
+            vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("compute".into())),
                 sig: sig(vec![], i32_, false),
                 virtuality: Virtuality::NonVirtual,
@@ -959,7 +959,7 @@ mod tests {
         let placeholder = class_with(&mut ctx, "_Fake", vec![], vec![]);
         let i32_ = int32_ty(&mut ctx);
 
-        let md = MethodDef {
+        let md = MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("foo".into())),
             sig: FnSig {
                 params: vec![],

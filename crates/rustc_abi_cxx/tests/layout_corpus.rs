@@ -262,7 +262,7 @@ fn build_single_inherit(ctx: &mut CxxTypeCtx) -> ClassId {
                 explicit_align: None,
             },
         ],
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident(String::from("~Base"))),
             sig: FnSig {
                 params: Vec::new(),
@@ -522,7 +522,7 @@ fn build_inherit_with_fields(ctx: &mut CxxTypeCtx) -> ClassId {
             ty: int_,
             explicit_align: None,
         }],
-        methods: vec![MethodDef {
+        methods: vec![MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident(String::from("~Animal"))),
             sig: FnSig {
                 params: Vec::new(),
@@ -573,7 +573,7 @@ fn build_polymorphic(ctx: &mut CxxTypeCtx) -> ClassId {
             explicit_align: None,
         }],
         methods: vec![
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("~Widget"))),
                 sig: FnSig {
                     params: Vec::new(),
@@ -587,7 +587,7 @@ fn build_polymorphic(ctx: &mut CxxTypeCtx) -> ClassId {
                 vtable_index: Some(0),
                 special: Some(SpecialMember::Dtor),
             },
-            MethodDef {
+            MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident(String::from("render"))),
                 sig: FnSig {
                     params: Vec::new(),
