@@ -316,6 +316,20 @@ pub fn generate_rust_bindings_with_macros(
     Ok(out)
 }
 
+/// v1.14: render a whole captured macro set as `pub const` lines —
+/// used by the Build pipeline to fold `#define` constants into the
+/// generated bindings module.
+pub fn render_macro_consts(set: &crate::macros::MacroSet) -> String {
+    let mut out = String::new();
+    out.push_str("    // M12: `#define` constants captured from the headers.\n");
+    for m in &set.entries {
+        out.push_str("    ");
+        out.push_str(&render_macro_const(m));
+    }
+    out.push('\n');
+    out
+}
+
 fn render_macro_const(m: &crate::macros::MacroConst) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();

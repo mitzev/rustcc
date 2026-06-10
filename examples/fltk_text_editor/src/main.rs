@@ -39,13 +39,13 @@ static TEST_MODE: AtomicBool = AtomicBool::new(false);
 static HANDLE_CALLS: AtomicI32 = AtomicI32::new(0);
 static PATH: Mutex<Option<String>> = Mutex::new(None);
 
-// FLTK constants (FL/Enumerations.H — `#define`s the macro pass
-// doesn't reach).
-const EV_KEYDOWN: i32 = 8;
-const MOD_CTRL: i32 = 0x0004_0000;
-const MOD_META: i32 = 0x0040_0000; // FL_COMMAND on macOS
-const MOD_SHIFT: i32 = 0x0001_0000;
-const KEY_ENTER: i32 = 0xFF0D; // FL_Enter
+// FLTK constants — from the generated bindings (the M12 macro pass
+// captures the FL_* `#define`s; v1.14). Narrowed to i32 once here.
+const EV_KEYDOWN: i32 = 8; // FL_KEYDOWN (Fl_Event enum)
+const MOD_CTRL: i32 = FL_CTRL as i32;
+const MOD_META: i32 = FL_META as i32; // FL_COMMAND on macOS
+const MOD_SHIFT: i32 = FL_SHIFT as i32;
+const KEY_ENTER: i32 = FL_Enter as i32;
 // Fl_Native_File_Chooser::Type (class-scope enum → ints)
 const CHOOSER_OPEN: i32 = 0; // BROWSE_FILE
 const CHOOSER_SAVE: i32 = 4; // BROWSE_SAVE_FILE

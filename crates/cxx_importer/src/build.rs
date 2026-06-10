@@ -442,6 +442,26 @@ impl Build {
         let argv_strs = build_argv(&self.include_paths, &full_clang_flags);
         let argv: Vec<&str> = argv_strs.iter().map(String::as_str).collect();
 
+        // ----- M12 (wired in v1.14): `#define` constants. -----
+        // Collected in a separate pre-pass because `collect_macros`
+        // owns its own libclang instance (only one may exist at a
+        // time). Object-like single-token-literal macros from every
+        // reachable header (FL_KEYDOWN, FL_CTRL, …), deduped by
+        // first definition; rendered into the bindings module below.
+        let mut macro_set = crate::macros::MacroSet::default();
+        {
+            let mut seen_names = std::collections::HashSet::new();
+            for header in &self.headers {
+                if let Ok(set) = crate::macros::collect_macros(header, &argv) {
+                    for m in set.entries {
+                        if seen_names.insert(m.name.clone()) {
+                            macro_set.entries.push(m);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut all_class_ids: Vec<rustc_abi_cxx::ClassId> = Vec::new();
         let mut seen: std::collections::HashSet<rustc_abi_cxx::ClassId> =
             std::collections::HashSet::new();
@@ -594,6 +614,20 @@ impl Build {
             &cfg,
         )
         .map_err(BuildError::Bindings)?;
+        let mut bindings_src = bindings_src;
+        if !macro_set.entries.is_empty() {
+            let consts = crate::rust_bindings::render_macro_consts(&macro_set);
+            // Land inside the lint-allowed module (right after its
+            // opening line) so thousands of unused consts don't
+            // trip dead_code in user crates.
+            let marker = "pub mod ";
+            if let Some(mod_idx) = bindings_src.find(marker) {
+                if let Some(line_end) = bindings_src[mod_idx..].find('\n') {
+                    let at = mod_idx + line_end + 1;
+                    bindings_src.insert_str(at, &consts);
+                }
+            }
+        }
         let bindings_path = out_dir.join(&self.bindings_filename);
         std::fs::write(&bindings_path, &bindings_src).map_err(|e| {
             BuildError::Io(format!(
