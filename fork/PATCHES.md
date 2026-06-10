@@ -3434,6 +3434,58 @@ calls the base-object destructor (`D2`), subobject-safe.
 subobject, and frees, each exactly once (balanced ctor/dtor counters),
 on `aarch64-apple-darwin` and `x86_64-apple-darwin`.
 
+### Patches 42–46 (1.96.0 rebase, v1.13.10 campaign, v1.14)
+
+- **42 (`42-rustcc-rebase-onto-Rust-1.96.0`)** — the whole series
+  rebased from 1.91-nightly onto **Rust 1.96.0 stable**; API-drift
+  fixes only (attr-parser signatures, `Statement::new`, visitor and
+  layout API renames). No behavior change.
+
+- **43 (`43-1.13.10-dtor-position-sig-checked-overrides-O3`)** — the
+  v1.13.10 correctness campaign, fork side. (a) The Itanium `D1`/`D0`
+  pair is emitted at the destructor's *declaration* position — the attr
+  spec gains positional `slot=~dtor,~` records (legacy `vdtor=1`
+  prepend semantics preserved). (b) Slots carry an optional param
+  signature (`slot=<name>,<sym>,<psig>`); `override fn` is checked
+  against it, so overloaded virtuals bind to the right slot and
+  `&self`-vs-`&mut self` (`_ZNK` vs `_ZN`) mismatches are hard errors.
+  (c) The mono collector roots vtable-referenced `drop_in_place` at
+  every opt level (no `codegen-units = 1` pin). (d) MSVC `??_G`
+  deleting-dtor flags + most-derived dtor selection. (e) The parser
+  accepts doc comments on class-body methods.
+
+- **44 (`44-v1.14-member-fn-pointer-ABI-triviality`)** — Itanium member
+  function pointers: `CxxMemberFnPtr<T>` (`{ptr_or_voff, adj}`) is
+  exempted from the C++-ABI "non-trivial, pass indirectly" rule on
+  `aarch64`/`x86_64` so the two-word pair passes by value exactly like
+  clang's `M<class>F…E`. Manglings (`MS0_FiiE`-style substitutions
+  included) land in `rustc_abi_cxx`; the `cxx` crate carries the repr
+  with the ARM-variant `adj` low-bit discipline documented.
+
+- **45 (`45-v1.14-ungate-fork-attrs-never-internalize-vtab`)** — (a)
+  the fork's interop attributes are **ungated built-ins**:
+  `#![feature(rustc_attrs)]` / `#![allow(internal_features)]` are no
+  longer required in fork crates (a 2-arg `rustc_attr!` shim arm maps
+  them to `Ungated`). (b) CGU partitioning never internalizes — and
+  marks `GloballyShared` — drop-glue instances referenced from emitted
+  C++ vtables, fixing undefined `_ZN4core3ptr13drop_in_place…` at
+  `-O3` with multiple CGUs.
+
+- **46 (`46-v1.14-cxx_ctor_inplace`)** — construct-in-place MIR pass
+  (`rustc_mir_transform::cxx_ctor_inplace`), three cooperating
+  rewrites: shape 1 collapses `tmp = call ctor(); place = move tmp`
+  into a direct call destination (post-inline, registered twice:
+  after `RemoveUnneededDrops` and after `SimplifyLocals::Final`);
+  shape 2 (pre-inline) rewrites the importer's by-value `new`
+  (MaybeUninit + `as_mut_ptr` + extern ctor + `assume_init`) so the
+  C++ ctor writes the sret return slot via `&raw mut _0`; shape 3
+  (pre-inline) de-aggregates `Self { __base: Base::new(..), .. }` so
+  the base constructs into the base subobject (drop-flag tolerant).
+  Result: `ed.write(RustEditor::new(..))` constructs the full FLTK
+  widget chain at the final heap address — ctor-time self-references
+  never dangle. Probes: `fltk_editor_advanced --self-test`
+  (`children_parent_ok (no fix-up)`), `subclass_dtor_position`.
+
 ---
 
 ## Build & test

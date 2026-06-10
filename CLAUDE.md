@@ -22,8 +22,10 @@ This repo deliberately has two kinds of code. **Do not mix them up.**
   `impl`.
 
 If unsure which world a file is in: check for a `rust-toolchain.toml`
-pinning `rustcc`, or a `#![feature(rustc_attrs)]` at the crate root →
-fork code. Otherwise treat it as plain Rust.
+pinning `rustcc`, or fork-only syntax (`class` keyword, `extern "C++"`,
+`#[cpp_virtual]`, …) in the sources → fork code. Otherwise treat it as
+plain Rust. (Pre-v1.14 fork crates also carried `#![feature(rustc_attrs)]`
+at the crate root; that marker is gone now that the attrs are ungated.)
 
 ## Default surface for a C++-interop type: the `class` keyword
 

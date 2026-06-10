@@ -274,11 +274,10 @@ on the shim path.
 
 ### Using the fork directly
 
-For hand-written bindings, emit the attributes directly:
+For hand-written bindings, emit the attributes directly (no feature
+gate needed since v1.14 — the fork's interop attrs are ungated):
 
 ```rust
-#![feature(rustc_attrs)]   // required — rustc-internal attrs
-
 unsafe extern "C++" {
     #[rustc_cxx_throws]
     fn maybe_throws(x: i32) -> Result<i32, ::cxx::CxxException>;
@@ -363,8 +362,10 @@ keep using the v1.12.x shim path.
 The native-invoke path requires:
 - fork rustc (`fork/build.sh`)
 - nightly toolchain
-- `#![feature(rustc_attrs)]` in the consuming crate
 - `cxx = { features = ["rustcc-fork"] }`
+
+(Until v1.13.x it also needed `#![feature(rustc_attrs)]` in the
+consuming crate; the attrs are ungated since v1.14.)
 
 The shim path requires none of these.
 

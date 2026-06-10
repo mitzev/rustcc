@@ -270,11 +270,8 @@ edition = "2021"
 
 const MAIN_RS_CLASS = `// Scaffolded by \`rustcc: New Project\` (class-keyword surface).
 // The \`class\` keyword is fork-only; build with the rustcc toolchain
-// (pinned in rust-toolchain.toml).
-#![feature(rustc_attrs)]
-// rustcc's class/ctor/virtual attributes ride \`rustc_attrs\`, an
-// internal feature — allow it so the build is warning-free.
-#![allow(internal_features)]
+// (pinned in rust-toolchain.toml). Since v1.14 the fork attributes
+// are ungated — no feature gates or allow attributes needed.
 
 pub class Counter {
     n: i64,

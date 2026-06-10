@@ -101,6 +101,20 @@ consume(CxxMove::from(my_owned));
 call site should invoke the move-ctor (or move-assignment) rather than
 pass by copy or reference.
 
+### 4.2.1 Construction is in place (v1.14)
+
+A Rust `class` value used to be built in a temporary and bitwise-moved
+to its binding — fatal for C++ constructors that *escape `this`* (FLTK
+widgets registering ctor-created children). Since v1.14 the fork's
+`cxx_ctor_inplace` MIR pass removes the temporaries along the whole
+construction chain: `ptr.write(D::new(..))` constructs directly into
+`*ptr`, a `#[constructor]` body's `Self { __base: Base::new(..), .. }`
+constructs the base directly into the base subobject, and an imported
+binding's by-value `new` constructs into its sret return slot. Ctor-time
+self-references are therefore born at the final address. Moves *after*
+construction remain bitwise — pinning guidance below still applies to
+any later relocation.
+
 ### 4.3 No `Copy`
 
 `#[repr(cpp)]` types never implement `Copy`, even if the underlying

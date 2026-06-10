@@ -12,13 +12,16 @@ the fork links directly against Clang-compiled C++ and
 constructors, destructors, single inheritance, `dynamic_cast`, ARC,
 and Swift value-witness tables.
 
-> **Status — v1.13.3 (current).** v1 shipped 2026-04-21; the feature
-> matrix below is the cumulative state of the v1.0x–v1.13x line.
-> Supported hosts: x86_64/aarch64 Linux & macOS, x86_64/aarch64
-> Windows MSVC, i686 Linux, and bare-metal ARM Cortex-M. Major
-> additions since v1: the full `cxx_importer` C++→Rust binding
-> generator, the Windows MSVC C++ ABI, C++ exception catching
-> (`cxx_throws`), C++ templates (incl. non-type arguments), the
+> **Status — v1.14.0 (current).** v1 shipped 2026-04-21; the feature
+> matrix below is the cumulative state of the v1.0x–v1.14x line, on a
+> **Rust 1.96.0 stable** base. Supported hosts: x86_64/aarch64 Linux &
+> macOS, x86_64/aarch64 Windows MSVC, i686 Linux, and bare-metal ARM
+> Cortex-M. Major additions since v1: the full `cxx_importer` C++→Rust
+> binding generator, the Windows MSVC C++ ABI, C++ exception catching
+> (`cxx_throws`), C++ templates (incl. non-type arguments),
+> subclassing imported C++ classes (deep chains + virtual dtor),
+> zero-boilerplate crate roots, construct-in-place semantics, member
+> function pointers, full FLTK binding coverage, the
 > developer-experience layer (`rustcc-cli`, the `vscode-rustcc`
 > extension, and a patched rust-analyzer), and the Swift interop
 > surface. See [`fork/PATCHES.md`](fork/PATCHES.md) for per-patch
@@ -45,7 +48,7 @@ If you've written `impl Drop for Widget { fn drop(&mut self) { unsafe
 
 ## Feature matrix
 
-Cumulative across the v1.0x–v1.13x line. Everything below is shipped.
+Cumulative across the v1.0x–v1.14x line. Everything below is shipped.
 
 ### C++ — types, dispatch, ABI
 
@@ -64,6 +67,9 @@ Cumulative across the v1.0x–v1.13x line. Everything below is shipped.
 | **Subclass an imported C++ class** | `class D : CppBase` over a `cxx_importer`-imported base — including a **deep** multi-level chain (e.g. `Fl_Text_Editor → … → Fl_Widget`): override concrete + pure virtuals at any level and the virtual destructor; C++ dispatches through a base pointer into the Rust `override`, `delete` runs Rust `Drop` (v1.13.7+; single-inheritance chain; validated on Itanium ARM/Intel + Linux + MSVC). The virtual-destructor path uses `operator new`/`delete`, so it needs a heap — not for bare-metal `no_std` |
 | Cross-crate polymorphic classes | ctor / wrapper / virtual attributes encode across crates |
 | **Windows MSVC C++ ABI** | vftables, scalar-deleting dtor, SEH funclets, sret-via-RCX/X8, dllexport; Wine-validated |
+| **Zero-boilerplate crate roots** | fork attrs are ungated built-ins — no `#![feature(rustc_attrs)]` / `allow(internal_features)` / `allow(dead_code)` (v1.14) |
+| **Construct-in-place** | the `cxx_ctor_inplace` MIR pass builds class values at their final address (write-dest fold, `__base` de-aggregation, importer-`new` sret rewrite) — C++ ctors that escape `this` are safe with no fix-ups (v1.14) |
+| **Member function pointers** | `CxxMemberFnPtr<T>` — Itanium `{ptr, adj}` pair, `M<class>F…E` mangling, by-value ABI parity with clang; virtual + null member ptrs (v1.14) |
 
 ### C++ — binding generation & interop
 
@@ -73,6 +79,12 @@ Cumulative across the v1.0x–v1.13x line. Everything below is shipped.
 | C++ templates | type + non-type (integral) + template-template arguments; both ABIs, clang-validated |
 | Auto-instantiation of STL specs | `std::vector<int>` referenced in a user API is discovered + force-instantiated |
 | C++ exception catching | `[[rustcc::cxx_throws]]` → `Result<T, CxxException>`; catch-all + typed; Itanium + MSVC |
+| Header-inline methods | bound via auto-generated shim trampolines (441 FLTK methods incl. `Fl_Widget::callback`) (v1.14) |
+| `#define` constants | macro-scrape pre-pass emits typed `pub const`s (140 FLTK constants) (v1.14) |
+| Class-scope + anonymous enums | named nested enums → transparent structs w/ assoc consts; anonymous → prefixed consts (v1.14) |
+| Nested records | `Outer::Inner` → flattened `Outer_Inner` structs (e.g. FLTK's `Style_Table_Entry` for syntax highlighting) (v1.14) |
+| Raw global statics | TU/namespace variables bind as `pub static` in `unsafe extern "C++"` with correct manglings (v1.14) |
+| `new_at` placement ctors | construct an imported class at a caller-supplied address (v1.13.10) |
 
 ### Swift
 

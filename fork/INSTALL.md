@@ -377,9 +377,10 @@ equivalent). `./fork/build.sh` doesn't install system deps — see
 its header for the prereq list.
 
 **`cargo +rustcc build` reports "the feature `rustc_attrs` is
-internal"**: that's a warning, not an error. The fork intentionally
-uses `rustc_attrs` for its custom attributes. Add
-`#![allow(internal_features)]` to silence if it bothers you.
+internal"**: only applies to pre-v1.14 toolchains. Since v1.14 the
+fork's interop attributes are ungated — remove any leftover
+`#![feature(rustc_attrs)]` / `#![allow(internal_features)]` from your
+crate roots. On older toolchains, keep both attributes.
 
 **"libclang.so/dylib not found"** when building `cxx_importer` or
 running the FLTK demos: install libclang for your OS (see
