@@ -1,8 +1,7 @@
 From 4149321f036d0d26465ddb1c786ef403d10c8b7c Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 14:03:19 +0300
-Subject: [PATCH 35/42] P09.68-msvc: typed C++ catches on MSVC (1.13 throws
- Phase 2D)
+Subject: [PATCH] P09.68-msvc: typed C++ catches on MSVC (1.13 throws Phase 2D)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

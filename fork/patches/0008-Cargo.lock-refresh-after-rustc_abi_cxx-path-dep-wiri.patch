@@ -1,7 +1,7 @@
 From 28eca29a18c245e74f931605557d4e3e342b5920 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:24:10 +0300
-Subject: [PATCH 08/42] Cargo.lock: refresh after rustc_abi_cxx path dep wiring
+Subject: [PATCH] Cargo.lock: refresh after rustc_abi_cxx path dep wiring
 
 ---
  Cargo.lock | 6 ++++++

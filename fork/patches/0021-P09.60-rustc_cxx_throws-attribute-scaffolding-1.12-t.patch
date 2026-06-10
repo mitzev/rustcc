@@ -1,7 +1,7 @@
 From de59426bcdc7593d1867d618381accc0eeb8ed26 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 08:43:43 +0300
-Subject: [PATCH 21/42] P09.60: #[rustc_cxx_throws] attribute scaffolding (1.12
+Subject: [PATCH] P09.60: #[rustc_cxx_throws] attribute scaffolding (1.12
  throws Phase 1)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

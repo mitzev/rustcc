@@ -1,8 +1,8 @@
 From d64fc1e137d4543ce5682d419816a81abc53ad86 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 10:05:07 +0300
-Subject: [PATCH 22/42] P09.61: fn_can_unwind respects CXX_THROWS (1.13 throws
- Phase 1A)
+Subject: [PATCH] P09.61: fn_can_unwind respects CXX_THROWS (1.13 throws Phase
+ 1A)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

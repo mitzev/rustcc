@@ -1,8 +1,8 @@
 From 6c81f0eef42478084ee4902a7ef011142b69921c Mon Sep 17 00:00:00 2001
 From: rustcc-build <rustcc@localhost>
 Date: Wed, 3 Jun 2026 09:42:13 +0300
-Subject: [PATCH 40/42] P09.x (1.13.7): cross-boundary virtual destructors for
- Rust subclasses
+Subject: [PATCH] P09.x (1.13.7): cross-boundary virtual destructors for Rust
+ subclasses
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

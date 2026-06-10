@@ -1,8 +1,8 @@
 From 99efff2960d13b5be65e373d446259923d79f7c2 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 10:55:36 +0300
-Subject: [PATCH 26/42] P09.65a: MIR-pass scaffold for cxx_throws Result
- wrapping (Phase 1E)
+Subject: [PATCH] P09.65a: MIR-pass scaffold for cxx_throws Result wrapping
+ (Phase 1E)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

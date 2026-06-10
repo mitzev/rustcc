@@ -1,8 +1,8 @@
 From 196eb6b20a8b53f7a82b21a96b9ccc44f5566743 Mon Sep 17 00:00:00 2001
 From: rustcc-build <rustcc@localhost>
 Date: Wed, 3 Jun 2026 06:33:35 +0300
-Subject: [PATCH 39/42] P09.x (1.13.7): subclass an imported C++ polymorphic
- base from Rust
+Subject: [PATCH] P09.x (1.13.7): subclass an imported C++ polymorphic base
+ from Rust
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

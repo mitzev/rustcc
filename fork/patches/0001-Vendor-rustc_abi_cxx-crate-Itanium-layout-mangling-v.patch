@@ -1,8 +1,8 @@
 From a59cb6a07b819793c8698a58fbf9b67bc714ca0e Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:22:22 +0300
-Subject: [PATCH 01/42] Vendor rustc_abi_cxx crate: Itanium layout, mangling,
- vtable construction
+Subject: [PATCH] Vendor rustc_abi_cxx crate: Itanium layout, mangling, vtable
+ construction
 
 Self-contained helper crate consumed by rustc_ty_utils (layout bridge)
 and rustc_symbol_mangling (Itanium mangler). Zero upstream dependencies

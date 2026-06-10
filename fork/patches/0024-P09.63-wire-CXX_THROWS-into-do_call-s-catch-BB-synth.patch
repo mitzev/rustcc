@@ -1,8 +1,8 @@
 From fd715ad83d0131e24946f86f19671a62975fdf97 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 10:16:14 +0300
-Subject: [PATCH 24/42] P09.63: wire CXX_THROWS into do_call's catch BB synth
- (Phase 1C)
+Subject: [PATCH] P09.63: wire CXX_THROWS into do_call's catch BB synth (Phase
+ 1C)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

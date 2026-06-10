@@ -1,7 +1,7 @@
 From 54f8e70e57e055a68d5ab75fbf0e067e89ac661b Mon Sep 17 00:00:00 2001
 From: Ognian Mitzev <OgiMitzev@gmail.com>
 Date: Sat, 23 May 2026 00:48:16 +0300
-Subject: [PATCH 17/42] P09.56: MSVC vtable + RTTI emission
+Subject: [PATCH] P09.56: MSVC vtable + RTTI emission
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

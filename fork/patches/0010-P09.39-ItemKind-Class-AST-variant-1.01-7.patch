@@ -1,7 +1,7 @@
 From e27f73cc5f997cd501c17c4d5c125ccf5bbc36b6 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Fri, 24 Apr 2026 20:57:37 +0300
-Subject: [PATCH 10/42] P09.39: ItemKind::Class AST variant (1.01 #7)
+Subject: [PATCH] P09.39: ItemKind::Class AST variant (1.01 #7)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

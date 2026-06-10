@@ -1,8 +1,8 @@
 From 22873f16f130c2779e1afb5d7e1682a8c85f5e80 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 10:08:32 +0300
-Subject: [PATCH 23/42] P09.62: BuilderMethods::cxx_catch_landing_pad (1.13
- throws Phase 1B)
+Subject: [PATCH] P09.62: BuilderMethods::cxx_catch_landing_pad (1.13 throws
+ Phase 1B)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

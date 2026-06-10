@@ -1,7 +1,7 @@
 From 60a3a1827e42cebb9f087b47589e4f26ec136551 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Wed, 3 Jun 2026 00:50:36 +0300
-Subject: [PATCH 37/42] P09.x (1.13.5): class-body method-modifier keywords +
+Subject: [PATCH] P09.x (1.13.5): class-body method-modifier keywords +
  verify-override
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

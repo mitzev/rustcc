@@ -1,8 +1,7 @@
 From 3a5fac422ef6cf4d2a0535f41f12558893845a2e Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:23:04 +0300
-Subject: [PATCH 02/42] ABI plumbing: ExternAbi::Cpp + callconv + stable-rustc
- bridge
+Subject: [PATCH] ABI plumbing: ExternAbi::Cpp + callconv + stable-rustc bridge
 
 Adds ExternAbi::Cpp and the matching canonicalization path in rustc_abi
 and rustc_target. Teaches x86, x86_64, and aarch64 callconv lowering to

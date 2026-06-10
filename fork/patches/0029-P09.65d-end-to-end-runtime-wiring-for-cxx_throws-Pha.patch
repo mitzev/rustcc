@@ -1,8 +1,7 @@
 From c131e614d098fb6425763ea6c1cbbff1e770e352 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 11:42:20 +0300
-Subject: [PATCH 29/42] P09.65d: end-to-end runtime wiring for cxx_throws Phase
- 1G
+Subject: [PATCH] P09.65d: end-to-end runtime wiring for cxx_throws Phase 1G
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

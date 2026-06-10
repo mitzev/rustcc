@@ -1,8 +1,7 @@
 From d5eb228cc973648b688f0c194b881d1aaece6b99 Mon Sep 17 00:00:00 2001
 From: Ognian Mitzev <OgiMitzev@gmail.com>
 Date: Sat, 23 May 2026 00:50:36 +0300
-Subject: [PATCH 18/42] P09.57: MSVC single dtor slot + scalar deleting
- destructor
+Subject: [PATCH] P09.57: MSVC single dtor slot + scalar deleting destructor
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

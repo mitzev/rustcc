@@ -1,9 +1,8 @@
 From ca8e84b766e85f37e1e2d956f53fd11abb4478e1 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Sat, 25 Apr 2026 02:06:26 +0300
-Subject: [PATCH 14/42] =?UTF-8?q?P09.48:=20#[rustc=5Fswift=5Fthrows]=20+?=
- =?UTF-8?q?=20SwiftError=20=E2=80=94=20Swift=20throwing=20fns=20(1.02=20th?=
- =?UTF-8?q?rows)?=
+Subject: [PATCH] =?UTF-8?q?P09.48:=20#[rustc=5Fswift=5Fthrows]=20+=20Swift?=
+ =?UTF-8?q?Error=20=E2=80=94=20Swift=20throwing=20fns=20(1.02=20throws)?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

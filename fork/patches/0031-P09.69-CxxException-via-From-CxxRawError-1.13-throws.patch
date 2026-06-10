@@ -1,8 +1,8 @@
 From 9d83812b2b62024ed06dcdd6c9b85f0d70088571 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 12:13:55 +0300
-Subject: [PATCH 31/42] P09.69: CxxException via From<CxxRawError> (1.13 throws
- Phase 2A)
+Subject: [PATCH] P09.69: CxxException via From<CxxRawError> (1.13 throws Phase
+ 2A)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

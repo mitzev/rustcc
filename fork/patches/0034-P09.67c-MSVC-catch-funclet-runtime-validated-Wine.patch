@@ -1,7 +1,7 @@
 From 21efa9b4596909856b517ef7a759d96227bb2dea Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 13:54:52 +0300
-Subject: [PATCH 34/42] P09.67c: MSVC catch funclet runtime-validated (Wine)
+Subject: [PATCH] P09.67c: MSVC catch funclet runtime-validated (Wine)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

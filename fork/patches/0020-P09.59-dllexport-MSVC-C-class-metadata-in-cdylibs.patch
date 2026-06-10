@@ -1,7 +1,7 @@
 From d14caa427770615767afa14bb250d2c3e66b7086 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 00:56:35 +0300
-Subject: [PATCH 20/42] P09.59: dllexport MSVC C++ class metadata in cdylibs
+Subject: [PATCH] P09.59: dllexport MSVC C++ class metadata in cdylibs
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

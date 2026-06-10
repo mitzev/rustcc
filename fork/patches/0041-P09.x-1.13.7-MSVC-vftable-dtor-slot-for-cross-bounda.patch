@@ -1,8 +1,8 @@
 From 669deee976402041ca77dc667c2626dae7437bc3 Mon Sep 17 00:00:00 2001
 From: rustcc-build <rustcc@localhost>
 Date: Wed, 3 Jun 2026 10:53:42 +0300
-Subject: [PATCH 41/42] P09.x (1.13.7): MSVC vftable dtor slot for
- cross-boundary virtual dtor
+Subject: [PATCH] P09.x (1.13.7): MSVC vftable dtor slot for cross-boundary
+ virtual dtor
 
 Make the virtual-destructor vtable dtor slot ABI-aware. Itanium emits
 the complete (`D1` = drop_in_place) + deleting (`D0` = drop_in_place +

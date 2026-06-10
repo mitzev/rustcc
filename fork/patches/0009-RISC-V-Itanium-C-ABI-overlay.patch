@@ -1,7 +1,7 @@
 From 5f29ed6461ef6a19d6bb965045657890460f915e Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Wed, 22 Apr 2026 16:05:29 +0300
-Subject: [PATCH 09/42] RISC-V Itanium C++ ABI overlay
+Subject: [PATCH] RISC-V Itanium C++ ABI overlay
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

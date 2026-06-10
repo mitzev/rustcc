@@ -1,7 +1,7 @@
 From 2fd044f1a1c54a4c0d14d5c02a9fa93788246cd4 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:23:14 +0300
-Subject: [PATCH 03/42] Attributes + repr variants: rustc_cxx_*, rustc_swift_*,
+Subject: [PATCH] Attributes + repr variants: rustc_cxx_*, rustc_swift_*,
  repr(cpp), repr(swift)
 
 Registers the compiler-internal attributes the rustcc proc macros emit

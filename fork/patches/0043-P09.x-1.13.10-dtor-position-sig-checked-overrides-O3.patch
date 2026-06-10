@@ -1,0 +1,612 @@
+From 63f4fab04289db6111909438071c5732612bcbdf Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 10 Jun 2026 10:37:54 +0300
+Subject: [PATCH] P09.x (1.13.10): dtor position, sig-checked overrides, O3
+ drop glue, MSVC ??_G, doc comments
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Five fixes from the v1.13.10 review campaign:
+
+1. Dtor slot position (HIGH): the D1/D0 pair sits at the destructor's
+   DECLARATION position (Itanium §2.5.2), not pinned first. New
+   positional `slot=~dtor,~` attr record (parse_imported_slots ->
+   CxxVtSlot::ImportedDtorPair) expanded in place by both vtable
+   emitters; legacy `vdtor=1`-only attrs keep the prepend semantics
+   (correct exactly when the dtor was declared first). `~op<N>`
+   placeholder records preserve operator-virtual slot indices.
+
+2. Signature-checked overrides: `slot=` records carry an optional
+   third field — the Itanium bare parameter encoding at the declaring
+   class. virtuals_on_chain matches name+params (disambiguating
+   OVERLOADED base virtuals, which name-only matching silently
+   corrupted) and rejects ABI-incompatible overrides with a real
+   diagnostic instead of emitting a mis-typed slot.
+
+3. Drop-glue at -C opt-level>=1: instantiation_mode now forces
+   GloballyShared (COMDAT) for the drop glue of #[repr(cpp)] classes
+   whose chain has a virtual dtor — the C++ vtable references the glue
+   BY SYMBOL (a codegen-time reference MIR-based LocalCopy placement
+   can't see), which left it undefined at link time. The collector
+   root also visits the drop use as INDIRECT, like trait-object
+   vtable entries.
+
+4. MSVC ??_G: the scalar-deleting-dtor thunk (and the exported ??_G
+   trampoline) now honor the flags argument — bit 0 gates `operator
+   delete`, so virtual destruction WITHOUT deallocation (`p->~T()`
+   through a base pointer) no longer frees storage it doesn't own.
+
+5. class-body parser: `///` doc comments on methods no longer trip
+   "fields must appear before methods" — the member lookahead skips
+   DocComment tokens, and the keyword-modifier path consumes them
+   into #[doc] attrs grafted onto the parsed method.
+
+Vendored rustc_abi_cxx gains mangle_itanium_params (the bare param
+encoding used for override checking).
+---
+ compiler/rustc_abi_cxx/src/mangle.rs          |  12 ++
+ compiler/rustc_codegen_llvm/src/cxx_vtable.rs |  87 +++++++++++--
+ compiler/rustc_codegen_llvm/src/mono_item.rs  |  53 ++++++--
+ compiler/rustc_middle/src/mono.rs             |  45 +++++++
+ compiler/rustc_monomorphize/src/collector.rs  |  10 +-
+ compiler/rustc_parse/src/parser/item.rs       |  33 ++++-
+ compiler/rustc_passes/src/check_attr.rs       |   5 +-
+ compiler/rustc_symbol_mangling/src/itanium.rs | 121 ++++++++++++++++--
+ 8 files changed, 330 insertions(+), 36 deletions(-)
+
+diff --git a/compiler/rustc_abi_cxx/src/mangle.rs b/compiler/rustc_abi_cxx/src/mangle.rs
+index 2dd7515c308..bd34e735ccb 100644
+--- a/compiler/rustc_abi_cxx/src/mangle.rs
++++ b/compiler/rustc_abi_cxx/src/mangle.rs
+@@ -99,6 +99,18 @@ pub fn mangle_itanium(&self, sym: &Symbol) -> String {
+         m.mangle_symbol(sym);
+         m.out
+     }
++
++    /// The Itanium *bare parameter encoding* of a function signature —
++    /// the `<params>` tail of `_ZN…E<params>` (`"v"` for an empty
++    /// list, e.g. `"iPKc"` for `(int, const char*)`). v1.13.10: used
++    /// to signature-check `override fn`s against the `slot=` records'
++    /// third field. Substitution state is local to this call,
++    /// matching a standalone declaration's encoding.
++    pub fn mangle_itanium_params(&self, sig: &crate::ty::FnSig) -> String {
++        let mut m = Mangler::new(self);
++        m.emit_params(&sig.params);
++        m.out
++    }
+ }
+ 
+ // -------- Substitution-aware mangler -----------------------------------
+diff --git a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+index b7b6162a7d8..bfdd76fb8d0 100644
+--- a/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
++++ b/compiler/rustc_codegen_llvm/src/cxx_vtable.rs
+@@ -362,15 +362,34 @@ fn emit_vtable<'ll, 'tcx>(
+     // points directly at the real C++ implementation symbol
+     // (P09.x / 1.13.7).
+     //
+-    // P09.x (1.13.7): if the chain has a virtual destructor, the two
+-    // leading slots (before the other virtuals) are this class's
+-    // complete (`D1`) and deleting (`D0`) destructors — Itanium order.
+-    for dtor_slot in cxx_dtor_slots(cx, adt_did) {
+-        slots.push(dtor_slot);
+-    }
++    // P09.x (1.13.7) / v1.13.10: the D1/D0 destructor pair sits at the
++    // destructor's DECLARATION position (Itanium §2.5.2). A v1.13.10+
++    // attr carries a positional `slot=~dtor,~` marker we expand in
++    // place; a legacy attr (`vdtor=1`, no marker) means the dtor was
++    // declared first, so the pair is prepended as before.
+     let virtuals = cxx_mangle::virtuals_on_chain(tcx, adt_did);
++    let has_positional_dtor =
++        virtuals.iter().any(|s| matches!(s, cxx_mangle::CxxVtSlot::ImportedDtorPair));
++    if !has_positional_dtor {
++        for dtor_slot in cxx_dtor_slots(cx, adt_did) {
++            slots.push(dtor_slot);
++        }
++    }
++    let mut dtor_pair_emitted = false;
+     for slot in &virtuals {
+-        slots.push(cxx_vt_slot_fn_addr(cx, slot));
++        match slot {
++            cxx_mangle::CxxVtSlot::ImportedDtorPair => {
++                // Expand once; ignore (malformed) duplicate markers —
++                // the thunk globals may only be defined a single time.
++                if !dtor_pair_emitted {
++                    for dtor_slot in cxx_dtor_slots(cx, adt_did) {
++                        slots.push(dtor_slot);
++                    }
++                    dtor_pair_emitted = true;
++                }
++            }
++            _ => slots.push(cxx_vt_slot_fn_addr(cx, slot)),
++        }
+     }
+     let _ = ptr_ty; // (retained for readability; const_struct infers)
+ 
+@@ -411,6 +430,11 @@ fn cxx_vt_slot_fn_addr<'ll, 'tcx>(
+         cxx_mangle::CxxVtSlot::Imported { link_name, .. } => {
+             declare_extern_fn_addr(cx, link_name.as_str())
+         }
++        // Expanded positionally by the vtable assembly loops before
++        // this is ever called.
++        cxx_mangle::CxxVtSlot::ImportedDtorPair => {
++            bug!("ImportedDtorPair must be expanded by the caller")
++        }
+     }
+ }
+ 
+@@ -551,21 +575,40 @@ fn emit_cxx_msvc_deleting_dtor_thunk<'ll, 'tcx>(
+     }
+ 
+     let start = Builder::append_block(cx, thunk, "start");
++    let free_bb = Builder::append_block(cx, thunk, "do_free");
++    let done_bb = Builder::append_block(cx, thunk, "done");
+     let mut bx = Builder::build(cx, start);
+     let this = llvm::get_param(thunk, 0);
++    let flags = llvm::get_param(thunk, 1);
+ 
+     let drop_abi = cx.fn_abi_of_instance(drop_instance, ty::List::empty());
+     let drop_fn_ty = drop_abi.llvm_type(cx);
+     let drop_callee = cx.get_fn_addr(drop_instance);
+     bx.call(drop_fn_ty, None, Some(drop_abi), drop_callee, &[this], None, Some(drop_instance));
+ 
++    // MSVC ABI: bit 0 of `flags` selects whether the scalar-deleting
++    // dtor frees the storage. MSVC/clang-cl call through this slot
++    // with flags = 0 for virtual destruction WITHOUT deallocation
++    // (e.g. `p->~Base()` through a base pointer, or destroying an
++    // automatic/embedded object virtually). Unconditionally freeing
++    // used to corrupt the heap for those calls. (Bit 1 = vector
++    // `delete[]` — not applicable to the single-object thunk.)
++    let one = bx.cx.const_i32(1);
++    let do_free = bx.and(flags, one);
++    let zero = bx.cx.const_i32(0);
++    let cond = bx.icmp(rustc_codegen_ssa::common::IntPredicate::IntNE, do_free, zero);
++    bx.cond_br(cond, free_bb, done_bb);
++
+     // operator delete(this) — MSVC `??3@YAXPEAX@Z`.
++    let mut bx_free = Builder::build(cx, free_bb);
+     let void_ty = cx.type_void();
+     let op_delete_ty = cx.type_func(&[ptr_ty], void_ty);
+     let op_delete = cx.declare_cfn("??3@YAXPEAX@Z", llvm::UnnamedAddr::Global, op_delete_ty);
+-    bx.call(op_delete_ty, None, None, op_delete, &[this], None, None);
++    bx_free.call(op_delete_ty, None, None, op_delete, &[this], None, None);
++    bx_free.br(done_bb);
+ 
+-    bx.ret(this);
++    let mut bx_done = Builder::build(cx, done_bb);
++    bx_done.ret(this);
+     thunk
+ }
+ 
+@@ -762,12 +805,30 @@ fn emit_msvc_vftable<'ll, 'tcx>(
+     // declaration order (P09.x / 1.13.7). A derived `override` replaces
+     // a base slot; a non-overridden imported slot points at the real
+     // C++ symbol.
+-    for dtor_slot in cxx_dtor_slots(cx, adt_did) {
+-        slots.push(dtor_slot);
+-    }
+     let virtuals = cxx_mangle::virtuals_on_chain(tcx, adt_did);
++    let has_positional_dtor =
++        virtuals.iter().any(|s| matches!(s, cxx_mangle::CxxVtSlot::ImportedDtorPair));
++    if !has_positional_dtor {
++        for dtor_slot in cxx_dtor_slots(cx, adt_did) {
++            slots.push(dtor_slot);
++        }
++    }
++    let mut dtor_pair_emitted = false;
+     for slot in &virtuals {
+-        slots.push(cxx_vt_slot_fn_addr(cx, slot));
++        match slot {
++            cxx_mangle::CxxVtSlot::ImportedDtorPair => {
++                if !dtor_pair_emitted {
++                    // On MSVC `cxx_dtor_slots` yields the single
++                    // scalar-deleting (`??_G`) slot — the Itanium pair
++                    // marker collapses to one entry here.
++                    for dtor_slot in cxx_dtor_slots(cx, adt_did) {
++                        slots.push(dtor_slot);
++                    }
++                    dtor_pair_emitted = true;
++                }
++            }
++            _ => slots.push(cxx_vt_slot_fn_addr(cx, slot)),
++        }
+     }
+ 
+     let initializer = cx.const_struct(&slots, false);
+diff --git a/compiler/rustc_codegen_llvm/src/mono_item.rs b/compiler/rustc_codegen_llvm/src/mono_item.rs
+index bf41f08e414..662631362dc 100644
+--- a/compiler/rustc_codegen_llvm/src/mono_item.rs
++++ b/compiler/rustc_codegen_llvm/src/mono_item.rs
+@@ -264,20 +264,55 @@ fn maybe_add_cxx_dtor_variants(
+         {
+             emit_trampoline(&d0_name, true);
+         }
+-        // P09.57: MSVC has a single "scalar deleting destructor"
+-        // (`??_G<class>@@`) in place of the Itanium D0 trampoline.
+-        // It takes a hidden int flags arg; when bit 0 is set the
+-        // generated body would call `operator delete(this)`. For
+-        // the minimal v1 emission we always-delete — the vftable
+-        // slot in MSVC's convention is reached via `delete p` so
+-        // the flag is set in practice; refining the conditional
+-        // call follows in a later patch.
++        // P09.57 / v1.13.10: MSVC's single "scalar deleting destructor"
++        // (`??_G<class>@@`) replaces the Itanium D0 trampoline. Its
++        // hidden `int flags` arg gates deallocation — MSVC/clang-cl
++        // call it with bit 0 CLEAR for virtual destruction without
++        // freeing (`p->~T()` through a base pointer, automatic or
++        // embedded objects), so the always-delete v1 emission could
++        // free storage it didn't own. Emit the proper 2-param body
++        // with a conditional `operator delete`.
+         if let Some(g_name) =
+             rustc_symbol_mangling::itanium::mangle_dtor_scalar_deleting(
+                 self.tcx, def_id,
+             )
+         {
+-            emit_trampoline(&g_name, true);
++            if self.get_defined_value(&g_name).is_none() {
++                let ptr_ty = self.type_ptr();
++                let i32_ty = self.type_i32();
++                let g_ty = self.type_func(&[ptr_ty, i32_ty], ptr_ty);
++                let g_fn = self.declare_cfn(&g_name, llvm::UnnamedAddr::No, g_ty);
++                llvm::set_linkage(g_fn, llvm::Linkage::LinkOnceODRLinkage);
++                if self.tcx.sess.target.supports_comdat() {
++                    llvm::SetUniqueComdat(self.llmod, g_fn);
++                }
++                let start = Builder::append_block(self, g_fn, "start");
++                let free_bb = Builder::append_block(self, g_fn, "do_free");
++                let done_bb = Builder::append_block(self, g_fn, "done");
++                let mut gbx = Builder::build(self, start);
++                let this = llvm::get_param(g_fn, 0);
++                let flags = llvm::get_param(g_fn, 1);
++                gbx.call(
++                    fn_ty, Some(&attrs), Some(fn_abi), d1_decl, &[this], None, Some(instance),
++                );
++                let one = gbx.cx.const_i32(1);
++                let masked = gbx.and(flags, one);
++                let zero = gbx.cx.const_i32(0);
++                let cond = gbx.icmp(rustc_codegen_ssa::common::IntPredicate::IntNE, masked, zero);
++                gbx.cond_br(cond, free_bb, done_bb);
++                let mut gbx_free = Builder::build(self, free_bb);
++                let void_ty = self.type_void();
++                let op_delete_ty = self.type_func(&[ptr_ty], void_ty);
++                let op_delete = self.declare_cfn(
++                    "??3@YAXPEAX@Z",
++                    llvm::UnnamedAddr::Global,
++                    op_delete_ty,
++                );
++                gbx_free.call(op_delete_ty, None, None, op_delete, &[this], None, None);
++                gbx_free.br(done_bb);
++                let mut gbx_done = Builder::build(self, done_bb);
++                gbx_done.ret(this);
++            }
+         }
+     }
+ 
+diff --git a/compiler/rustc_middle/src/mono.rs b/compiler/rustc_middle/src/mono.rs
+index 3909db8bfce..e0d202d939a 100644
+--- a/compiler/rustc_middle/src/mono.rs
++++ b/compiler/rustc_middle/src/mono.rs
+@@ -58,6 +58,39 @@ pub enum MonoItem<'tcx> {
+     GlobalAsm(ItemId),
+ }
+ 
++/// rustcc (v1.13.10): true iff `ty` is a `#[repr(cpp)]` class whose
++/// single-inheritance chain has a virtual destructor — i.e. its drop
++/// glue is referenced by symbol from the emitted C++ vtable. Local
++/// copy of the chain walk (the fork keeps these duplicated rather than
++/// adding cross-crate deps; see rustc_monomorphize::collector and
++/// rustc_symbol_mangling::itanium for the siblings).
++fn cxx_vtable_references_drop_glue<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
++    fn chain_has_vdtor(tcx: TyCtxt<'_>, did: rustc_hir::def_id::DefId) -> bool {
++        if let Some(spec) = rustc_hir::find_attr!(
++            tcx, did, rustc_hir::attrs::AttributeKind::RustcCxxImportedVtable { spec, .. } => *spec
++        ) && spec.as_str().split(';').any(|r| r.trim() == "vdtor=1")
++        {
++            return true;
++        }
++        let adt = tcx.adt_def(did);
++        let Some(variant) = adt.variants().iter().next() else { return false };
++        let Some(first) = variant.fields.raw.first() else { return false };
++        if !rustc_hir::find_attr!(
++            tcx, first.did, rustc_hir::attrs::AttributeKind::RustcCxxBase(..)
++        ) {
++            return false;
++        }
++        match tcx.type_of(first.did).skip_binder().kind() {
++            ty::Adt(base_adt, _) => chain_has_vdtor(tcx, base_adt.did()),
++            _ => false,
++        }
++    }
++    match ty.kind() {
++        ty::Adt(adt, _) if adt.repr().cpp() => chain_has_vdtor(tcx, adt.did()),
++        _ => false,
++    }
++}
++
+ fn opt_incr_drop_glue_mode<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> InstantiationMode {
+     // Non-ADTs can't have a Drop impl. This case is mostly hit by closures whose captures require
+     // dropping.
+@@ -173,6 +206,18 @@ pub fn instantiation_mode(&self, tcx: TyCtxt<'tcx>) -> InstantiationMode {
+         // The heuristics implemented here do better than a completely naive approach in the
+         // compiler benchmark suite, but there is no reason to believe they are optimal.
+         if let InstanceKind::DropGlue(_, Some(ty)) = instance.def {
++            // rustcc (v1.13.10): a `#[repr(cpp)]` class whose chain has a
++            // virtual destructor has its drop glue referenced BY SYMBOL
++            // from the emitted C++ vtable (the D1 slot and the D0
++            // deleting-dtor thunk) — a reference created at CODEGEN
++            // time that MIR-based use placement cannot see. LocalCopy
++            // would materialize the glue only at MIR call sites (often
++            // none exist), leaving the vtable's reference undefined at
++            // link time under -C opt-level >= 1. Force a globally
++            // shared COMDAT instantiation instead.
++            if cxx_vtable_references_drop_glue(tcx, ty) {
++                return InstantiationMode::GloballyShared { may_conflict: true };
++            }
+             if tcx.sess.opts.optimize == OptLevel::No {
+                 return InstantiationMode::GloballyShared { may_conflict: false };
+             }
+diff --git a/compiler/rustc_monomorphize/src/collector.rs b/compiler/rustc_monomorphize/src/collector.rs
+index 921f5992f60..fe159d6448b 100644
+--- a/compiler/rustc_monomorphize/src/collector.rs
++++ b/compiler/rustc_monomorphize/src/collector.rs
+@@ -1545,7 +1545,15 @@ fn process_item(&mut self, id: hir::ItemId) {
+                             self.tcx.adt_def(adt_did),
+                             self.tcx.mk_args(&[]),
+                         );
+-                        visit_drop_use(self.tcx, ty, true, DUMMY_SP, self.output);
++                        // INDIRECT use (like a trait-object vtable
++                        // entry): the C++ vtable references the glue
++                        // by symbol, so it must be emitted with
++                        // GloballyShared visibility. A direct use
++                        // resolves to a LocalCopy instantiation at
++                        // opt-level>=3, which never materializes
++                        // (no MIR call site exists) and left the
++                        // vtable's reference undefined at link time.
++                        visit_drop_use(self.tcx, ty, false, DUMMY_SP, self.output);
+                     }
+                 }
+                 if self.strategy == MonoItemCollectionStrategy::Eager
+diff --git a/compiler/rustc_parse/src/parser/item.rs b/compiler/rustc_parse/src/parser/item.rs
+index 8f1c8fd54e1..5ae20c902ec 100644
+--- a/compiler/rustc_parse/src/parser/item.rs
++++ b/compiler/rustc_parse/src/parser/item.rs
+@@ -2238,6 +2238,17 @@ fn skip_over_outer_attributes(&self) -> usize {
+         loop {
+             if dist >= 256 { return dist; }
+             let tok = self.look_ahead(dist, |t| t.clone());
++            // `///` doc comments lex as a single DocComment token (not
++            // `#[doc = ...]`), and are outer attributes for the
++            // member that follows — skip them like `#[...]` so a
++            // documented method is still classified as a method
++            // (v1.13.10; previously `/// docs` before a method made
++            // the lookahead fall into the field branch and error with
++            // "fields must appear before methods").
++            if let token::DocComment(..) = tok.kind {
++                dist += 1;
++                continue;
++            }
+             if tok.kind != token::Pound { return dist; }
+             // `#` — expect `[...]` group next.
+             dist += 1;
+@@ -2394,7 +2405,26 @@ fn parse_cxx_class_item(
+ 
+             if is_modified_method {
+                 let off = modifier_off.unwrap();
+-                if post_attrs != 0 {
++                // Doc comments before the modifier run are fine —
++                // consume them into `#[doc]` attributes and graft
++                // them onto the parsed method below. Real `#[...]`
++                // attributes stay rejected (they'd race the
++                // synthesized `#[cpp_virtual]`/`#[constructor]`).
++                let mut doc_attrs: ThinVec<Attribute> = ThinVec::new();
++                while let token::DocComment(comment_kind, attr_style, data) = self.token.kind {
++                    if attr_style != ast::AttrStyle::Outer {
++                        break; // inner doc comment: let the field/method path diagnose
++                    }
++                    doc_attrs.push(rustc_ast::attr::mk_doc_comment(
++                        &self.psess.attr_id_generator,
++                        comment_kind,
++                        ast::AttrStyle::Outer,
++                        data,
++                        self.token.span,
++                    ));
++                    self.bump();
++                }
++                if self.token.kind == token::Pound {
+                     return Err(self.dcx().struct_span_err(
+                         self.token.span,
+                         "`virtual` / `override` / `constructor` keyword modifiers can't be \
+@@ -2450,6 +2480,7 @@ fn parse_cxx_class_item(
+                         if let Some(vis) = saved_vis {
+                             item.vis = vis;
+                         }
++                        item.attrs.extend(doc_attrs);
+                         item.attrs.extend(synth);
+                         methods.push(item);
+                         saw_method = true;
+diff --git a/compiler/rustc_passes/src/check_attr.rs b/compiler/rustc_passes/src/check_attr.rs
+index f6400a97bfa..1d46b53410b 100644
+--- a/compiler/rustc_passes/src/check_attr.rs
++++ b/compiler/rustc_passes/src/check_attr.rs
+@@ -2318,7 +2318,10 @@ fn cxx_imported_slot_names(tcx: TyCtxt<'_>, adt_did: DefId) -> Vec<String> {
+             && let Some(name) = rest.split(',').next()
+         {
+             let name = name.trim();
+-            if !name.is_empty() {
++            // `~`-prefixed records are positional markers (`~dtor`
++            // destructor pair, `~op<N>` operator placeholders) — not
++            // override-matchable method names.
++            if !name.is_empty() && !name.starts_with('~') {
+                 out.push(name.to_string());
+             }
+         }
+diff --git a/compiler/rustc_symbol_mangling/src/itanium.rs b/compiler/rustc_symbol_mangling/src/itanium.rs
+index fa56e8ab730..720753058be 100644
+--- a/compiler/rustc_symbol_mangling/src/itanium.rs
++++ b/compiler/rustc_symbol_mangling/src/itanium.rs
+@@ -274,13 +274,32 @@ pub fn is_polymorphic_cpp_class<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> bool
+ #[derive(Clone, Debug)]
+ pub enum CxxVtSlot {
+     Rust { name: rustc_span::Symbol, def_id: DefId },
+-    Imported { name: rustc_span::Symbol, link_name: rustc_span::Symbol },
++    Imported {
++        name: rustc_span::Symbol,
++        link_name: rustc_span::Symbol,
++        /// v1.13.10: the slot's Itanium bare parameter encoding at its
++        /// declaring class (third `slot=` field). Lets override
++        /// matching disambiguate overloaded names and reject
++        /// signature mismatches. `None` on legacy attrs.
++        psig: Option<rustc_span::Symbol>,
++    },
++    /// v1.13.10: positional `slot=~dtor,~` marker — the D1/D0 destructor
++    /// pair sits at the destructor's DECLARATION position (Itanium
++    /// §2.5.2), not necessarily first. Codegen expands this to the
++    /// derived class's own complete/deleting dtor slots. Legacy attrs
++    /// (`vdtor=1` with no marker) keep the old prepend semantics, which
++    /// were correct exactly when the dtor was declared first.
++    ImportedDtorPair,
+ }
+ 
+ impl CxxVtSlot {
+     pub fn name(&self) -> rustc_span::Symbol {
+         match self {
+             CxxVtSlot::Rust { name, .. } | CxxVtSlot::Imported { name, .. } => *name,
++            // `~` can't appear in a Rust identifier, so this can never
++            // collide with (or be replaced by) a real override.
++            #[allow(rustc::symbol_intern_string_literal)]
++            CxxVtSlot::ImportedDtorPair => rustc_span::Symbol::intern("~dtor"),
+         }
+     }
+ }
+@@ -299,15 +318,23 @@ fn parse_imported_slots(spec: rustc_span::Symbol) -> Vec<CxxVtSlot> {
+     let mut out = Vec::new();
+     for record in spec.as_str().split(';') {
+         if let Some(rest) = record.trim().strip_prefix("slot=") {
+-            let mut parts = rest.splitn(2, ',');
++            let mut parts = rest.splitn(3, ',');
+             let name = parts.next().unwrap_or("").trim();
+             let symbol = parts.next().unwrap_or("").trim();
++            let psig = parts.next().map(str::trim).filter(|s| !s.is_empty());
+             if name.is_empty() || symbol.is_empty() {
+                 continue;
+             }
++            if name == "~dtor" {
++                // Positional destructor-pair marker (v1.13.10); the
++                // symbol field is a placeholder `~`.
++                out.push(CxxVtSlot::ImportedDtorPair);
++                continue;
++            }
+             out.push(CxxVtSlot::Imported {
+                 name: rustc_span::Symbol::intern(name),
+                 link_name: rustc_span::Symbol::intern(symbol),
++                psig: psig.map(rustc_span::Symbol::intern),
+             });
+         }
+     }
+@@ -460,21 +487,93 @@ pub fn virtuals_on_chain<'tcx>(tcx: TyCtxt<'tcx>, adt_did: DefId) -> Vec<CxxVtSl
+     for derived_did in virtual_methods_on_class(tcx, adt_did) {
+         let derived_name = tcx.item_name(derived_did);
+         let new_slot = CxxVtSlot::Rust { name: derived_name, def_id: derived_did };
+-        let mut replaced = false;
+-        for slot in out.iter_mut() {
+-            if slot.name() == derived_name {
+-                *slot = new_slot.clone();
+-                replaced = true;
+-                break;
++        // v1.13.10: when the matched slot carries a parameter
++        // encoding (third `slot=` field), the override's own params
++        // must encode identically — this both disambiguates
++        // OVERLOADED base virtuals (same name, different params:
++        // name-only matching used to overwrite an arbitrary one of
++        // them) and rejects ABI-incompatible overrides that would
++        // silently corrupt every C++ call through the slot.
++        let derived_psig = cxx_override_param_sig(tcx, derived_did);
++        let name_matches: Vec<usize> = out
++            .iter()
++            .enumerate()
++            .filter(|(_, s)| s.name() == derived_name)
++            .map(|(i, _)| i)
++            .collect();
++        let chosen = name_matches.iter().copied().find(|&i| match &out[i] {
++            CxxVtSlot::Imported { psig: Some(p), .. } => {
++                match &derived_psig {
++                    Some(d) => p.as_str() == d.as_str(),
++                    // Couldn't lower the override's params (already
++                    // diagnosed elsewhere) — accept by name.
++                    None => true,
++                }
+             }
+-        }
+-        if !replaced {
+-            out.push(new_slot);
++            // Legacy record / Rust slot: name-only.
++            _ => true,
++        });
++        match chosen {
++            Some(i) => out[i] = new_slot.clone(),
++            None if !name_matches.is_empty() => {
++                // Name matched but every candidate's signature
++                // disagreed — a C++ compiler would treat this as
++                // HIDING, not overriding. Refuse to emit a slot that
++                // would be called with the wrong ABI.
++                let candidates: Vec<String> = name_matches
++                    .iter()
++                    .filter_map(|&i| match &out[i] {
++                        CxxVtSlot::Imported { psig: Some(p), .. } => {
++                            Some(format!("`({})`", p.as_str()))
++                        }
++                        _ => None,
++                    })
++                    .collect();
++                tcx.dcx().span_err(
++                    tcx.def_span(derived_did),
++                    format!(
++                        "`override fn {derived_name}`'s parameters (Itanium encoding `{}`) match no base virtual `{derived_name}` overload (base declares: {})",
++                        derived_psig.as_deref().unwrap_or("?"),
++                        candidates.join(", "),
++                    ),
++                );
++            }
++            None => out.push(new_slot),
+         }
+     }
+     out
+ }
+ 
++/// v1.13.10: the Itanium bare parameter encoding of a Rust
++/// `#[cpp_virtual]` method's signature (self skipped) — comparable
++/// against the third `slot=` field of `#[rustc_cxx_imported_vtable]`.
++/// `None` when a parameter type has no C++ lowering (diagnosed by the
++/// regular method-mangling path).
++fn cxx_override_param_sig<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<String> {
++    let fn_sig = tcx.fn_sig(def_id).skip_binder().skip_binder();
++    let mut ctx = CxxTypeCtx::new(CxxTarget::from_rustc_triple(
++        tcx.sess.opts.target_triple.tuple(),
++        tcx.sess.target.pointer_width as u32,
++    ));
++    let has_self = tcx.def_kind(def_id) == DefKind::AssocFn
++        && tcx.associated_item(def_id).is_method();
++    let input_skip = if has_self { 1 } else { 0 };
++    let mut params = Vec::new();
++    for ty in fn_sig.inputs().iter().skip(input_skip) {
++        params.push(rustc_ty_to_cxx(tcx, &mut ctx, *ty).ok()?);
++    }
++    let void = ctx.intern_type(CxxType::Void);
++    let sig = CxxFnSig {
++        params,
++        ret: void,
++        cv: CvQual::default(),
++        ref_q: None,
++        variadic: false,
++        noexcept: false,
++    };
++    Some(ctx.mangle_itanium_params(&sig))
++}
++
+ /// P09.24: Itanium-mangled name for the class's vtable
+ /// (`_ZTV<class>`), typeinfo (`_ZTI<class>`), or typeinfo-name
+ /// (`_ZTS<class>`). Uses the same namespace-prefix logic as
+-- 
+2.50.1 (Apple Git-155)
+

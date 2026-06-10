@@ -1,8 +1,7 @@
 From 1dce86d2094a9ec3f25da3323e3df48dc3af6ca6 Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 12:55:37 +0300
-Subject: [PATCH 32/42] P09.68: typed C++ catches at codegen (1.13 throws Phase
- 2B)
+Subject: [PATCH] P09.68: typed C++ catches at codegen (1.13 throws Phase 2B)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

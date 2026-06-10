@@ -1,8 +1,7 @@
 From cb170e346e4be1510c0b937a66049a1bb7a531fb Mon Sep 17 00:00:00 2001
 From: test <test@local>
 Date: Sat, 23 May 2026 11:01:56 +0300
-Subject: [PATCH 27/42] P09.65b: MIR pass wraps happy path in Result::Ok (Phase
- 1F)
+Subject: [PATCH] P09.65b: MIR pass wraps happy path in Result::Ok (Phase 1F)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

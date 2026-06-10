@@ -1,7 +1,7 @@
 From 1ce2012c3bbc2ad6da27479c457fee4fb9bb8706 Mon Sep 17 00:00:00 2001
 From: mitzev <ogi@kunasystems.com>
 Date: Tue, 21 Apr 2026 23:23:47 +0300
-Subject: [PATCH 06/42] Symbol mangling: Itanium + Swift dispatch modules
+Subject: [PATCH] Symbol mangling: Itanium + Swift dispatch modules
 
 Adds itanium.rs and swift.rs to rustc_symbol_mangling; the library's
 symbol_name path now routes ExternAbi::Cpp / ExternAbi::Swift items to
