@@ -29,13 +29,10 @@ fork code. Otherwise treat it as plain Rust.
 
 When writing a *new Rust type that must be ABI-compatible with C++* on
 the fork toolchain, prefer the **`class` keyword** — it's the lowest-
-boilerplate surface and mirrors C++ at the declaration site. The crate
-root needs:
-
-```rust
-#![feature(rustc_attrs)]
-#![allow(internal_features)]   // class/ctor/virtual attrs ride rustc_attrs
-```
+boilerplate surface and mirrors C++ at the declaration site. As of
+v1.14 no crate-root attributes are needed (the fork's interop
+attributes are ungated built-ins, and generated bindings carry their
+own lint allows in a wrapped module).
 
 Canonical form:
 

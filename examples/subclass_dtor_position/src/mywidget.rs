@@ -1,6 +1,3 @@
-#![feature(rustc_attrs)]
-#![allow(internal_features)] // class/ctor/virtual attrs ride rustc_attrs
-#![allow(dead_code)]
 
 //! v1.13.10 regression example: subclass an imported C++ base whose
 //! virtual DESTRUCTOR is not the first declared virtual.

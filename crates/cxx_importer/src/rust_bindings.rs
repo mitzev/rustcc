@@ -589,10 +589,19 @@ fn emit_direct_extern_cpp(
         })
         .collect();
 
-    let initial_indent = if config.crate_module.is_some() { "    " } else { "" };
-    if let Some(modname) = config.crate_module.as_deref() {
-        let _ = writeln!(out, "pub mod {modname} {{");
-    }
+    // v1.14: the whole generated surface lives in a module carrying
+    // the lint allows, re-exported at the include site — so user
+    // crates need no crate-root `#![allow(...)]` for binding noise
+    // (dead_code on unused wrappers, C++ naming conventions, the
+    // unsafe/paren shapes of generated bodies).
+    let modname = config.crate_module.clone().unwrap_or_else(|| "__rustcc_ffi".to_string());
+    let _ = writeln!(
+        out,
+        "#[allow(nonstandard_style, dead_code, unused_imports, unused_unsafe, unused_variables, unused_parens)]"
+    );
+    let _ = writeln!(out, "#[allow(clippy::all)]");
+    let _ = writeln!(out, "pub mod {modname} {{");
+    let initial_indent = "    ";
 
     // Group classes by their `NestedName` namespace prefix so the
     // emitter recovers the C++ scope structure as a Rust `mod`
@@ -629,9 +638,9 @@ fn emit_direct_extern_cpp(
         &static_data_by_class,
     )?;
 
-    if config.crate_module.is_some() {
-        let _ = writeln!(out, "}}");
-    }
+    let _ = writeln!(out, "}}");
+    let _ = writeln!(out, "#[doc(inline)]");
+    let _ = writeln!(out, "pub use {modname}::*;");
     Ok(out)
 }
 

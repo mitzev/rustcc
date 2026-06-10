@@ -1,5 +1,3 @@
-#![feature(rustc_attrs)]
-#![allow(internal_features, dead_code)]
 
 //! Member-function-pointer round-trips (v1.14 phase 1).
 //!

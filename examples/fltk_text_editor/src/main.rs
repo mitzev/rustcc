@@ -18,16 +18,6 @@
 //! cargo +rustcc run --release --bin editor -- --self-test   # headless probes
 //! ```
 
-#![feature(rustc_attrs)]
-#![allow(internal_features)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_unsafe)]
-#![allow(unused_variables)]
-#![allow(unused_parens)]
-#![allow(clippy::all)]
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/target/m26-out/bindings.rs"));
 
@@ -483,7 +473,7 @@ unsafe fn self_test() -> i32 {
         }
     };
     unsafe {
-        let win = build_ui();
+        let _win = build_ui();
         let buf = BUF.load(Relaxed);
         let ed = ED.load(Relaxed);
 

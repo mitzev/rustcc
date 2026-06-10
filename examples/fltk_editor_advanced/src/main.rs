@@ -31,16 +31,6 @@
 //! cargo +rustcc run --release --bin editor                  # the GUI
 //! ```
 
-#![feature(rustc_attrs)]
-#![allow(internal_features)] // class/ctor/virtual attrs ride rustc_attrs
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_unsafe)]
-#![allow(unused_variables)]
-#![allow(unused_parens)]
-#![allow(clippy::all)]
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/target/gen-out/bindings.rs"));
 

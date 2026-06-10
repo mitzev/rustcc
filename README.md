@@ -215,8 +215,7 @@ produces the exact Itanium symbol Clang emits on the C++ side.
 ### A polymorphic class defined in Rust, called from C++
 
 ```rust
-// widget.rs
-#![feature(rustc_attrs)]
+// widget.rs — no crate-root attributes needed (v1.14+)
 
 pub class Widget {
     v: i32,

@@ -1,0 +1,146 @@
+From 4de34ff3569eb9415abf4fd92acf7d87900332a6 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Wed, 10 Jun 2026 23:38:04 +0300
+Subject: [PATCH] P09.x (v1.14): ungate fork attrs + never internalize vtable
+ drop glue
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+1. Every fork interop attribute (constructor, cpp_virtual, the
+   synthesized rustc_cxx_*, rustc_cxx_imported_vtable, the Swift
+   markers) is now UNGATED: they are the fork's public surface, and
+   gating them behind the internal `rustc_attrs` feature forced every
+   user crate and generated binding to carry `#![feature(rustc_attrs)]`
+   + `#![allow(internal_features)]`. One edit to the 2-arg rustc_attr!
+   shim arm; upstream internals keep the gated 5/6-arg forms.
+
+2. Partitioning: drop glue referenced BY SYMBOL from a C++ vtable
+   (repr(cpp) + virtual-dtor chain) is excluded from symbol
+   internalization. The reference is created at codegen time in
+   whichever CGU emits the vtable — invisible to the access recording —
+   so internalization produced undefined drop_in_place symbols whenever
+   the glue landed in a different CGU (16-CGU release builds; only
+   linked before by placement luck).
+---
+ compiler/rustc_feature/src/builtin_attrs.rs   | 32 ++++++++----
+ .../rustc_monomorphize/src/partitioning.rs    | 52 ++++++++++++++++++-
+ 2 files changed, 72 insertions(+), 12 deletions(-)
+
+diff --git a/compiler/rustc_feature/src/builtin_attrs.rs b/compiler/rustc_feature/src/builtin_attrs.rs
+index 7f4625160ba..b65529b832a 100644
+--- a/compiler/rustc_feature/src/builtin_attrs.rs
++++ b/compiler/rustc_feature/src/builtin_attrs.rs
+@@ -406,18 +406,28 @@ macro_rules! rustc_attr {
+             },
+         }
+     };
+-    // rustcc back-compat (1.97-parity): the fork registers its internal
+-    // attributes with the simplified 2-arg form `rustc_attr!(name, "desc")`
+-    // that upstream introduced after 1.96. Provide it here so the fork
+-    // patches apply unchanged onto 1.96.0. Permissive template (Word +
+-    // NameValueStr) — the real shape is validated by each attribute's
+-    // new-system parser (the old template check is skipped for parsed
+-    // attributes, see rustc_attr_parsing::validate_attr).
++    // rustcc: every fork interop attribute registers through this
++    // 2-arg form — and as of v1.14 they are UNGATED. They are the
++    // fork's *public surface* (`constructor`, `cpp_virtual`, the
++    // synthesized `rustc_cxx_*`, the binding-carried
++    // `rustc_cxx_imported_vtable`, the Swift markers): gating them
++    // behind the internal `rustc_attrs` feature forced every user
++    // crate and every generated binding to carry
++    // `#![feature(rustc_attrs)]` + `#![allow(internal_features)]`.
++    // Upstream's own `rustc_*` internals keep using the explicit
++    // 5/6-arg gated forms above. Permissive template (Word +
++    // NameValueStr) — the real shape is validated by each
++    // attribute's new-system parser.
+     ($attr:ident, $($notes:expr),* $(,)?) => {
+-        rustc_attr!(
+-            $attr, Normal, template!(Word, NameValueStr: "value"),
+-            WarnFollowing, EncodeCrossCrate::Yes, $($notes),*
+-        )
++        BuiltinAttribute {
++            name: sym::$attr,
++            encode_cross_crate: EncodeCrossCrate::Yes,
++            type_: Normal,
++            safety: AttributeSafety::Normal,
++            template: template!(Word, NameValueStr: "value"),
++            gate: Ungated,
++            duplicates: WarnFollowing,
++        }
+     };
+ }
+ 
+diff --git a/compiler/rustc_monomorphize/src/partitioning.rs b/compiler/rustc_monomorphize/src/partitioning.rs
+index 6f9795fb3bf..ea840e22a72 100644
+--- a/compiler/rustc_monomorphize/src/partitioning.rs
++++ b/compiler/rustc_monomorphize/src/partitioning.rs
+@@ -250,7 +250,22 @@ fn place_mono_items<'tcx, I>(cx: &PartitioningCx<'_, 'tcx>, mono_items: I) -> Pl
+             always_export_generics,
+         );
+ 
+-        if visibility == Visibility::Hidden && can_be_internalized {
++        // rustcc (v1.14): drop glue referenced BY SYMBOL from a C++
++        // vtable (repr(cpp) + virtual-dtor chain) must never be
++        // internalized — the reference is created at codegen time in
++        // whichever CGU emits the vtable, which the access-recording
++        // below cannot see. Internalizing it linked fine only when
++        // the glue happened to land in the same CGU as the vtable.
++        let is_cxx_vtable_drop_glue = matches!(
++            mono_item,
++            MonoItem::Fn(instance)
++                if matches!(instance.def, ty::InstanceKind::DropGlue(_, Some(ty))
++                    if cxx_vtable_references_drop_glue_partition(cx.tcx, ty))
++        );
++        if visibility == Visibility::Hidden
++            && can_be_internalized
++            && !is_cxx_vtable_drop_glue
++        {
+             internalization_candidates.insert(mono_item);
+         }
+         let size_estimate = mono_item.size_estimate(cx.tcx);
+@@ -511,6 +526,41 @@ fn compute_inlined_overlap<'tcx>(cgu1: &CodegenUnit<'tcx>, cgu2: &CodegenUnit<'t
+     overlap
+ }
+ 
++/// rustcc (v1.14): sibling of `rustc_middle::mono`'s
++/// `cxx_vtable_references_drop_glue` — true iff `ty` is a
++/// `#[repr(cpp)]` class whose chain has a virtual destructor, i.e.
++/// its drop glue is referenced by symbol from the emitted C++ vtable.
++#[allow(rustc::usage_of_qualified_ty)]
++fn cxx_vtable_references_drop_glue_partition<'tcx>(
++    tcx: TyCtxt<'tcx>,
++    ty: rustc_middle::ty::Ty<'tcx>,
++) -> bool {
++    fn chain_has_vdtor(tcx: TyCtxt<'_>, did: DefId) -> bool {
++        if let Some(spec) = rustc_hir::find_attr!(
++            tcx, did, rustc_hir::attrs::AttributeKind::RustcCxxImportedVtable { spec, .. } => *spec
++        ) && spec.as_str().split(';').any(|r| r.trim() == "vdtor=1")
++        {
++            return true;
++        }
++        let adt = tcx.adt_def(did);
++        let Some(variant) = adt.variants().iter().next() else { return false };
++        let Some(first) = variant.fields.raw.first() else { return false };
++        if !rustc_hir::find_attr!(
++            tcx, first.did, rustc_hir::attrs::AttributeKind::RustcCxxBase(..)
++        ) {
++            return false;
++        }
++        match tcx.type_of(first.did).skip_binder().kind() {
++            ty::Adt(base_adt, _) => chain_has_vdtor(tcx, base_adt.did()),
++            _ => false,
++        }
++    }
++    match ty.kind() {
++        ty::Adt(adt, _) if adt.repr().cpp() => chain_has_vdtor(tcx, adt.did()),
++        _ => false,
++    }
++}
++
+ fn internalize_symbols<'tcx>(
+     cx: &PartitioningCx<'_, 'tcx>,
+     codegen_units: &mut [CodegenUnit<'tcx>],
+-- 
+2.50.1 (Apple Git-155)
+

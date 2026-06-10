@@ -1,6 +1,3 @@
-#![feature(rustc_attrs)]
-#![allow(internal_features)] // class/ctor/virtual attrs ride rustc_attrs
-#![allow(dead_code)]
 
 //! A Rust `class` that subclasses the **deepest** level of an *imported*
 //! C++ inheritance chain (`Widget : Drawable : Shape`) and overrides
