@@ -83,6 +83,8 @@ unsafe extern "C" {
     fn rde_children_parent_ok(g: *mut Fl_Group) -> i32;
     fn rde_child_count(g: *mut Fl_Group) -> i32;
     fn rde_fix_children_parent(g: *mut Fl_Group);
+    fn rde_color(c: u32);
+    fn rde_rectf(x: i32, y: i32, w: i32, h: i32);
     fn free(p: *mut ::core::ffi::c_void); // for Fl_Text_Buffer::text_range results
 }
 
@@ -206,9 +208,11 @@ pub class StatusBox : Fl_Box {
             // inside a Rust override — fl_color + fl_rectf + fl_draw.
             let w = this as *mut Fl_Widget;
             let (x, y) = ((*w).x(), (*w).y());
-            fl_color(0x00C00000); // 0xRRGGBB00 green
-            fl_rectf(x + 4, y + 6, 10, 10);
-            fl_color(0x00000000);
+            // fl_color/fl_rectf are header-inline free fns (no symbol;
+            // free-fn inline-shim routing is tracked) -> C++ helpers.
+            rde_color(0x00C00000); // 0xRRGGBB00 green
+            rde_rectf(x + 4, y + 6, 10, 10);
+            rde_color(0x00000000);
             fl_draw(c"rust-draw".as_ptr(), x + 20, y + 16);
         }
     }

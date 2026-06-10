@@ -14,6 +14,7 @@
 //    verifies at runtime that the self-references survived — turning a
 //    silent construct-then-move hazard into a loud test failure.
 #include <FL/Fl_Text_Editor.H>
+#include <FL/fl_draw.H>
 #include <FL/Fl_Group.H>
 
 extern "C" {
@@ -47,3 +48,9 @@ void rde_fix_children_parent(Fl_Group* g) {
 }
 
 }  // extern "C"
+
+// v1.14 paint probe: FLTK 1.4's fl_color/fl_rectf are header-INLINE
+// free functions (graphics-driver dispatch) — no symbol to bind until
+// free-function inline-shim routing lands (tracked). Tiny anchors:
+extern "C" void rde_color(unsigned c) { fl_color(c); }
+extern "C" void rde_rectf(int x, int y, int w, int h) { fl_rectf(x, y, w, h); }
