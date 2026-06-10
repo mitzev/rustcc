@@ -4883,11 +4883,17 @@ fn m16_anonymous_enum_is_skipped_in_v0() {
     )
     .expect("import");
 
-    // Anonymous enums have no name to dedup on; v0 drops them.
-    assert!(
-        extras.enums.iter().all(|e| !e.name.0.is_empty()),
-        "anonymous enum should not appear in EnumSet",
-    );
+    // v1.14: anonymous enums are CAPTURED (empty-name sentinel) and
+    // emit as `pub const <Prefix><MEMBER>` plain constants — the
+    // collection no longer drops them.
+    let anon = extras
+        .enums
+        .iter()
+        .find(|e| e.name.0.is_empty())
+        .expect("anonymous enum captured with empty-name sentinel");
+    assert_eq!(anon.variants.len(), 1);
+    assert_eq!(anon.variants[0].name, "GLOBAL_X");
+    assert_eq!(anon.variants[0].value, 7);
     cleanup(&header);
 }
 

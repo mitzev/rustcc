@@ -341,7 +341,33 @@ struct Disp {\n\
   enum { CURSOR_A = 2, CURSOR_B };\n\
   enum Named { N_ONE = 1 };\n\
 };\n";
-    let out = emit(src, "anonenum");
+    // Enums ride the extras side-tables — use the full pipeline
+    // (mirrors Build::compile), not the classes-only `emit()`.
+    let out = {
+        let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("anonenum");
+        let header = dir.join("h.hpp");
+        std::fs::write(&header, src).unwrap();
+        let mut ctx = CxxTypeCtx::new(host_target());
+        let (ids, extras) = cxx_importer::import_header_with_extras(
+            &header,
+            &["-x", "c++", "-std=c++17"],
+            &mut ctx,
+        )
+        .expect("import");
+        cxx_importer::rust_bindings::generate_rust_bindings_with_extras(
+            &ctx,
+            &ids,
+            &Default::default(),
+            &extras.aliases,
+            &extras.enums,
+            &RustBindingsConfig {
+                backend: BindingsBackend::DirectExternCpp,
+                ..Default::default()
+            },
+        )
+        .expect("emit")
+    };
     assert!(out.contains("pub const Disp_WRAP_NONE: "), "{out}");
     assert!(out.contains("pub const Disp_WRAP_AT_COLUMN: ") && out.contains("= 7;"), "{out}");
     assert!(out.contains("pub const Disp_CURSOR_B: ") && out.contains("= 3;"), "{out}");
