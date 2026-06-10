@@ -486,17 +486,19 @@ fn attach_methods_recursively(
             None => continue,
         };
         let parent_name = parent.get_name().unwrap_or_default();
-        // Same access filter as the in-class child walk: skip
-        // protected / private methods. A free C trampoline can't
-        // legally call them, and emitting shims for them would
-        // produce un-compilable C++ source. Out-of-class
-        // declarations (`void Foo::bar() {}` at TU scope) carry
-        // the access info on the cursor too.
+        // Same access policy as the in-class child walk: keep
+        // non-public *virtuals* and dtors in the model (they occupy
+        // vtable slots and drive final-overrider resolution); skip
+        // other non-public members, which a free C trampoline can't
+        // legally call. Out-of-class declarations (`void Foo::bar()
+        // {}` at TU scope) carry the access info on the cursor too.
         if matches!(
             method_entity.get_accessibility(),
             Some(clang::Accessibility::Protected)
                 | Some(clang::Accessibility::Private),
-        ) {
+        ) && !method_entity.is_virtual_method()
+            && method_entity.get_kind() != EntityKind::Destructor
+        {
             continue;
         }
         // `lower_method` may fail if the method uses an unsupported type
@@ -1355,20 +1357,24 @@ impl<'a> Importer<'a> {
                 | EntityKind::Constructor
                 | EntityKind::Destructor
                 | EntityKind::ConversionFunction => {
-                    // Skip non-public methods. C++ access control
-                    // means a protected/private method can't be
-                    // called from a free C trampoline anyway —
-                    // including them in the binding would emit
-                    // shims that fail to compile (`'foo' is a
-                    // protected member of 'Bar'`). libclang
-                    // reports access via `get_accessibility()`;
-                    // ctors / dtors / conversions are always
-                    // public-or-default.
+                    // Non-public methods can't be called through a free
+                    // C trampoline, so they get no wrappers/shims — but
+                    // non-public *virtuals* still occupy vtable slots
+                    // and drive final-overrider resolution (e.g. FLTK's
+                    // protected `Fl_Text_Display::draw()` overriding the
+                    // pure `Fl_Widget::draw()`; protected `on_insert`/
+                    // `on_move`/`on_remove` hooks on `Fl_Group`).
+                    // Dropping them here used to shift every later slot
+                    // index and misresolve overriders. Keep virtuals and
+                    // destructors in the model (flagged via
+                    // `MethodDef::access`); skip the rest as before.
                     if matches!(
                         child.get_accessibility(),
                         Some(clang::Accessibility::Protected)
                             | Some(clang::Accessibility::Private),
-                    ) {
+                    ) && !child.is_virtual_method()
+                        && child.get_kind() != EntityKind::Destructor
+                    {
                         continue;
                     }
                     // M22: skip methods whose `lower_method` fails
@@ -1532,11 +1538,17 @@ impl<'a> Importer<'a> {
                         | EntityKind::Constructor
                         | EntityKind::Destructor
                         | EntityKind::ConversionFunction => {
+                            // Same policy as the in-class walk: keep
+                            // non-public virtuals + dtors in the model
+                            // (vtable slots / overrider resolution);
+                            // skip other non-public members.
                             if matches!(
                                 child.get_accessibility(),
                                 Some(clang::Accessibility::Protected)
                                     | Some(clang::Accessibility::Private),
-                            ) {
+                            ) && !child.is_virtual_method()
+                                && child.get_kind() != EntityKind::Destructor
+                            {
                                 continue;
                             }
                             let m = match self
@@ -1670,6 +1682,35 @@ impl<'a> Importer<'a> {
 
                     }
                 })?;
+                // `va_list` cannot cross the C trampoline boundary, and
+                // libclang HIDES it: on arm64-darwin the param's type is
+                // reported as plain `int` (display, canonical, and kind
+                // all say Int — no TypeRef child either), so the model
+                // silently mis-lowers it and the emitted shim fails to
+                // compile (`Fl_Text_Buffer::vprintf(const char*,
+                // va_list)` rendered the second param as `int`). The
+                // only reliable detector is the parameter's *source
+                // tokens*. Reject the whole method; the per-method skip
+                // policy surfaces it as a doc comment instead of
+                // breaking the shim TU.
+                let has_va_list_token = child
+                    .get_range()
+                    .map(|r| {
+                        r.tokenize().iter().any(|t| {
+                            matches!(
+                                t.get_spelling().as_str(),
+                                "va_list" | "__builtin_va_list" | "__va_list_tag"
+                            )
+                        })
+                    })
+                    .unwrap_or(false);
+                if has_va_list_token {
+                    return Err(ImportError::UnsupportedFeature {
+                        what: "va_list parameter",
+                        where_: ctx_where.clone(),
+                        span: None,
+                    });
+                }
                 params.push(self.import_type(pty, &ctx_where)?);
                 has_default.push(!child.get_children().is_empty());
             }
@@ -1796,7 +1837,18 @@ impl<'a> Importer<'a> {
             },
         };
 
+        // Record C++ member access. Non-public virtuals stay in the
+        // model (they occupy vtable slots and drive final-overrider
+        // resolution); emitters consult `access` to suppress callable
+        // wrappers/shims, which a free C trampoline couldn't name.
+        let access = match entity.get_accessibility() {
+            Some(clang::Accessibility::Protected) => Access::Protected,
+            Some(clang::Accessibility::Private) => Access::Private,
+            _ => Access::Public,
+        };
+
         Ok(MethodDef {
+            access,
             name: method_name,
             sig: FnSig {
                 params,

@@ -100,3 +100,81 @@ fn virtual_destructor_marks_vdtor_and_uses_base_object_dtor() {
         "polymorphic base Drop must NOT call the complete-object dtor D1:\n{out}"
     );
 }
+
+/// Non-public virtuals occupy vtable slots and drive final-overrider
+/// resolution even though they get no callable wrappers — the FLTK
+/// shape: a pure public root virtual overridden by a *protected*
+/// mid-chain virtual, plus protected hook virtuals between public ones
+/// (`Fl_Group::on_insert/on_move/on_remove` sit between `as_gl_window`
+/// and `delete_child` in the real Fl vtable). Dropping them used to
+/// shift every later slot index and misresolve `draw` to
+/// `__cxa_pure_virtual`, mis-classifying the class as abstract.
+#[test]
+fn non_public_virtuals_keep_their_vtable_slots() {
+    let src = "\
+struct Root {\n\
+  int x;\n\
+  explicit Root(int x_);\n\
+  virtual ~Root();\n\
+  virtual void draw() = 0;\n\
+  virtual int handle(int e);\n\
+};\n\
+struct Mid : Root {\n\
+  explicit Mid(int x_);\n\
+protected:\n\
+  void draw() override;\n\
+  virtual int hook_a(int v);\n\
+  virtual void hook_b();\n\
+public:\n\
+  virtual int tail();\n\
+};\n";
+    let out = emit(src, "nonpublic");
+
+    // Mid's flattened primary vtable (after the D1/D0 pair):
+    //   draw (final overrider = protected Mid::draw — CONCRETE),
+    //   handle, hook_a, hook_b, tail — in exactly this order.
+    let attr_line = out
+        .lines()
+        .find(|l| l.contains("rustc_cxx_imported_vtable") && l.contains("_ZTV3Mid"))
+        .expect("Mid must carry an imported-vtable attribute");
+
+    // 1. The protected override is the final overrider — NOT pure.
+    assert!(
+        attr_line.contains("slot=draw,_ZN3Mid4drawEv"),
+        "protected Mid::draw must be draw's final overrider:\n{attr_line}"
+    );
+    assert!(
+        !attr_line.contains("slot=draw,__cxa_pure_virtual"),
+        "draw must not fall back to __cxa_pure_virtual:\n{attr_line}"
+    );
+
+    // 2. Protected hooks occupy their slots, in declaration order,
+    //    BETWEEN the public methods.
+    let pos = |needle: &str| {
+        attr_line
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing `{needle}` in:\n{attr_line}"))
+    };
+    let p_handle = pos("slot=handle,");
+    let p_hook_a = pos("slot=hook_a,_ZN3Mid6hook_aEi");
+    let p_hook_b = pos("slot=hook_b,_ZN3Mid6hook_bEv");
+    let p_tail = pos("slot=tail,");
+    assert!(
+        p_handle < p_hook_a && p_hook_a < p_hook_b && p_hook_b < p_tail,
+        "slot order must be handle < hook_a < hook_b < tail:\n{attr_line}"
+    );
+
+    // 3. The protected override makes Mid concrete: the inherited-vdtor
+    //    Drop must be emitted (it is suppressed for abstract classes).
+    assert!(
+        out.contains("__cxx_Mid_inherited_dtor"),
+        "Mid is concrete (protected draw override) so the inherited-dtor \
+         Drop must be emitted:\n{out}"
+    );
+
+    // 4. No callable wrappers for the protected members.
+    assert!(
+        !out.contains("fn hook_a") && !out.contains("fn hook_b"),
+        "protected virtuals must not get callable Rust wrappers:\n{out}"
+    );
+}

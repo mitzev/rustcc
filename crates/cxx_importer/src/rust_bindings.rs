@@ -104,9 +104,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use rustc_abi_cxx::{
-    ClassId, CtorVariant, CxxType, CxxTypeCtx, DtorVariant, FloatKind, IntWidth,
-    MethodDef, MethodName, NameSegment, OperatorKind, SpecialMember, Symbol, TypeId,
-    VTableEntry, Virtuality,
+    Access, ClassId, CtorVariant, CxxType, CxxTypeCtx, DtorVariant, FloatKind,
+    IntWidth, MethodDef, MethodName, NameSegment, OperatorKind, SpecialMember,
+    Symbol, TypeId, VTableEntry, Virtuality,
 };
 
 use crate::annotations::{Annotation, AnnotationSet};
@@ -1279,6 +1279,16 @@ fn render_direct_extern_class(
     for (method_idx, (method, resolved_name)) in
         methods.iter().zip(resolved_names.iter()).enumerate()
     {
+        // Slot-only members: non-public virtuals (and dtors) stay in
+        // the class model so vtable slot order and final-overrider
+        // resolution are correct, but a free C trampoline can't
+        // legally call them — emit no wrapper. (Their slot still
+        // appears in `#[rustc_cxx_imported_vtable]`, so a Rust
+        // subclass CAN `override fn` them — overriding a protected
+        // virtual is legal C++, e.g. FLTK's `draw()`.)
+        if method.access != Access::Public {
+            continue;
+        }
         // Per-method resilience: when classification fails (virtual
         // method with unresolved vtable_index, unsupported special
         // member, opaque return type, …), drop just *that* method
@@ -2204,6 +2214,13 @@ fn resolve_method_names(
     // collisions.
     let mut entries: Vec<(String, String)> = Vec::with_capacity(methods.len());
     for method in methods {
+        // Slot-only (non-public) members never get wrappers, so a
+        // base-name/signature failure on one must not abort the
+        // class — give it an unusable placeholder instead.
+        if method.access != Access::Public {
+            entries.push(("__slot_only".to_string(), String::new()));
+            continue;
+        }
         let default_base = base_rust_name_for_method(method, class_name)?;
         let method_fqn = format!(
             "{class_fqn}::{}",
@@ -2217,20 +2234,42 @@ fn resolve_method_names(
                 _ => None,
             })
             .unwrap_or(default_base);
-        let disamb = stringify_param_signature(ctx, method, class_name)?;
+        // A method whose param types can't be rendered (e.g. one
+        // referencing a class-nested record) is skipped later by the
+        // per-method emission policy — don't let the overload
+        // disambiguator abort the whole class on it. A unique
+        // placeholder keeps the surviving names deterministic.
+        let disamb = match stringify_param_signature(ctx, method, class_name) {
+            Ok(d) => d,
+            Err(_) => format!("__unrenderable_{}", entries.len()),
+        };
         entries.push((base, disamb));
     }
 
-    // Second pass: feed into the disambiguator.
-    let entries_view: Vec<OverloadEntry<&str>> = entries
+    // Second pass: feed into the disambiguator — PUBLIC methods only.
+    // Non-public (slot-only) members get no wrappers, so they must not
+    // influence overload disambiguation of the public surface (a
+    // protected `draw()` must not rename a public `draw(int)`).
+    let public_idx: Vec<usize> = methods
         .iter()
-        .map(|(b, d)| OverloadEntry {
-            base_name: b.as_str(),
-            disambiguator: d.as_str(),
+        .enumerate()
+        .filter(|(_, m)| m.access == Access::Public)
+        .map(|(i, _)| i)
+        .collect();
+    let entries_view: Vec<OverloadEntry<&str>> = public_idx
+        .iter()
+        .map(|&i| OverloadEntry {
+            base_name: entries[i].0.as_str(),
+            disambiguator: entries[i].1.as_str(),
         })
         .collect();
     let resolved = disambiguate_overloads(entries_view);
-    Ok(resolved.into_iter().map(|i| i.0).collect())
+    let mut resolved_all: Vec<String> =
+        entries.iter().map(|(b, _)| b.clone()).collect();
+    for (k, &i) in public_idx.iter().enumerate() {
+        resolved_all[i] = resolved[k].0.clone();
+    }
+    Ok(resolved_all)
 }
 
 /// The source-level C++ identifier for a method, used as the
@@ -4085,11 +4124,13 @@ fn render_m15b_callback_wrapper(
             Err(_) => return, // bail; alias still emits as plain `pub type`
         }
     }
-    // Render the trailing void* parameter for the thunk
-    // signature. Use `*mut ::core::ffi::c_void` for clarity
-    // (the renderer would produce `*mut ()` which is correct
-    // but unconventional).
-    let void_ptr_ty = "*mut ::core::ffi::c_void".to_string();
+    // Render the trailing void* parameter for the thunk signature.
+    // This MUST match what `render_rust_type` produced for the alias's
+    // own `void*` param — `*mut ()` — because `fn_ptr()` returns the
+    // thunk cast to the alias type `Some(thunk as unsafe extern "C"
+    // fn(...))`; a `c_void` here used to make every generated wrapper
+    // a type-mismatch compile error against its `*mut ()` alias.
+    let void_ptr_ty = "*mut ()".to_string();
     let mut thunk_param_strs: Vec<String> = Vec::with_capacity(n);
     for (i, ty) in closure_arg_strs.iter().enumerate() {
         thunk_param_strs.push(format!("arg{i}: {ty}"));
@@ -4103,6 +4144,21 @@ fn render_m15b_callback_wrapper(
     let thunk_param_list = thunk_param_strs.join(", ");
     let thunk_name = format!("__cxx_{alias_name}_thunk");
     let wrapper_name = format!("{alias_name}_Wrapper");
+    // Non-void callbacks (e.g. FLTK's `Fl_System_Handler` returning
+    // int): the closure bound, the thunk signature, and the `fn_ptr`
+    // cast must all carry `-> R` or the cast to the alias type is a
+    // compile-time mismatch.
+    let ret_str = match ctx.type_of(sig.ret) {
+        CxxType::Void => String::new(),
+        _ => match render_rust_type(
+            ctx,
+            sig.ret,
+            &format!("callback `{alias_name}` ret"),
+        ) {
+            Ok(s) => format!(" -> {s}"),
+            Err(_) => return, // bail; alias still emits as plain `pub type`
+        },
+    };
 
     // Doc comment to anchor the generated section.
     let _ = writeln!(out);
@@ -4125,7 +4181,7 @@ fn render_m15b_callback_wrapper(
     // Wrapper struct.
     let _ = writeln!(
         out,
-        "{indent}pub struct {wrapper_name}<F: Fn({closure_arg_list}) + 'static> {{",
+        "{indent}pub struct {wrapper_name}<F: Fn({closure_arg_list}){ret_str} + 'static> {{",
     );
     let _ = writeln!(out, "{indent}    boxed: {void_ptr_ty},");
     let _ = writeln!(
@@ -4137,7 +4193,7 @@ fn render_m15b_callback_wrapper(
     // impl block.
     let _ = writeln!(
         out,
-        "{indent}impl<F: Fn({closure_arg_list}) + 'static> {wrapper_name}<F> {{",
+        "{indent}impl<F: Fn({closure_arg_list}){ret_str} + 'static> {wrapper_name}<F> {{",
     );
     // new()
     let _ = writeln!(out, "{indent}    pub fn new(f: F) -> Self {{");
@@ -4168,7 +4224,7 @@ fn render_m15b_callback_wrapper(
     let _ = writeln!(out, "{indent}    pub fn fn_ptr(&self) -> {alias_name} {{");
     let _ = writeln!(
         out,
-        "{indent}        Some({thunk_name}::<F> as unsafe extern \"C\" fn({thunk_param_list}))",
+        "{indent}        Some({thunk_name}::<F> as unsafe extern \"C\" fn({thunk_param_list}){ret_str})",
     );
     let _ = writeln!(out, "{indent}    }}");
 
@@ -4190,7 +4246,7 @@ fn render_m15b_callback_wrapper(
     );
     let _ = writeln!(
         out,
-        "{indent}unsafe extern \"C\" fn {thunk_name}<F: Fn({closure_arg_list}) + 'static>({thunk_param_list}) {{",
+        "{indent}unsafe extern \"C\" fn {thunk_name}<F: Fn({closure_arg_list}){ret_str} + 'static>({thunk_param_list}){ret_str} {{",
     );
     let _ = writeln!(
         out,
@@ -4204,13 +4260,15 @@ fn render_m15b_callback_wrapper(
         out,
         "{indent}    let f: &F = unsafe {{ &*(user as *const F) }};",
     );
-    let _ = writeln!(out, "{indent}    f({});", closure_call_args.join(", "));
+    // Tail expression (no semicolon): forwards the closure's return
+    // value for non-void callbacks, and is equally valid for `()`.
+    let _ = writeln!(out, "{indent}    f({})", closure_call_args.join(", "));
     let _ = writeln!(out, "{indent}}}");
 
     // Drop impl that reclaims the box.
     let _ = writeln!(
         out,
-        "{indent}impl<F: Fn({closure_arg_list}) + 'static> ::core::ops::Drop for {wrapper_name}<F> {{",
+        "{indent}impl<F: Fn({closure_arg_list}){ret_str} + 'static> ::core::ops::Drop for {wrapper_name}<F> {{",
     );
     let _ = writeln!(out, "{indent}    fn drop(&mut self) {{");
     let _ = writeln!(out, "{indent}        if !self.boxed.is_null() {{");
@@ -4845,6 +4903,24 @@ fn render_rust_type_with_opts(
         }
         CxxType::Record(class_id) => {
             let class = ctx.class(*class_id);
+            // A record nested inside another CLASS is never emitted as
+            // a top-level Rust type (only TU- and namespace-scope
+            // records are), so naming it here would produce a dangling
+            // identifier — e.g. `Fl_Text_Editor::Key_Binding` rendered
+            // as a bare `Key_Binding` with no definition anywhere in
+            // the bindings. Err instead; the per-method skip policy
+            // drops just the referencing method with a doc comment.
+            let class_nested = class.name.0.len() > 1
+                && class.name.0[..class.name.0.len() - 1]
+                    .iter()
+                    .any(|s| matches!(s, NameSegment::Class(_)));
+            if class_nested {
+                return Err(BindingsError::UnsupportedType {
+                    where_: where_.into(),
+                    kind: "class-nested record (not emitted at top level)"
+                        .into(),
+                });
+            }
             ident_of_class_with_ctx(class, Some(ctx)).ok_or_else(|| {
                 BindingsError::UnsupportedType {
                     where_: where_.into(),
@@ -5531,11 +5607,34 @@ fn synthesize_default_literal(ctx: &CxxTypeCtx, ty: TypeId) -> Option<String> {
             // value-initialization. For scoped enums we'd
             // need to pick a variant, which is risky; only
             // synthesize for unscoped (int-like) enums.
+            //
+            // The literal must match how `render_rust_type` renders
+            // the parameter: class-scope enums render as the
+            // underlying int (bare literal is right), but TU- and
+            // namespace-scope enums render by NAME and are emitted as
+            // `#[repr(transparent)] pub struct Name(pub <int>)` —
+            // there the literal must be the tuple-struct constructor
+            // `Name(0_<int>)`, not a bare `0_<int>`.
             if *scoped {
                 None
             } else {
-                let _ = name;
-                synthesize_default_literal(ctx, *underlying)
+                let class_scope =
+                    name.0.iter().any(|s| matches!(s, NameSegment::Class(_)));
+                let inner = synthesize_default_literal(ctx, *underlying)?;
+                if class_scope {
+                    Some(inner)
+                } else {
+                    let leaf = name.0.iter().rev().find_map(|s| match s {
+                        NameSegment::Enum(id) | NameSegment::Class(id) => {
+                            Some(id.0.clone())
+                        }
+                        _ => None,
+                    });
+                    match leaf {
+                        Some(n) => Some(format!("{n}({inner})")),
+                        None => Some(inner),
+                    }
+                }
             }
         }
         // References, records by value, function pointers,
@@ -5757,7 +5856,7 @@ mod tests {
         });
         let point_ty = ctx.intern_type(CxxType::Record(id));
         // Point::new(x, y)
-        ctx.class_mut(id).methods.push(MethodDef {
+        ctx.class_mut(id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("new".into())),
             sig: FnSig {
                 params: vec![i32_, i32_],
@@ -5772,7 +5871,7 @@ mod tests {
             special: Some(SpecialMember::OtherCtor),
         });
         // Point::get_x() const -> i32
-        ctx.class_mut(id).methods.push(MethodDef {
+        ctx.class_mut(id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("get_x".into())),
             sig: FnSig {
                 params: vec![],
@@ -5787,7 +5886,7 @@ mod tests {
             special: None,
         });
         // Point::translated(dx, dy) const -> Point
-        ctx.class_mut(id).methods.push(MethodDef {
+        ctx.class_mut(id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("translated".into())),
             sig: FnSig {
                 params: vec![i32_, i32_],
@@ -5834,28 +5933,28 @@ mod tests {
         });
         let void_ = void_ty(&mut ctx);
         // copy ctor Point(const Point&)
-        ctx.class_mut(id).methods.push(MethodDef {
+        ctx.class_mut(id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("Point".into())),
             sig: FnSig { params: vec![const_ref], ret: void_, cv: CvQual::default(), ref_q: None, variadic: false, noexcept: true },
             virtuality: Virtuality::NonVirtual, vtable_index: None,
             special: Some(SpecialMember::CopyCtor),
         });
         // move ctor Point(Point&&)
-        ctx.class_mut(id).methods.push(MethodDef {
+        ctx.class_mut(id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("Point".into())),
             sig: FnSig { params: vec![rvalue_ref], ret: void_, cv: CvQual::default(), ref_q: None, variadic: false, noexcept: true },
             virtuality: Virtuality::NonVirtual, vtable_index: None,
             special: Some(SpecialMember::MoveCtor),
         });
         // copy assign operator=(const Point&)
-        ctx.class_mut(id).methods.push(MethodDef {
+        ctx.class_mut(id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Operator(OperatorKind::Assign),
             sig: FnSig { params: vec![const_ref], ret: rvalue_ref, cv: CvQual::default(), ref_q: None, variadic: false, noexcept: true },
             virtuality: Virtuality::NonVirtual, vtable_index: None,
             special: Some(SpecialMember::CopyAssign),
         });
         // move assign operator=(Point&&)
-        ctx.class_mut(id).methods.push(MethodDef {
+        ctx.class_mut(id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Operator(OperatorKind::Assign),
             sig: FnSig { params: vec![rvalue_ref], ret: rvalue_ref, cv: CvQual::default(), ref_q: None, variadic: false, noexcept: true },
             virtuality: Virtuality::NonVirtual, vtable_index: None,
@@ -5908,7 +6007,7 @@ mod tests {
             cv: CvQual { is_const: true, is_volatile: false },
         });
         let void_ = void_ty(&mut ctx);
-        ctx.class_mut(id).methods.push(MethodDef {
+        ctx.class_mut(id).methods.push(MethodDef { access: Default::default(),
             name: MethodName::Ident(Ident("Point".into())),
             sig: FnSig {
                 params: vec![const_ref_point],
@@ -6132,7 +6231,7 @@ mod tests {
             name: NestedName(vec![NameSegment::Class(Ident("Shape".into()))]),
             bases: vec![],
             fields: vec![],
-            methods: vec![MethodDef {
+            methods: vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("area".into())),
                 sig: FnSig {
                     params: vec![],
@@ -6273,7 +6372,7 @@ mod tests {
             name: NestedName(vec![NameSegment::Class(Ident("Fl".into()))]),
             bases: vec![],
             fields: vec![],
-            methods: vec![MethodDef {
+            methods: vec![MethodDef { access: Default::default(),
                 name: MethodName::Ident(Ident("run".into())),
                 sig: FnSig {
                     params: vec![],

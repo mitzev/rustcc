@@ -27,7 +27,7 @@
 use std::fmt::Write as _;
 
 use rustc_abi_cxx::{
-    ClassId, CvQual, CxxType, CxxTypeCtx, FloatKind, IntWidth, MethodDef,
+    Access, ClassId, CvQual, CxxType, CxxTypeCtx, FloatKind, IntWidth, MethodDef,
     MethodName, NameSegment, NestedName, OperatorKind, RefKind, SpecialMember,
     Symbol, TemplateArg, TypeId, Virtuality,
 };
@@ -92,8 +92,17 @@ pub fn generate_shims(
         // is ill-formed C++ (`error: allocating an object of
         // abstract class type`). A class is abstract iff its
         // vtable still references `__cxa_pure_virtual` after
-        // override resolution.
-        if !ctx.is_poisoned(class_id) && !is_abstract_class(ctx, class_id) {
+        // override resolution. Skip classes with a non-public
+        // destructor too: `delete p;` (and the paired heap ctors)
+        // would be ill-formed outside the class.
+        let dtor_non_public = class.methods.iter().any(|m| {
+            matches!(m.special, Some(SpecialMember::Dtor))
+                && m.access != Access::Public
+        });
+        if !ctx.is_poisoned(class_id)
+            && !is_abstract_class(ctx, class_id)
+            && !dtor_non_public
+        {
             let mut ctor_idx: usize = 0;
             for method in &class.methods {
                 let is_ctor = matches!(
