@@ -37,16 +37,6 @@ int rde_children_parent_ok(Fl_Group* g) {
 }
 int rde_child_count(Fl_Group* g) { return g->children(); }
 
-// Repair the construct-then-move damage: re-point each child's
-// `parent_` at the group's FINAL address. `Fl_Widget::parent(Fl_Group*)`
-// is the public setter FLTK documents "for hacks only" — this is one.
-// (The group's own child array holds pointers TO the heap-allocated
-// children, which survive the move; only the children's back-pointers
-// dangle.)
-void rde_fix_children_parent(Fl_Group* g) {
-    for (int i = 0; i < g->children(); i++) g->child(i)->parent(g);
-}
-
 }  // extern "C"
 
 // v1.14 paint probe: FLTK 1.4's fl_color/fl_rectf are header-INLINE

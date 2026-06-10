@@ -483,17 +483,15 @@ unsafe fn build_ui() -> *mut Fl_Window {
         add_menu_items(bar);
 
         let ed = cxx_operator_new(core::mem::size_of::<RustEditor>()) as *mut RustEditor;
+        // The ctor-in-place MIR pass (v1.14) constructs straight into
+        // *ed, so the ctor-created children (scrollbars) capture the
+        // final address — no re-parent fix-up needed.
         ed.write(RustEditor::new(0, 28, 900, 640));
         ED.store(ed, Relaxed);
-        // Re-parent the ctor-created children (scrollbars) at the
-        // final address — the Rust-class ctor protocol constructs the
-        // __base in a temporary and moves it (see the advanced
-        // example's README); pure-Rust fix-up via FLTK's public
-        // parent() setter.
-        let g = ed as *mut Fl_Group;
-        for i in 0..(*g).children() {
-            (*(*g).child(i)).parent_mut_fl_group(g);
-        }
+        debug_assert!({
+            let g = ed as *mut Fl_Group;
+            (0..(*g).children()).all(|i| (*(*g).child(i)).parent() == g)
+        });
         let disp = ed as *mut Fl_Text_Display;
         (*disp).buffer(buf);
         (*disp).linenumber_width(36);

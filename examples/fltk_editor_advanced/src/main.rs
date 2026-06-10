@@ -82,7 +82,6 @@ unsafe extern "C" {
     fn rde_clear_current_group();
     fn rde_children_parent_ok(g: *mut Fl_Group) -> i32;
     fn rde_child_count(g: *mut Fl_Group) -> i32;
-    fn rde_fix_children_parent(g: *mut Fl_Group);
     fn rde_color(c: u32);
     fn rde_rectf(x: i32, y: i32, w: i32, h: i32);
     fn free(p: *mut ::core::ffi::c_void); // for Fl_Text_Buffer::text_range results
@@ -311,24 +310,26 @@ unsafe fn self_test() -> i32 {
         let ed = cxx_operator_new(::core::mem::size_of::<RustEditor>()) as *mut RustEditor;
         ed.write(RustEditor::new(10, 10, 400, 300));
 
-        // Construct-then-move probe: Fl_Text_Display's ctor created
-        // child scrollbars whose parent_ pointed at the construction
-        // temporary. Rust does NOT guarantee eliding the move from
-        // `RustEditor::new`'s return into `ed.write(..)` — and in
-        // practice it does not elide here, so the back-pointers
-        // dangle until repaired. This probe makes the hazard VISIBLE,
-        // then verifies the documented fix-up (re-parent the children
-        // at the final address via FLTK's public parent() setter).
-        let before = rde_children_parent_ok(ed as *mut Fl_Group);
+        // Construct-in-place probe: Fl_Text_Display's ctor creates
+        // child scrollbars whose parent_ points at the object being
+        // constructed. The fork's ctor-in-place MIR pass folds the
+        // `RustEditor::new` return directly into `ed.write(..)`'s
+        // destination (and the `Self { __base: Base::new(..) }`
+        // aggregate into the base subobject), so those ctor-time
+        // self-references are born at the final heap address — no
+        // re-parent fix-up needed.
         println!(
-            "info construct-then-move: children parent ptrs {} the move \
+            "info construct-in-place: children parent ptrs {} \
              (child_count = {})",
-            if before == 1 { "SURVIVED" } else { "DANGLED after" },
+            if rde_children_parent_ok(ed as *mut Fl_Group) == 1 {
+                "VALID"
+            } else {
+                "DANGLED"
+            },
             rde_child_count(ed as *mut Fl_Group),
         );
-        rde_fix_children_parent(ed as *mut Fl_Group);
         check(
-            "children_parent_ok (after fix-up)",
+            "children_parent_ok (no fix-up)",
             rde_children_parent_ok(ed as *mut Fl_Group),
             1,
         );
@@ -378,8 +379,8 @@ unsafe fn run_gui() -> i32 {
     unsafe {
         let mut window = Fl_Window::new_cstr(900, 640, c"rustcc — Rust subclasses FLTK");
         // Detach the implicit current-group capture BEFORE building
-        // the Rust widgets, then parent them explicitly at their
-        // final heap addresses (see README: construct-then-move).
+        // the Rust widgets, then parent them explicitly: FLTK's
+        // auto-add would parent them to the window twice otherwise.
         window.as_fl_group_mut().end();
         rde_clear_current_group();
 
@@ -401,13 +402,13 @@ unsafe fn run_gui() -> i32 {
 
         let ed = cxx_operator_new(::core::mem::size_of::<RustEditor>()) as *mut RustEditor;
         ed.write(RustEditor::new(10, 10, 880, 580));
-        // Repair the ctor-time self-references that the (non-elided)
-        // Rust move invalidated, then verify — see README.
-        rde_fix_children_parent(ed as *mut Fl_Group);
+        // The ctor-in-place MIR pass constructs straight into *ed, so
+        // ctor-time self-references (child scrollbars' parent_) are
+        // already valid — verify, no fix-up.
         assert_eq!(
             rde_children_parent_ok(ed as *mut Fl_Group),
             1,
-            "construct-then-move fix-up failed — see README"
+            "ctor-in-place broke: children parent ptrs dangle"
         );
         (*(ed as *mut Fl_Text_Display)).buffer(buffer);
         (*(ed as *mut Fl_Text_Display)).linenumber_width(36);

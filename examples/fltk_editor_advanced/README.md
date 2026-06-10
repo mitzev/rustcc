@@ -48,31 +48,33 @@ cargo +rustcc run --release --bin editor                  # the GUI
 
 Expected self-test tail: `ADVANCED FLTK SUBCLASS SELF-TEST: ALL OK`.
 
-## The construct-then-move caveat (read this)
+## Construct-in-place (v1.14)
 
-A Rust constructor builds the object in a temporary and **bitwise-moves**
-it to its final address; Rust does *not* guarantee eliding that move.
-`Fl_Text_Display`'s C++ constructor creates child scrollbars whose
-`parent_` back-pointers capture the temporary's address — after the
-move they dangle. This demo makes the hazard **visible** (the self-test
-prints whether the pointers survived) and repairs it by re-parenting
-the children at the final address (`Fl_Widget::parent(Fl_Group*)`,
-FLTK's documented "for hacks only" setter) before the widget is used.
+C++ constructors may *escape `this`*: `Fl_Text_Display`'s ctor creates
+child scrollbars whose `parent_` back-pointers capture the address of
+the object under construction. Plain Rust builds a value in a temporary
+and bitwise-moves it home, which would leave those back-pointers
+dangling. Since v1.14 the fork's **ctor-in-place MIR pass** removes the
+temporaries along the whole chain — `ed.write(RustEditor::new(..))`
+constructs directly into `*ed`, the `Self { __base: Base::new(..) }`
+aggregate constructs the base directly into the base subobject, and the
+imported binding's by-value `new` constructs into its return slot — so
+ctor-time self-references are born at the final address. The self-test
+asserts this (`children_parent_ok (no fix-up)`); no re-parent fix-up or
+`new_at` workaround is needed for the Rust-`class` path anymore.
 
-Generalizing beyond FLTK: any C++ base whose constructor *escapes
-`this`* needs either such a fix-up or a construct-at-final-address
-primitive (`new_at`) — tracked as a fork improvement. The same is why
-widgets are heap-placed via `operator new` (C++ deletes them) and the
-window's implicit group capture is cleared before constructing Rust
-widgets.
+Widgets are still heap-placed via `operator new` (C++ `delete`s them
+through the base pointer), and the window's implicit group capture is
+cleared before constructing Rust widgets so they don't self-register
+mid-construction.
 
 One more build note: FLTK is linked as the **static archive by
 absolute path** — the Homebrew dylib hides inline symbols (e.g.
 `~Fl_Text_Editor()`), and `-lfltk` would pick the dylib.
 
-(v1.13.10 removed two earlier workarounds: the drop-glue force
+(History of removed workarounds: v1.13.10 dropped the drop-glue force
 function — the collector now emits vtable-referenced `drop_in_place`
-at every opt level — and the `codegen-units = 1` pin. For imported
-classes whose constructors escape `this`, the bindings now also offer
-`new_at` placement constructors; the Rust-`class` ctor protocol itself
-still constructs-then-moves, which the self-test detects and repairs.)
+at every opt level — and the `codegen-units = 1` pin. v1.14 dropped the
+construct-then-move re-parent fix-up: the ctor-in-place MIR pass now
+constructs at the final address. `new_at` placement constructors remain
+available in the bindings for C++-side placement scenarios.)
