@@ -38,6 +38,26 @@ static WRAP_ON: AtomicBool = AtomicBool::new(false);
 static TEST_MODE: AtomicBool = AtomicBool::new(false);
 static HANDLE_CALLS: AtomicI32 = AtomicI32::new(0);
 static PATH: Mutex<Option<String>> = Mutex::new(None);
+static STYLE_BUF: AtomicPtr<Fl_Text_Buffer> = AtomicPtr::new(core::ptr::null_mut());
+
+/// repr(C) twin of `Fl_Text_Display_Style_Table_Entry` (the nested
+/// record emits opaque; field emission for PODs is a tracked
+/// enhancement). Layout asserted against the generated type's size
+/// in `build_ui`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct StyleEntry {
+    color: u32,   // Fl_Color
+    font: i32,    // Fl_Font
+    size: i32,    // Fl_Fontsize
+    attr: u32,
+    bgcolor: u32, // Fl_Color
+}
+/// 'A' = plain text, 'B' = comment lines (`//` / `#`) in blue.
+static STYLE_TABLE: [StyleEntry; 2] = [
+    StyleEntry { color: 0, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
+    StyleEntry { color: 0x0000D000, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
+];
 
 // FLTK constants — from the generated bindings (the M12 macro pass
 // captures the FL_* `#define`s; v1.14). Narrowed to i32 once here.
@@ -166,7 +186,39 @@ unsafe extern "C" fn modify_cb(
     MODIFY_EVENTS.fetch_add(1, Relaxed);
     if inserted > 0 || deleted > 0 {
         DIRTY.store(true, Relaxed);
-        unsafe { refresh_title() };
+        unsafe {
+            restyle();
+            refresh_title();
+        }
+    }
+}
+
+/// Rebuild the parallel style buffer: comment lines (`//`, `#`)
+/// style 'B', everything else 'A'. TextEdit-grade, not a real lexer —
+/// the point is exercising `highlight_data` + the nested-record
+/// binding end to end.
+unsafe fn restyle() {
+    unsafe {
+        let buf = BUF.load(Relaxed);
+        let sbuf = STYLE_BUF.load(Relaxed);
+        if buf.is_null() || sbuf.is_null() {
+            return;
+        }
+        let raw = (*buf).text();
+        if raw.is_null() {
+            return;
+        }
+        let text = CStr::from_ptr(raw).to_string_lossy().into_owned();
+        libc_free(raw as *mut ::core::ffi::c_void);
+        let mut styles = String::with_capacity(text.len());
+        for line in text.split_inclusive('\n') {
+            let t = line.trim_start();
+            let s = if t.starts_with("//") || t.starts_with('#') { 'B' } else { 'A' };
+            for _ in 0..line.len() {
+                styles.push(s);
+            }
+        }
+        (*sbuf).text_const_i8_str(&styles);
     }
 }
 
@@ -445,6 +497,24 @@ unsafe fn build_ui() -> *mut Fl_Window {
         let disp = ed as *mut Fl_Text_Display;
         (*disp).buffer(buf);
         (*disp).linenumber_width(36);
+
+        // Syntax highlighting (v1.14 nested-record binding): the
+        // style table rides the repr(C) twin; size-checked here.
+        assert_eq!(
+            core::mem::size_of::<StyleEntry>(),
+            core::mem::size_of::<Fl_Text_Display_Style_Table_Entry>(),
+        );
+        let sbuf = cxx_operator_new(core::mem::size_of::<Fl_Text_Buffer>()) as *mut Fl_Text_Buffer;
+        Fl_Text_Buffer::new_at(sbuf, 0, 1024);
+        STYLE_BUF.store(sbuf, Relaxed);
+        (*disp).highlight_data(
+            sbuf,
+            STYLE_TABLE.as_ptr() as *const Fl_Text_Display_Style_Table_Entry,
+            STYLE_TABLE.len() as i32,
+            b'A' as i8,
+            None,
+            core::ptr::null_mut(),
+        );
 
         let find = cxx_operator_new(core::mem::size_of::<FindBar>()) as *mut FindBar;
         find.write(FindBar::new(60, 672, 720, 26));

@@ -814,18 +814,32 @@ fn build_namespace_tree_full(
         // class identifier itself.
         let prefix = &segments[..segments.len() - 1];
         // Class-scope inner records (`struct Outer { struct
-        // Inner { ... }; }`) and class-scope anonymous unions
-        // require associated-type emission inside the parent's
-        // `impl` block — out of v0 scope. Skip them silently
-        // rather than failing the whole emission. The user
-        // loses access to the inner type name but the parent
-        // and every other class still emit.
-        let has_class_prefix = prefix
-            .iter()
-            .any(|s| matches!(s, NameSegment::Class(_) | NameSegment::TemplateSpec { .. }));
-        if has_class_prefix {
+        // Inner { … }; }`) — v1.14: emit them FLATTENED at the
+        // nearest enclosing namespace (`Outer_Inner`), the same
+        // treatment class-scope enums/aliases get. The name join
+        // happens in `ident_of_class_with_ctx`; here we just stop
+        // the prefix walk at the first class segment so the tree
+        // node is the namespace, not a (nonexistent) class node.
+        // Unnamed inner records still skip via the empty-name
+        // guard above.
+        if segments.iter().any(|s| match s {
+            NameSegment::Class(id) | NameSegment::Namespace(id) => {
+                is_synthetic_anon_segment(&id.0)
+            }
+            _ => false,
+        }) {
+            // Anonymous union/struct details — unnameable, skip.
             continue;
         }
+        let prefix: &[NameSegment] = {
+            let first_class = prefix.iter().position(|s| {
+                matches!(s, NameSegment::Class(_) | NameSegment::TemplateSpec { .. })
+            });
+            match first_class {
+                Some(i) => &prefix[..i],
+                None => prefix,
+            }
+        };
         let mut node = &mut root;
         for seg in prefix {
             let key = match seg {
@@ -977,6 +991,16 @@ fn render_namespace_tree(
         let where_ = format!("alias `{alias_name}`");
         match render_rust_type(ctx, *target, &where_) {
             Ok(rendered) => {
+                // v1.14: a class-scope `typedef struct {…} Name;` now
+                // ALSO emits its target as a flattened record of the
+                // same name — `pub type X = X;` would be a self-cycle.
+                if rendered == *alias_name {
+                    let _ = writeln!(
+                        out,
+                        "{indent}// alias `{alias_name}` skipped: same-named record emitted at this scope",
+                    );
+                    continue;
+                }
                 let _ = writeln!(out, "{indent}pub type {alias_name} = {rendered};");
                 // M15.b: when the alias target is a function-
                 // pointer signature with a trailing `void*`
@@ -5163,17 +5187,10 @@ fn render_rust_type_with_opts(
             // as a bare `Key_Binding` with no definition anywhere in
             // the bindings. Err instead; the per-method skip policy
             // drops just the referencing method with a doc comment.
-            let class_nested = class.name.0.len() > 1
-                && class.name.0[..class.name.0.len() - 1]
-                    .iter()
-                    .any(|s| matches!(s, NameSegment::Class(_)));
-            if class_nested {
-                return Err(BindingsError::UnsupportedType {
-                    where_: where_.into(),
-                    kind: "class-nested record (not emitted at top level)"
-                        .into(),
-                });
-            }
+            // v1.14: class-nested records emit flattened
+            // (`Outer_Inner`) — `ident_of_class_with_ctx` does the
+            // join, so a reference renders the same name the
+            // emitted type carries.
             ident_of_class_with_ctx(class, Some(ctx)).ok_or_else(|| {
                 BindingsError::UnsupportedType {
                     where_: where_.into(),
@@ -5236,16 +5253,6 @@ fn render_rust_type_with_opts(
                 });
             }
             let class = ctx.class(*class);
-            let class_nested = class.name.0.len() > 1
-                && class.name.0[..class.name.0.len() - 1]
-                    .iter()
-                    .any(|s| matches!(s, NameSegment::Class(_)));
-            if class_nested {
-                return Err(BindingsError::UnsupportedType {
-                    where_: where_.into(),
-                    kind: "member pointer into class-nested record".into(),
-                });
-            }
             let name = ident_of_class_with_ctx(class, Some(ctx)).ok_or_else(|| {
                 BindingsError::UnsupportedType {
                     where_: where_.into(),
@@ -6183,11 +6190,40 @@ fn ident_of_class(class: &rustc_abi_cxx::ClassDef) -> Option<String> {
 /// types — `Box<int>` → `Box_i32`, `Pair<int, double>` →
 /// `Pair_i32_f64`. Without the ctx we can't resolve TypeIds, so
 /// fall back to the bare template name (legacy behavior).
+
+/// libclang reports anonymous records/unions with a synthetic name
+/// like `(anonymous union at /path/foo.h:58:3)`. Nothing nameable.
+fn is_synthetic_anon_segment(s: &str) -> bool {
+    s.starts_with("(anonymous") || s.starts_with("(unnamed")
+}
+
 fn ident_of_class_with_ctx(
     class: &rustc_abi_cxx::ClassDef,
     ctx: Option<&CxxTypeCtx>,
 ) -> Option<String> {
     use rustc_abi_cxx::NameSegment;
+    // v1.14: a class nested inside another class emits FLATTENED —
+    // every class segment from the first class boundary onward joins
+    // with '_' (`Fl_Text_Display_Style_Table_Entry`).
+    let class_segs: Vec<&str> = class
+        .name
+        .0
+        .iter()
+        .skip_while(|s| !matches!(s, NameSegment::Class(_) | NameSegment::TemplateSpec { .. }))
+        .filter_map(|s| match s {
+            NameSegment::Class(id) => Some(id.0.as_str()),
+            NameSegment::TemplateSpec { name, .. } => Some(name.0.as_str()),
+            _ => None,
+        })
+        .collect();
+    if class_segs.iter().any(|s| is_synthetic_anon_segment(s)) {
+        return None;
+    }
+    if class_segs.len() > 1
+        && class.name.0.last().is_some_and(|s| matches!(s, NameSegment::Class(_)))
+    {
+        return Some(class_segs.join("_"));
+    }
     class.name.0.last().and_then(|seg| match seg {
         NameSegment::Class(id) | NameSegment::Namespace(id) => Some(id.0.clone()),
         NameSegment::TemplateSpec { name, args } => {
