@@ -23,6 +23,10 @@
 //! cargo +rustcc run --release --bin editor
 //! ```
 
+// The generated bindings carry `#[rustc_cxx_imported_vtable]` on
+// polymorphic FLTK classes (v1.13.7+), which rides `rustc_attrs`.
+#![feature(rustc_attrs)]
+#![allow(internal_features)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
