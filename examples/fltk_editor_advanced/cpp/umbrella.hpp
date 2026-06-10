@@ -18,3 +18,4 @@
 #include <FL/Fl_Text_Buffer.H>
 #include <FL/Fl_Box.H>
 #include <FL/Enumerations.H>
+#include <FL/fl_draw.H>

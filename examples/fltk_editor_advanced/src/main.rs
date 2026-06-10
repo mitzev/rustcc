@@ -200,7 +200,17 @@ pub class StatusBox : Fl_Box {
             return;
         }
         let this = self as *const Self as *mut Fl_Box;
-        unsafe { base_box_draw(this) };
+        unsafe {
+            base_box_draw(this);
+            // v1.14 paint probe: the free-function drawing API from
+            // inside a Rust override — fl_color + fl_rectf + fl_draw.
+            let w = this as *mut Fl_Widget;
+            let (x, y) = ((*w).x(), (*w).y());
+            fl_color(0x00C00000); // 0xRRGGBB00 green
+            fl_rectf(x + 4, y + 6, 10, 10);
+            fl_color(0x00000000);
+            fl_draw(c"rust-draw".as_ptr(), x + 20, y + 16);
+        }
     }
 }
 

@@ -605,6 +605,25 @@ fn walk_top_level(
                 let _ = importer.collect_enum(entity);
             }
         }
+        // v1.14: capture TU/namespace-scope DATA globals
+        // (`extern FL_EXPORT Fl_Fontsize FL_NORMAL_SIZE;`). Rides the
+        // M11.c StaticDataDef shape with a class-free parent path;
+        // the emitter renders them as extern statics at module root.
+        EntityKind::VarDecl => {
+            let parent_kind = entity
+                .get_semantic_parent()
+                .map(|p| p.get_kind());
+            let at_ns_scope = matches!(
+                parent_kind,
+                Some(EntityKind::Namespace)
+                    | Some(EntityKind::TranslationUnit)
+                    | Some(EntityKind::NotImplemented)
+                    | None
+            );
+            if at_ns_scope && !entity_in_system_header(entity) {
+                let _ = importer.collect_global_var(entity);
+            }
+        }
         // M17: capture C++ `typedef T U;` and `using U = T;` at
         // TU/namespace scope. Failures are non-fatal — aliases
         // are emit-only ergonomics, so a target type we can't
@@ -683,6 +702,7 @@ struct Importer<'a> {
     enums: Vec<CxxEnumDef>,
     /// USR-keyed dedup for enums. Same rationale as `alias_usrs`.
     enum_usrs: std::collections::HashSet<String>,
+    global_var_usrs: std::collections::HashSet<String>,
     /// M11.b: free functions at TU/namespace scope. Same
     /// dedup-by-USR pattern as aliases / enums.
     free_fns: Vec<FreeFnDef>,
@@ -736,6 +756,7 @@ impl<'a> Importer<'a> {
             alias_usrs: std::collections::HashSet::new(),
             enums: Vec::new(),
             enum_usrs: std::collections::HashSet::new(),
+            global_var_usrs: std::collections::HashSet::new(),
             free_fns: Vec::new(),
             free_fn_usrs: std::collections::HashSet::new(),
             static_data: Vec::new(),
@@ -849,6 +870,44 @@ impl<'a> Importer<'a> {
     /// at TU or namespace scope. Returns `Ok(())` regardless of
     /// outcome — failures (missing underlying type, anonymous
     /// enum, …) silently skip just like aliases.
+    /// v1.14: TU/namespace-scope data global -> StaticDataDef with a
+    /// class-free parent. Skips function-typed and unsupported-typed
+    /// vars silently (emit-only ergonomics).
+    fn collect_global_var(&mut self, entity: &Entity<'_>) -> Result<(), ImportError> {
+        let Some(name) = entity.get_name() else { return Ok(()) };
+        if name.is_empty() {
+            return Ok(());
+        }
+        if let Some(usr) = entity.get_usr() {
+            if !self.global_var_usrs.insert(usr.0) {
+                return Ok(());
+            }
+        }
+        let Some(ty) = entity.get_type() else { return Ok(()) };
+        let where_ = format!("global `{name}`");
+        let Ok(tid) = self.import_type(ty, &where_) else { return Ok(()) };
+        let is_const = ty.is_const_qualified();
+        let mut parent = Vec::new();
+        let mut p = entity.get_semantic_parent();
+        while let Some(node) = p {
+            if node.get_kind() == EntityKind::Namespace {
+                if let Some(n) = node.get_name() {
+                    parent.insert(0, rustc_abi_cxx::NameSegment::Namespace(
+                        rustc_abi_cxx::Ident(n),
+                    ));
+                }
+            }
+            p = node.get_semantic_parent();
+        }
+        self.static_data.push(crate::static_data::StaticDataDef {
+            parent,
+            name: rustc_abi_cxx::Ident(name),
+            ty: tid,
+            cv: rustc_abi_cxx::CvQual { is_const, is_volatile: false },
+        });
+        Ok(())
+    }
+
     fn collect_enum(&mut self, entity: &Entity<'_>) -> Result<(), ImportError> {
         // Forward declarations (`enum class Foo;`) carry no body.
         // libclang reports them as definitions only after the body

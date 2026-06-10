@@ -652,6 +652,40 @@ fn emit_direct_extern_cpp(
         &static_data_by_class,
     )?;
 
+    // v1.14: TU/namespace-scope data globals (class-free parent
+    // path) — extern statics. Global-namespace C++ variables are
+    // UNMANGLED; namespaced ones use the Itanium variable mangling.
+    {
+        let globals: Vec<_> = static_data
+            .iter()
+            .filter(|sd| {
+                !sd.parent.iter().any(|s| matches!(s, NameSegment::Class(_)))
+            })
+            .collect();
+        if !globals.is_empty() {
+            let mut block = String::new();
+            for sd in globals {
+                let Ok(ty) = render_rust_type(ctx, sd.ty, "global") else { continue };
+                let link = if sd.parent.is_empty() {
+                    sd.name.0.clone()
+                } else {
+                    ctx.mangle(&Symbol::Variable {
+                        scope: rustc_abi_cxx::NestedName(sd.parent.clone()),
+                        name: sd.name.clone(),
+                        ty: sd.ty,
+                    })
+                };
+                let mut_kw = if sd.cv.is_const { "" } else { "mut " };
+                let _ = writeln!(block, "    #[link_name = \"{link}\"]");
+                let _ = writeln!(block, "    pub static {mut_kw}{}: {ty};", sd.name.0);
+            }
+            if !block.is_empty() {
+                let _ = writeln!(out, "unsafe extern \"C++\" {{");
+                out.push_str(&block);
+                let _ = writeln!(out, "}}");
+            }
+        }
+    }
     let _ = writeln!(out, "}}");
     let _ = writeln!(out, "#[doc(inline)]");
     let _ = writeln!(out, "pub use {modname}::*;");
