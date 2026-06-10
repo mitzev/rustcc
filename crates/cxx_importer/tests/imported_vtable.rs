@@ -235,3 +235,28 @@ struct DtorFirst {\n\
         "dtor-first must use the legacy flag-only form:\n{attr2}"
     );
 }
+
+/// Multiple inheritance — direct or anywhere up the chain — must
+/// suppress the attr entirely: the format models one non-virtual
+/// primary chain, and emitting a linearized first-base-only attr gave
+/// a Rust subclass a vtable with no secondary sub-tables (UB through
+/// the second base). wxWidgets-shaped regression (wxEvtHandler :
+/// wxObject + wxTrackable sits under every widget).
+#[test]
+fn multiple_inheritance_suppresses_the_attr() {
+    let src = "\
+struct A { int a; virtual int fa(); };\n\
+struct B { int b; virtual int fb(); };\n\
+struct C : A, B { explicit C(int v); virtual int fc(); };\n\
+struct D : C { virtual int fd(); };\n\
+struct Single : A { virtual int fs(); };\n";
+    let out = emit(src, "mi_guard");
+    assert!(
+        !out.contains("ztv=_ZTV1C") && !out.contains("ztv=_ZTV1D"),
+        "MI class (direct or inherited) must not carry an imported-vtable attr:\n{out}"
+    );
+    assert!(
+        out.contains("ztv=_ZTV6Single"),
+        "single-inheritance sibling must still get its attr:\n{out}"
+    );
+}

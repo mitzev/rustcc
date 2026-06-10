@@ -58,14 +58,15 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use clang::{
-    Clang, Entity, EntityKind, EntityVisitResult, ExceptionSpecification, Index,
-    RefQualifier, TemplateArgument, Type, TypeKind,
+    Clang, Entity, EntityKind, EntityVisitResult, EvaluationResult,
+    ExceptionSpecification, Index, RefQualifier, TemplateArgument, Type,
+    TypeKind,
 };
 use rustc_abi_cxx::{
     Access, BaseSpec, ClassDef, ClassId, CvQual, CxxType, CxxTypeCtx,
-    FieldDef, FloatKind, FnSig, Ident, IntWidth, MethodDef, MethodName,
-    NameSegment, NestedName, OperatorKind, RecordKind, RefKind, SpecialMember,
-    TemplateArg, TypeId, VTableEntry, Virtuality,
+    DefaultArgValue, FieldDef, FloatKind, FnSig, Ident, IntWidth, MethodDef,
+    MethodName, NameSegment, NestedName, OperatorKind, RecordKind, RefKind,
+    SpecialMember, TemplateArg, TypeId, VTableEntry, Virtuality,
 };
 
 use crate::aliases::{AliasSet, TypeAlias};
@@ -525,10 +526,12 @@ fn attach_methods_recursively(
             // the push so we can capture the final method index.
             let is_static = matches!(method_entity.get_kind(), EntityKind::Method)
                 && method_entity.is_static_method();
-            // M18: capture the trailing-default-arg count from
-            // `lower_method`'s scratch slot before any further
-            // call clobbers it.
+            // M18: capture the trailing-default-arg count (and the
+            // M18.c evaluated values) from `lower_method`'s scratch
+            // slots before any further call clobbers them.
             let default_count = importer.last_method_default_count;
+            let default_values =
+                std::mem::take(&mut importer.last_method_default_values);
             let method_idx = importer.ctx.class(class_id).methods.len();
             importer.ctx.class_mut(class_id).methods.push(method);
             if is_static {
@@ -539,6 +542,11 @@ fn attach_methods_recursively(
                     class_id,
                     method_idx,
                     default_count,
+                );
+                importer.ctx.record_default_arg_values(
+                    class_id,
+                    method_idx,
+                    default_values,
                 );
             }
         }
@@ -693,6 +701,13 @@ struct Importer<'a> {
     /// `lower_method` entry so a method without defaults
     /// doesn't pick up the previous method's count.
     last_method_default_count: usize,
+    /// M18.c: scratch slot paired with `last_method_default_count`
+    /// — the libclang-evaluated values for that trailing-default
+    /// window, in source order (length == the count; `None` for
+    /// defaults that didn't constant-evaluate). Call sites read
+    /// it together with the count and forward to
+    /// `ctx.record_default_arg_values`.
+    last_method_default_values: Vec<Option<DefaultArgValue>>,
     /// M24: template-parameter substitution map active when
     /// walking a class-template specialization's methods. Keyed
     /// by parameter name (`T`, `U`, ...) — the `lower_method`
@@ -726,6 +741,7 @@ impl<'a> Importer<'a> {
             static_data: Vec::new(),
             static_data_usrs: std::collections::HashSet::new(),
             last_method_default_count: 0,
+            last_method_default_values: Vec::new(),
             current_template_subst: HashMap::new(),
         }
     }
@@ -1284,6 +1300,12 @@ impl<'a> Importer<'a> {
         // recording on the ctx after the class body is assigned.
         // Same deferral pattern as `pending_static_marks`.
         let mut pending_default_arg_marks: Vec<(usize, usize)> = Vec::new();
+        // M18.c: parallel deferral for the evaluated default
+        // values — (method_idx, per-trailing-slot values).
+        let mut pending_default_arg_values: Vec<(
+            usize,
+            Vec<Option<DefaultArgValue>>,
+        )> = Vec::new();
 
         // Fields: prefer `Type::get_fields()` over `entity.get_children()`.
         // The former iterates through libclang's type-visitor which
@@ -1402,8 +1424,10 @@ impl<'a> Importer<'a> {
                         && child.is_static_method();
                     // M18: capture before `lower_method` is called
                     // again on the next sibling (which would clobber
-                    // the scratch slot).
+                    // the scratch slots).
                     let default_count = self.last_method_default_count;
+                    let default_values =
+                        std::mem::take(&mut self.last_method_default_values);
                     let method_idx = methods.len();
                     methods.push(m);
                     if is_static {
@@ -1417,6 +1441,8 @@ impl<'a> Importer<'a> {
                     if default_count > 0 {
                         pending_default_arg_marks
                             .push((method_idx, default_count));
+                        pending_default_arg_values
+                            .push((method_idx, default_values));
                     }
                 }
                 // M11.c: class-scope static data members
@@ -1563,6 +1589,9 @@ impl<'a> Importer<'a> {
                             ) && child.is_static_method();
                             let default_count =
                                 self.last_method_default_count;
+                            let default_values = std::mem::take(
+                                &mut self.last_method_default_values,
+                            );
                             let method_idx = methods.len();
                             methods.push(m);
                             if is_static {
@@ -1571,6 +1600,8 @@ impl<'a> Importer<'a> {
                             if default_count > 0 {
                                 pending_default_arg_marks
                                     .push((method_idx, default_count));
+                                pending_default_arg_values
+                                    .push((method_idx, default_values));
                             }
                         }
                         _ => {}
@@ -1624,6 +1655,11 @@ impl<'a> Importer<'a> {
             self.ctx.record_default_arg_count(id, *idx, *count);
         }
 
+        // M18.c: apply deferred evaluated default values.
+        for (idx, values) in pending_default_arg_values {
+            self.ctx.record_default_arg_values(id, idx, values);
+        }
+
         // M13: if this import call upgraded a previously-poisoned
         // entry (forward-only → full definition), clear the poison
         // marker now that the class has real fields / methods /
@@ -1641,11 +1677,12 @@ impl<'a> Importer<'a> {
         parent_name: &str,
         enclosing_class: ClassId,
     ) -> Result<MethodDef, ImportError> {
-        // Reset the M18 scratch slot — every `lower_method` call
-        // sets it as a side effect, but we want a clean baseline
+        // Reset the M18 scratch slots — every `lower_method` call
+        // sets them as a side effect, but we want a clean baseline
         // so an early-error path doesn't carry over the previous
-        // method's count.
+        // method's count / values.
         self.last_method_default_count = 0;
+        self.last_method_default_values = Vec::new();
         let name = entity.get_name().unwrap_or_default();
         let kind = entity.get_kind();
         let ctx_where = format!("{parent_name}::{name}");
@@ -1666,12 +1703,18 @@ impl<'a> Importer<'a> {
         // M18: a ParmDecl with non-empty children carries a
         // default-argument expression as one of those children
         // (e.g. `IntegerLiteral`, `CXXBoolLiteralExpr`,
-        // `GNUNullExpr`, …). We don't resolve the value here —
-        // that requires constant-evaluation plumbing — but we
-        // record per-parameter "has-default" so the emitter can
-        // surface a doc comment listing optional trailing args.
+        // `GNUNullExpr`, …). We record per-parameter "has-default"
+        // so the emitter can surface a doc comment listing
+        // optional trailing args.
+        // M18.c: additionally constant-evaluate each default via
+        // libclang so the `_with_defaults` convenience wrappers
+        // pass the *real* C++ value (`int buflen = 128*1024` →
+        // `131072_i32`) instead of zero-synthesizing. Defaults
+        // that don't evaluate to a scalar keep `None` and fall
+        // back to the M18.b zero/null/false synthesis.
         let mut params = Vec::new();
         let mut has_default: Vec<bool> = Vec::new();
+        let mut default_values: Vec<Option<DefaultArgValue>> = Vec::new();
         for child in entity.get_children() {
             if child.get_kind() == EntityKind::ParmDecl {
                 let pty = child.get_type().ok_or_else(|| {
@@ -1712,7 +1755,20 @@ impl<'a> Importer<'a> {
                     });
                 }
                 params.push(self.import_type(pty, &ctx_where)?);
-                has_default.push(!child.get_children().is_empty());
+                let param_has_default = !child.get_children().is_empty();
+                has_default.push(param_has_default);
+                // Evaluating a `ParmDecl` evaluates its VarDecl
+                // init slot, which is where clang stores the
+                // default-argument expression. Gated on the
+                // has-default heuristic so we don't pay the
+                // evaluation cost on plain parameters (whose
+                // child, if any, is a TypeRef — evaluation would
+                // just return `None` anyway).
+                default_values.push(if param_has_default {
+                    evaluate_default_arg(&child)
+                } else {
+                    None
+                });
             }
         }
         // C++ defaults must occupy a contiguous tail
@@ -1724,6 +1780,8 @@ impl<'a> Importer<'a> {
             .take_while(|&&b| b)
             .count();
         self.last_method_default_count = trailing_defaults;
+        self.last_method_default_values =
+            default_values.split_off(default_values.len() - trailing_defaults);
         let _ = enclosing_class;
 
         // Ctors and dtors have no source-level return type; use `void`
@@ -2564,6 +2622,29 @@ fn entity_fqn(entity: &Entity<'_>) -> String {
     }
     parts.reverse();
     parts.join("::")
+}
+
+/// M18.c: constant-evaluate a defaulted parameter's initializer
+/// via libclang (`clang_Cursor_Evaluate`). Clang stores a
+/// `ParmDecl`'s default-argument expression in the VarDecl init
+/// slot, which is exactly what cursor evaluation folds — so
+/// `int buflen = 128*1024` comes back as `SignedInteger(131072)`,
+/// `bool wrap = true` as `SignedInteger(1)`, `double s = 1.5` as
+/// `Float(1.5)`. Only scalar results are kept; strings, pointer
+/// expressions, and unexposed results return `None`, and the
+/// bindings emitter falls back to M18.b zero-synthesis (plus its
+/// doc-comment disclosure) for those slots.
+fn evaluate_default_arg(param: &Entity<'_>) -> Option<DefaultArgValue> {
+    match param.evaluate()? {
+        EvaluationResult::SignedInteger(v) => Some(DefaultArgValue::Int(v)),
+        EvaluationResult::UnsignedInteger(v) => Some(DefaultArgValue::UInt(v)),
+        EvaluationResult::Float(v) => Some(DefaultArgValue::Float(v)),
+        EvaluationResult::Unexposed
+        | EvaluationResult::String(_)
+        | EvaluationResult::ObjCString(_)
+        | EvaluationResult::CFString(_)
+        | EvaluationResult::Other(_) => None,
+    }
 }
 
 /// Read inline `[[clang::annotate("rustcc::…")]]` annotations from

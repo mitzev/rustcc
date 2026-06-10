@@ -104,9 +104,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use rustc_abi_cxx::{
-    Access, ClassId, CtorVariant, CxxType, CxxTypeCtx, DtorVariant, FloatKind,
-    IntWidth, MethodDef, MethodName, NameSegment, OperatorKind, SpecialMember,
-    Symbol, TypeId, VTableEntry, Virtuality,
+    Access, ClassId, CtorVariant, CxxType, CxxTypeCtx, DefaultArgValue,
+    DtorVariant, FloatKind, IntWidth, MethodDef, MethodName, NameSegment,
+    OperatorKind, SpecialMember, Symbol, TypeId, VTableEntry, Virtuality,
 };
 
 use crate::annotations::{Annotation, AnnotationSet};
@@ -1074,6 +1074,27 @@ fn class_is_abstract(ctx: &CxxTypeCtx, class_id: ClassId) -> bool {
 }
 
 fn build_imported_vtable_attr(ctx: &CxxTypeCtx, class_id: ClassId) -> Option<String> {
+    // v1.13.10+: GUARD multiple / virtual inheritance anywhere up the
+    // base graph. The attr (and the fork's chain-walk) models a single
+    // non-virtual primary chain; emitting it for an MI class silently
+    // linearized the FIRST base only — a Rust subclass would get a
+    // vtable with no secondary sub-tables, and C++ dispatch through a
+    // second base would be UB. No attr → the fork rejects `override fn`
+    // with a real diagnostic instead. (MI subclassing is the planned
+    // v1.14 feature — see fork/MI-DESIGN-v1.14.md.)
+    fn chain_is_single_nonvirtual(ctx: &CxxTypeCtx, id: ClassId) -> bool {
+        let class = ctx.class(id);
+        if class.bases.len() > 1 || class.bases.iter().any(|b| b.virtual_) {
+            return false;
+        }
+        class
+            .bases
+            .first()
+            .is_none_or(|b| chain_is_single_nonvirtual(ctx, b.class))
+    }
+    if !chain_is_single_nonvirtual(ctx, class_id) {
+        return None;
+    }
     // `primary_vtable_slots` flattens the FULL single-inheritance chain
     // and resolves each slot's override-matching name via its declaring
     // class — so this works for *deep* imported bases (e.g. FLTK's
@@ -2182,6 +2203,12 @@ struct MethodEmission {
     /// one default-arg type can't be safely synthesized and the
     /// convenience wrapper is suppressed.
     synthesized_default_literals: Option<Vec<String>>,
+    /// M18.c: parallel to `synthesized_default_literals` when that
+    /// is `Some` — `true` per slot whose literal is the importer-
+    /// evaluated C++ value, `false` for M18.b zero-synthesis
+    /// fallbacks. The wrapper renderer keys its in-body provenance
+    /// comment off this. Empty when no literals were produced.
+    default_literals_evaluated: Vec<bool>,
     /// M20.b: parallel index list — for each entry, the position
     /// in `wrapper_user_params` where a `*const c_char` parameter
     /// lives. Populated only when `cstr_ergonomics` is on AND
@@ -2493,10 +2520,14 @@ fn classify_for_direct_extern(
     };
 
     // M18.b: synthesize a Rust default literal per trailing
-    // default-arg slot. If any one of them fails synthesis,
-    // `synthesized_default_literals` stays `None` and the
-    // convenience wrapper is suppressed.
+    // default-arg slot. M18.c upgrade: slots whose C++ default the
+    // importer constant-evaluated render the *real* value
+    // (`131072_i32` for FLTK's `int buflen = 128*1024`); only the
+    // slots that didn't evaluate fall back to zero-synthesis. If
+    // any slot fails both paths, `synthesized_default_literals`
+    // stays `None` and the convenience wrapper is suppressed.
     let default_count = ctx.default_arg_count(class_id, method_idx);
+    let mut default_literals_evaluated: Vec<bool> = Vec::new();
     let synthesized_defaults: Option<Vec<String>> = if default_count == 0
         || default_count > method.sig.params.len()
     {
@@ -2506,18 +2537,31 @@ fn classify_for_direct_extern(
         let trailing = &method.sig.params[n - default_count..n];
         let mut out: Vec<String> = Vec::with_capacity(default_count);
         let mut all_ok = true;
-        for &ty_id in trailing {
-            match synthesize_default_literal(ctx, ty_id) {
-                Some(lit) => out.push(lit),
-                None => {
-                    all_ok = false;
-                    break;
+        for (slot, &ty_id) in trailing.iter().enumerate() {
+            let evaluated = ctx
+                .default_arg_value(class_id, method_idx, slot)
+                .and_then(|v| render_evaluated_default(ctx, ty_id, v));
+            match evaluated {
+                Some(lit) => {
+                    out.push(lit);
+                    default_literals_evaluated.push(true);
                 }
+                None => match synthesize_default_literal(ctx, ty_id) {
+                    Some(lit) => {
+                        out.push(lit);
+                        default_literals_evaluated.push(false);
+                    }
+                    None => {
+                        all_ok = false;
+                        break;
+                    }
+                },
             }
         }
         if all_ok {
             Some(out)
         } else {
+            default_literals_evaluated.clear();
             None
         }
     };
@@ -2579,6 +2623,7 @@ fn classify_for_direct_extern(
                 wrapper_user_params: user_param_pairs.clone(),
                 wrapper_forward_arg_names: user_forward_names.clone(),
                 synthesized_default_literals: synthesized_defaults.clone(),
+                default_literals_evaluated: default_literals_evaluated.clone(),
                 cstr_param_indices: cstr_param_indices.clone(),
                 throws,
                 raw_ret_ty: String::new(),
@@ -2617,6 +2662,7 @@ fn classify_for_direct_extern(
                 wrapper_user_params: Vec::new(),
                 wrapper_forward_arg_names: Vec::new(),
                 synthesized_default_literals: None,
+                default_literals_evaluated: Vec::new(),
                 cstr_param_indices: Vec::new(),
                 throws: false,
                 raw_ret_ty: String::new(),
@@ -2660,6 +2706,7 @@ fn classify_for_direct_extern(
                 wrapper_user_params: Vec::new(),
                 wrapper_forward_arg_names: Vec::new(),
                 synthesized_default_literals: None,
+                default_literals_evaluated: Vec::new(),
                 cstr_param_indices: Vec::new(),
                 throws: false,
                 raw_ret_ty: String::new(),
@@ -2695,6 +2742,7 @@ fn classify_for_direct_extern(
                 wrapper_user_params: Vec::new(),
                 wrapper_forward_arg_names: Vec::new(),
                 synthesized_default_literals: None,
+                default_literals_evaluated: Vec::new(),
                 cstr_param_indices: Vec::new(),
                 throws: false,
                 raw_ret_ty: String::new(),
@@ -2740,6 +2788,7 @@ fn classify_for_direct_extern(
                 wrapper_user_params: Vec::new(),
                 wrapper_forward_arg_names: Vec::new(),
                 synthesized_default_literals: None,
+                default_literals_evaluated: Vec::new(),
                 cstr_param_indices: Vec::new(),
                 throws: false,
                 raw_ret_ty: String::new(),
@@ -2909,6 +2958,7 @@ fn classify_for_direct_extern(
         wrapper_user_params: user_param_pairs,
         wrapper_forward_arg_names: user_forward_names,
         synthesized_default_literals: synthesized_defaults,
+        default_literals_evaluated,
         cstr_param_indices,
         default_arg_count: ctx.default_arg_count(class_id, method_idx),
         throws,
@@ -4784,12 +4834,29 @@ fn render_m18b_convenience_wrappers(
         // as a regular comment (not a `///` doc — that would
         // attach to nothing), giving the user grep-able context
         // when they read the generated source.
+        //
+        // M18.c: when every dropped slot carries an importer-
+        // evaluated value, say so — those literals ARE the C++
+        // defaults, not zero-guesses, so the mismatch disclaimer
+        // doesn't apply.
         let synth_str = synthesized.join(", ");
-        let _ = writeln!(
-            out,
-            "{indent}    // M18.b: trailing {k} arg{s} default-synthesized as ({synth_str}).",
-            s = if k == 1 { "" } else { "s" },
-        );
+        let window_evaluated = emission
+            .default_literals_evaluated
+            .get(default_count - k..)
+            .is_some_and(|w| w.len() == k && w.iter().all(|&e| e));
+        if window_evaluated {
+            let _ = writeln!(
+                out,
+                "{indent}    // M18.c: trailing {k} arg{s} filled with the evaluated C++ default{s} ({synth_str}).",
+                s = if k == 1 { "" } else { "s" },
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "{indent}    // M18.b: trailing {k} arg{s} default-synthesized as ({synth_str}).",
+                s = if k == 1 { "" } else { "s" },
+            );
+        }
 
         // Body: forward to the full-arity wrapper.
         let _ = writeln!(
@@ -5681,6 +5748,143 @@ fn render_enum_discriminant(value: i64, signed: bool) -> String {
     }
 }
 
+/// M18.c: render an importer-evaluated C++ default value as a
+/// Rust source literal typed against the parameter's `CxxType`.
+/// This is the preferred source for `_with_defaults` wrapper
+/// arguments — `int buflen = 128*1024` renders as `131072_i32`
+/// instead of the M18.b zero-synthesis. Returns `None` when the
+/// evaluated value doesn't sensibly type against the parameter
+/// (lossy int narrowing, non-finite floats, non-0/1 bools,
+/// pointer/record/reference params), in which case the caller
+/// falls back to [`synthesize_default_literal`].
+///
+/// Accepted shapes deliberately mirror `synthesize_default_literal`
+/// (bool / int / float / unscoped enum) so M18.c only upgrades the
+/// *value*, never widens the set of wrapper-eligible types.
+fn render_evaluated_default(
+    ctx: &CxxTypeCtx,
+    ty: TypeId,
+    value: DefaultArgValue,
+) -> Option<String> {
+    /// `v` reinterpreted as u64 must round-trip; checks a signed/
+    /// unsigned value against the parameter's width so we never
+    /// emit an out-of-range literal (which would fail to compile).
+    fn int_fits(value: DefaultArgValue, signed: bool, width: IntWidth) -> bool {
+        let bits: u32 = match width {
+            IntWidth::I8 => 8,
+            IntWidth::I16 => 16,
+            IntWidth::I32 => 32,
+            IntWidth::I64 => 64,
+            IntWidth::I128 => 128,
+        };
+        match (value, signed) {
+            (DefaultArgValue::Int(v), true) => {
+                bits >= 64
+                    || ((-1_i64 << (bits - 1)) <= v && v < (1_i64 << (bits - 1)))
+            }
+            (DefaultArgValue::Int(v), false) => {
+                v >= 0 && (bits >= 64 || (v as u64) < (1_u64 << bits))
+            }
+            (DefaultArgValue::UInt(v), true) => {
+                bits > 64 || v < (1_u64 << (bits - 1).min(63))
+            }
+            (DefaultArgValue::UInt(v), false) => {
+                bits >= 64 || v < (1_u64 << bits)
+            }
+            (DefaultArgValue::Float(_), _) => false,
+        }
+    }
+
+    match ctx.type_of(ty) {
+        CxxType::Bool => match value {
+            DefaultArgValue::Int(0) | DefaultArgValue::UInt(0) => {
+                Some("false".to_string())
+            }
+            DefaultArgValue::Int(1) | DefaultArgValue::UInt(1) => {
+                Some("true".to_string())
+            }
+            _ => None,
+        },
+        CxxType::Int { signed, width } => {
+            if !int_fits(value, *signed, *width) {
+                return None;
+            }
+            let r = int_rust(*signed, *width);
+            match value {
+                DefaultArgValue::Int(v) => Some(format!("{v}_{r}")),
+                DefaultArgValue::UInt(v) => Some(format!("{v}_{r}")),
+                DefaultArgValue::Float(_) => None,
+            }
+        }
+        CxxType::Float { kind } => {
+            // libclang folds integer-typed initializers of float
+            // params (`double x = 1`) to an integer result, so
+            // accept all three carriers. `{}` on a Rust float
+            // Display never produces exponent notation and always
+            // round-trips, so suffixing the rendered value is a
+            // valid literal of the exact same bits.
+            let v: f64 = match value {
+                DefaultArgValue::Int(v) => v as f64,
+                DefaultArgValue::UInt(v) => v as f64,
+                DefaultArgValue::Float(v) => v,
+            };
+            if !v.is_finite() {
+                return None;
+            }
+            match kind {
+                FloatKind::F32 => Some(format!("{}_f32", v as f32)),
+                FloatKind::F64 => Some(format!("{v}_f64")),
+                FloatKind::LongDouble => None,
+            }
+        }
+        CxxType::Enum {
+            underlying,
+            scoped,
+            name,
+        } => {
+            // Same scoping rules as `synthesize_default_literal`:
+            // unscoped enums only, with the literal shaped to how
+            // `render_rust_type` renders the parameter (bare int
+            // for class-scope enums, `Name(<int>)` tuple-struct
+            // ctor for TU-/namespace-scope ones).
+            if *scoped {
+                None
+            } else {
+                let class_scope =
+                    name.0.iter().any(|s| matches!(s, NameSegment::Class(_)));
+                let inner = render_evaluated_default(ctx, *underlying, value)?;
+                if class_scope {
+                    Some(inner)
+                } else {
+                    let leaf = name.0.iter().rev().find_map(|s| match s {
+                        NameSegment::Enum(id) | NameSegment::Class(id) => {
+                            Some(id.0.clone())
+                        }
+                        _ => None,
+                    });
+                    match leaf {
+                        Some(n) => Some(format!("{n}({inner})")),
+                        None => Some(inner),
+                    }
+                }
+            }
+        }
+        // Pointer defaults that constant-evaluate to a scalar are
+        // virtually always `nullptr`/`0`, which the M18.b null
+        // synthesis already renders correctly — and a *non-null*
+        // pointer constant has no safe Rust literal. References,
+        // records, fn pointers, arrays, member pointers, void:
+        // same `None` policy as `synthesize_default_literal`.
+        CxxType::Ptr { .. }
+        | CxxType::Ref { .. }
+        | CxxType::Record(_)
+        | CxxType::Fn(_)
+        | CxxType::Array { .. }
+        | CxxType::MemberPtr { .. }
+        | CxxType::Void => None,
+    }
+}
+
 /// M18.b: synthesize a Rust source literal that matches what
 /// the C++ side would use for an unspecified default argument.
 /// Returns `None` for types where no general-purpose default
@@ -5695,11 +5899,13 @@ fn render_enum_discriminant(value: i64, signed: bool) -> String {
 /// practice line up with the overwhelming majority of C++
 /// API defaults — FLTK uses `int = 0`, `const char* =
 /// nullptr`, `bool = false`, `Fl_Color = 0` (an integer
-/// alias). For the cases where a C++ API has a non-zero
-/// default (`int delay = 100`), the synthesized wrapper
-/// passes 0 instead, which is wrong but visible: the
-/// wrapper carries a `///` doc comment listing every
-/// synthesized value so the reader can spot mismatches.
+/// alias). Since M18.c, defaults the importer could constant-
+/// evaluate take [`render_evaluated_default`]'s real-value
+/// literal instead; this zero-synthesis is the fallback for
+/// slots that didn't evaluate (string literals, expressions
+/// involving other declarations, …). A fallback wrapper still
+/// carries the in-body comment listing every synthesized value
+/// so the reader can spot mismatches.
 fn synthesize_default_literal(ctx: &CxxTypeCtx, ty: TypeId) -> Option<String> {
     match ctx.type_of(ty) {
         CxxType::Bool => Some("false".to_string()),
