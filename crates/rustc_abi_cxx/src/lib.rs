@@ -21,7 +21,7 @@ mod vtable;
 mod vtable_msvc;
 mod vtt;
 
-pub use ctx::CxxTypeCtx;
+pub use ctx::{CxxTypeCtx, DefaultArgValue};
 pub use diag::LayoutError;
 pub use layout::{HfaElem, HfaKind, RecordLayout};
 pub use mangle::{CtorVariant, DtorVariant, Symbol};

@@ -3089,6 +3089,149 @@ fn m18b_synthesizes_for_ctor_with_nullable_label() {
 }
 
 // ============================================================
+// M18.c: `_with_defaults` wrappers pass the *evaluated* C++
+// default value (via libclang `clang_Cursor_Evaluate`) instead
+// of zero-synthesizing. Regression for the FLTK data-loss bug
+// where `Fl_Text_Buffer::loadfile(file, int buflen = 128*1024)`
+// called through `loadfile_str_with_defaults` passed buflen=0
+// and silently read nothing.
+// ============================================================
+
+#[test]
+fn m18c_with_defaults_wrapper_passes_evaluated_cxx_default() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // `f(int n = 128 * 1024)` — the FLTK `buflen` shape. The
+    // default is an *expression*, so this also exercises constant
+    // folding (libclang evaluates it to 131072), not just literal
+    // capture.
+    let header = temp_header(
+        "struct B {\n  void f(int n = 128 * 1024);\n};\n",
+        "m18c_evaluated_int_default",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("pub fn f_with_defaults(&mut self)"),
+        "_with_defaults wrapper missing; got:\n{src}",
+    );
+    assert!(
+        src.contains("self.f(131072_i32)"),
+        "_with_defaults must forward the evaluated C++ default \
+         131072_i32, not a zero-synthesized 0_i32; got:\n{src}",
+    );
+    assert!(
+        !src.contains("self.f(0_i32)"),
+        "zero-synthesis leaked into the wrapper body; got:\n{src}",
+    );
+    // Provenance comment switches from the M18.b "default-
+    // synthesized" disclaimer to the M18.c evaluated wording.
+    assert!(
+        src.contains("evaluated C++ default"),
+        "expected the M18.c provenance comment; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m18c_evaluates_bool_float_and_negative_defaults() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let header = temp_header(
+        "struct B {\n  void g(bool wrap = true, double scale = 1.5, int off = -3);\n};\n",
+        "m18c_scalar_kinds",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    assert!(
+        src.contains("self.g(true, 1.5_f64, -3_i32)"),
+        "all-defaults wrapper should forward the evaluated bool / \
+         float / negative-int values; got:\n{src}",
+    );
+    // Partial drop keeps the leading user arg and fills the rest.
+    assert!(
+        src.contains("self.g(arg0, 1.5_f64, -3_i32)"),
+        "_default_1 wrapper should forward evaluated trailing values; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+#[test]
+fn m18c_falls_back_to_zero_synthesis_when_default_does_not_evaluate() {
+    use cxx_importer::rust_bindings::{
+        generate_rust_bindings, BindingsBackend, RustBindingsConfig,
+    };
+    let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    // A string-literal default has no scalar evaluation → the
+    // pointer slot keeps M18.b null synthesis (and the M18.b
+    // disclaimer comment), while the evaluable int slot still
+    // gets its real value.
+    let header = temp_header(
+        "struct B {\n  void h(const char* name = \"x\", int n = 7);\n};\n",
+        "m18c_mixed_fallback",
+    );
+    let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
+    let class_ids = import_header(
+        &header,
+        &["-x", "c++", "-std=c++17"],
+        &mut ctx,
+    )
+    .expect("import");
+    let cfg = RustBindingsConfig {
+        backend: BindingsBackend::DirectExternCpp,
+        ..RustBindingsConfig::default()
+    };
+    let src = generate_rust_bindings(&ctx, &class_ids, &cfg).expect("emit");
+
+    // All-defaults wrapper: null fallback for the string slot,
+    // evaluated 7_i32 for the int slot, M18.b wording (the window
+    // is only partially evaluated).
+    assert!(
+        src.contains("self.h(::core::ptr::null(), 7_i32)"),
+        "mixed wrapper should combine null fallback + evaluated int; got:\n{src}",
+    );
+    assert!(
+        src.contains("default-synthesized as (::core::ptr::null(), 7_i32)"),
+        "partially-evaluated window must keep the M18.b disclaimer; got:\n{src}",
+    );
+    // Dropping only the int arg: that window is fully evaluated.
+    assert!(
+        src.contains("self.h(arg0, 7_i32)"),
+        "_default_1 wrapper should forward the evaluated int; got:\n{src}",
+    );
+
+    cleanup(&header);
+}
+
+// ============================================================
 // M20.b: `&CStr` smart parameter wrappers, opt-in via
 // `cstr_ergonomics: true`. For each `*const c_char` parameter
 // the importer emits a `_cstr` wrapper that takes

@@ -9,6 +9,25 @@ use crate::ty::{
     ClassDef, ClassId, CxxType, RustEnumDef, RustEnumId, TypeId, TypeOrigin,
 };
 
+/// M18.c: a C++ default-argument value the importer constant-
+/// evaluated via libclang (`clang_Cursor_Evaluate`). Only scalar
+/// results are representable — that's all the convenience-wrapper
+/// emitter can render as a Rust literal anyway. Booleans ride
+/// `Int` (libclang evaluates `true` to integer 1); the emitter
+/// re-types the value against the parameter's `CxxType`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DefaultArgValue {
+    /// Signed-integer evaluation result (also bools and unscoped
+    /// enum values).
+    Int(i64),
+    /// Unsigned-integer evaluation result (libclang ≥ 4.0 reports
+    /// unsigned-typed constants separately).
+    UInt(u64),
+    /// Floating-point evaluation result.
+    Float(f64),
+}
+
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CxxTypeCtx {
@@ -40,6 +59,15 @@ pub struct CxxTypeCtx {
     /// the C++ side considered optional. Stored as a side-table
     /// for the same back-compat reasoning as `static_methods`.
     default_arg_counts: HashMap<(ClassId, usize), usize>,
+    /// M18.c: per-method *evaluated* values for the trailing
+    /// default parameters counted in `default_arg_counts`. The
+    /// `Vec` is aligned with the trailing-default window in
+    /// source order (length == the recorded count); `None` slots
+    /// are defaults libclang couldn't constant-evaluate (string
+    /// literals, enum-class members, ctor calls, …), for which
+    /// the emitter falls back to M18.b zero-synthesis. Same
+    /// side-table reasoning as `default_arg_counts`.
+    default_arg_values: HashMap<(ClassId, usize), Vec<Option<DefaultArgValue>>>,
     /// M21.b: per-field bit width for bitfield members.
     /// `(ClassId, field_idx)` points into `class.fields`. Non-
     /// bitfield fields don't appear in this map. Stored as a
@@ -84,6 +112,7 @@ impl CxxTypeCtx {
             poison_reason: HashMap::new(),
             static_methods: HashSet::new(),
             default_arg_counts: HashMap::new(),
+            default_arg_values: HashMap::new(),
             bitfield_widths: HashMap::new(),
             pragma_pack: HashMap::new(),
             packed: HashSet::new(),
@@ -166,6 +195,40 @@ impl CxxTypeCtx {
             .get(&(class, method_idx))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// M18.c: record the libclang-evaluated values for the trailing
+    /// default parameters of `class.methods[method_idx]`. `values`
+    /// is aligned with the trailing-default window in source order
+    /// (same window `record_default_arg_count` counts); `None`
+    /// slots are defaults that didn't constant-evaluate. All-`None`
+    /// vectors are dropped — they carry no more information than
+    /// the count alone.
+    pub fn record_default_arg_values(
+        &mut self,
+        class: ClassId,
+        method_idx: usize,
+        values: Vec<Option<DefaultArgValue>>,
+    ) {
+        if values.iter().any(Option::is_some) {
+            self.default_arg_values.insert((class, method_idx), values);
+        }
+    }
+
+    /// M18.c: the evaluated value of the `trailing_idx`-th
+    /// parameter *within the trailing-default window* of
+    /// `class.methods[method_idx]` (0 = first defaulted param).
+    /// `None` when the importer recorded no value — the emitter
+    /// then falls back to M18.b zero-synthesis.
+    pub fn default_arg_value(
+        &self,
+        class: ClassId,
+        method_idx: usize,
+        trailing_idx: usize,
+    ) -> Option<DefaultArgValue> {
+        self.default_arg_values
+            .get(&(class, method_idx))
+            .and_then(|v| v.get(trailing_idx).copied().flatten())
     }
 
     /// M21.b: record that `class.fields[field_idx]` is a bitfield

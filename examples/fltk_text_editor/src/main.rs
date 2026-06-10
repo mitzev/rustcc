@@ -198,7 +198,7 @@ unsafe fn run_action(act: usize) {
             }
             ACT_OPEN => {
                 if let Some(p) = choose_file(CHOOSER_OPEN, "Open") {
-                    (*buf).loadfile(cstr(&p).as_ptr(), 128 * 1024);
+                    (*buf).loadfile_with_defaults(cstr(&p).as_ptr());
                     *PATH.lock().unwrap() = Some(p);
                     DIRTY.store(false, Relaxed);
                     refresh_title();
@@ -275,12 +275,7 @@ unsafe fn save_to(path: &str) {
     unsafe {
         let buf = BUF.load(Relaxed);
         let len = (*buf).length();
-        // Full arity: the `_with_defaults` form synthesizes buflen=0
-        // (C++ default is 128*1024), which writes nothing.
-        // Full arity on outputfile/loadfile: the `_with_defaults`
-        // forms synthesize buflen=0 (C++ default: 128*1024), which
-        // silently reads/writes NOTHING — caught by the self-test.
-        (*buf).outputfile(cstr(path).as_ptr(), 0, len, 128 * 1024);
+        (*buf).outputfile_with_defaults(cstr(path).as_ptr(), 0, len);
         DIRTY.store(false, Relaxed);
     }
 }
@@ -504,7 +499,7 @@ unsafe fn self_test() -> i32 {
         check("saved file exists", tmp.exists());
         check("dirty cleared by save", !DIRTY.load(Relaxed));
         (*buf).text_const_i8_str("");
-        (*buf).loadfile(cstr(&tmp_s).as_ptr(), 128 * 1024);
+        (*buf).loadfile_with_defaults(cstr(&tmp_s).as_ptr());
         let txt = CStr::from_ptr((*buf).text()).to_string_lossy().into_owned();
         check("round-trip content", txt == "hello rustcc\nsecond line\n");
 
