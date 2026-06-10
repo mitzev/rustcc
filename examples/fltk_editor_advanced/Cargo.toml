@@ -1,0 +1,40 @@
+# Standalone manifest (outside the workspace) so the libclang-feature
+# dependency on cxx_importer doesn't bleed into the main workspace.
+#
+# Two-step build (see README.md):
+#   1. `cargo run --release --bin gen_bindings`     (stock nightly + libclang)
+#   2. `cargo +rustcc run --release --bin editor`   (rustcc fork — the `class` keyword)
+#      append `-- --self-test` for the headless probe run.
+[package]
+name = "fltk_editor_advanced"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "gen_bindings"
+path = "gen_bindings.rs"
+
+[[bin]]
+name = "editor"
+path = "src/main.rs"
+
+[dependencies]
+cxx_importer = { path = "../../crates/cxx_importer", features = ["libclang", "build"] }
+rustc_abi_cxx = { path = "../../crates/rustc_abi_cxx" }
+# The generated bindings emit `::cxx::CxxBase<Base>` upcast impls for
+# the imported FLTK inheritance chains.
+cxx = { path = "../../crates/cxx" }
+
+[build-dependencies]
+cc = "1"
+
+# Single codegen unit: the fork's collector roots a Rust class's
+# drop-in-place glue (referenced by its vtable's deleting-dtor thunk)
+# only in the class's defining CGU; with the default 16 release CGUs
+# the cross-CGU reference comes out undefined at link time. Known fork
+# limitation — see the project bug review.
+[profile.release]
+codegen-units = 1
+
+[workspace]
