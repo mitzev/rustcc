@@ -2193,21 +2193,17 @@ impl<'a> Importer<'a> {
 
                     }
                 })?;
-                // M15: collapse pointer-to-function-type to a bare
-                // `CxxType::Fn` rather than `Ptr { pointee: Fn }`.
-                // Itanium and Rust both treat function pointers as
-                // a single ABI unit, so the extra `Ptr` indirection
-                // would lead the renderer to emit `*const fn(...)`
-                // — wrong for callbacks. Keep one level of pointer
-                // indirection (`void (*)(int)`) but drop it for
-                // higher levels (`void (**)(int)` keeps the outer
-                // Ptr around the Fn).
-                if matches!(
-                    pointee.get_kind(),
-                    TypeKind::FunctionPrototype | TypeKind::FunctionNoPrototype,
-                ) {
-                    self.import_function_proto(pointee, where_)?
-                } else {
+                // v1.13.10: model pointer-to-function FAITHFULLY as
+                // `Ptr { pointee: Fn }`. The old M15 collapse to a bare
+                // `Fn` kept the renderer honest (it would have emitted
+                // `*mut fn(...)`), but it broke the MANGLER: the param
+                // encoded as `Fviiii…E` instead of `PFviiii…E`, so
+                // every method taking a fn-pointer-typedef param (e.g.
+                // `Fl_Text_Buffer::add_modify_callback`) linked against
+                // a symbol that doesn't exist. The renderer now
+                // collapses `Ptr{Fn}` itself (one `Option<fn>`), so the
+                // model can carry the real shape end to end.
+                {
                     let id = self.import_type(pointee, where_)?;
                     CxxType::Ptr {
                         pointee: id,

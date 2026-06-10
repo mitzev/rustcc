@@ -801,3 +801,87 @@ fn mangle_templates_nttp_matches_clang() {
         "_Z10take_stack5StackIi3BoxE"
     );
 }
+
+/// v1.13.10: function-pointer parameters mangle as `PF<ret><params>E`
+/// (Itanium §5.1.5.1) with full substitution participation — pinned
+/// against clang for FLTK's `Fl_Callback` shapes. Was a literal `F?E`,
+/// which made every callback-taking method unlinkable.
+#[test]
+fn fn_pointer_params_match_clang() {
+    use rustc_abi_cxx::{
+        ClassDef, CvQual, CxxType, CxxTypeCtx, FnSig, Ident, IntWidth,
+        MethodName, NameSegment, NestedName, RecordKind, Symbol, Target,
+    };
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let void = ctx.intern_type(CxxType::Void);
+    let int = ctx.intern_type(CxxType::Int { signed: true, width: IntWidth::I32 });
+    let chr = ctx.intern_type(CxxType::Int { signed: true, width: IntWidth::I8 });
+    let widget = ctx.define_class(ClassDef {
+        name: NestedName(vec![NameSegment::Class(Ident("Fl_Widget".into()))]),
+        bases: vec![],
+        fields: vec![],
+        methods: vec![],
+        kind: RecordKind::Struct,
+        is_polymorphic: false,
+        is_final: false,
+        source_alignment: None,
+    });
+    let widget_ty = ctx.intern_type(CxxType::Record(widget));
+    let p_widget = ctx.intern_type(CxxType::Ptr { pointee: widget_ty, cv: CvQual::default() });
+    let p_void = ctx.intern_type(CxxType::Ptr { pointee: void, cv: CvQual::default() });
+    // void (*)(Fl_Widget*, void*)
+    let cb_fn = ctx.intern_type(CxxType::Fn(FnSig {
+        params: vec![p_widget, p_void],
+        ret: void,
+        cv: CvQual::default(),
+        ref_q: None,
+        variadic: false,
+        noexcept: false,
+    }));
+    let p_cb = ctx.intern_type(CxxType::Ptr { pointee: cb_fn, cv: CvQual::default() });
+
+    // void Fl_Widget::callback(Fl_Callback*)  ->  _ZN9Fl_Widget8callbackEPFvPS_PvE
+    let sym = ctx.mangle_itanium(&Symbol::Method {
+        class: widget,
+        name: MethodName::Ident(Ident("callback".into())),
+        sig: FnSig {
+            params: vec![p_cb],
+            ret: void,
+            cv: CvQual::default(),
+            ref_q: None,
+            variadic: false,
+            noexcept: false,
+        },
+    });
+    assert_eq!(sym, "_ZN9Fl_Widget8callbackEPFvPS_PvE");
+
+    // void M::add(const char*, int, Fl_Callback*, void*, int)
+    //   ->  _ZN1M3addEPKciPFvP9Fl_WidgetPvES4_i
+    let m = ctx.define_class(ClassDef {
+        name: NestedName(vec![NameSegment::Class(Ident("M".into()))]),
+        bases: vec![],
+        fields: vec![],
+        methods: vec![],
+        kind: RecordKind::Struct,
+        is_polymorphic: false,
+        is_final: false,
+        source_alignment: None,
+    });
+    let pkc = ctx.intern_type(CxxType::Ptr {
+        pointee: chr,
+        cv: CvQual { is_const: true, is_volatile: false },
+    });
+    let sym2 = ctx.mangle_itanium(&Symbol::Method {
+        class: m,
+        name: MethodName::Ident(Ident("add".into())),
+        sig: FnSig {
+            params: vec![pkc, int, p_cb, p_void, int],
+            ret: void,
+            cv: CvQual::default(),
+            ref_q: None,
+            variadic: false,
+            noexcept: false,
+        },
+    });
+    assert_eq!(sym2, "_ZN1M3addEPKciPFvP9Fl_WidgetPvES4_i");
+}

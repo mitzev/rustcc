@@ -449,7 +449,27 @@ impl<'a> Mangler<'a> {
                     self.out.push('E');
                 }
             }
-            CxxType::Fn(_) => self.out.push_str("F?E"),
+            // Function type (Itanium §5.1.5.1): `F <ret> <params> E`.
+            // Appears in practice behind a pointer (`PFvP9Fl_WidgetPvE`
+            // = `void (*)(Fl_Widget*, void*)` — FLTK's Fl_Callback) —
+            // the `P` comes from the enclosing Ptr arm. Was a literal
+            // `F?E`, which produced 63 unlinkable symbols in the FLTK
+            // bindings and dropped the whole menu/callback surface.
+            CxxType::Fn(sig) => {
+                self.out.push('F');
+                self.emit_type(sig.ret);
+                if sig.params.is_empty() {
+                    self.out.push('v');
+                } else {
+                    for &p in &sig.params {
+                        self.emit_type(p);
+                    }
+                }
+                if sig.variadic {
+                    self.out.push('z');
+                }
+                self.out.push('E');
+            }
             CxxType::MemberPtr { .. } => self.out.push_str("M??"),
         }
     }

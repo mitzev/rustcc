@@ -3910,7 +3910,16 @@ fn m15_lowers_function_pointer_alias_to_fn_type() {
         .iter()
         .find(|a| a.name.0 == "SignalHandler")
         .expect("SignalHandler alias captured");
-    match ctx.type_of(alias.target) {
+    // v1.13.10: pointer-to-function is modeled FAITHFULLY as
+    // `Ptr { pointee: Fn }` so the mangler emits `PF…E` (the old bare-Fn
+    // collapse dropped the `P`, producing unlinkable symbols for every
+    // fn-pointer-typedef method param). The renderer collapses the pair
+    // to a single `Option<fn>` itself.
+    let fn_ty = match ctx.type_of(alias.target) {
+        CxxType::Ptr { pointee, .. } => *pointee,
+        other => panic!("expected Ptr{{Fn}}, got {other:?}"),
+    };
+    match ctx.type_of(fn_ty) {
         CxxType::Fn(sig) => {
             assert_eq!(sig.params.len(), 1);
             assert!(matches!(

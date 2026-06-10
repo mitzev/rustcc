@@ -4984,6 +4984,17 @@ fn render_rust_type_with_opts(
             }
         },
         CxxType::Ptr { pointee, cv } => {
+            // Pointer-to-FUNCTION collapses: the Fn arm already renders
+            // `Option<unsafe extern "C" fn(...)>`, which IS the
+            // (nullable) function pointer. Wrapping another `*mut`
+            // produced a double pointer for params declared through a
+            // function-TYPE typedef (FLTK's `Fl_Callback*`), making
+            // every menu/callback registration ABI-wrong on the Rust
+            // side. (Typedefs that are already pointers — e.g.
+            // `Fl_Text_Modify_Cb` — never hit this arm twice.)
+            if matches!(ctx.type_of(*pointee), CxxType::Fn(_)) {
+                return render_rust_type_with_opts(ctx, *pointee, where_, opts);
+            }
             let inner = if opts.cstr_ergonomics && is_byte_int(ctx, *pointee) {
                 "::core::ffi::c_char".to_string()
             } else {
@@ -5701,7 +5712,12 @@ fn synthesize_default_literal(ctx: &CxxTypeCtx, ty: TypeId) -> Option<String> {
             FloatKind::F64 => Some("0.0_f64".to_string()),
             FloatKind::LongDouble => None,
         },
-        CxxType::Ptr { cv, .. } => {
+        CxxType::Ptr { pointee, cv } => {
+            // Pointer-to-function renders as `Option<fn>` (see
+            // render_rust_type), so its null default is `None`.
+            if matches!(ctx.type_of(*pointee), CxxType::Fn(_)) {
+                return Some("::core::option::Option::None".to_string());
+            }
             // Raw pointers: null is the universal C++ default.
             if cv.is_const {
                 Some("::core::ptr::null()".to_string())
