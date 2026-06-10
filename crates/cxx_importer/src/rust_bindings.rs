@@ -1081,23 +1081,65 @@ fn build_imported_vtable_attr(ctx: &CxxTypeCtx, class_id: ClassId) -> Option<Str
     // most slots are inherited rather than declared on the leaf class.
     let slots = ctx.primary_vtable_slots(class_id)?;
 
+    // The D1/D0 destructor pair sits at the dtor's DECLARATION position
+    // (Itanium §2.5.2), which `primary_vtable_slots` now models
+    // faithfully. Compatibility split:
+    //   - dtor pair in LEADING position (slots 0..2 — e.g. all of FLTK,
+    //     whose `~Fl_Widget` is declared first): emit the legacy
+    //     `vdtor=1` flag with no positional record. Old toolchains
+    //     prepend the pair, which is exactly right here.
+    //   - dtor pair anywhere else: emit a positional `slot=~dtor,~`
+    //     marker the v1.13.10+ fork places in-position. Legacy
+    //     toolchains mis-built these vtables anyway (pair pinned to the
+    //     front), so the new record breaks nothing that worked.
+    let dtor_leading = slots.first().is_some_and(|s| s.is_dtor);
     let mut slot_specs: Vec<String> = Vec::new();
     let mut has_vdtor = false;
+    let mut dtor_marker_emitted = false;
+    let mut unnamed_idx = 0usize;
     for s in &slots {
-        // Virtual destructor: the derived Rust class supplies its own
-        // `D1`/`D0` in the leading slots (P09.x / 1.13.7), so record the
-        // flag and skip the base's dtor entries.
         if s.is_dtor {
             has_vdtor = true;
+            // The two dtor entries (D1 then D0) collapse into ONE
+            // marker record; the fork expands it back to the pair.
+            if !dtor_leading && !dtor_marker_emitted {
+                slot_specs.push("slot=~dtor,~".to_string());
+                dtor_marker_emitted = true;
+            }
             continue;
         }
-        // Skip operator/conversion slots (no plain name to match an
-        // `override fn` against); the base keeps its own implementation.
-        let Some(name) = &s.name else { continue };
-        if name.is_empty() {
-            continue;
+        match &s.name {
+            Some(name) if !name.is_empty() => {
+                // Third field (v1.13.10): the Itanium parameter
+                // encoding at the DECLARING class — the fork uses it
+                // to disambiguate overloaded names and to
+                // signature-check `override fn`s. Old toolchains'
+                // `splitn(2, ',')` folds it into the symbol field of
+                // a record they only consume by name+position, so
+                // legacy layouts are unaffected... except the symbol
+                // would gain a stray suffix — emit the legacy 2-field
+                // form when there is no overload pressure AND psig is
+                // unavailable; otherwise always 3-field.
+                match &s.param_sig {
+                    Some(psig) => slot_specs.push(format!(
+                        "slot={},{},{}",
+                        name, s.mangled_target, psig
+                    )),
+                    None => slot_specs
+                        .push(format!("slot={},{}", name, s.mangled_target)),
+                }
+            }
+            // Operator / conversion virtuals have no plain name an
+            // `override fn` could match, but they OCCUPY slots —
+            // dropping them used to shift every later index. `~op<N>`
+            // preserves the position; `~` is impossible in both C++
+            // and Rust identifiers, so the record can never collide
+            // with a real method or be matched by an override.
+            _ => {
+                slot_specs.push(format!("slot=~op{},{}", unnamed_idx, s.mangled_target));
+                unnamed_idx += 1;
+            }
         }
-        slot_specs.push(format!("slot={},{}", name, s.mangled_target));
     }
     // Nothing to extend (not polymorphic in a useful way) → no attribute.
     if slot_specs.is_empty() && !has_vdtor {
@@ -1166,7 +1208,8 @@ fn render_direct_extern_class(
         let _ = writeln!(block, "{indent}#[repr(C)]");
         let _ = writeln!(
             block,
-            "{indent}pub struct {class_name} {{ _opaque: [::core::mem::MaybeUninit<u8>; 0] }}",
+            "{indent}pub struct {class_name} {{ _opaque: [::core::mem::MaybeUninit<u8>; 0], \
+             _not_send_sync: ::core::marker::PhantomData<*mut u8> }}",
         );
         return Ok(block);
     }
@@ -1229,6 +1272,17 @@ fn render_direct_extern_class(
         block,
         "{indent}    _opaque: [::core::mem::MaybeUninit<u8>; {}],",
         layout.size_bytes,
+    );
+    // v1.13.10: a C++ object is not thread-portable by default — its
+    // methods and destructor may touch thread-affine state (GUI
+    // toolkits especially). Without a marker the byte-array struct is
+    // auto-`Send + Sync`, letting SAFE code move e.g. an `Fl_Window`
+    // to another thread. `PhantomData<*mut u8>` (a ZST — layout
+    // unchanged) suppresses both; types audited as thread-safe can
+    // opt back in with explicit `unsafe impl Send/Sync` downstream.
+    let _ = writeln!(
+        block,
+        "{indent}    _not_send_sync: ::core::marker::PhantomData<*mut u8>,",
     );
     let _ = writeln!(block, "{indent}}}");
     let _ = writeln!(block);
@@ -2960,7 +3014,7 @@ fn render_direct_extern_wrapper(
                 }
                 let _ = writeln!(
                     out,
-                    "{indent}    if __raw.kind == ::cxx::CXX_EXC_OK {{",
+                    "{indent}    if __raw.kind() == ::cxx::CXX_EXC_OK {{",
                 );
                 let _ = writeln!(
                     out,
@@ -2971,7 +3025,7 @@ fn render_direct_extern_wrapper(
                 let _ = writeln!(
                     out,
                     "{indent}        ::core::result::Result::Err(unsafe {{ \
-                     ::cxx::CxxException::from_raw(__raw.kind, __raw.message) }})",
+                     ::cxx::CxxException::from_raw(__raw.kind(), __raw.message_ptr()) }})",
                 );
                 let _ = writeln!(out, "{indent}    }}");
             } else {
@@ -3004,6 +3058,63 @@ fn render_direct_extern_wrapper(
                 let _ = writeln!(out, "{indent}    }}");
             }
             let _ = writeln!(out, "{indent}}}");
+
+            // v1.13.10: placement-construct sibling. The by-value
+            // wrapper above runs the C++ ctor into a STACK temporary
+            // and bitwise-moves the result out — but Rust does not
+            // guarantee eliding that move, so a constructor that
+            // escapes `this` (self-registration, internal children
+            // holding back-pointers — e.g. FLTK widgets) ends up with
+            // dangling self-references. `*_at` runs the ctor directly
+            // at the FINAL address, which is what the underlying C++
+            // shim takes anyway.
+            if !emission.throws {
+                let _ = writeln!(out);
+                let _ = writeln!(
+                    out,
+                    "{indent}/// Placement-construct at `this` (the C++ ctor runs at the",
+                );
+                let _ = writeln!(
+                    out,
+                    "{indent}/// FINAL address — use for ctors that escape `this`).",
+                );
+                let _ = writeln!(out, "{indent}///");
+                let _ = writeln!(out, "{indent}/// # Safety");
+                let _ = writeln!(
+                    out,
+                    "{indent}/// `this` must be valid for writes of `size_of::<Self>()` and",
+                );
+                let _ = writeln!(
+                    out,
+                    "{indent}/// properly aligned; the storage must not contain a live value.",
+                );
+                if emission.wrapper_params.is_empty() {
+                    let _ = writeln!(
+                        out,
+                        "{indent}pub unsafe fn {name}_at(this: *mut Self) {{",
+                        name = display_name,
+                    );
+                    let _ = writeln!(
+                        out,
+                        "{indent}    unsafe {{ {ext}(this); }}",
+                        ext = emission.extern_ident,
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "{indent}pub unsafe fn {name}_at(this: *mut Self, {params}) {{",
+                        name = display_name,
+                        params = emission.wrapper_params,
+                    );
+                    let _ = writeln!(
+                        out,
+                        "{indent}    unsafe {{ {ext}(this, {fwd}); }}",
+                        ext = emission.extern_ident,
+                        fwd = emission.forward_args,
+                    );
+                }
+                let _ = writeln!(out, "{indent}}}");
+            }
         }
         EmissionKind::Instance => {
             let receiver_kw = match emission.wrapper_receiver {
@@ -3077,7 +3188,7 @@ fn render_direct_extern_wrapper(
                     );
                     let _ = writeln!(
                         out,
-                        "{indent}    if __raw.kind == ::cxx::CXX_EXC_OK {{",
+                        "{indent}    if __raw.kind() == ::cxx::CXX_EXC_OK {{",
                     );
                     let _ = writeln!(
                         out,
@@ -3088,7 +3199,7 @@ fn render_direct_extern_wrapper(
                     let _ = writeln!(
                         out,
                         "{indent}        ::core::result::Result::Err(unsafe {{ \
-                         ::cxx::CxxException::from_raw(__raw.kind, __raw.message) }})",
+                         ::cxx::CxxException::from_raw(__raw.kind(), __raw.message_ptr()) }})",
                     );
                     let _ = writeln!(out, "{indent}    }}");
                 }
@@ -3260,7 +3371,7 @@ fn render_direct_extern_wrapper(
                     );
                     let _ = writeln!(
                         out,
-                        "{indent}    if __raw.kind == ::cxx::CXX_EXC_OK {{",
+                        "{indent}    if __raw.kind() == ::cxx::CXX_EXC_OK {{",
                     );
                     let _ = writeln!(
                         out,
@@ -3271,7 +3382,7 @@ fn render_direct_extern_wrapper(
                     let _ = writeln!(
                         out,
                         "{indent}        ::core::result::Result::Err(unsafe {{ \
-                         ::cxx::CxxException::from_raw(__raw.kind, __raw.message) }})",
+                         ::cxx::CxxException::from_raw(__raw.kind(), __raw.message_ptr()) }})",
                     );
                     let _ = writeln!(out, "{indent}    }}");
                 }
@@ -5422,7 +5533,7 @@ fn render_free_fns(
                 );
                 let _ = writeln!(
                     out,
-                    "{indent}    if __raw.kind == ::cxx::CXX_EXC_OK {{",
+                    "{indent}    if __raw.kind() == ::cxx::CXX_EXC_OK {{",
                 );
                 let _ = writeln!(
                     out,
@@ -5432,7 +5543,7 @@ fn render_free_fns(
                 let _ = writeln!(
                     out,
                     "{indent}        ::core::result::Result::Err(unsafe {{ \
-                     ::cxx::CxxException::from_raw(__raw.kind, __raw.message) }})",
+                     ::cxx::CxxException::from_raw(__raw.kind(), __raw.message_ptr()) }})",
                 );
                 let _ = writeln!(out, "{indent}    }}");
             }

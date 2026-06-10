@@ -163,17 +163,25 @@ fn build_subtable_entries(
         // from `most_derived` down toward the class that originally
         // declared the slot; the first class that re-declares the
         // method with a matching signature wins.
-        let target_class = find_overrider(ctx, most_derived, slot.declared_in, &slot.method);
-        // Resolve the actual MethodDef on `target_class` rather than
-        // assuming the slot index matches there.
         let original = ctx.class(slot.declared_in).methods[slot.method.as_index()].clone();
+        let slot_is_dtor = matches!(original.special, Some(SpecialMember::Dtor));
+        // The destructor slot ALWAYS belongs to the most-derived class
+        // (clang-cl: an IMPLICIT derived dtor still puts `D::~D()
+        // [scalar deleting]` in the vftable). `find_overrider` only
+        // matches explicitly declared dtors, which used to leave the
+        // BASE's dtor in a derived class's slot.
+        let target_class = if slot_is_dtor {
+            most_derived
+        } else {
+            find_overrider(ctx, most_derived, slot.declared_in, &slot.method)
+        };
         let method = ctx
             .class(target_class)
             .methods
             .iter()
             .find(|m| methods_override(&original, m))
             .unwrap_or(&ctx.class(slot.declared_in).methods[slot.method.as_index()]);
-        let mangled = if matches!(method.special, Some(SpecialMember::Dtor)) {
+        let mangled = if slot_is_dtor {
             // MSVC's vtable dtor slot points at the scalar deleting
             // dtor `??_G`, not the base dtor. We model that as a
             // synthetic Dtor symbol using the D0 variant marker.
@@ -233,10 +241,28 @@ fn compute_slots(ctx: &CxxTypeCtx, subobj: ClassId) -> Vec<Slot> {
                 // original declarer's, which we keep.
                 continue;
             }
-            slots.push(Slot {
-                method: MethodId(idx as u32),
-                declared_in: class,
-            });
+            // MSVC quirk (verified vs clang-cl): ADJACENT same-name
+            // overloads introduced by the same class land in REVERSE
+            // declaration order — `h(int); h(double); k();` lays out
+            // as [h(double), h(int), k]. Insert before the contiguous
+            // run of same-name slots this class just emitted.
+            let mut insert_at = slots.len();
+            while insert_at > 0 {
+                let prev = &slots[insert_at - 1];
+                if prev.declared_in != class {
+                    break;
+                }
+                let prev_m =
+                    &ctx.class(prev.declared_in).methods[prev.method.as_index()];
+                if prev_m.name != m.name {
+                    break;
+                }
+                insert_at -= 1;
+            }
+            slots.insert(
+                insert_at,
+                Slot { method: MethodId(idx as u32), declared_in: class },
+            );
         }
     }
     slots
@@ -396,5 +422,149 @@ mod tests {
             }
             _ => panic!("expected fn-ptr entry"),
         }
+    }
+
+    fn msvc_virt(name: &str, c: &mut CxxTypeCtx, ret: Option<crate::ty::TypeId>, special: Option<SpecialMember>) -> MethodDef {
+        let v = ret.unwrap_or_else(|| c.intern_type(crate::ty::CxxType::Void));
+        MethodDef {
+            access: Default::default(),
+            name: MethodName::Ident(Ident(name.into())),
+            sig: FnSig {
+                params: vec![],
+                ret: v,
+                cv: crate::ty::CvQual::default(),
+                ref_q: None,
+                variadic: false,
+                noexcept: special.is_some(),
+            },
+            virtuality: Virtuality::Virtual,
+            vtable_index: None,
+            special,
+        }
+    }
+
+    fn msvc_fn_ptrs(c: &CxxTypeCtx, id: ClassId) -> Vec<String> {
+        let vt = c.vtable_msvc(id).expect("polymorphic");
+        vt.sub_tables[0]
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                crate::VTableEntry::FunctionPointer { mangled_target, .. } => {
+                    Some(mangled_target.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// clang-cl: the vftable's dtor slot is the SCALAR DELETING dtor
+    /// `??_G…UEAAPEAXI@Z`, never the plain `??1`; and an IMPLICIT
+    /// derived dtor still targets the most-derived class.
+    #[test]
+    fn dtor_slot_is_scalar_deleting_of_most_derived() {
+        let mut c = ctx();
+        let base_dtor = msvc_virt("~B", &mut c, None, Some(SpecialMember::Dtor));
+        let b = c.define_class(ClassDef {
+            name: crate::ty::NestedName(vec![crate::ty::NameSegment::Class(Ident("B".into()))]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![base_dtor],
+            kind: crate::ty::RecordKind::Struct,
+            is_polymorphic: true,
+            is_final: false,
+            source_alignment: None,
+        });
+        // D : B declares NO dtor (implicit) — slot must still be ??_GD.
+        let d = c.define_class(ClassDef {
+            name: crate::ty::NestedName(vec![crate::ty::NameSegment::Class(Ident("D".into()))]),
+            bases: vec![crate::ty::BaseSpec {
+                class: b,
+                virtual_: false,
+                access: crate::ty::Access::Public,
+            }],
+            fields: vec![],
+            methods: vec![],
+            kind: crate::ty::RecordKind::Struct,
+            is_polymorphic: true,
+            is_final: false,
+            source_alignment: None,
+        });
+        assert_eq!(msvc_fn_ptrs(&c, b), vec!["??_GB@@UEAAPEAXI@Z"]);
+        assert_eq!(msvc_fn_ptrs(&c, d), vec!["??_GD@@UEAAPEAXI@Z"]);
+    }
+
+    /// clang-cl: `h(int); h(double); k();` lays out as
+    /// [h(double), h(int), k] — adjacent same-name overloads reverse.
+    #[test]
+    fn adjacent_overload_groups_reverse() {
+        let mut c = ctx();
+        let v = c.intern_type(crate::ty::CxxType::Void);
+        let i = c.intern_type(crate::ty::CxxType::Int {
+            signed: true,
+            width: crate::ty::IntWidth::I32,
+        });
+        let f = c.intern_type(crate::ty::CxxType::Float {
+            kind: crate::ty::FloatKind::F64,
+        });
+        let mk = |name: &str, param: crate::ty::TypeId| MethodDef {
+            access: Default::default(),
+            name: MethodName::Ident(Ident(name.into())),
+            sig: FnSig {
+                params: vec![param],
+                ret: v,
+                cv: crate::ty::CvQual::default(),
+                ref_q: None,
+                variadic: false,
+                noexcept: false,
+            },
+            virtuality: Virtuality::Virtual,
+            vtable_index: None,
+            special: None,
+        };
+        let mut k = msvc_virt("k", &mut c, Some(v), None);
+        k.sig.ret = v;
+        let ov = c.define_class(ClassDef {
+            name: crate::ty::NestedName(vec![crate::ty::NameSegment::Class(Ident("Ov".into()))]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![mk("h", i), mk("h", f), k],
+            kind: crate::ty::RecordKind::Struct,
+            is_polymorphic: true,
+            is_final: false,
+            source_alignment: None,
+        });
+        let ptrs = msvc_fn_ptrs(&c, ov);
+        assert_eq!(ptrs.len(), 3);
+        // h(double) first, then h(int), then k.
+        assert!(ptrs[0].starts_with("?h@Ov@@") && ptrs[0].contains('N'), "{ptrs:?}");
+        assert!(ptrs[1].starts_with("?h@Ov@@") && ptrs[1].contains('H'), "{ptrs:?}");
+        assert!(ptrs[2].starts_with("?k@Ov@@"), "{ptrs:?}");
+    }
+
+    /// clang-cl: the dtor slot sits at its DECLARATION position —
+    /// `early(); ~NotFirst(); late();` lays out [early, ??_G, late].
+    #[test]
+    fn msvc_dtor_at_declaration_position() {
+        let mut c = ctx();
+        let v = c.intern_type(crate::ty::CxxType::Void);
+        let early = msvc_virt("early", &mut c, Some(v), None);
+        let dtor = msvc_virt("~NotFirst", &mut c, None, Some(SpecialMember::Dtor));
+        let late = msvc_virt("late", &mut c, Some(v), None);
+        let nf = c.define_class(ClassDef {
+            name: crate::ty::NestedName(vec![crate::ty::NameSegment::Class(Ident(
+                "NotFirst".into(),
+            ))]),
+            bases: vec![],
+            fields: vec![],
+            methods: vec![early, dtor, late],
+            kind: crate::ty::RecordKind::Struct,
+            is_polymorphic: true,
+            is_final: false,
+            source_alignment: None,
+        });
+        let ptrs = msvc_fn_ptrs(&c, nf);
+        assert!(ptrs[0].starts_with("?early@"), "{ptrs:?}");
+        assert_eq!(ptrs[1], "??_GNotFirst@@UEAAPEAXI@Z", "{ptrs:?}");
+        assert!(ptrs[2].starts_with("?late@"), "{ptrs:?}");
     }
 }

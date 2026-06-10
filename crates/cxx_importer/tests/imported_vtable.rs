@@ -178,3 +178,60 @@ public:\n\
         "protected virtuals must not get callable Rust wrappers:\n{out}"
     );
 }
+
+/// Dtor at its DECLARATION position (not first) + operator virtuals:
+/// the attr carries a positional `slot=~dtor,~` marker and `~op<N>`
+/// placeholders so no slot index ever shifts. A dtor-FIRST class (the
+/// FLTK shape) keeps the legacy flag-only form for fork back-compat.
+#[test]
+fn dtor_position_and_operator_slots_are_positional() {
+    let src = "\
+struct NotFirst {\n\
+  int x;\n\
+  explicit NotFirst(int x_);\n\
+  virtual int early();\n\
+  virtual ~NotFirst();\n\
+  virtual bool operator==(const NotFirst& o) const;\n\
+  virtual int late();\n\
+};\n";
+    let out = emit(src, "dtorpos");
+    let attr = out
+        .lines()
+        .find(|l| l.contains("rustc_cxx_imported_vtable") && l.contains("_ZTV8NotFirst"))
+        .expect("NotFirst must carry an imported-vtable attribute");
+
+    // Records in C++ declaration order: early, ~dtor marker, ~op0
+    // (operator==), late.
+    let p = |needle: &str| {
+        attr.find(needle)
+            .unwrap_or_else(|| panic!("missing `{needle}` in:\n{attr}"))
+    };
+    let p_early = p("slot=early,_ZN8NotFirst5earlyEv");
+    let p_dtor = p("slot=~dtor,~");
+    let p_op = p("slot=~op0,_ZNK8NotFirsteqERKS_");
+    let p_late = p("slot=late,_ZN8NotFirst4lateEv");
+    assert!(
+        p_early < p_dtor && p_dtor < p_op && p_op < p_late,
+        "positional order must be early < ~dtor < ~op0 < late:\n{attr}"
+    );
+    assert!(attr.contains("vdtor=1"), "vdtor flag still required:\n{attr}");
+
+    // Control: a dtor-FIRST class emits NO ~dtor marker (legacy form).
+    let src_first = "\
+struct DtorFirst {\n\
+  int x;\n\
+  explicit DtorFirst(int x_);\n\
+  virtual ~DtorFirst();\n\
+  virtual int only();\n\
+};\n";
+    let out2 = emit(src_first, "dtorfirst");
+    let attr2 = out2
+        .lines()
+        .find(|l| l.contains("rustc_cxx_imported_vtable") && l.contains("_ZTV9DtorFirst"))
+        .expect("DtorFirst attr");
+    assert!(attr2.contains("vdtor=1"), "{attr2}");
+    assert!(
+        !attr2.contains("~dtor"),
+        "dtor-first must use the legacy flag-only form:\n{attr2}"
+    );
+}

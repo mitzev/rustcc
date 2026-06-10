@@ -3777,8 +3777,12 @@ fn m15b_emits_wrapper_for_callback_alias_with_void_user_data() {
         src.contains("pub fn fn_ptr(&self) -> Fl_Callback"),
         "Wrapper::fn_ptr accessor missing or wrong return type; got:\n{src}",
     );
+    // `*mut ()`, matching how `render_rust_type` renders the alias's
+    // own `void*` param — `fn_ptr()` casts the thunk to the alias
+    // type, so the two MUST agree (a `c_void` here used to make every
+    // generated wrapper a type-mismatch compile error).
     assert!(
-        src.contains("pub fn user_data(&self) -> *mut ::core::ffi::c_void"),
+        src.contains("pub fn user_data(&self) -> *mut ()"),
         "Wrapper::user_data accessor missing; got:\n{src}",
     );
     // The thunk reclaims the boxed closure on drop.

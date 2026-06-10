@@ -223,8 +223,37 @@ pub const CXX_EXC_TYPED_BASE: u32 = 16;
 #[repr(C)]
 #[cfg_attr(feature = "rustcc-fork", rustc_diagnostic_item = "CxxRawError")]
 pub struct CxxRawError {
-    pub kind: u32,
-    pub message: *const std::os::raw::c_char,
+    // v1.13.10: crate-private. With public fields, SAFE code could
+    // build `CxxRawError { message: 1 as *const _ }` and feed it to
+    // the safe `From<CxxRawError> for CxxException` impl, which runs
+    // `CStr::from_ptr` on it — UB from safe code. All out-of-crate
+    // construction now goes through the unsafe [`Self::new`]; the
+    // layout (repr(C): u32 + pointer) is unchanged, so the C++ shims
+    // that return this struct by value across FFI are unaffected.
+    pub(crate) kind: u32,
+    pub(crate) message: *const std::os::raw::c_char,
+}
+
+impl CxxRawError {
+    /// Build a raw error manually.
+    ///
+    /// # Safety
+    /// `message` must be null or point to a NUL-terminated string that
+    /// stays alive until the value is decoded (the `From` impl /
+    /// [`CxxException::from_raw`] read it immediately).
+    pub unsafe fn new(kind: u32, message: *const std::os::raw::c_char) -> Self {
+        Self { kind, message }
+    }
+
+    /// The exception-kind tag (`CXX_EXC_OK` / `CXX_EXC_STD` / …).
+    pub fn kind(&self) -> u32 {
+        self.kind
+    }
+
+    /// The raw message pointer (possibly null).
+    pub fn message_ptr(&self) -> *const std::os::raw::c_char {
+        self.message
+    }
 }
 
 /// Decode the raw FFI return into a `Result`. Used by the

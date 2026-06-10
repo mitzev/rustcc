@@ -258,14 +258,24 @@ impl<'a> MsvcMangler<'a> {
                 });
             }
             Symbol::Dtor { class, variant } => {
-                // Dtor: `??1Class@@<info>` (vector deleting dtor is
-                // a separate symbol `??_E`, scalar deleting is
-                // `??_G`. The D2/D1/D0 distinction maps roughly to
-                // base / complete / deleting; for the layer this
-                // crate models, we emit the base (`??1`) and let
-                // the caller request the deleting variants
-                // separately via vtable entries.)
-                let _ = variant;
+                // Dtor symbols: `??1` is the plain destructor; the
+                // vftable's dtor slot holds the SCALAR DELETING
+                // destructor `??_G` (vector deleting `??_E` is for
+                // `delete[]`). The D2/D1/D0 distinction maps roughly
+                // to base / complete / deleting — `D0` therefore
+                // selects `??_G`: `??_G<name>@@UEAAPEAXI@Z` (public
+                // virtual member, x64/arm64 encoding, returns void*,
+                // takes the unsigned-int delete flags). Ignoring the
+                // variant here used to put the PLAIN dtor in the
+                // vftable slot, so `delete p;` through the vtable
+                // never freed memory.
+                if *variant == DtorVariant::D0 {
+                    self.out.push_str("??_G");
+                    let class_path = &self.ctx.class(*class).name.0;
+                    self.emit_qualified_name_tail(class_path);
+                    self.out.push_str("UEAAPEAXI@Z");
+                    return;
+                }
                 self.out.push_str("??1");
                 let class_path = &self.ctx.class(*class).name.0;
                 self.emit_qualified_name_tail(class_path);

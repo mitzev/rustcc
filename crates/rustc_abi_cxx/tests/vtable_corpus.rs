@@ -626,3 +626,137 @@ fn vtable_multi_level_matches_clang() {
     );
     assert_eq!(actual, expected);
 }
+
+// -------- Dtor declaration-position regression (v1.13.10) ---------------
+//
+// Itanium §2.5.2 places vtable components in DECLARATION order; the
+// D1/D0 destructor pair occupies the virtual destructor's declaration
+// position. The old model pinned the pair to the front (and dropped
+// dtors introduced off-root entirely). All three shapes below are
+// pinned against `clang++ -fdump-vtable-layouts`.
+
+fn virt(name: &str, ret: TypeId, special: Option<SpecialMember>) -> MethodDef {
+    MethodDef {
+        access: Default::default(),
+        name: MethodName::Ident(Ident(name.to_string())),
+        sig: sig_no_args(ret, CvQual::default(), special.is_some()),
+        virtuality: Virtuality::Virtual,
+        vtable_index: None,
+        special,
+    }
+}
+
+fn fn_ptrs(ctx: &CxxTypeCtx, class_id: ClassId) -> Vec<String> {
+    let vt = ctx.vtable(class_id).expect("polymorphic");
+    vt.sub_tables[0]
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            VTableEntry::FunctionPointer { mangled_target, .. } => {
+                Some(mangled_target.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// `struct A { virtual void f(); virtual ~A(); virtual void g(); }`
+/// clang: [f, D1, D0, g].
+#[test]
+fn dtor_pair_sits_at_declaration_position() {
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let void = void_ty(&mut ctx);
+    let a = ctx.define_class(ClassDef {
+        name: nested(&["A"]),
+        bases: Vec::new(),
+        fields: Vec::new(),
+        methods: vec![
+            virt("f", void, None),
+            virt("~A", void, Some(SpecialMember::Dtor)),
+            virt("g", void, None),
+        ],
+        kind: RecordKind::Struct,
+        is_polymorphic: true,
+        is_final: false,
+        source_alignment: None,
+    });
+    assert_eq!(
+        fn_ptrs(&ctx, a),
+        vec!["_ZN1A1fEv", "_ZN1AD1Ev", "_ZN1AD0Ev", "_ZN1A1gEv"],
+    );
+}
+
+/// `struct R { virtual void rf(); }; struct M : R { virtual ~M();
+/// virtual void mh(); }` — dtor introduced at level 1. clang for M:
+/// [rf, D1, D0, mh]. The old model dropped the pair entirely here.
+#[test]
+fn dtor_introduced_mid_chain_keeps_its_position() {
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let void = void_ty(&mut ctx);
+    let r = ctx.define_class(ClassDef {
+        name: nested(&["R"]),
+        bases: Vec::new(),
+        fields: Vec::new(),
+        methods: vec![virt("rf", void, None)],
+        kind: RecordKind::Struct,
+        is_polymorphic: true,
+        is_final: false,
+        source_alignment: None,
+    });
+    let m = ctx.define_class(ClassDef {
+        name: nested(&["M"]),
+        bases: vec![BaseSpec { class: r, virtual_: false, access: Access::Public }],
+        fields: Vec::new(),
+        methods: vec![
+            virt("~M", void, Some(SpecialMember::Dtor)),
+            virt("mh", void, None),
+        ],
+        kind: RecordKind::Struct,
+        is_polymorphic: true,
+        is_final: false,
+        source_alignment: None,
+    });
+    assert_eq!(
+        fn_ptrs(&ctx, m),
+        vec!["_ZN1R2rfEv", "_ZN1MD1Ev", "_ZN1MD0Ev", "_ZN1M2mhEv"],
+    );
+}
+
+/// `struct D : A { ~D() override; virtual void d2(); }` — re-declared
+/// dtor overrides IN PLACE (clang for D: [f, D1(D), D0(D), g, d2]).
+#[test]
+fn redeclared_dtor_overrides_in_place() {
+    let mut ctx = CxxTypeCtx::new(Target::aarch64_apple_darwin());
+    let void = void_ty(&mut ctx);
+    let a = ctx.define_class(ClassDef {
+        name: nested(&["A"]),
+        bases: Vec::new(),
+        fields: Vec::new(),
+        methods: vec![
+            virt("f", void, None),
+            virt("~A", void, Some(SpecialMember::Dtor)),
+            virt("g", void, None),
+        ],
+        kind: RecordKind::Struct,
+        is_polymorphic: true,
+        is_final: false,
+        source_alignment: None,
+    });
+    let d = ctx.define_class(ClassDef {
+        name: nested(&["D"]),
+        bases: vec![BaseSpec { class: a, virtual_: false, access: Access::Public }],
+        fields: Vec::new(),
+        methods: vec![
+            virt("~D", void, Some(SpecialMember::Dtor)),
+            virt("d2", void, None),
+        ],
+        kind: RecordKind::Struct,
+        is_polymorphic: true,
+        is_final: false,
+        source_alignment: None,
+    });
+    assert_eq!(
+        fn_ptrs(&ctx, d),
+        vec!["_ZN1A1fEv", "_ZN1DD1Ev", "_ZN1DD0Ev", "_ZN1A1gEv", "_ZN1D2d2Ev"],
+    );
+}

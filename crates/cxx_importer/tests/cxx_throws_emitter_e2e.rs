@@ -363,6 +363,13 @@ pub struct CxxRawError {
     pub message: *const c_char,
 }
 
+impl CxxRawError {
+    // Mirror the real crate's v1.13.10 accessors (the emitter now
+    // reads through getters instead of public fields).
+    pub fn kind(&self) -> u32 { self.kind }
+    pub fn message_ptr(&self) -> *const c_char { self.message }
+}
+
 pub const CXX_EXC_OK: u32 = 0;
 pub const CXX_EXC_STD: u32 = 1;
 pub const CXX_EXC_UNKNOWN: u32 = 2;

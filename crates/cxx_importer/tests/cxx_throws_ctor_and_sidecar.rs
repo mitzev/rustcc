@@ -120,7 +120,7 @@ public:
         &body[..body.len().min(500)]
     );
     assert!(
-        body.contains("__raw.kind == ::cxx::CXX_EXC_OK"),
+        body.contains("__raw.kind() == ::cxx::CXX_EXC_OK"),
         "expected kind check before assume_init; body excerpt:\n{}",
         &body[..body.len().min(500)]
     );

@@ -99,6 +99,20 @@ impl CxxTypeCtx {
         m.mangle_symbol(sym);
         m.out
     }
+
+    /// The Itanium *bare parameter encoding* of a function signature —
+    /// the `<params>` tail of `_ZN…E<params>` (`"v"` for an empty
+    /// list, e.g. `"iPKc"` for `(int, const char*)`). v1.13.10 uses
+    /// this as the optional third `slot=` field of
+    /// `#[rustc_cxx_imported_vtable]` so the fork can disambiguate
+    /// overloaded virtuals and signature-check `override fn`s.
+    /// Substitution state is local to this call, matching a
+    /// standalone declaration's encoding.
+    pub fn mangle_itanium_params(&self, sig: &crate::ty::FnSig) -> String {
+        let mut m = Mangler::new(self);
+        m.emit_params(&sig.params);
+        m.out
+    }
 }
 
 // -------- Substitution-aware mangler -----------------------------------

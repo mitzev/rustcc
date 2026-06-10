@@ -91,8 +91,14 @@ pub struct PrimaryVtableSlot {
     /// The slot's target symbol: the final overrider's mangled name, or
     /// `__cxa_pure_virtual` for an unoverridden pure virtual.
     pub mangled_target: String,
-    /// True for the two leading Itanium destructor slots (`D1`/`D0`).
+    /// True for the destructor slots (`D1`/`D0`, at the dtor's
+    /// declaration position).
     pub is_dtor: bool,
+    /// Itanium bare parameter encoding of the slot's signature at its
+    /// DECLARING class (`"v"`, `"i"`, `"PKc"`, …). `None` for dtor
+    /// slots. v1.13.10: lets the fork disambiguate overloaded names
+    /// and signature-check `override fn`s.
+    pub param_sig: Option<String>,
 }
 
 impl CxxTypeCtx {
@@ -125,18 +131,24 @@ impl CxxTypeCtx {
             else {
                 continue;
             };
-            let (name, is_dtor) = match slot.kind {
-                VSlotKind::DtorD1 | VSlotKind::DtorD0 => (None, true),
+            let (name, is_dtor, param_sig) = match slot.kind {
+                VSlotKind::DtorD1 | VSlotKind::DtorD0 => (None, true, None),
                 VSlotKind::Method => {
-                    // Name from the *declaring* class (override-matching
-                    // is by the name as introduced; the overrider keeps it).
+                    // Name + param encoding from the *declaring* class
+                    // (override-matching is by the declaration; the
+                    // overrider keeps both).
                     let name = slot.originator_method_idx.and_then(|i| {
                         method_ident(&self.class(slot.originator_class).methods[i].name)
                     });
-                    (name, false)
+                    let psig = slot.originator_method_idx.map(|i| {
+                        self.mangle_itanium_params(
+                            &self.class(slot.originator_class).methods[i].sig,
+                        )
+                    });
+                    (name, false, psig)
                 }
             };
-            out.push(PrimaryVtableSlot { name, mangled_target, is_dtor });
+            out.push(PrimaryVtableSlot { name, mangled_target, is_dtor, param_sig });
         }
         Some(out)
     }
@@ -426,35 +438,45 @@ fn build_virtual_slots(
 ) -> Vec<VSlot> {
     let chain = collect_chain(ctx, most_derived);
     let mut slots: Vec<VSlot> = Vec::new();
+    let mut dtor_emitted = false;
 
-    for (level, &cls_id) in chain.iter().enumerate() {
+    for &cls_id in &chain {
         let cls = ctx.class(cls_id);
-
-        if level == 0 && has_virtual_dtor(cls) {
-            slots.push(VSlot {
-                kind: VSlotKind::DtorD1,
-                originator_class: cls_id,
-                originator_method_idx: None,
-                overrider_class: most_derived,
-                overrider_method_idx: None,
-            });
-            slots.push(VSlot {
-                kind: VSlotKind::DtorD0,
-                originator_class: cls_id,
-                originator_method_idx: None,
-                overrider_class: most_derived,
-                overrider_method_idx: None,
-            });
-        }
 
         for (idx, m) in cls.methods.iter().enumerate() {
             if m.virtuality == Virtuality::NonVirtual {
                 continue;
             }
-            // Dtors are represented as the D1/D0 slot pair; an explicitly
-            // declared dtor at an intermediate level doesn't add slots
-            // (the dtor slot is already targeted at `most_derived`).
             if m.special == Some(SpecialMember::Dtor) {
+                // Itanium §2.5.2: vtable components appear in
+                // DECLARATION order, with the complete-object (D1) /
+                // deleting (D0) destructor pair occupying the virtual
+                // destructor's declaration position — `struct A {
+                // virtual void f(); virtual ~A(); virtual void g(); }`
+                // lays out as [f, D1, D0, g], NOT [D1, D0, f, g]
+                // (verified vs `clang -fdump-vtable-layouts`). The
+                // first virtual dtor in the chain (any level — a root
+                // without one inherits the position from wherever it
+                // is introduced) fixes the position; deeper re-declared
+                // dtors override IN PLACE, and the pair always targets
+                // the most-derived class.
+                if !dtor_emitted {
+                    slots.push(VSlot {
+                        kind: VSlotKind::DtorD1,
+                        originator_class: cls_id,
+                        originator_method_idx: None,
+                        overrider_class: most_derived,
+                        overrider_method_idx: None,
+                    });
+                    slots.push(VSlot {
+                        kind: VSlotKind::DtorD0,
+                        originator_class: cls_id,
+                        originator_method_idx: None,
+                        overrider_class: most_derived,
+                        overrider_method_idx: None,
+                    });
+                    dtor_emitted = true;
+                }
                 continue;
             }
 
@@ -475,13 +497,6 @@ fn build_virtual_slots(
     }
 
     slots
-}
-
-fn has_virtual_dtor(cls: &crate::ty::ClassDef) -> bool {
-    cls.methods.iter().any(|m| {
-        m.virtuality != Virtuality::NonVirtual
-            && m.special == Some(SpecialMember::Dtor)
-    })
 }
 
 fn find_override_target(
