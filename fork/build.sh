@@ -45,7 +45,14 @@ fi
 (
   cd "$CLONE_DIR"
   echo "==> checking out $PINNED_COMMIT"
-  git fetch origin "$PINNED_COMMIT" --depth 1 2>/dev/null || true
+  # Fetch the pin with FULL ancestry (the blob:none filter from the
+  # clone keeps it cheap — trees/commits only). The pin sits on a
+  # release branch, not master; a --depth 1 fetch would leave
+  # bootstrap unable to walk history to the LLVM-bump commit, so
+  # `download-ci-llvm` resolves a non-served commit and 404s.
+  git fetch origin "$PINNED_COMMIT" 2>/dev/null \
+    || git fetch origin "$PINNED_COMMIT" --depth 1 2>/dev/null \
+    || true
   git checkout "$PINNED_COMMIT"
 )
 
