@@ -184,7 +184,10 @@ fi
 echo "==> stage-1 build (expect 30-90 min)"
 (
   cd "$CLONE_DIR"
-  ./x.py build --stage 1 compiler
+  # `library` (which builds the compiler first) — a bare `compiler`
+  # build leaves the stage1 sysroot without host std, so driving
+  # cargo with RUSTC=<stage1> fails E0463 on every host compile.
+  ./x.py build --stage 1 library
 )
 
 # 5. Print the path to the freshly-built rustc.

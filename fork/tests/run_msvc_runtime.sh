@@ -94,8 +94,15 @@ fi
 echo "=> Building msvc_runtime_smoke for x86_64-pc-windows-msvc"
 echo "   via fork rustc + -Zbuild-std=core,panic_abort"
 
+# Drive the repo-pinned NIGHTLY cargo with the fork rustc via $RUSTC
+# (the stage1 toolchain ships no cargo; `cargo +rustcc-stage1` makes
+# rustup fall back to whatever default cargo exists — on CI runners
+# that's STABLE, which rejects -Z flags). -Zbuild-std reads the
+# library sources from the fork rustc's own sysroot.
 CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="$EXTRA_RUSTFLAGS" \
-cargo +rustcc-stage1 -Zbuild-std=core,panic_abort \
+RUSTC="$RUSTCC_STAGE1/bin/rustc" \
+RUSTC_BOOTSTRAP=1 \
+cargo -Zbuild-std=core,panic_abort \
     build --target x86_64-pc-windows-msvc --release 2>&1
 
 BINS_DIR="$SMOKE_DIR/target/x86_64-pc-windows-msvc/release"
