@@ -5498,11 +5498,42 @@ fn render_free_fns(
             format!("__rustcc_throws_{}", ff.name.0)
         } else {
             let scope = NestedName(ff.def_scope().to_vec());
-            ctx.mangle(&Symbol::Function {
+            let mangled = ctx.mangle(&Symbol::Function {
                 scope,
                 name: ff.name.clone(),
                 sig: ff.sig.clone(),
-            })
+            });
+            // Header-inline free fn: no out-of-line symbol — link
+            // the shim trampoline instead (mirrors the v1.14
+            // inline-METHOD routing). By-value class params/returns
+            // keep the direct name (extern "C" would disagree with
+            // C++'s non-trivial ABI rules), as do variadics.
+            let by_value_record = |t: rustc_abi_cxx::TypeId| {
+                matches!(ctx.type_of(t), rustc_abi_cxx::CxxType::Record(_))
+            };
+            // I64 skip mirrors the shim emitter (long/long long
+            // ambiguity in overload sets) — the two predicates must
+            // agree or the extern points at a shim that was skipped.
+            let has_i64 = |t: rustc_abi_cxx::TypeId| {
+                matches!(
+                    ctx.type_of(t),
+                    rustc_abi_cxx::CxxType::Int {
+                        width: rustc_abi_cxx::IntWidth::I64,
+                        ..
+                    }
+                )
+            };
+            if ff.is_inline
+                && !ff.sig.variadic
+                && !by_value_record(ff.sig.ret)
+                && !ff.sig.params.iter().copied().any(by_value_record)
+                && !has_i64(ff.sig.ret)
+                && !ff.sig.params.iter().copied().any(has_i64)
+            {
+                format!("__rustcc_shim_{mangled}")
+            } else {
+                mangled
+            }
         };
         // Pick a Rust-safe identifier for the extern_ident +
         // wrapper. Free functions don't have a class prefix so

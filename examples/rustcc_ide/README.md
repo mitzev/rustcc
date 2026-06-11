@@ -142,10 +142,21 @@ cargo +rustcc run --release --bin ide         # the GUI
   to `<project>/.rustcc_ide.toml` (stable slugs, not indices) on every
   Target-menu change; Open Project restores it. Fresh projects are
   seeded with their flavor's default.
-- **Toolbar** — New / Save / Run / Debug / Step In / Step Over /
-  Stop as one-click `Fl_Button`s; every button dispatches the *same*
-  action its menu item does (one `menu_cb`, actions as user data —
-  possible because M15.c gave inline fn-ptr methods real shims).
+- **Toolbar with a generated icon set** — New / Save / Run / Debug /
+  Step In / Step Over / Stop as icon-only buttons with tooltips. The
+  icons are **vector glyphs drawn in Rust**: a fork `class IconButton
+  : Fl_Button` overrides the protected C++ virtual `draw()` (super-
+  called by symbol) and paints with the imported `fl_draw`
+  primitives — paper-with-plus, floppy, green run triangle, bug,
+  dive-arrow, hop-arc, red stop square. Crisp at any scale, zero
+  image assets. Every button dispatches the *same* action its menu
+  item does (one `menu_cb`, actions as user data). Wiring this
+  exposed the free-function flavor of the inline-shim gap: FLTK's
+  whole `fl_draw` surface (`fl_rectf`, `fl_polygon`, `fl_arc`, …) is
+  header-inline one-liners, declared by the bindings but unlinkable —
+  the importer now emits `__rustcc_shim_` trampolines for header-
+  inline free functions (lockstep I64 skip with the bindings, same
+  long/long-long rule as M15.c).
 - **Variables pane in the main layout** — the console's right-hand
   neighbor inside the tile (drag their shared border); locals
   auto-refresh on every stop, the watch box reads globals. Captures

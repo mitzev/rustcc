@@ -274,6 +274,17 @@ impl Driver {
         ctx: &rustc_abi_cxx::CxxTypeCtx,
         classes: &[ClassId],
     ) -> Result<String, ShimError> {
+        self.emit_shims_with_free_fns(ctx, classes, &[])
+    }
+
+    /// `emit_shims` + trampolines for header-inline FREE functions
+    /// (which have no out-of-line symbol to link against).
+    pub fn emit_shims_with_free_fns(
+        &self,
+        ctx: &rustc_abi_cxx::CxxTypeCtx,
+        classes: &[ClassId],
+        free_fns: &[crate::free_fns::FreeFnDef],
+    ) -> Result<String, ShimError> {
         let header_strs: Vec<&str> = self
             .graph
             .roots
@@ -285,6 +296,7 @@ impl Driver {
             &ShimOptions {
                 headers: &header_strs,
                 classes,
+                free_fns,
             },
         )
     }

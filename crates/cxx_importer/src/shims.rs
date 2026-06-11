@@ -59,6 +59,11 @@ pub struct ShimOptions<'a> {
     /// The classes to emit shims for. Methods inside each class are
     /// enumerated and shimmed when supported.
     pub classes: &'a [ClassId],
+    /// Free functions; HEADER-INLINE ones get a
+    /// `__rustcc_shim_<mangled>` trampoline (calling the inline
+    /// definition instantiates it in this TU) so the Rust extern has
+    /// a real symbol to link.
+    pub free_fns: &'a [crate::free_fns::FreeFnDef],
 }
 
 pub fn generate_shims(
@@ -173,6 +178,39 @@ pub fn generate_shims(
         }
     }
 
+    // Header-inline FREE functions (fl_rectf, fl_polygon, …): the
+    // trampoline both provides the linkable symbol and instantiates
+    // the inline definition. I64 ints are skipped — the IR collapses
+    // long/long long, which makes calls into overload sets ambiguous
+    // (fl_voidptr(long) vs fl_voidptr(void*)). MUST stay in lockstep
+    // with the bindings emitter's inline-routing predicate.
+    for ff in opts.free_fns {
+        let has_i64 = |ty: TypeId| {
+            matches!(ctx.type_of(ty), CxxType::Int { width: IntWidth::I64, .. })
+        };
+        if !ff.is_inline
+            || ff.sig.variadic
+            || has_i64(ff.sig.ret)
+            || ff.sig.params.iter().copied().any(has_i64)
+        {
+            continue;
+        }
+        match render_free_fn_shim(ctx, ff) {
+            Ok(rendered) => {
+                out.push_str(&rendered);
+                out.push('\n');
+            }
+            Err(ShimError::UnsupportedType { where_, kind }) => {
+                let _ = writeln!(
+                    out,
+                    "// shim skipped: {}: {where_}: {kind}",
+                    ff.name.0,
+                );
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
     Ok(out)
 }
 
@@ -268,6 +306,48 @@ fn render_heap_ctor_shim(
     );
     let _ = writeln!(out, "}}");
     Ok(out)
+}
+
+fn render_free_fn_shim(
+    ctx: &CxxTypeCtx,
+    ff: &crate::free_fns::FreeFnDef,
+) -> Result<String, ShimError> {
+    let mangled = ctx.mangle(&Symbol::Function {
+        scope: NestedName(ff.def_scope().to_vec()),
+        name: ff.name.clone(),
+        sig: ff.sig.clone(),
+    });
+    let shim_sym = format!("__rustcc_shim_{mangled}");
+    let ret_src = render_cxx_type(ctx, ff.sig.ret, "free-fn return type")?;
+    let mut params = Vec::with_capacity(ff.sig.params.len());
+    let mut args = Vec::with_capacity(ff.sig.params.len());
+    for (i, p) in ff.sig.params.iter().enumerate() {
+        params.push(render_cxx_param(ctx, *p, &format!("arg{i}"), "free-fn parameter")?);
+        args.push(format!("arg{i}"));
+    }
+    let mut callee = String::new();
+    for seg in ff.def_scope() {
+        if let NameSegment::Namespace(id) = seg {
+            callee.push_str(&id.0);
+            callee.push_str("::");
+        }
+    }
+    callee.push_str(&ff.name.0);
+    let invoke = format!("{callee}({})", args.join(", "));
+    let body = if matches!(ctx.type_of(ff.sig.ret), CxxType::Void) {
+        format!("    try {{ {invoke}; }} catch (...) {{ std::terminate(); }}\n")
+    } else {
+        format!(
+            "    try {{ return ({ret_src})({invoke}); }} catch (...) {{ std::terminate(); }}\n"
+        )
+    };
+    let param_list = params.join(", ");
+    let signature = if is_fn_ptr(ctx, ff.sig.ret) {
+        format!("extern \"C\" auto {shim_sym}({param_list}) noexcept -> {ret_src}")
+    } else {
+        format!("extern \"C\" {ret_src} {shim_sym}({param_list}) noexcept")
+    };
+    Ok(format!("{signature} {{\n{body}}}\n"))
 }
 
 fn render_method_shim(

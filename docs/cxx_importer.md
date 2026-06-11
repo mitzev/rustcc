@@ -553,6 +553,19 @@ function pointer types, nothing useful compiles.
 > `I64`, and inside a function-pointer type that spelling must be
 > exact, so such signatures (e.g. FLTK's `Fl_Callback1`, `long`
 > user data) keep the skip path.
+>
+> **M15.d (shipped):** the same treatment for header-inline FREE
+> functions. FLTK's whole `fl_draw` surface (`fl_rectf`,
+> `fl_polygon`, `fl_arc`, …) is one-line inline wrappers with no
+> out-of-line symbols; the bindings declared them and the link
+> failed on first use. `FreeFnDef` now records `is_inline`, the
+> shim generator emits `__rustcc_shim_<mangled>` trampolines
+> (instantiating the inline definition in the shim TU), and the
+> bindings route inline free fns through them. Both sides apply the
+> same skip predicate (variadic, by-value records, I64 ints — the
+> `long`/`long long` collapse makes overload sets like
+> `fl_voidptr(long)` ambiguous) so a routed extern always has a
+> shim behind it.
 
 **The shape.** Two layers:
 

@@ -69,6 +69,7 @@ fn emits_header_and_exception_include() {
         &ShimOptions {
             headers: &["widget.h"],
             classes: &[widget],
+        free_fns: &[],
         },
     )
     .expect("generator should succeed");
@@ -104,6 +105,7 @@ fn emits_extern_c_noexcept_trampoline_for_nonvirtual_method() {
         &ShimOptions {
             headers: &["w.h"],
             classes: &[widget],
+        free_fns: &[],
         },
     )
     .unwrap();
@@ -149,6 +151,7 @@ fn void_return_omits_return_keyword_in_body() {
         &ShimOptions {
             headers: &["w.h"],
             classes: &[widget],
+        free_fns: &[],
         },
     )
     .unwrap();
@@ -187,6 +190,7 @@ fn uses_mangled_symbol_in_shim_name() {
         &ShimOptions {
             headers: &["w.h"],
             classes: &[widget],
+        free_fns: &[],
         },
     )
     .unwrap();
@@ -242,6 +246,7 @@ fn skips_virtual_and_special_methods() {
         &ShimOptions {
             headers: &["w.h"],
             classes: &[widget],
+        free_fns: &[],
         },
     )
     .unwrap();
@@ -291,6 +296,7 @@ fn renders_reference_and_record_params() {
         &ShimOptions {
             headers: &["w.h"],
             classes: &[widget],
+        free_fns: &[],
         },
     )
     .unwrap();
@@ -334,6 +340,7 @@ fn renders_namespaced_class_in_self_param() {
         &ShimOptions {
             headers: &["bar.h"],
             classes: &[inner],
+        free_fns: &[],
         },
     )
     .unwrap();

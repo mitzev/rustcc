@@ -518,6 +518,7 @@ struct Concrete : public Mid {
     let opts = cxx_importer::shims::ShimOptions {
         headers: &["dummy.hpp"],
         classes: &class_ids,
+        free_fns: &[],
     };
     let shims_src = cxx_importer::shims::generate_shims(&ctx, &opts).expect("shims");
 

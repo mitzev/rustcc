@@ -236,6 +236,8 @@ unsafe extern "C++" {
     fn base_browser_handle(this: *mut Fl_Browser_, ev: i32) -> i32;
     #[link_name = "_ZN7Fl_Tabs6handleEi"]
     fn base_tabs_handle(this: *mut Fl_Tabs, ev: i32) -> i32;
+    #[link_name = "_ZN9Fl_Button4drawEv"]
+    fn base_button_draw(this: *mut Fl_Button);
     #[link_name = "_Znwm"]
     fn cxx_operator_new(size: usize) -> *mut u8;
 }
@@ -2917,17 +2919,127 @@ const LY_EDGRP_H: i32 = 404; // tab strip + editor
 const LY_CONSOLE_H: i32 = 298;
 const LY_VARS_W: i32 = 300; // variables pane (right of console)
 
-/// The toolbar: every button dispatches the SAME action its menu
-/// item does (menu_cb is an ordinary Fl_Widget callback).
+/// Toolbar icon ids — vector glyphs painted by draw_toolbar_icon.
+const ICON_NEW: i32 = 0;
+const ICON_SAVE: i32 = 1;
+const ICON_RUN: i32 = 2;
+const ICON_DEBUG: i32 = 3;
+const ICON_STEP_IN: i32 = 4;
+const ICON_STEP_OVER: i32 = 5;
+const ICON_STOP: i32 = 6;
+
+/// The toolbar: icon-only buttons with tooltips; every button
+/// dispatches the SAME action its menu item does (menu_cb is an
+/// ordinary Fl_Widget callback). (tooltip, action, icon id)
 const TOOLBAR_SPEC: &[(&str, usize, i32)] = &[
-    ("New", ACT_NEW, 52),
-    ("Save", ACT_SAVE, 56),
-    ("Run", ACT_BUILD_RUN, 52),
-    ("Debug", ACT_DBG_START, 64),
-    ("Step In", ACT_DBG_STEP_IN, 70),
-    ("Step Over", ACT_DBG_STEP_OVER, 84),
-    ("Stop", ACT_DBG_STOP, 54),
+    ("New file (Cmd+N)", ACT_NEW, ICON_NEW),
+    ("Save (Cmd+S)", ACT_SAVE, ICON_SAVE),
+    ("Build & Run (Cmd+R)", ACT_BUILD_RUN, ICON_RUN),
+    ("Start Debug session (F5)", ACT_DBG_START, ICON_DEBUG),
+    ("Step In (F11)", ACT_DBG_STEP_IN, ICON_STEP_IN),
+    ("Step Over (F10)", ACT_DBG_STEP_OVER, ICON_STEP_OVER),
+    ("Stop (debug session / Shift+F5)", ACT_DBG_STOP, ICON_STOP),
 ];
+
+/// The generated icon set: small vector glyphs drawn with the
+/// imported fl_draw primitives, centered on (cx, cy). Crisp at any
+/// scale, no image assets.
+fn draw_toolbar_icon(icon: i32, cx: i32, cy: i32) {
+    const DARK: u32 = 0x3A3A3A00;
+    const PAPER: u32 = 0xFAFAFA00;
+    const GREEN: u32 = 0x1E8E2E00;
+    const RED: u32 = 0xC0282800;
+    const BLUE: u32 = 0x2058B800;
+    unsafe {
+        match icon {
+            ICON_NEW => {
+                // Sheet of paper with a green plus.
+                fl_color(PAPER);
+                fl_rectf(cx - 6, cy - 7, 10, 14);
+                fl_color(DARK);
+                fl_rect(cx - 6, cy - 7, 10, 14);
+                fl_color(GREEN);
+                fl_rectf(cx + 1, cy + 1, 8, 2);
+                fl_rectf(cx + 4, cy - 2, 2, 8);
+            }
+            ICON_SAVE => {
+                // Floppy: body, shutter, label.
+                fl_color(BLUE);
+                fl_rectf(cx - 6, cy - 6, 13, 13);
+                fl_color(PAPER);
+                fl_rectf(cx - 3, cy - 6, 7, 5); // shutter
+                fl_rectf(cx - 4, cy + 1, 9, 6); // label
+                fl_color(BLUE);
+                fl_rectf(cx, cy - 5, 2, 3); // shutter slot
+            }
+            ICON_RUN => {
+                fl_color(GREEN);
+                fl_polygon(cx - 4, cy - 7, cx - 4, cy + 7, cx + 7, cy);
+            }
+            ICON_DEBUG => {
+                // Bug: body + head + legs.
+                fl_color(GREEN);
+                fl_pie(cx - 4, cy - 3, 9, 10, 0.0, 360.0);
+                fl_pie(cx - 2, cy - 6, 5, 5, 0.0, 360.0);
+                fl_color(DARK);
+                fl_line(cx - 4, cy - 1, cx - 7, cy - 3);
+                fl_line(cx - 4, cy + 2, cx - 7, cy + 2);
+                fl_line(cx - 4, cy + 5, cx - 7, cy + 7);
+                fl_line(cx + 4, cy - 1, cx + 7, cy - 3);
+                fl_line(cx + 4, cy + 2, cx + 7, cy + 2);
+                fl_line(cx + 4, cy + 5, cx + 7, cy + 7);
+            }
+            ICON_STEP_IN => {
+                // Arrow diving onto a frame line.
+                fl_color(DARK);
+                fl_rectf(cx - 6, cy + 5, 13, 2);
+                fl_color(BLUE);
+                fl_rectf(cx - 1, cy - 7, 2, 7);
+                fl_polygon(cx - 4, cy - 1, cx + 4, cy - 1, cx, cy + 4);
+            }
+            ICON_STEP_OVER => {
+                // Arc hopping over a dot, arrowhead at the end.
+                fl_color(BLUE);
+                fl_arc(cx - 6, cy - 6, 12, 10, 0.0, 180.0);
+                fl_polygon(cx + 3, cy - 2, cx + 9, cy - 2, cx + 6, cy + 3);
+                fl_color(DARK);
+                fl_rectf(cx - 2, cy + 3, 4, 4);
+            }
+            ICON_STOP => {
+                fl_color(RED);
+                fl_rectf(cx - 5, cy - 5, 11, 11);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A toolbar button that paints a vector glyph over the stock body —
+/// Fl_Button::draw is a protected C++ virtual, overridden from Rust
+/// through the imported vtable slot and super-called by symbol.
+pub class IconButton : Fl_Button {
+    icon: i32,
+
+    pub constructor fn new(x: i32, y: i32, w: i32, h: i32, icon: i32) -> Self {
+        IconButton {
+            __base: Fl_Button::new(x, y, w, h, ::core::ptr::null()),
+            icon,
+        }
+    }
+
+    pub override fn draw(&self) {
+        let this = self as *const Self as *mut Fl_Button;
+        unsafe {
+            base_button_draw(this);
+            let w = this as *mut Fl_Widget;
+            draw_toolbar_icon(
+                self.icon,
+                (*w).x() + (*w).w() / 2,
+                (*w).y() + (*w).h() / 2,
+            );
+        }
+    }
+}
 
 unsafe fn build_ui() -> *mut Fl_Window {
     unsafe {
@@ -3038,19 +3150,21 @@ unsafe fn build_ui() -> *mut Fl_Window {
         let tbg = cxx_operator_new(core::mem::size_of::<Fl_Group>()) as *mut Fl_Group;
         Fl_Group::new_at(tbg, 0, LY_BAR_H, LY_W, LY_TOOL_H, core::ptr::null());
         (*tbg).end();
-        let mut bx = 4;
-        for &(label, act, wpx) in TOOLBAR_SPEC {
-            let b = cxx_operator_new(core::mem::size_of::<Fl_Button>()) as *mut Fl_Button;
-            Fl_Button::new_at(b, bx, LY_BAR_H + 3, wpx, LY_TOOL_H - 6, core::ptr::null());
-            (*(b as *mut Fl_Widget)).copy_label_str(label);
-            (*(b as *mut Fl_Widget)).labelsize_i32(11);
+        let mut bx = 6;
+        for &(tip, act, icon) in TOOLBAR_SPEC {
+            let b = cxx_operator_new(core::mem::size_of::<IconButton>()) as *mut IconButton;
+            b.write(IconButton::new(bx, LY_BAR_H + 3, 32, LY_TOOL_H - 6, icon));
+            // FLTK keeps the tooltip POINTER — leak a 'static copy.
+            let tipc: &'static std::ffi::CStr =
+                Box::leak(std::ffi::CString::new(tip).unwrap().into_boxed_c_str());
+            (*(b as *mut Fl_Widget)).tooltip_const_i8(tipc.as_ptr());
             (*(b as *mut Fl_Widget))
                 .callback_option_unsafe_extern_c_fn_mut_fl_widget_mut_mut(
                     Some(menu_cb),
                     act as *mut (),
                 );
             (*tbg).add(b as *mut Fl_Widget);
-            bx += wpx + 4;
+            bx += 32 + 4;
         }
         let sp = cxx_operator_new(core::mem::size_of::<Fl_Group>()) as *mut Fl_Group;
         Fl_Group::new_at(sp, bx, LY_BAR_H, LY_W - bx, LY_TOOL_H, core::ptr::null());
@@ -3681,13 +3795,20 @@ unsafe fn self_test() -> i32 {
                 && LY_TABS_H < LY_EDGRP_H
                 && LY_NAV_W + LY_VARS_W < LY_W,
         );
-        check(
-            "toolbar covers the everyday actions",
+        check("toolbar covers the everyday actions with distinct icons", {
+            let mut icons: Vec<i32> = TOOLBAR_SPEC.iter().map(|&(_, _, i)| i).collect();
+            icons.sort_unstable();
+            icons.dedup();
             TOOLBAR_SPEC.len() == 7
-                && TOOLBAR_SPEC.iter().any(|&(l, a, _)| l == "Run" && a == ACT_BUILD_RUN)
-                && TOOLBAR_SPEC.iter().any(|&(l, a, _)| l == "Debug" && a == ACT_DBG_START)
-                && TOOLBAR_SPEC.iter().all(|&(_, _, w)| w > 0),
-        );
+                && icons.len() == 7
+                && TOOLBAR_SPEC
+                    .iter()
+                    .any(|&(tip, a, i)| tip.contains("Run") && a == ACT_BUILD_RUN && i == ICON_RUN)
+                && TOOLBAR_SPEC
+                    .iter()
+                    .any(|&(tip, a, i)| tip.contains("Debug") && a == ACT_DBG_START && i == ICON_DEBUG)
+                && TOOLBAR_SPEC.iter().all(|&(tip, _, _)| !tip.is_empty())
+        });
 
         // 20. FULL gate: real lldb session — breakpoint hit, variables
         //     visible, step, continue to exit.

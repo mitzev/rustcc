@@ -1098,6 +1098,7 @@ impl<'a> Importer<'a> {
                 variadic,
                 noexcept: false,
             },
+            is_inline: entity.is_inline_function(),
         });
         Ok(())
     }

@@ -661,8 +661,9 @@ impl Build {
         })?;
 
         // ----- 4. Emit C++ shims. ------
-        let mut shims_src =
-            driver.emit_shims(&ctx, &all_class_ids).map_err(BuildError::Shim)?;
+        let mut shims_src = driver
+            .emit_shims_with_free_fns(&ctx, &all_class_ids, &free_fns.entries)
+            .map_err(BuildError::Shim)?;
 
         // v1.12.15: append the throws-shim source for every
         // free fn carrying `cxx_throws` / `cxx_throws(T1, T2)`

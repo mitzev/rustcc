@@ -43,6 +43,14 @@ pub struct FreeFnDef {
     pub name: Ident,
     /// Full signature — params, return, variadic, noexcept.
     pub sig: FnSig,
+    /// Header-inline (in-class body or `inline` keyword): no
+    /// out-of-line symbol exists, so the bindings route the call
+    /// through a `__rustcc_shim_<mangled>` trampoline whose C++ TU
+    /// instantiates the inline definition. (FLTK's whole fl_draw
+    /// surface — fl_rectf, fl_polygon, fl_arc … — is shaped
+    /// exactly like this.)
+    #[cfg_attr(feature = "cache", serde(default))]
+    pub is_inline: bool,
 }
 
 impl FreeFnDef {
