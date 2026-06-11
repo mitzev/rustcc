@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Fri, 12 Jun 2026 01:58:45 +0300
+Subject: [PATCH] =?UTF-8?q?P09.x=20(v1.15):=20Itanium=20x86-64=20=E2=80=94?=
+ =?UTF-8?q?=20exempt=20PMF=20returns=20from=20forced=20sret?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The v1.14 pointer-to-member-function triviality exemption landed on
+the AArch64 and MSVC overlays but missed the Itanium x86-64 copy of
+the rule, so extern "C++" functions RETURNING a member fn pointer
+by value got a hidden sret buffer the C++ side (which returns PMFs
+in RAX:RDX per the SysV classification) never wrote. First executed
+against a real C++ compiler by the g++/libstdc++ CI leg running
+examples/member_fn_ptr: SIGSEGV dispatching through the garbage
+pointer.
+---
+ compiler/rustc_target/src/callconv/x86_64.rs | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/compiler/rustc_target/src/callconv/x86_64.rs b/compiler/rustc_target/src/callconv/x86_64.rs
+index 428c6add8df..7bc5c4c5873 100644
+--- a/compiler/rustc_target/src/callconv/x86_64.rs
++++ b/compiler/rustc_target/src/callconv/x86_64.rs
+@@ -382,9 +382,18 @@ pub(crate) fn compute_cxx_abi_info<'a, Ty, C>(cx: &C, fn_abi: &mut FnAbi<'a, Ty>
+     // forwarders generate). Without this rule, a `#[repr(C)]`
+     // 8-byte struct would come back in `rax` while C++ writes to
+     // `rdi` → garbage. Symmetric to the AArch64 overlay.
++    //
++    // v1.15.0: pointer-to-member-function pairs are exempt here
++    // too — g++/clang return them in RAX:RDX. The v1.14 exemption
++    // landed on the AArch64 + MSVC overlays but missed this
++    // Itanium x86-64 copy; nothing executed it against a real C++
++    // compiler until the g++/libstdc++ Linux CI leg ran
++    // examples/member_fn_ptr (SIGSEGV: Rust passed a hidden sret
++    // buffer that g++ never wrote).
+     if !fn_abi.ret.is_ignore()
+         && (fn_abi.ret.layout.is_cxx_non_trivial_for_calls(cx)
+             || fn_abi.ret.layout.is_adt())
++        && !fn_abi.ret.layout.is_cxx_member_fn_ptr(cx)
+     {
+         fn_abi.ret.force_indirect();
+     }

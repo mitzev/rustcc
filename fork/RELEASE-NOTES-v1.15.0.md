@@ -1,7 +1,7 @@
 # rustcc v1.15.0 — the GCC backend learns C++ interop, and an IDE to prove it
 
 A feature release on **Rust 1.96.0 stable**. The patch series grows to
-**49** patches (`0001`–`0049`). Three threads converge here: the
+**50** patches (`0001`–`0050`). Three threads converge here: the
 `rustc_codegen_gcc` backend gains the full C++-interop machinery, the
 binding importer closes its inline/function-pointer shim gaps against
 real-world headers, and the whole stack is exercised end-to-end by a
@@ -62,6 +62,13 @@ forms — a Rust declaration whose C++ symbol nothing defines:
 Deliberate refusals are documented where the IR can't distinguish
 `long` from `long long` (exact spelling matters inside function types
 and overload sets).
+
+The new Linux legs immediately earned their keep: the g++ run of
+`examples/member_fn_ptr` exposed that the v1.14 PMF-return
+exemption was missing from the Itanium **x86-64** callconv overlay
+(present on AArch64 + MSVC) — Rust passed a hidden sret buffer that
+g++, returning the pair in RAX:RDX, never wrote. Fixed as patch
+0050 and re-validated end to end on g++/Linux.
 
 ## 3. Validation matrix: bare metal + FreeRTOS, executed on qemu
 

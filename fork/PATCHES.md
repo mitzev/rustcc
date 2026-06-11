@@ -3531,6 +3531,18 @@ on `aarch64-apple-darwin` and `x86_64-apple-darwin`.
   Probes: `cxx_throws_native` + the typed smoke pass identically on
   both backends.
 
+- **50 (`50-v1.15-Itanium-x86-64-exempt-PMF-returns-from-f`)** — the
+  v1.14 pointer-to-member-function triviality exemption (clang/g++
+  return PMFs in registers) landed on the AArch64 and MSVC callconv
+  overlays but missed the Itanium **x86-64** copy of the
+  force-indirect rule, so an `extern "C++"` fn RETURNING a member fn
+  pointer by value got a hidden sret buffer the C++ side never wrote
+  — Rust then read uninitialized stack. Nothing executed that path
+  against a real C++ compiler until the v1.15 g++/libstdc++ CI leg
+  ran `examples/member_fn_ptr` (SIGSEGV dispatching through the
+  garbage pair). One-line fix mirroring the other two overlays;
+  by-value PMF *arguments* were already correct.
+
 ---
 
 ## Build & test
