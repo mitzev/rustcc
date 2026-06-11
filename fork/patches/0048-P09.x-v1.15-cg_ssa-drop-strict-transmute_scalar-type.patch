@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 11 Jun 2026 13:39:18 +0300
+Subject: [PATCH] =?UTF-8?q?P09.x=20(v1.15):=20cg=5Fssa=20=E2=80=94=20drop?=
+ =?UTF-8?q?=20strict=20transmute=5Fscalar=20type=20pre-check?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The debug_assert_eq!(val_ty(imm), from_backend_ty) holds trivially
+for LLVM (opaque pointers, uniform scalar types) but is wrong for
+nominally-typed backends: cg_gcc carries i8* where the canonical
+pointer is void*, and size_t where the scalar says __int64_t — same
+layout, different gccjit type objects. The match right below
+bitcasts/pointercasts per primitive kind, which is the meaningful
+validation; a truly mismatched immediate still fails inside the cast.
+
+Unblocks the importer-binding new()/Box paths under
+-Zcodegen-backend=gcc: the full subclass_cpp_base demo (pure +
+concrete overrides, new Rust virtual, virtual dtor via deleting
+thunk) passes on the pure-GCC pipeline; LLVM backend re-verified on
+the same probes.
+---
+ compiler/rustc_codegen_ssa/src/mir/rvalue.rs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/compiler/rustc_codegen_ssa/src/mir/rvalue.rs b/compiler/rustc_codegen_ssa/src/mir/rvalue.rs
+index 2cb96c4ec0f..ae675ffbc2f 100644
+--- a/compiler/rustc_codegen_ssa/src/mir/rvalue.rs
++++ b/compiler/rustc_codegen_ssa/src/mir/rvalue.rs
+@@ -965,7 +965,14 @@ pub(super) fn transmute_scalar<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+     imm = bx.from_immediate(imm);
+ 
+     let from_backend_ty = bx.cx().type_from_scalar(from_scalar);
+-    debug_assert_eq!(bx.cx().val_ty(imm), from_backend_ty);
++    // P09.x (v1.15): no strict `val_ty(imm) == from_backend_ty`
++    // pre-check here (upstream has a `debug_assert_eq`). Nominally
++    // typed backends (cg_gcc) legitimately carry immediates whose
++    // backend type differs from the canonical scalar type while
++    // being layout-identical — `i8*` vs `void*`, `size_t` vs
++    // `__int64_t`. The match below bitcasts / pointercasts per
++    // primitive kind, which is the meaningful validation; a truly
++    // mismatched immediate still fails inside the cast.
+     let to_backend_ty = bx.cx().type_from_scalar(to_scalar);
+ 
+     // If we have a scalar, we must already know its range. Either

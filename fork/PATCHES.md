@@ -3486,6 +3486,31 @@ on `aarch64-apple-darwin` and `x86_64-apple-darwin`.
   never dangle. Probes: `fltk_editor_advanced --self-test`
   (`children_parent_ok (no fix-up)`), `subclass_dtor_position`.
 
+- **47 (`47-v1.15-cg_gcc-Itanium-class-metadata-ctor-vptr`)** — GCC
+  codegen backend support, phase 1: `rustc_codegen_gcc/src/cxx_vtable.rs`
+  emits `_ZTV`/`_ZTI`/`_ZTS` + the ctor vptr install under
+  `-Zcodegen-backend=gcc`. gccjit specifics: vague linkage via
+  top-level-asm `.weak` (no linkonce_odr in libgccjit); emission
+  queued in `predefine_fn` and flushed after the predefine loop
+  (gccjit can't upgrade imported declarations to definitions);
+  constant address points ride `u8`-typed bases (`void*` arithmetic
+  ICEs GCC, struct-typed bases stride wrong); the deleting-dtor thunk
+  is a plain gccjit function. `abi.rs` maps the fork's
+  `CanonAbi::Cpp`/`Swift` to plain C (Swift interop stays LLVM-only).
+  Probe: pure-GCC pipeline (cg_gcc Rust + g++ C++) passes base
+  dispatch, placement-new + virtual call, and subclass override
+  through an opaque base pointer.
+
+- **48 (`48-v1.15-cg_ssa-drop-strict-transmute_scalar`)** — the
+  shared `transmute_scalar` dropped its `val_ty(imm) ==
+  from_backend_ty` debug pre-check: nominally-typed backends (cg_gcc)
+  legitimately carry `i8*` vs `void*` / `size_t` vs `__int64_t`
+  immediates; the per-primitive bitcast/pointercast right after is
+  the meaningful validation. Unblocks importer-binding `new()` / Box
+  paths under cg_gcc — the full `subclass_cpp_base` demo (pure +
+  concrete overrides, new virtual, virtual dtor via the deleting
+  thunk) passes on the pure-GCC pipeline.
+
 ---
 
 ## Build & test

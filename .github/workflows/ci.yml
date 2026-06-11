@@ -200,6 +200,61 @@ jobs:
           cargo build --release --locked
           ./target/release/cxx_throws_native
 
+  # v1.15: the GCC *backend* e2e — Rust compiled by
+  # -Zcodegen-backend=gcc (libgccjit, CI-downloaded), C++ by g++; the
+  # subclass_cpp_base demo must pass with zero LLVM involvement in
+  # Rust codegen. Builds stage1 in-tree (x.py) rather than via
+  # fork/build.sh because the gcc backend + ci-gcc download are
+  # bootstrap-level options.
+  subclass-e2e-cg-gcc:
+    name: fork rustc (cg_gcc backend) + subclass e2e (pure GCC)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    env:
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Free disk space (Linux)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go || true
+          sudo docker image prune --all --force || true
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ clang libclang-dev cmake ninja-build \
+                                  pkg-config libssl-dev
+
+      - name: Clone rust 1.96.0 + apply fork patches
+        run: ./fork/build.sh --apply-only
+
+      - name: Build stage1 with the gcc codegen backend
+        working-directory: ../rust-lang-rust-fork
+        run: |
+          ./x.py build --stage 1 library \
+            --set 'rust.codegen-backends=["llvm","gcc"]' \
+            --set gcc.download-ci-gcc=true \
+            --set llvm.download-ci-llvm=true
+
+      - name: Run subclass_cpp_base under -Zcodegen-backend=gcc
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/../rust-lang-rust-fork/build/x86_64-unknown-linux-gnu/ci-gcc/lib
+        run: |
+          R="$GITHUB_WORKSPACE/../rust-lang-rust-fork/build/host/stage1/bin/rustc"
+          cd examples/subclass_cpp_base
+          cargo run --bin gen_bindings --release
+          "$R" --edition 2024 -Zcodegen-backend=gcc --crate-type staticlib \
+               --crate-name subclass_cpp_base src/mywidget.rs -o target/libsub_gcc.a
+          g++ -std=c++17 -c cpp/cppbase.cpp -o target/cppbase.o
+          g++ -std=c++17 -c caller.cpp -o target/caller.o
+          gcc -c runner.c -o target/runner.o
+          g++ target/runner.o target/caller.o target/cppbase.o \
+              target/libsub_gcc.a -o target/demo_gcc
+          ./target/demo_gcc
+
   cxx-throws-native-msvc-wine:
     name: fork rustc + cxx_throws native invoke (x86_64-pc-windows-msvc under Wine)
     if: ${{ github.event_name == 'workflow_dispatch' }}

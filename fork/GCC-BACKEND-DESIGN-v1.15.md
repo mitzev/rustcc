@@ -58,6 +58,23 @@ silently lacks vtables.
 | `llvm.eh.typeid.for` typed selector | **no equivalent** | move type matching into the runtime helper: catch-all lands, helper does `__cxa_begin_catch`-side typeinfo comparison against the `#[rustc_cxx_throws_typeinfos]` list and returns the same small 1-based index. Personality already ran a catch-all match, so this is allowed (we re-implement the clause walk in the helper using `std::type_info::operator==`, which on Itanium is pointer-or-string compare). `cxx::native_invoke` grows `__rustcc_cxx_catch_typed_dyn(exc, *const *const c_void, len) -> CxxRawError` |
 | MSVC funclets | n/a | GCC backend is Itanium-only; keep the LLVM-only gate for MSVC |
 
+## Status (2026-06-11)
+
+M1–M4 are **done** (patches 0047/0048): the pure-GCC pipeline
+(`-Zcodegen-backend=gcc` Rust + g++ C++) passes the smoke probes
+(base dispatch, placement-new + virtual call, subclass override
+through an opaque base pointer) AND the full importer-driven
+`subclass_cpp_base` demo — pure + concrete overrides, a new Rust
+virtual, and the virtual destructor through the base pointer
+(deleting-dtor thunk → drop glue → `_ZdlPv`). Verified in the amd64
+container (CI libgccjit via `gcc.download-ci-gcc`); LLVM backend
+re-verified on the same probes from the same stage1. CI: the
+`subclass-e2e-cg-gcc` dispatch leg replicates it on a runner.
+Discovered + fixed along the way: gccjit declare-then-define
+ordering, `void*`/struct-stride constant arithmetic, and the
+shared `transmute_scalar` strict type pre-check (see patch 0048).
+Remaining: M5 (cxx_throws).
+
 ## Milestones
 
 - **M1 — environment (~1 day)**: docker (aarch64-unknown-linux-gnu,

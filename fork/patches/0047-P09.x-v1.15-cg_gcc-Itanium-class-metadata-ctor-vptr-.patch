@@ -1,0 +1,562 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 11 Jun 2026 12:13:56 +0300
+Subject: [PATCH] =?UTF-8?q?P09.x=20(v1.15):=20cg=5Fgcc=20=E2=80=94=20Itani?=
+ =?UTF-8?q?um=20class=20metadata=20+=20ctor=20vptr=20init?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+GCC-backend port of the fork's C++ vtable machinery (LLVM
+cxx_vtable.rs, Itanium half). rustc -Zcodegen-backend=gcc now emits
+_ZTV/_ZTI/_ZTS for #[repr(cpp)] classes and installs the vptr in
+constructors, so a pure-GCC pipeline (cg_gcc Rust + g++ C++) does
+cross-language virtual dispatch in both directions.
+
+gccjit specifics vs the LLVM emission:
+- vague linkage: gccjit has no linkonce_odr/comdat — globals are
+  emitted Exported plus a top-level-asm '.weak <sym>' directive
+  (ELF targets; the GCC phase targets Linux).
+- emission timing: queued during predefine_fn, flushed AFTER the
+  predefine loop (base.rs) — eager emission would get_fn_addr
+  methods that aren't predefined yet, creating imported gccjit
+  functions that can never become definitions.
+- constant address points (&_ZTV[2], RTTI vtable + 2 slots) use the
+  new_array_access(..).get_address(..) constant form on u8-typed
+  bases — void* bases ICE GCC (incomplete element type) and
+  struct-typed bases would stride struct-sized.
+- the deleting-dtor thunk (drop_in_place + _ZdlPv) is an ordinary
+  gccjit function; vptr stores cast the return place to (u8*)*.
+- abi.rs: the fork's CanonAbi::Cpp/Swift map to plain C at the GCC
+  level (Itanium member fns are C functions with this first; Swift
+  interop stays LLVM-only).
+
+Probe (container, x86_64-linux, CI libgccjit + g++ 13):
+  class Widget + class Gauge : Widget, -Zcodegen-backend=gcc:
+  make_widget_value(5)=105 (Rust path, vptr install),
+  placement-new Widget(7)->foo()=107 (C++ ctor call + dispatch
+  through the Rust-emitted vtable),
+  init_gauge(3,4) as Widget* ->foo()=4000 (override via derived
+  vtable, indirect) — PASS.
+---
+ compiler/rustc_codegen_gcc/src/abi.rs        |   7 +
+ compiler/rustc_codegen_gcc/src/base.rs       |   6 +
+ compiler/rustc_codegen_gcc/src/builder.rs    |  10 +
+ compiler/rustc_codegen_gcc/src/context.rs    |   5 +
+ compiler/rustc_codegen_gcc/src/cxx_vtable.rs | 397 +++++++++++++++++++
+ compiler/rustc_codegen_gcc/src/lib.rs        |   1 +
+ compiler/rustc_codegen_gcc/src/mono_item.rs  |   7 +
+ 7 files changed, 433 insertions(+)
+ create mode 100644 compiler/rustc_codegen_gcc/src/cxx_vtable.rs
+
+diff --git a/compiler/rustc_codegen_gcc/src/abi.rs b/compiler/rustc_codegen_gcc/src/abi.rs
+index 4d1274a63d1..1e94281fa3e 100644
+--- a/compiler/rustc_codegen_gcc/src/abi.rs
++++ b/compiler/rustc_codegen_gcc/src/abi.rs
+@@ -243,6 +243,13 @@ fn gcc_cconv(&self, cx: &CodegenCx<'gcc, 'tcx>) -> Option<FnAttribute<'gcc>> {
+ pub fn conv_to_fn_attribute<'gcc>(conv: CanonAbi, arch: &Arch) -> Option<FnAttribute<'gcc>> {
+     let attribute = match conv {
+         CanonAbi::C | CanonAbi::Rust => return None,
++        // P09.x (v1.15): rustcc's extern "C++" lowers to the C
++        // calling convention at the GCC level (Itanium member fns ARE
++        // plain C functions with `this` first; sret/this-adjust
++        // handling happens in the shared ABI layer). extern "Swift"
++        // (swiftcc) has no GCC equivalent — treat as C; actual Swift
++        // interop remains LLVM-only (see GCC-BACKEND-DESIGN-v1.15.md).
++        CanonAbi::Cpp | CanonAbi::Swift => return None,
+         // gcc/gccjit does not have anything for this.
+         CanonAbi::RustPreserveNone => return None,
+         CanonAbi::RustCold => FnAttribute::Cold,
+diff --git a/compiler/rustc_codegen_gcc/src/base.rs b/compiler/rustc_codegen_gcc/src/base.rs
+index 73b0723895b..0f2a7ffd3f7 100644
+--- a/compiler/rustc_codegen_gcc/src/base.rs
++++ b/compiler/rustc_codegen_gcc/src/base.rs
+@@ -228,6 +228,12 @@ fn module_codegen(
+                 );
+             }
+ 
++            // P09.x (v1.15): emit queued `#[repr(cpp)]` class metadata
++            // now that every local method has a definable Function,
++            // and before ctor bodies (define loop) take the vtable's
++            // address for the vptr store.
++            crate::cxx_vtable::emit_pending_class_metadata(&cx);
++
+             // ... and now that we have everything pre-defined, fill out those definitions.
+             for &(mono_item, item_data) in &mono_items {
+                 mono_item.define::<Builder<'_, '_, '_>>(&mut cx, cgu_name.as_str(), item_data);
+diff --git a/compiler/rustc_codegen_gcc/src/builder.rs b/compiler/rustc_codegen_gcc/src/builder.rs
+index 8ae7e2ec9f4..4d67829eb9f 100644
+--- a/compiler/rustc_codegen_gcc/src/builder.rs
++++ b/compiler/rustc_codegen_gcc/src/builder.rs
+@@ -518,6 +518,16 @@ fn build(cx: &'a CodegenCx<'gcc, 'tcx>, block: Block<'gcc>) -> Builder<'a, 'gcc,
+         Builder::with_cx(cx, block)
+     }
+ 
++    // P09.x (v1.15): ctor vptr install for `#[repr(cpp)]` classes —
++    // GCC-backend port of the LLVM impl.
++    fn maybe_emit_cxx_ctor_vptr_init(
++        &mut self,
++        instance: Instance<'tcx>,
++        ret_place_ptr: RValue<'gcc>,
++    ) {
++        crate::cxx_vtable::maybe_emit_vptr_init(self, instance, ret_place_ptr);
++    }
++
+     fn llbb(&self) -> Block<'gcc> {
+         self.block
+     }
+diff --git a/compiler/rustc_codegen_gcc/src/context.rs b/compiler/rustc_codegen_gcc/src/context.rs
+index bd4dc1a7abc..b50c5a1bcdc 100644
+--- a/compiler/rustc_codegen_gcc/src/context.rs
++++ b/compiler/rustc_codegen_gcc/src/context.rs
+@@ -44,6 +44,10 @@ pub struct CodegenCx<'gcc, 'tcx> {
+     pub functions: RefCell<FxHashMap<String, Function<'gcc>>>,
+     pub intrinsics: RefCell<FxHashMap<String, Function<'gcc>>>,
+ 
++    /// P09.x (v1.15): per-CGU dedup for emitted `#[repr(cpp)]` class
++    /// metadata (`_ZTV`/`_ZTI`/`_ZTS`) — see `cxx_vtable`.
++    pub cxx_emitted_vtables: RefCell<FxHashSet<rustc_hir::def_id::DefId>>,
++
+     pub tls_model: gccjit::TlsModel,
+ 
+     pub bool_type: Type<'gcc>,
+@@ -248,6 +252,7 @@ pub fn new(
+             function_address_names: Default::default(),
+             functions: RefCell::new(functions),
+             intrinsics: RefCell::new(FxHashMap::default()),
++            cxx_emitted_vtables: RefCell::new(FxHashSet::default()),
+ 
+             tls_model,
+ 
+diff --git a/compiler/rustc_codegen_gcc/src/cxx_vtable.rs b/compiler/rustc_codegen_gcc/src/cxx_vtable.rs
+new file mode 100644
+index 00000000000..41c074450a9
+--- /dev/null
++++ b/compiler/rustc_codegen_gcc/src/cxx_vtable.rs
+@@ -0,0 +1,397 @@
++//! P09.x (v1.15) — Itanium vtable / typeinfo / typeinfo-name emission
++//! for `#[repr(cpp)]` classes on the GCC backend. Port of the LLVM
++//! backend's `cxx_vtable.rs` (Itanium half only — GCC never targets
++//! the MSVC C++ ABI).
++//!
++//! Differences from the LLVM port, driven by libgccjit's API:
++//!
++//! - **Vague linkage**: gccjit globals are only
++//!   exported/internal/imported — there is no `linkonce_odr` + comdat.
++//!   On ELF targets we emit the global `Exported` and append a
++//!   top-level `.weak <sym>` asm directive, which gas applies to the
++//!   definition regardless of relative position. (Mach-O/COFF would
++//!   need `.weak_definition`/selectany — out of scope; the GCC
++//!   backend phase targets Linux.)
++//! - **Constant address points** (`&_ZTV[2]`, RTTI vtable + 2 slots)
++//!   are formed with `new_array_access(..).get_address(..)` — a
++//!   constant expression gccjit accepts in initializers (the same
++//!   trick `const_ptr_byte_offset` uses).
++//! - The deleting-destructor thunk is an ordinary gccjit function
++//!   (two calls + ret), not LLVM IR.
++
++use gccjit::{FunctionType, GlobalKind, RValue, ToRValue, Type};
++use rustc_codegen_ssa::traits::*;
++use rustc_hir::def::DefKind;
++use rustc_hir::def_id::DefId;
++use rustc_middle::bug;
++use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
++use rustc_symbol_mangling::itanium as cxx_mangle;
++
++use crate::builder::Builder;
++use crate::context::CodegenCx;
++
++/// Store the Itanium vtable address point (`&_ZTV<class>[2]`) into
++/// offset 0 of `ret_place_ptr` if `instance` is a `#[rustc_cxx_ctor]`
++/// on a polymorphic `#[repr(cpp)]` class. Mirrors the LLVM backend's
++/// `maybe_emit_vptr_init`; invoked from the shared SSA trait hook.
++pub fn maybe_emit_vptr_init<'a, 'gcc, 'tcx>(
++    bx: &mut Builder<'a, 'gcc, 'tcx>,
++    instance: Instance<'tcx>,
++    ret_place_ptr: RValue<'gcc>,
++) {
++    let tcx = bx.tcx;
++    let def_id = instance.def_id();
++    if !cxx_mangle::has_cxx_ctor_attr(tcx, def_id) {
++        return;
++    }
++    let Some(adt_did) = cpp_class_of_method(tcx, def_id) else {
++        return;
++    };
++    if !cxx_mangle::is_polymorphic_cpp_class(tcx, adt_did) {
++        return;
++    }
++
++    let vtable_sym = cxx_mangle::mangle_cxx_vtable_symbol(tcx, adt_did);
++    let i8p_ty = bx.cx.type_i8().make_pointer();
++    // If this CGU defined the vtable (metadata flush ran before the
++    // define loop) reuse it via the globals map; otherwise reference
++    // the other-CGU/-crate definition as a pure import. Never let
++    // this create an Exported placeholder — that would be a
++    // tentative definition clashing with the real weak one.
++    let vtable_base = if bx.cx.globals.borrow().contains_key(vtable_sym.as_str()) {
++        bx.cx
++            .get_or_insert_global(&vtable_sym, bx.cx.type_i8(), false, None)
++            .get_address(None)
++    } else {
++        bx.cx
++            .context
++            .new_global(None, gccjit::GlobalKind::Imported, bx.cx.type_i8(), &vtable_sym)
++            .get_address(None)
++    };
++
++    // Address point = base + 2 pointer-sized header slots
++    // (offset-to-top, RTTI). Byte-granular: the base must be
++    // `u8*`-typed — `const_ptr_byte_offset`'s array-access trick
++    // would step struct-sized strides on the defined (struct-typed)
++    // global, and ICEs on `void*` (incomplete element type).
++    let vtable_base_i8 = bx.cx.context.new_cast(None, vtable_base, i8p_ty);
++    let ptr_bytes = tcx.data_layout.pointer_size().bytes();
++    let addr_point = bx.cx.const_ptr_byte_offset(
++        vtable_base_i8,
++        rustc_abi::Size::from_bytes(2 * ptr_bytes),
++    );
++
++    // *(<ptr>*)ret_place_ptr = addr_point — offset 0 is the vptr slot
++    // reserved by the polymorphic layout path.
++    let ptr_align = tcx.data_layout.pointer_align().abi;
++    let dst = bx.cx.context.new_cast(None, ret_place_ptr, i8p_ty.make_pointer());
++    bx.store(addr_point, dst.to_rvalue(), ptr_align);
++}
++
++/// If `def_id` is an associated fn on a polymorphic `#[repr(cpp)]`
++/// class, queue the class for metadata emission. Trigger:
++/// `predefine_fn` — but unlike the LLVM backend the emission itself is
++/// DEFERRED to `emit_pending_class_metadata` (after the predefine
++/// loop): emitting eagerly would `get_fn_addr` methods that haven't
++/// been predefined yet, creating *imported* gccjit functions that can
++/// never be upgraded to definitions ("cannot add block to an imported
++/// function").
++pub fn queue_class_metadata<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, def_id: DefId) {
++    let Some(adt_did) = cpp_class_of_method(cx.tcx, def_id) else {
++        return;
++    };
++    if !cxx_mangle::is_polymorphic_cpp_class(cx.tcx, adt_did) {
++        return;
++    }
++    // Imported C++ bases own their own metadata symbols.
++    if cxx_mangle::is_imported_cpp_base(cx.tcx, adt_did) {
++        return;
++    }
++    cx.cxx_emitted_vtables.borrow_mut().insert(adt_did);
++}
++
++/// Emit `_ZTV`/`_ZTI`/`_ZTS` for every queued class. Called once per
++/// CGU after the predefine loop — every local method then has a
++/// definable gccjit Function, and the vtable globals exist before any
++/// ctor body (define loop) references them for the vptr store.
++pub fn emit_pending_class_metadata<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>) {
++    let mut pending: Vec<DefId> = cx.cxx_emitted_vtables.borrow().iter().copied().collect();
++    // Deterministic emission order.
++    pending.sort_by_key(|d| (d.krate, d.index));
++    for adt_did in pending {
++        emit_class_metadata(cx, adt_did);
++    }
++}
++
++fn cpp_class_of_method<'tcx>(tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<DefId> {
++    if tcx.def_kind(def_id) != DefKind::AssocFn {
++        return None;
++    }
++    let impl_did = tcx.opt_parent(def_id)?;
++    if !matches!(tcx.def_kind(impl_did), DefKind::Impl { .. }) {
++        return None;
++    }
++    let self_ty = tcx.type_of(impl_did).skip_binder();
++    let ty::Adt(adt_def, _) = self_ty.kind() else {
++        return None;
++    };
++    if !adt_def.repr().cpp() {
++        return None;
++    }
++    Some(adt_def.did())
++}
++
++fn emit_class_metadata<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, adt_did: DefId) {
++    let tcx = cx.tcx;
++    let class_name = tcx.item_name(adt_did).to_string();
++    let class_name_mangled = format!("{}{}", class_name.len(), class_name);
++
++    let vtable_sym = cxx_mangle::mangle_cxx_vtable_symbol(tcx, adt_did);
++    let typeinfo_sym = cxx_mangle::mangle_cxx_typeinfo_symbol(tcx, adt_did);
++    let typeinfo_name_sym = cxx_mangle::mangle_cxx_typeinfo_name_symbol(tcx, adt_did);
++
++    let typeinfo_name_gv = emit_typeinfo_name(cx, &typeinfo_name_sym, &class_name_mangled);
++    let typeinfo_gv = emit_typeinfo(cx, tcx, adt_did, &typeinfo_sym, typeinfo_name_gv);
++    emit_vtable(cx, adt_did, &vtable_sym, typeinfo_gv);
++}
++
++/// Define a constant global named `symbol` with `initializer`, weak on
++/// ELF (see module docs). Returns its address as an opaque-ptr rvalue.
++fn define_weak_const_global<'gcc, 'tcx>(
++    cx: &CodegenCx<'gcc, 'tcx>,
++    symbol: &str,
++    initializer: RValue<'gcc>,
++) -> RValue<'gcc> {
++    if cx.globals.borrow().contains_key(symbol) {
++        bug!("cxx_vtable(gcc): symbol `{symbol}` already defined");
++    }
++    let ty: Type<'gcc> = initializer.get_type();
++    let global = cx.declare_global(symbol, ty, GlobalKind::Exported, false, None);
++    global.global_set_initializer_rvalue(initializer);
++    mark_weak(cx, symbol);
++    global.get_address(None)
++}
++
++fn mark_weak<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, symbol: &str) {
++    let target = &cx.tcx.sess.target;
++    if !target.is_like_darwin && !target.is_like_windows {
++        cx.context.add_top_level_asm(None, &format!(".weak {symbol}"));
++    }
++}
++
++fn emit_typeinfo_name<'gcc, 'tcx>(
++    cx: &CodegenCx<'gcc, 'tcx>,
++    symbol: &str,
++    mangled: &str,
++) -> RValue<'gcc> {
++    let bytes_with_nul: Vec<u8> =
++        mangled.as_bytes().iter().copied().chain(std::iter::once(0u8)).collect();
++    let initializer = cx.const_bytes(&bytes_with_nul);
++    define_weak_const_global(cx, symbol, initializer)
++}
++
++fn emit_typeinfo<'gcc, 'tcx>(
++    cx: &CodegenCx<'gcc, 'tcx>,
++    tcx: TyCtxt<'tcx>,
++    adt_did: DefId,
++    symbol: &str,
++    typeinfo_name: RValue<'gcc>,
++) -> RValue<'gcc> {
++    let ptr_ty = cx.type_ptr();
++    let ptr_bytes = tcx.data_layout.pointer_size().bytes();
++
++    let base_did = cxx_mangle::polymorphic_base_of_class(tcx, adt_did);
++    let rtti_vtable_sym = if base_did.is_some() {
++        "_ZTVN10__cxxabiv120__si_class_type_infoE"
++    } else {
++        "_ZTVN10__cxxabiv117__class_type_infoE"
++    };
++    // Declared `u8`-typed so the byte-offset array-access below is
++    // byte-granular and constant-foldable (`void*` would ICE on the
++    // incomplete element type; libc++abi owns the real definition).
++    let rtti_vtable_base = if cx.globals.borrow().contains_key(rtti_vtable_sym) {
++        cx.get_or_insert_global(rtti_vtable_sym, cx.type_i8(), false, None).get_address(None)
++    } else {
++        cx.context
++            .new_global(None, GlobalKind::Imported, cx.type_i8(), rtti_vtable_sym)
++            .get_address(None)
++    };
++    let rtti_vtable_addr_point = cx.const_ptr_byte_offset(
++        rtti_vtable_base,
++        rustc_abi::Size::from_bytes(2 * ptr_bytes),
++    );
++
++    let initializer = if let Some(base_did) = base_did {
++        let base_typeinfo_ref = if let Some(zti) = cxx_mangle::imported_base_zti(tcx, base_did) {
++            cx.get_or_insert_global(zti.as_str(), ptr_ty, false, None).get_address(None)
++        } else if cxx_mangle::is_polymorphic_cpp_class(tcx, base_did) {
++            let base_typeinfo_sym = cxx_mangle::mangle_cxx_typeinfo_symbol(tcx, base_did);
++            cx.get_or_insert_global(&base_typeinfo_sym, ptr_ty, false, None).get_address(None)
++        } else {
++            ensure_nonpoly_base_typeinfo(cx, tcx, base_did)
++        };
++        cx.const_struct(&[rtti_vtable_addr_point, typeinfo_name, base_typeinfo_ref], false)
++    } else {
++        cx.const_struct(&[rtti_vtable_addr_point, typeinfo_name], false)
++    };
++
++    define_weak_const_global(cx, symbol, initializer)
++}
++
++fn ensure_nonpoly_base_typeinfo<'gcc, 'tcx>(
++    cx: &CodegenCx<'gcc, 'tcx>,
++    tcx: TyCtxt<'tcx>,
++    adt_did: DefId,
++) -> RValue<'gcc> {
++    let typeinfo_sym = cxx_mangle::mangle_cxx_typeinfo_symbol(tcx, adt_did);
++    if cx.globals.borrow().contains_key(typeinfo_sym.as_str()) {
++        return cx
++            .get_or_insert_global(&typeinfo_sym, cx.type_ptr(), false, None)
++            .get_address(None);
++    }
++    let class_name = tcx.item_name(adt_did).to_string();
++    let class_name_mangled = format!("{}{}", class_name.len(), class_name);
++    let typeinfo_name_sym = cxx_mangle::mangle_cxx_typeinfo_name_symbol(tcx, adt_did);
++    let typeinfo_name_gv = if cx.globals.borrow().contains_key(typeinfo_name_sym.as_str()) {
++        cx.get_or_insert_global(&typeinfo_name_sym, cx.type_ptr(), false, None).get_address(None)
++    } else {
++        emit_typeinfo_name(cx, &typeinfo_name_sym, &class_name_mangled)
++    };
++    emit_typeinfo(cx, tcx, adt_did, &typeinfo_sym, typeinfo_name_gv)
++}
++
++fn emit_vtable<'gcc, 'tcx>(
++    cx: &CodegenCx<'gcc, 'tcx>,
++    adt_did: DefId,
++    symbol: &str,
++    typeinfo: RValue<'gcc>,
++) {
++    let tcx = cx.tcx;
++    let isize_ty = cx.type_isize();
++
++    // Slot 0: offset-to-top (zero for the primary table, stored
++    // pointer-sized). Slot 1: RTTI pointer. Slots 2+: fn pointers.
++    let offset_to_top = cx.const_int(isize_ty, 0);
++
++    let mut slots: Vec<RValue<'gcc>> = Vec::new();
++    slots.push(offset_to_top);
++    slots.push(typeinfo);
++
++    let virtuals = cxx_mangle::virtuals_on_chain(tcx, adt_did);
++    let has_positional_dtor =
++        virtuals.iter().any(|s| matches!(s, cxx_mangle::CxxVtSlot::ImportedDtorPair));
++    if !has_positional_dtor {
++        for dtor_slot in cxx_dtor_slots(cx, adt_did) {
++            slots.push(dtor_slot);
++        }
++    }
++    let mut dtor_pair_emitted = false;
++    for slot in &virtuals {
++        match slot {
++            cxx_mangle::CxxVtSlot::ImportedDtorPair => {
++                if !dtor_pair_emitted {
++                    for dtor_slot in cxx_dtor_slots(cx, adt_did) {
++                        slots.push(dtor_slot);
++                    }
++                    dtor_pair_emitted = true;
++                }
++            }
++            _ => slots.push(cxx_vt_slot_fn_addr(cx, slot)),
++        }
++    }
++
++    let initializer = cx.const_struct(&slots, false);
++    define_weak_const_global(cx, symbol, initializer);
++}
++
++fn cxx_vt_slot_fn_addr<'gcc, 'tcx>(
++    cx: &CodegenCx<'gcc, 'tcx>,
++    slot: &cxx_mangle::CxxVtSlot,
++) -> RValue<'gcc> {
++    match slot {
++        cxx_mangle::CxxVtSlot::Rust { def_id, .. } => {
++            cx.get_fn_addr(Instance::mono(cx.tcx, *def_id))
++        }
++        cxx_mangle::CxxVtSlot::Imported { link_name, .. } => {
++            declare_extern_fn_addr(cx, link_name.as_str())
++        }
++        cxx_mangle::CxxVtSlot::ImportedDtorPair => {
++            bug!("ImportedDtorPair must be expanded by the caller")
++        }
++    }
++}
++
++/// The address of an external function symbol, declared `void()` if
++/// not already known. Only the address matters for a vtable slot.
++fn declare_extern_fn_addr<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, symbol: &str) -> RValue<'gcc> {
++    let func = *cx.functions.borrow_mut().entry(symbol.to_string()).or_insert_with(|| {
++        cx.context.new_function(None, FunctionType::Extern, cx.type_void(), &[], symbol, false)
++    });
++    func.get_address(None)
++}
++
++/// Itanium leading/positional dtor pair: `[D1, D0]` — the complete
++/// (`drop_in_place::<D>`) then deleting (drop + `operator delete`)
++/// destructors of the most-derived class. Empty when the chain has no
++/// virtual destructor.
++fn cxx_dtor_slots<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, adt_did: DefId) -> Vec<RValue<'gcc>> {
++    if !cxx_mangle::chain_has_virtual_dtor(cx.tcx, adt_did) {
++        return Vec::new();
++    }
++    let ty = Ty::new_adt(cx.tcx, cx.tcx.adt_def(adt_did), cx.tcx.mk_args(&[]));
++    let drop_instance = Instance::resolve_drop_in_place(cx.tcx, ty);
++
++    let d1 = cx.get_fn_addr(drop_instance);
++    let d0 = emit_cxx_deleting_dtor_thunk(cx, adt_did, drop_instance);
++    vec![d1, d0]
++}
++
++/// `void(this)`: `drop_in_place::<D>(this); operator delete(this)`.
++fn emit_cxx_deleting_dtor_thunk<'gcc, 'tcx>(
++    cx: &CodegenCx<'gcc, 'tcx>,
++    adt_did: DefId,
++    drop_instance: Instance<'tcx>,
++) -> RValue<'gcc> {
++    let name = format!(
++        "__rustcc_cxx_delete${}",
++        cxx_mangle::mangle_cxx_vtable_symbol(cx.tcx, adt_did)
++    );
++    if let Some(func) = cx.functions.borrow().get(&name) {
++        return func.get_address(None);
++    }
++
++    let void_ty = cx.type_void();
++    let ptr_ty = cx.type_ptr();
++    let this_param = cx.context.new_parameter(None, ptr_ty, "this");
++    let thunk = cx.context.new_function(
++        None,
++        FunctionType::Exported,
++        void_ty,
++        &[this_param],
++        &name,
++        false,
++    );
++    cx.functions.borrow_mut().insert(name.clone(), thunk);
++    mark_weak(cx, &name);
++
++    let block = thunk.new_block("start");
++    let this = thunk.get_param(0).to_rvalue();
++
++    // drop_in_place::<D>(this) — direct call to the monomorphized
++    // drop glue (its ABI is `void(*mut D)`; the opaque `this` pointer
++    // is cast to the parameter type gccjit expects).
++    let drop_fn = cx.get_fn(drop_instance);
++    let drop_param_ty = drop_fn.get_param(0).to_rvalue().get_type();
++    let this_cast = cx.context.new_cast(None, this, drop_param_ty);
++    block.add_eval(None, cx.context.new_call(None, drop_fn, &[this_cast]));
++
++    // operator delete(this) — Itanium `_ZdlPv`.
++    let op_delete = *cx.functions.borrow_mut().entry("_ZdlPv".to_string()).or_insert_with(|| {
++        let p = cx.context.new_parameter(None, ptr_ty, "p");
++        cx.context.new_function(None, FunctionType::Extern, void_ty, &[p], "_ZdlPv", false)
++    });
++    block.add_eval(None, cx.context.new_call(None, op_delete, &[this]));
++
++    block.end_with_void_return(None);
++    thunk.get_address(None)
++}
+diff --git a/compiler/rustc_codegen_gcc/src/lib.rs b/compiler/rustc_codegen_gcc/src/lib.rs
+index d50968bad25..7b94477f573 100644
+--- a/compiler/rustc_codegen_gcc/src/lib.rs
++++ b/compiler/rustc_codegen_gcc/src/lib.rs
+@@ -58,6 +58,7 @@
+ mod consts;
+ mod context;
+ mod coverageinfo;
++mod cxx_vtable;
+ mod debuginfo;
+ mod declare;
+ mod errors;
+diff --git a/compiler/rustc_codegen_gcc/src/mono_item.rs b/compiler/rustc_codegen_gcc/src/mono_item.rs
+index d5874779021..45ae859ce48 100644
+--- a/compiler/rustc_codegen_gcc/src/mono_item.rs
++++ b/compiler/rustc_codegen_gcc/src/mono_item.rs
+@@ -75,5 +75,12 @@ fn predefine_fn(
+ 
+         self.functions.borrow_mut().insert(symbol_name.to_string(), decl);
+         self.function_instances.borrow_mut().insert(instance, decl);
++
++        // P09.x (v1.15): queue `_ZTV`/`_ZTI`/`_ZTS` emission for a
++        // polymorphic `#[repr(cpp)]` class when one of its methods is
++        // predefined. Flushed after the predefine loop (base.rs) —
++        // gccjit functions can't be declared-then-defined the way
++        // LLVM declarations can.
++        crate::cxx_vtable::queue_class_metadata(self, instance.def_id());
+     }
+ }
