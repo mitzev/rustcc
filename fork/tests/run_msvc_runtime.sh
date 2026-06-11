@@ -72,6 +72,11 @@ if [ -z "$LLVM_LIB" ] && [ -x "$HOMEBREW_LLVM_BIN/llvm-lib" ]; then
     LLVM_LIB="$HOMEBREW_LLVM_BIN/llvm-lib"
 fi
 
+# The msvc target's link flags travel ENTIRELY via the cargo env
+# var below (config.toml cannot expand $HOME): xwin import-lib
+# search paths + console subsystem, plus the C++ stub when built.
+XWIN_FLAGS="-Lnative=$XWIN/crt/lib/x86_64 -Lnative=$XWIN/sdk/lib/um/x86_64 -Lnative=$XWIN/sdk/lib/ucrt/x86_64 -Clink-arg=/subsystem:console"
+
 if [ -f "cpp/maybe_throws.cpp" ] && [ -n "$CLANG_CL" ]; then
     echo "=> Pre-compiling cpp/maybe_throws.cpp for x86_64-pc-windows-msvc"
     "$CLANG_CL" /c /EHsc /std:c++17 /MT \
@@ -86,9 +91,9 @@ if [ -f "cpp/maybe_throws.cpp" ] && [ -n "$CLANG_CL" ]; then
     else
         lld-link /lib "/OUT:${CPP_LIB}" "$CPP_OBJ"
     fi
-    EXTRA_RUSTFLAGS="-Lnative=$(dirname "$CPP_LIB") -lstatic=maybe_throws"
+    EXTRA_RUSTFLAGS="$XWIN_FLAGS -Lnative=$(dirname "$CPP_LIB") -lstatic=maybe_throws"
 else
-    EXTRA_RUSTFLAGS=""
+    EXTRA_RUSTFLAGS="$XWIN_FLAGS"
 fi
 
 echo "=> Building msvc_runtime_smoke for x86_64-pc-windows-msvc"

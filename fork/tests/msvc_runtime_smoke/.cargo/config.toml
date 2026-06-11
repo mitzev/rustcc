@@ -5,17 +5,11 @@
 # - `xwin` SDK splatted to `$HOME/.xwin/` via
 #   `cargo install xwin && xwin --accept-license splat -o ~/.xwin`.
 #
-# Paths below assume xwin in `$HOME/.xwin`; adjust if elsewhere.
+# The xwin -Lnative search paths + /subsystem:console + the
+# pre-compiled maybe_throws.lib flags all come from the runner
+# script via CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS —
+# config.toml can't expand $HOME, and hardcoding an absolute
+# home here broke every machine that wasn't the author's (the
+# CI runner's lld-link couldn't find kernel32.lib).
 [target.x86_64-pc-windows-msvc]
 linker = "lld-link"
-rustflags = [
-  "-Lnative=/Users/ogi/.xwin/crt/lib/x86_64",
-  "-Lnative=/Users/ogi/.xwin/sdk/lib/um/x86_64",
-  "-Lnative=/Users/ogi/.xwin/sdk/lib/ucrt/x86_64",
-  # v1.13.0 P09.67b: build.rs would need host std (not in
-  # stage-1 sysroot), so we pre-compile maybe_throws.lib via
-  # the runner script (run_msvc_runtime.sh) and pass its
-  # directory + name via additional -L / -l args. The script
-  # appends them as link-arg flags at cargo invocation time.
-  "-Clink-arg=/subsystem:console",
-]
