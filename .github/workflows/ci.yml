@@ -122,12 +122,22 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Free disk space (Linux)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go || true
+          sudo docker image prune --all --force || true
+
       - name: System deps (clang + C++ runtime)
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev libc++-dev libc++abi-dev
 
       - name: Build fork rustc stage-1
+        env:
+          # 1.96.0 release-tag CI LLVM is still served — skip the
+          # ~90 min from-source LLVM build that exhausts free runners.
+          RUSTCC_DOWNLOAD_CI_LLVM: "1"
         run: ./fork/build.sh
 
       - name: Build the cxx_throws_native example
@@ -157,12 +167,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Free disk space (Linux)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go || true
+          sudo docker image prune --all --force || true
+
       - name: System deps (libclang for parsing; g++ for codegen)
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ clang libclang-dev
 
       - name: Build fork rustc stage-1
+        env:
+          RUSTCC_DOWNLOAD_CI_LLVM: "1"
         run: ./fork/build.sh
 
       - name: Run the subclass + member-ptr demos with g++
@@ -189,6 +207,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Free disk space (Linux)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go || true
+          sudo docker image prune --all --force || true
+
       - name: System deps (wine + clang + xwin)
         run: |
           sudo dpkg --add-architecture i386
@@ -198,6 +222,8 @@ jobs:
           xwin --accept-license splat --output ~/.xwin
 
       - name: Build fork rustc stage-1
+        env:
+          RUSTCC_DOWNLOAD_CI_LLVM: "1"
         run: ./fork/build.sh
 
       - name: Run the MSVC runtime smoke suite under Wine

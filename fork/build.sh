@@ -84,18 +84,20 @@ if [[ $APPLY_ONLY -eq 1 ]]; then
 fi
 
 # 4. Copy the stock config template and build.
+#
+# LLVM source: by default we BUILD LLVM from source (slow but never
+# bit-rots — rust-lang CI eventually prunes download-ci-llvm
+# artifacts for old pins). For the 1.96.0 *release tag* base the CI
+# artifacts are still served (verified 2026-06): set
+# `RUSTCC_DOWNLOAD_CI_LLVM=1` to download instead — saves ~90 min and
+# most of the disk pressure on CI runners.
+: "${RUSTCC_DOWNLOAD_CI_LLVM:=0}"
 if [[ ! -f "$CLONE_DIR/bootstrap.toml" ]]; then
   cp "$CLONE_DIR/bootstrap.example.toml" "$CLONE_DIR/bootstrap.toml"
-  # rust-lang/rust's CI prunes `download-ci-llvm` artifacts for
-  # older commits. Our pinned commit is old enough that the
-  # prebuilt LLVM tarball has been deleted, so bootstrap falls
-  # back to a 404 on every retry. Force-build LLVM from source
-  # — adds ~30 min to a cold build but is the only path that
-  # reliably works across rebase cycles. Also turn off
-  # `assertions` for speed.
-  python3 - "$CLONE_DIR/bootstrap.toml" <<'PY'
+  python3 - "$CLONE_DIR/bootstrap.toml" "$RUSTCC_DOWNLOAD_CI_LLVM" <<'PY'
 import sys, re
 path = sys.argv[1]
+download_ci_llvm = 'true' if sys.argv[2] == '1' else 'false'
 # Explicit UTF-8 encoding on both read + write — Python on Windows
 # defaults to cp1252 which encodes ASCII-only safely but emits
 # Latin-1 bytes for any non-ASCII character. bootstrap.py opens
@@ -115,16 +117,15 @@ text = re.sub(r'^#?\s*assertions\s*=.*$', 'assertions = false', text, flags=re.M
 if not text.endswith('\n'):
     text += '\n'
 text += (
-    '\n# rustcc fork override (v1.13.8, Rust 1.96.0 base).\n'
-    '# rust-lang CI prunes download-ci-llvm artifacts for older commits;\n'
-    '# even the 1.96.0 *release* commit returns 404 now, so build LLVM\n'
-    '# from source (reliable -- adds ~30 min to a cold build but never\n'
-    '# bit-rots like the artifact bucket does).\n'
+    '\n# rustcc fork override (Rust 1.96.0 base).\n'
+    '# LLVM: from-source by default (never bit-rots); CI download\n'
+    '# opt-in via RUSTCC_DOWNLOAD_CI_LLVM=1 (release-tag artifacts\n'
+    '# are still served -- saves ~90 min on CI runners).\n'
     '# 1.96.0 is a *stable* channel, which forbids `#![feature(...)]`;\n'
     '# the fork needs `feature(rustc_attrs)`, so force the nightly\n'
     '# channel on the built toolchain.\n'
     '[llvm]\n'
-    'download-ci-llvm = false\n'
+    'download-ci-llvm = ' + download_ci_llvm + '\n'
     '[rust]\n'
     'channel = "nightly"\n'
 )
