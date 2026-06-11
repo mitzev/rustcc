@@ -63,6 +63,9 @@ static NAV: AtomicPtr<FileNav> = AtomicPtr::new(core::ptr::null_mut());
 /// the single editor view switches between them (nav click / Open).
 static OPEN_FILES: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
 static NAV_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Project-relative paths removed from the project view (kept on
+/// disk); persisted in .rustcc_ide.toml.
+static PROJECT_EXCLUDES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Highlight keywords: fork keywords extracted at startup from the
 /// VSCode extension's TextMate grammar (single source of truth) plus
 /// the core Rust keyword set.
@@ -198,6 +201,8 @@ const ACT_NEW_STM32: usize = 58;
 const ACT_NEW_ESP32: usize = 59;
 const ACT_HELP: usize = 60;
 const ACT_ABOUT: usize = 61;
+const ACT_REMOVE_FROM_PROJ: usize = 62;
+const ACT_DELETE_FILE: usize = 63;
 const ACT_UPLOAD: usize = 48;
 const ACT_UPLOAD_CFG: usize = 49;
 const ACT_DBG_START: usize = 50;
@@ -671,7 +676,7 @@ unsafe fn run_action(act: usize) {
             a if (ACT_TGT_BASE..ACT_TGT_BASE + 6).contains(&a) => {
                 let t = (a - ACT_TGT_BASE) as i32;
                 TARGET.store(t, Relaxed);
-                project_save_target();
+                project_save_cfg();
                 console_append(&format!("target = {}\n", TARGET_NAMES[t as usize]));
             }
             ACT_NEW_HOST => new_project_flow(0),
@@ -703,6 +708,8 @@ unsafe fn run_action(act: usize) {
             }
             ACT_DBG_STOP => dbg_stop(),
             ACT_CLOSE_FILE => close_current_file(),
+            ACT_REMOVE_FROM_PROJ => remove_from_project(),
+            ACT_DELETE_FILE => delete_current_file(true),
             ACT_UPLOAD_CFG => edit_upload_config(),
             ACT_OPEN_PROJECT => {
                 if let Some(dir) = choose_file(CHOOSER_DIR_OPEN, "Open project folder") {
@@ -736,6 +743,7 @@ unsafe fn save_to(path: &str) {
         let len = (*buf).length();
         (*buf).outputfile_with_defaults(cstr(path).as_ptr(), 0, len);
         DIRTY.store(false, Relaxed);
+        console_append(&format!("saved {}\n", display_path(path)));
     }
 }
 
@@ -1001,6 +1009,26 @@ fn is_unsaved(path: &str) -> bool {
     !path.starts_with('/')
 }
 
+/// A path as shown to the user: relative to the open project when it
+/// lives inside it (with a canonicalized retry — /tmp vs /private/tmp
+/// style symlink mismatches), the full path otherwise.
+fn display_path(p: &str) -> String {
+    let root = PROJECT_DIR.lock().unwrap().clone().unwrap_or_default();
+    if !root.is_empty() {
+        if let Some(r) = p.strip_prefix(&format!("{root}/")) {
+            return r.to_string();
+        }
+        if let (Ok(cp), Ok(cr)) =
+            (std::fs::canonicalize(p), std::fs::canonicalize(&root))
+        {
+            if let Ok(rel) = cp.strip_prefix(&cr) {
+                return rel.to_string_lossy().into_owned();
+            }
+        }
+    }
+    p.to_string()
+}
+
 /// File ▸ New: a fresh buffer in its own tab, named "unsaved" (then
 /// "unsaved-2", …). Save / Save As renames the tab to the real file.
 fn new_unsaved_file() {
@@ -1115,15 +1143,20 @@ fn nav_refresh() {
         if let Some(dir) = PROJECT_DIR.lock().unwrap().clone() {
             collect_files(&dir, 0, &mut paths);
         }
+        {
+            // Files removed from the project (kept on disk) stay out
+            // of the scan; an OPEN tab still shows below.
+            let excl = PROJECT_EXCLUDES.lock().unwrap();
+            paths.retain(|p| !excl.contains(&display_path(p)));
+        }
         for (p, _) in OPEN_FILES.lock().unwrap().iter() {
             if !paths.contains(p) {
                 paths.push(p.clone());
             }
         }
         let cur = PATH.lock().unwrap().clone();
-        let root = PROJECT_DIR.lock().unwrap().clone().unwrap_or_default();
         for p in &paths {
-            let shown = p.strip_prefix(&format!("{root}/")).unwrap_or(p);
+            let shown = display_path(p);
             let marker = if Some(p) == cur.as_ref() { "@b" } else { "" };
             b.add_str_with_defaults(&format!("{marker}{shown}"));
         }
@@ -2127,7 +2160,7 @@ fn close_file_at(idx: usize) {
                 nav_refresh();
             }
         }
-        console_append(&format!("closed {closed}\n"));
+        console_append(&format!("closed {}\n", display_path(&closed)));
     }
 }
 
@@ -2142,6 +2175,67 @@ fn close_current_file() {
     }
 }
 
+/// File ▸ Remove from Project: the current file leaves the project
+/// view (and its tab closes) but STAYS on disk; the exclusion is
+/// persisted in .rustcc_ide.toml.
+fn remove_from_project() {
+    let Some(cur) = PATH.lock().unwrap().clone() else { return };
+    if PROJECT_DIR.lock().unwrap().is_none() {
+        console_append("no project open\n");
+        return;
+    }
+    if is_unsaved(&cur) {
+        close_current_file();
+        return;
+    }
+    let rel = display_path(&cur);
+    {
+        let mut excl = PROJECT_EXCLUDES.lock().unwrap();
+        if !excl.contains(&rel) {
+            excl.push(rel.clone());
+        }
+    }
+    project_save_cfg();
+    close_current_file();
+    nav_refresh();
+    console_append(&format!("removed {rel} from project (file kept on disk)\n"));
+}
+
+/// File ▸ Delete File…: confirm, then remove the current file from
+/// DISK and close its tab. `ask` is false only in the self-test.
+fn delete_current_file(ask: bool) {
+    let Some(cur) = PATH.lock().unwrap().clone() else { return };
+    if is_unsaved(&cur) {
+        close_current_file();
+        return;
+    }
+    let rel = display_path(&cur);
+    if ask {
+        // fl_choice's first arg is a printf format — escape '%'.
+        let msg = format!("Delete {rel} from disk?\nThis cannot be undone.")
+            .replace('%', "%%");
+        let pick = unsafe {
+            fl_choice(
+                cstr(&msg).as_ptr(),
+                c"Cancel".as_ptr(),
+                c"Delete".as_ptr(),
+                core::ptr::null(),
+            )
+        };
+        if pick != 1 {
+            return;
+        }
+    }
+    match std::fs::remove_file(&cur) {
+        Ok(()) => {
+            close_current_file();
+            nav_refresh();
+            console_append(&format!("deleted {rel}\n"));
+        }
+        Err(e) => console_append(&format!("delete failed: {e}\n")),
+    }
+}
+
 /// Stable per-target slugs for the project config (indices would
 /// silently re-map if the Target menu is ever reordered).
 const TARGET_SLUGS: [&str; 6] =
@@ -2151,25 +2245,34 @@ fn project_cfg_path(dir: &str) -> String {
     format!("{dir}/.rustcc_ide.toml")
 }
 
-/// Persist the selected Target into the open project.
-fn project_save_target() {
+/// Persist per-project state (Target + removed files).
+fn project_save_cfg() {
     let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
     let t = TARGET.load(Relaxed) as usize;
     let slug = TARGET_SLUGS.get(t).copied().unwrap_or("host");
-    let body = format!(
-        "# rustcc IDE project state (written on Target changes)\ntarget = \"{slug}\"\n"
+    let mut body = format!(
+        "# rustcc IDE project state (written on Target / project changes)\ntarget = \"{slug}\"\n"
     );
+    for e in PROJECT_EXCLUDES.lock().unwrap().iter() {
+        body.push_str(&format!("exclude = \"{e}\"\n"));
+    }
     let _ = std::fs::write(project_cfg_path(dir.as_str()), body);
 }
 
-fn project_load_target(dir: &str) -> Option<i32> {
+fn project_load_cfg(dir: &str) -> Option<(Option<i32>, Vec<String>)> {
     let txt = std::fs::read_to_string(project_cfg_path(dir)).ok()?;
-    let slug = txt.lines().find_map(|l| {
+    let mut target = None;
+    let mut excludes = Vec::new();
+    for l in txt.lines() {
         let l = l.trim();
-        l.strip_prefix("target")
-            .map(|r| r.trim_start_matches(['=', ' ']).trim_matches('"'))
-    })?;
-    TARGET_SLUGS.iter().position(|s| *s == slug).map(|i| i as i32)
+        if let Some(r) = l.strip_prefix("target") {
+            let slug = r.trim_start_matches(['=', ' ']).trim_matches('"');
+            target = TARGET_SLUGS.iter().position(|s| *s == slug).map(|i| i as i32);
+        } else if let Some(r) = l.strip_prefix("exclude") {
+            excludes.push(r.trim_start_matches(['=', ' ']).trim_matches('"').to_string());
+        }
+    }
+    Some((target, excludes))
 }
 
 fn set_project(dir: &str) {
@@ -2178,15 +2281,21 @@ fn set_project(dir: &str) {
     // Restore the project's saved Target; a project without a config
     // (fresh scaffold / pre-existing folder) is seeded with the
     // current selection.
-    match project_load_target(dir) {
-        Some(t) => {
-            TARGET.store(t, Relaxed);
-            console_append(&format!(
-                "target = {} (restored from project)\n",
-                TARGET_NAMES[t as usize]
-            ));
+    match project_load_cfg(dir) {
+        Some((target, excludes)) => {
+            *PROJECT_EXCLUDES.lock().unwrap() = excludes;
+            if let Some(t) = target {
+                TARGET.store(t, Relaxed);
+                console_append(&format!(
+                    "target = {} (restored from project)\n",
+                    TARGET_NAMES[t as usize]
+                ));
+            }
         }
-        None => project_save_target(),
+        None => {
+            PROJECT_EXCLUDES.lock().unwrap().clear();
+            project_save_cfg();
+        }
     }
     let lib = format!("{dir}/src/lib.rs");
     let main = format!("{dir}/src/main.rs");
@@ -2584,6 +2693,8 @@ const MENU_SPEC: &[(&str, i32, usize)] = &[
     ("&File/New Project/Raspberry Pi &Pico Project…", 0, ACT_NEW_PICO),
     ("&File/Open &Project…", MOD_META | MOD_SHIFT | 'o' as i32, ACT_OPEN_PROJECT),
     ("&File/&Close File", MOD_META | 'w' as i32, ACT_CLOSE_FILE),
+    ("&File/Remove from Pro&ject", 0, ACT_REMOVE_FROM_PROJ),
+    ("&File/De&lete File…", 0, ACT_DELETE_FILE),
     ("&File/&Quit", MOD_META | 'q' as i32, ACT_QUIT),
     ("&Edit/&Undo", MOD_META | 'z' as i32, ACT_UNDO),
     ("&Edit/&Redo", MOD_META | MOD_SHIFT | 'z' as i32, ACT_REDO),
@@ -2629,6 +2740,17 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
     }
 }
 
+/// Layout: everything under the menu bar lives in ONE Fl_Tile, so
+/// the nav|editor and editor|console borders DRAG (Fl_Tile resizes
+/// children sharing an edge). Children must EXACTLY tile the area.
+const LY_W: i32 = 1180;
+const LY_H: i32 = 760;
+const LY_BAR_H: i32 = 28; // menu bar
+const LY_NAV_W: i32 = 220;
+const LY_TABS_H: i32 = 24;
+const LY_EDGRP_H: i32 = 434; // tab strip + editor
+const LY_CONSOLE_H: i32 = 298;
+
 unsafe fn build_ui() -> *mut Fl_Window {
     unsafe {
         // new_at: Fl_Window's ctor creates a platform window-driver
@@ -2655,7 +2777,12 @@ unsafe fn build_ui() -> *mut Fl_Window {
         // The ctor-in-place MIR pass (v1.14) constructs straight into
         // *ed, so the ctor-created children (scrollbars) capture the
         // final address — no re-parent fix-up needed.
-        ed.write(RustEditor::new(220, 52, 960, 406));
+        ed.write(RustEditor::new(
+            LY_NAV_W,
+            LY_BAR_H + LY_TABS_H,
+            LY_W - LY_NAV_W,
+            LY_EDGRP_H - LY_TABS_H,
+        ));
         ED.store(ed, Relaxed);
         debug_assert!({
             let g = ed as *mut Fl_Group;
@@ -2697,7 +2824,14 @@ unsafe fn build_ui() -> *mut Fl_Window {
         CONSOLE_BUF.store(cbuf, Relaxed);
         let con =
             cxx_operator_new(core::mem::size_of::<Fl_Text_Display>()) as *mut Fl_Text_Display;
-        Fl_Text_Display::new_at(con, 220, 462, 960, 298, c"".as_ptr());
+        Fl_Text_Display::new_at(
+            con,
+            LY_NAV_W,
+            LY_BAR_H + LY_EDGRP_H,
+            LY_W - LY_NAV_W,
+            LY_CONSOLE_H,
+            c"".as_ptr(),
+        );
         (*con).buffer(cbuf);
         (*con).textsize_i32(12);
         CONSOLE.store(con, Relaxed);
@@ -2715,14 +2849,35 @@ unsafe fn build_ui() -> *mut Fl_Window {
         Fl_Group::current_mut_fl_group(core::ptr::null_mut());
         TABBAR.store(tabs, Relaxed);
 
-        (*(ed as *mut Fl_Text_Display)).linenumber_width(36);
+        // Assemble: tab strip + editor share a group whose
+        // resizable is the EDITOR (the strip keeps its height when
+        // the console border drags); nav, that group, and the
+        // console tile the Fl_Tile exactly.
+        let edgrp = cxx_operator_new(core::mem::size_of::<Fl_Group>()) as *mut Fl_Group;
+        Fl_Group::new_at(
+            edgrp,
+            LY_NAV_W,
+            LY_BAR_H,
+            LY_W - LY_NAV_W,
+            LY_EDGRP_H,
+            core::ptr::null(),
+        );
+        (*edgrp).end();
+        (*edgrp).add(tabs as *mut Fl_Widget);
+        (*edgrp).add(ed as *mut Fl_Widget);
+        (*edgrp).resizable(ed as *mut Fl_Widget);
+
+        let tile = cxx_operator_new(core::mem::size_of::<Fl_Tile>()) as *mut Fl_Tile;
+        Fl_Tile::new_at(tile, 0, LY_BAR_H, LY_W, LY_H - LY_BAR_H, core::ptr::null());
+        (*tile).as_fl_group_mut().end();
+        (*tile).as_fl_group_mut().add(nav as *mut Fl_Widget);
+        (*tile).as_fl_group_mut().add(edgrp as *mut Fl_Widget);
+        (*tile).as_fl_group_mut().add(con as *mut Fl_Widget);
 
         let g = (*win).as_fl_group_mut();
         g.add(bar as *mut Fl_Widget);
-        g.add(tabs as *mut Fl_Widget);
-        g.add(nav as *mut Fl_Widget);
-        g.add(ed as *mut Fl_Widget);
-        g.add(con as *mut Fl_Widget);
+        g.add(tile as *mut Fl_Widget);
+        g.resizable(tile as *mut Fl_Widget);
 
         load_keywords();
         WIN.store(win, Relaxed);
@@ -3209,10 +3364,58 @@ unsafe fn self_test() -> i32 {
                 .contains("\"stm32f4\""),
         );
         TARGET.store(2, Relaxed); // simulate Target menu pick
-        project_save_target();
+        project_save_cfg();
         TARGET.store(0, Relaxed);
         set_project(&proj_s); // reopen: restores the saved target
         check("project target restored on reopen", TARGET.load(Relaxed) == 2);
+
+        // display_path: project-relative, incl. the canonicalized
+        // retry (temp dirs sit behind the /var → /private/var link).
+        check(
+            "display_path is project-relative",
+            display_path(&format!("{proj_s}/src/lib.rs")) == "src/lib.rs"
+                && std::fs::canonicalize(&proj_s).is_ok_and(|c| {
+                    display_path(&format!("{}/src/lib.rs", c.to_string_lossy()))
+                        == "src/lib.rs"
+                }),
+        );
+
+        // Remove from Project: tab closes, nav scan excludes it, the
+        // exclusion persists across reopen — the file stays on disk.
+        let extra = format!("{proj_s}/src/extra.rs");
+        std::fs::write(&extra, "// extra\n").unwrap();
+        open_in_editor(&extra);
+        remove_from_project();
+        check(
+            "remove-from-project closes tab, keeps file, excludes from nav",
+            std::path::Path::new(&extra).exists()
+                && !OPEN_FILES.lock().unwrap().iter().any(|(p, _)| *p == extra)
+                && !NAV_PATHS.lock().unwrap().iter().any(|p| *p == extra)
+                && PROJECT_EXCLUDES.lock().unwrap().contains(&"src/extra.rs".to_string()),
+        );
+        set_project(&proj_s); // reopen: exclusion came from the cfg
+        check(
+            "exclusion persists across project reopen",
+            PROJECT_EXCLUDES.lock().unwrap().contains(&"src/extra.rs".to_string()),
+        );
+
+        // Delete File: gone from disk and from the tabs.
+        let gone = format!("{proj_s}/src/gone.rs");
+        std::fs::write(&gone, "// doomed\n").unwrap();
+        open_in_editor(&gone);
+        delete_current_file(false);
+        check(
+            "delete removes the file from disk and tabs",
+            !std::path::Path::new(&gone).exists()
+                && !OPEN_FILES.lock().unwrap().iter().any(|(p, _)| *p == gone),
+        );
+
+        // Splitter layout: the Fl_Tile children must tile exactly.
+        check(
+            "tile layout tiles exactly",
+            LY_EDGRP_H + LY_CONSOLE_H == LY_H - LY_BAR_H && LY_TABS_H < LY_EDGRP_H
+                && LY_NAV_W < LY_W,
+        );
 
         // 20. FULL gate: real lldb session — breakpoint hit, variables
         //     visible, step, continue to exit.

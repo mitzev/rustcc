@@ -124,6 +124,20 @@ cargo +rustcc run --release --bin ide         # the GUI
   + tab (unsaved, unsaved-2, …); Save / Save As renames the tab in
   place to the real file. File ▸ Open also routes through the
   multi-buffer path now (it used to load into the current view).
+- **Draggable splitters** — nav | editor and editor | console borders
+  drag (`Fl_Tile` owns everything under the menu bar; the tab strip +
+  editor share a group whose `resizable` is the editor, so the strip
+  keeps its height). The window itself resizes proportionally.
+- **Paths display project-relative** everywhere (nav, console
+  messages), with a canonicalized fallback for `/tmp` → `/private/tmp`
+  style symlinks; full paths only for files outside the project.
+- **File ▸ Remove from Project** — closes the tab and hides the file
+  from the navigator (persisted as `exclude =` lines in
+  `.rustcc_ide.toml`); the file stays on disk. **File ▸ Delete
+  File…** — `fl_choice` confirm, then removes it from disk and closes
+  the tab. (Wiring the confirm dialog exposed another importer bug,
+  now fixed: variadic functions mangled without the trailing `z` —
+  `fl_choice` is printf-style — producing unlinkable symbols.)
 - **Per-project Target persistence** — the selected Target is written
   to `<project>/.rustcc_ide.toml` (stable slugs, not indices) on every
   Target-menu change; Open Project restores it. Fresh projects are

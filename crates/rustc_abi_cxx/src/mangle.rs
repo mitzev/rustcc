@@ -193,7 +193,7 @@ impl<'a> Mangler<'a> {
                     emit_source_name(name, &mut self.out);
                     self.out.push('E');
                 }
-                self.emit_params(&sig.params);
+                self.emit_params_v(&sig.params, sig.variadic);
             }
             Symbol::Method { class, name, sig } => {
                 self.out.push_str("_Z");
@@ -208,7 +208,7 @@ impl<'a> Mangler<'a> {
                 self.emit_nested_prefix(&path);
                 self.emit_method_name(name);
                 self.out.push('E');
-                self.emit_params(&sig.params);
+                self.emit_params_v(&sig.params, sig.variadic);
             }
             Symbol::Ctor { class, variant, sig } => {
                 self.out.push_str("_Z");
@@ -221,7 +221,7 @@ impl<'a> Mangler<'a> {
                     CtorVariant::C3 => "C3",
                 });
                 self.out.push('E');
-                self.emit_params(&sig.params);
+                self.emit_params_v(&sig.params, sig.variadic);
             }
             Symbol::Dtor { class, variant } => {
                 self.out.push_str("_Z");
@@ -373,11 +373,22 @@ impl<'a> Mangler<'a> {
     }
 
     fn emit_params(&mut self, params: &[TypeId]) {
-        if params.is_empty() {
+        self.emit_params_v(params, false);
+    }
+
+    /// Itanium §5.1.5: a variadic signature appends `z` after the
+    /// fixed parameters (`fl_choice(const char*, ..., ...)` =
+    /// `_Z9fl_choicePKcS0_S0_S0_z`). Dropping it produced unlinkable
+    /// symbols for every variadic free function/method.
+    fn emit_params_v(&mut self, params: &[TypeId], variadic: bool) {
+        if params.is_empty() && !variadic {
             self.out.push('v');
         } else {
             for p in params {
                 self.emit_type(*p);
+            }
+            if variadic {
+                self.out.push('z');
             }
         }
     }
