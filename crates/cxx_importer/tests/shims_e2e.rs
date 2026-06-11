@@ -21,6 +21,8 @@ use std::sync::Mutex;
 use cxx_importer::{Driver, HeaderGraph};
 use rustc_abi_cxx::{CxxTypeCtx, Target};
 
+mod common;
+
 static LIBCLANG: Mutex<()> = Mutex::new(());
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -39,6 +41,14 @@ fn write(path: &PathBuf, body: &str) {
 #[test]
 fn driver_emits_shims_that_compile_and_expose_expected_symbols() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tc = match common::find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no C++ compiler available");
+            return;
+        }
+    };
 
     let dir = tmpdir("widget");
     let header_path = dir.join("widget.h");
@@ -81,7 +91,7 @@ struct Widget {
 
     write(&shim_path, &shim_src);
 
-    let status = Command::new("clang++")
+    let status = Command::new(&tc.compiler)
         .args(["-std=c++17", "-c", "-o"])
         .arg(&obj_path)
         .arg(&shim_path)
@@ -120,6 +130,14 @@ struct Widget {
 #[test]
 fn driver_handles_multiple_roots_with_shared_include_dir() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tc = match common::find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no C++ compiler available");
+            return;
+        }
+    };
 
     let dir = tmpdir("multi");
     let include_dir = dir.join("include");
@@ -197,7 +215,7 @@ struct Beta {
     let obj_path = dir.join("multi_shims.o");
     write(&shim_path, &shim_src);
 
-    let status = Command::new("clang++")
+    let status = Command::new(&tc.compiler)
         .args(["-std=c++17", "-I"])
         .arg(include_dir.canonicalize().unwrap())
         .args(["-c", "-o"])

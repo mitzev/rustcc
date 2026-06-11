@@ -24,6 +24,8 @@ use rustc_abi_cxx::{
     Target, TemplateArg, TypeId, VTableEntry, Virtuality,
 };
 
+mod common;
+
 /// libclang's initialization is process-exclusive (`Clang::new()` errors
 /// out on second call while another instance exists). Serialize import
 /// tests with a module-wide mutex so cargo's parallel test runner
@@ -2171,6 +2173,13 @@ fn m14_heap_shim_and_new_boxed_wrapper_pair_through_full_pipeline() {
     // contain both halves of the pairing so consumers can route
     // heap allocation through `CxxHeap`.
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
+    let tc = match common::find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no C++ compiler available");
+            return;
+        }
+    };
     let header = temp_header(
         "struct Calc {\n\
          \x20   Calc(int a, int b);\n\
@@ -2243,7 +2252,7 @@ fn m14_heap_shim_and_new_boxed_wrapper_pair_through_full_pipeline() {
     // Update the shim source's `#include "<absolute path>"` to
     // resolve against the directory we just created. The driver
     // emits an absolute path, so this just works.
-    let cpp_compile = std::process::Command::new("clang++")
+    let cpp_compile = std::process::Command::new(&tc.compiler)
         .args(["-c", "-std=c++17", "-fPIC"])
         .arg("-o")
         .arg(&shim_obj)

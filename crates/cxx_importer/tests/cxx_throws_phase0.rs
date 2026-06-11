@@ -29,6 +29,8 @@ use std::process::Command;
 
 use cxx_importer::{render_throws_shim_cpp, CXX_RAW_ERROR_HEADER};
 
+mod common;
+
 fn tmpdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "rustcc_cxx_throws_phase0_{tag}_{}_{}",
@@ -42,31 +44,16 @@ fn tmpdir(tag: &str) -> PathBuf {
     dir
 }
 
-fn find_clangpp() -> Option<String> {
-    for cand in ["clang++", "/usr/bin/clang++", "/usr/local/bin/clang++"] {
-        if Command::new(cand)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Some(cand.into());
-        }
-    }
-    None
-}
-
 #[test]
 fn phase0_shim_catches_std_and_unknown_exceptions_at_runtime() {
-    let clangpp = match find_clangpp() {
+    let tc = match common::find_cxx() {
         Some(c) => c,
         None => {
-            eprintln!("skip: clang++ not available on this host");
+            eprintln!("skip: no C++ compiler available on this host");
             return;
         }
     };
+    let clangpp = tc.compiler.clone();
 
     let dir = tmpdir("e2e");
     let cpp = dir.join("throws.cpp");
@@ -119,19 +106,19 @@ int do_throw_int() {
 
     std::fs::write(&cpp, &cpp_src).unwrap();
 
-    // Compile the shim against libc++ (LLVM's C++ stdlib) so its
-    // symbols match the `-lc++` link below. On macOS libc++ is already
-    // the default; on Linux clang++ defaults to libstdc++, which would
-    // emit `std::__cxx11::*` symbols that don't resolve against libc++
-    // (undefined-symbol link errors). `-stdlib=libc++` makes both ends
-    // agree. (CI installs libc++-dev / libc++abi-dev for this.)
+    // Compile the shim against the stdlib the link step will use:
+    // clang++ pins -stdlib=libc++ so both ends agree (-lc++ below);
+    // g++ keeps its libstdc++ default (-lstdc++ below). (CI installs
+    // libc++-dev / libc++abi-dev for the clang leg.)
     let cxx_compile = Command::new(&clangpp)
-        .args(["-std=c++17", "-stdlib=libc++", "-fexceptions", "-c"])
+        .args(["-std=c++17", "-fexceptions"])
+        .args(tc.stdlib_compile_flags())
+        .arg("-c")
         .arg(&cpp)
         .arg("-o")
         .arg(&obj)
         .output()
-        .expect("spawn clang++");
+        .expect("spawn C++ compiler");
     assert!(
         cxx_compile.status.success(),
         "clang++ failed:\n  stdout: {}\n  stderr: {}\n  source was:\n{}",
@@ -217,41 +204,33 @@ fn main() {
     .unwrap();
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let rust_compile = Command::new(&rustc)
-        .args(["--edition=2024", "--crate-type", "bin"])
-        .arg(&main_rs)
-        .arg("-o")
-        .arg(&bin)
-        .arg("-C")
-        .arg(format!("link-arg={}", obj.display()))
-        .arg("-lc++")
-        .output()
-        .expect("spawn rustc");
+    let link_rustc = |edition: &str| {
+        let mut cmd = Command::new(&rustc);
+        cmd.args([format!("--edition={edition}").as_str(), "--crate-type", "bin"])
+            .arg(&main_rs)
+            .arg("-o")
+            .arg(&bin)
+            .arg("-C")
+            .arg(format!("link-arg={}", obj.display()));
+        if let Some(dir) = tc.lib_search_dir() {
+            cmd.arg("-L").arg(format!("native={}", dir.display()));
+        }
+        cmd.args(tc.link_libs());
+        cmd.output().expect("spawn rustc")
+    };
+    let rust_compile = link_rustc("2024");
     if !rust_compile.status.success() {
         let stderr = String::from_utf8_lossy(&rust_compile.stderr);
-        // Linux runners that default to libstdc++ won't find libc++
-        // — soft-skip same as the MI runtime test. The Phase 0
-        // mechanism is C++-stdlib-agnostic; on Linux we'd just swap
-        // `-lc++` for `-lstdc++`. Tracked for v1.12.1.
-        if stderr.contains("library 'c++' not found")
-            || stderr.contains("cannot find -lc++")
-        {
-            eprintln!("skip: libc++ not available on this host");
+        // Soft-skip when the selected stdlib's dev package is missing
+        // on this host (same policy as the MI runtime test).
+        if tc.stdlib_missing(&stderr) {
+            eprintln!("skip: C++ stdlib not linkable on this host");
             return;
         }
         // Older fork rustcs might not accept edition=2024. Retry
         // with 2021 — the runner doesn't use any 2024-only features.
         if stderr.contains("edition") && stderr.contains("2024") {
-            let retry = Command::new(&rustc)
-                .args(["--edition=2021", "--crate-type", "bin"])
-                .arg(&main_rs)
-                .arg("-o")
-                .arg(&bin)
-                .arg("-C")
-                .arg(format!("link-arg={}", obj.display()))
-                .arg("-lc++")
-                .output()
-                .expect("spawn rustc retry");
+            let retry = link_rustc("2021");
             if !retry.status.success() {
                 panic!(
                     "rustc link failed (after edition retry):\n{}",

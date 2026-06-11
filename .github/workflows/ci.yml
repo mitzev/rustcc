@@ -55,6 +55,51 @@ jobs:
           cargo build --locked
           cargo run --locked
 
+  # v1.14.x: the same workspace suite on a g++/libstdc++ host — the
+  # default toolchain of every mainstream Linux distro. libclang is
+  # still installed (the importer PARSES with it), but all C++
+  # compilation + linking goes through g++ and GNU libstdc++: the
+  # toolchain-aware test helper (tests/common/mod.rs) honors $CXX and
+  # swaps -stdlib=libc++/-lc++ for the libstdc++ defaults. Deliberately
+  # NO libc++-dev here, so any libc++ dependency that creeps back in
+  # fails this leg.
+  workspace-test-gcc:
+    name: cargo test --workspace (g++ / libstdc++)
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTFLAGS: -Dwarnings
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Show toolchains
+        run: |
+          rustup show active-toolchain || true
+          g++ --version | head -1
+
+      - name: Install system deps (libclang for parsing; g++ for codegen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ clang libclang-dev
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: gcc
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --locked
+
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      - name: cargo run -p cxx_throws_demo (g++ shims, libstdc++)
+        working-directory: examples/cxx_throws_demo
+        run: |
+          cargo build --locked
+          cargo run --locked
+
   patches-apply:
     name: fork/patches apply cleanly on pinned nightly
     runs-on: ubuntu-latest
@@ -95,6 +140,46 @@ jobs:
       - name: Run the cxx_throws_native example
         working-directory: examples/cxx_throws_native
         run: |
+          ./target/release/cxx_throws_native
+
+  # v1.14.x: full fork-rustc e2e with the C++ side built by g++ —
+  # subclass an imported base (+ deep chain, member ptrs, dtor
+  # position) and catch g++/libstdc++-thrown exceptions natively.
+  # Same dispatch-only gating as the other stage-1 legs (~30 min
+  # fork build on a clean runner).
+  subclass-e2e-gcc:
+    name: fork rustc + subclass/throws e2e (g++ / libstdc++)
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    env:
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: System deps (libclang for parsing; g++ for codegen)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ clang libclang-dev
+
+      - name: Build fork rustc stage-1
+        run: ./fork/build.sh
+
+      - name: Run the subclass + member-ptr demos with g++
+        env:
+          RUSTC: ${{ github.workspace }}/../rust-lang-rust-fork/build/host/stage1/bin/rustc
+        run: |
+          for d in subclass_cpp_base subclass_cpp_deep member_fn_ptr subclass_dtor_position; do
+            echo "==> $d (CXX=$CXX)"
+            ./examples/$d/build_demo.sh
+          done
+
+      - name: Build + run cxx_throws_native with g++
+        working-directory: examples/cxx_throws_native
+        env:
+          RUSTC: ${{ github.workspace }}/../rust-lang-rust-fork/build/host/stage1/bin/rustc
+        run: |
+          cargo build --release --locked
           ./target/release/cxx_throws_native
 
   cxx-throws-native-msvc-wine:

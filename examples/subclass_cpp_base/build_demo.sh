@@ -9,7 +9,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-export LIBCLANG_PATH="${LIBCLANG_PATH:-/opt/homebrew/opt/llvm/lib}"
+# libclang: explicit on macOS (Homebrew keeps it off the default path);
+# Linux clang-sys autodiscovers from libclang-dev.
+if [[ -z "${LIBCLANG_PATH:-}" && "$(uname)" == "Darwin" ]]; then
+  export LIBCLANG_PATH="/opt/homebrew/opt/llvm/lib"
+fi
+CXX="${CXX:-clang++}"
+CC="${CC:-clang}"
 RUSTC="${RUSTC:-$HOME/rust-lang-rust-fork/build/host/stage1/bin/rustc}"
 
 mkdir -p target
@@ -22,10 +28,10 @@ echo "==> 2. compile Rust subclass with the rustcc fork rustc"
     src/mywidget.rs -o target/libsubclass_cpp_base.a
 
 echo "==> 3. compile C++ base + caller + runner, link, run"
-clang++ -std=c++17 -c cpp/cppbase.cpp -o target/cppbase.o
-clang++ -std=c++17 -c caller.cpp       -o target/caller.o
-clang   -c runner.c                    -o target/runner.o
-clang++ target/runner.o target/caller.o target/cppbase.o \
+"$CXX" -std=c++17 -c cpp/cppbase.cpp -o target/cppbase.o
+"$CXX" -std=c++17 -c caller.cpp       -o target/caller.o
+"$CC"   -c runner.c                    -o target/runner.o
+"$CXX" target/runner.o target/caller.o target/cppbase.o \
     target/libsubclass_cpp_base.a -o target/demo
 
 echo "==> run"

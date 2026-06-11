@@ -30,6 +30,8 @@ use cxx_importer::rust_bindings::{
 use cxx_importer::{import_header_with_extras, render_throws_shim_cpp, CXX_RAW_ERROR_HEADER};
 use rustc_abi_cxx::{CxxTypeCtx, Target};
 
+mod common;
+
 static LIBCLANG: Mutex<()> = Mutex::new(());
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -57,22 +59,6 @@ fn host_target() -> Target {
     } else {
         Target::x86_64_unknown_linux_gnu()
     }
-}
-
-fn find_clangpp() -> Option<String> {
-    for cand in ["clang++", "/usr/bin/clang++", "/usr/local/bin/clang++"] {
-        if Command::new(cand)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Some(cand.into());
-        }
-    }
-    None
 }
 
 #[test]
@@ -176,26 +162,6 @@ int do_clean();
     );
 }
 
-fn rustc_supports_extern_cpp() -> bool {
-    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let dir = tmpdir("abi_probe");
-    let src = dir.join("probe.rs");
-    let out = dir.join("probe.rlib");
-    if std::fs::write(&src, b"pub unsafe extern \"C++\" fn _x() {}\n").is_err() {
-        return false;
-    }
-    Command::new(&rustc)
-        .args(["--edition=2021", "--crate-type", "lib"])
-        .arg(&src)
-        .arg("-o")
-        .arg(&out)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 #[test]
 fn end_to_end_compile_link_run_with_phase0_shim() {
     let _g = LIBCLANG.lock().unwrap_or_else(|e| e.into_inner());
@@ -204,13 +170,14 @@ fn end_to_end_compile_link_run_with_phase0_shim() {
     // functions so the generated bindings emit `extern "C"`
     // shims (not `extern "C++"`). That means stock rustc can
     // build the runner — no fork rustc dependency.
-    let clangpp = match find_clangpp() {
+    let tc = match common::find_cxx() {
         Some(c) => c,
         None => {
-            eprintln!("skip: clang++ not available on this host");
+            eprintln!("skip: no C++ compiler available");
             return;
         }
     };
+    let clangpp = tc.compiler.clone();
 
     let dir = tmpdir("e2e");
     let hdr = dir.join("h.hpp");
@@ -298,10 +265,11 @@ void do_throw_void() {
     std::fs::write(&cpp, &cpp_src).unwrap();
 
     let cxx_compile = Command::new(&clangpp)
-        // -stdlib=libc++ so the shim's symbols match the `-lc++` link
-        // below (no-op on macOS where libc++ is default; required on
-        // Linux where clang++ defaults to libstdc++).
-        .args(["-std=c++17", "-stdlib=libc++", "-fexceptions", "-c"])
+        // Stdlib must match the link below: clang++ pins libc++,
+        // g++ keeps its libstdc++ default.
+        .args(["-std=c++17", "-fexceptions"])
+        .args(tc.stdlib_compile_flags())
+        .arg("-c")
         .arg(&cpp)
         .arg("-o")
         .arg(&obj)
@@ -419,22 +387,22 @@ fn main() {
     .unwrap();
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let rust_compile = Command::new(&rustc)
-        .args(["--edition=2021", "--crate-type", "bin"])
+    let mut cmd = Command::new(&rustc);
+    cmd.args(["--edition=2021", "--crate-type", "bin"])
         .arg(&main_rs)
         .arg("-o")
         .arg(&bin)
         .arg("-C")
-        .arg(format!("link-arg={}", obj.display()))
-        .arg("-lc++")
-        .output()
-        .expect("spawn rustc");
+        .arg(format!("link-arg={}", obj.display()));
+    if let Some(dir) = tc.lib_search_dir() {
+        cmd.arg("-L").arg(format!("native={}", dir.display()));
+    }
+    cmd.args(tc.link_libs());
+    let rust_compile = cmd.output().expect("spawn rustc");
     if !rust_compile.status.success() {
         let stderr = String::from_utf8_lossy(&rust_compile.stderr);
-        if stderr.contains("library 'c++' not found")
-            || stderr.contains("cannot find -lc++")
-        {
-            eprintln!("skip: libc++ not available on this host");
+        if tc.stdlib_missing(&stderr) {
+            eprintln!("skip: C++ stdlib not linkable on this host");
             return;
         }
         panic!(

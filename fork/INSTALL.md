@@ -53,6 +53,19 @@ sudo apt-get install -y \
 sudo apt-get install -y libclang-dev libfltk1.3-dev
 ```
 
+**C++ compiler choice (Linux):** both toolchains are first-class. The
+distro default `g++` + GNU libstdc++ works out of the box — the test
+harnesses and example scripts honor `$CXX`/`$CC` (e.g.
+`CXX=g++ CC=gcc ./examples/subclass_cpp_base/build_demo.sh`), and the
+`cc`-crate-driven binding builds pick the matching stdlib per target
+automatically. clang + libc++ works the same way (`CXX=clang++`;
+install `libc++-dev libc++abi-dev`). libclang is always required for
+*parsing* headers regardless of which compiler builds the C++.
+Caught-exception interop (`cxx_throws`) works against both libstdc++
+and libc++ — the fork emits the standard Itanium
+`__gxx_personality_v0` EH path. CI runs the workspace suite on both
+(`workspace-test` = clang/libc++, `workspace-test-gcc` = g++/libstdc++).
+
 ### Fedora / RHEL / Rocky
 
 ```bash

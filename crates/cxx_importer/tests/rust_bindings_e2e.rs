@@ -23,6 +23,8 @@ use cxx_importer::rust_bindings::{
 };
 use rustc_abi_cxx::{CxxTypeCtx, Target};
 
+mod common;
+
 /// Process-exclusive: `Clang::new()` errors out on a second instance.
 static LIBCLANG: Mutex<()> = Mutex::new(());
 
@@ -93,6 +95,15 @@ fn imports_class_emits_bindings_links_to_cxx_and_calls_through() {
         );
         return;
     }
+
+    let tc = match common::find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no C++ compiler available");
+            return;
+        }
+    };
+    let clangpp = tc.compiler.clone();
 
     let dir = tmpdir("calc_roundtrip");
     let header_hpp = dir.join("calc.hpp");
@@ -205,8 +216,12 @@ int Calc::sum() const { return a_ + b_; }
 
     // Step 3: compile the C++ side to an object file using the user's
     // host clang++.
-    let cpp_compile = Command::new("clang++")
-        .args(["-c", "-std=c++17", "-fPIC"])
+    let cpp_compile = Command::new(&clangpp)
+        // Stdlib must match the link below: clang++ pins libc++,
+        // g++ keeps its libstdc++ default.
+        .args(["-c", "-std=c++17"])
+        .args(tc.stdlib_compile_flags())
+        .arg("-fPIC")
         .arg("-o")
         .arg(&calc_obj)
         .arg(&calc_cpp)
@@ -245,24 +260,28 @@ fn main() {{
     // proc macros, so the rustc invocation is just source + linker
     // flags.
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let cxx_runtime_link = if cfg!(target_os = "macos") { "-lc++" } else { "-lstdc++" };
-
-    let rust_compile = Command::new(&rustc)
-        .args(["--edition=2021"])
+    let mut cmd = Command::new(&rustc);
+    cmd.args(["--edition=2021"])
         .arg(&main_rs)
         .arg("-o")
         .arg(&bin)
-        .arg(format!("-Clink-arg={}", calc_obj.display()))
-        .arg(format!("-Clink-arg={cxx_runtime_link}"))
-        .output()
-        .expect("spawn rustc");
-    assert!(
-        rust_compile.status.success(),
-        "rustc compile failed:\nstderr:\n{}\nbindings.rs:\n{}\nmain.rs:\n{}",
-        String::from_utf8_lossy(&rust_compile.stderr),
-        bindings_src,
-        main_src,
-    );
+        .arg(format!("-Clink-arg={}", calc_obj.display()));
+    if let Some(dir) = tc.lib_search_dir() {
+        cmd.arg("-L").arg(format!("native={}", dir.display()));
+    }
+    cmd.args(tc.link_libs());
+    let rust_compile = cmd.output().expect("spawn rustc");
+    if !rust_compile.status.success() {
+        let stderr = String::from_utf8_lossy(&rust_compile.stderr);
+        if tc.stdlib_missing(&stderr) {
+            eprintln!("skip: C++ stdlib not linkable on this host");
+            return;
+        }
+        panic!(
+            "rustc compile failed:\nstderr:\n{}\nbindings.rs:\n{}\nmain.rs:\n{}",
+            stderr, bindings_src, main_src,
+        );
+    }
 
     // Step 6: run, expect exit code 37.
     let run = Command::new(&bin).output().expect("spawn runner");

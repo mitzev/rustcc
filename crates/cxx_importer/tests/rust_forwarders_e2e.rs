@@ -26,6 +26,8 @@ use rustc_abi_cxx::{
     Target, Virtuality,
 };
 
+mod common;
+
 /// Probe the active rustc for `extern "C++"` support. The fork
 /// accepts the ABI string; stock rustc rejects it with E0703.
 /// `RUSTC` env var is honored to mirror what the test bodies use
@@ -265,6 +267,14 @@ fn record_returned_by_value_roundtrips_across_cxx_boundary() {
         }
     };
 
+    let tc = match common::find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no C++ compiler available");
+            return;
+        }
+    };
+
     // IR: Point with Point::new(i32, i32) -> Self and
     // Point::translated(&self, i32, i32) -> Point.
     let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
@@ -433,7 +443,7 @@ int main() {
 "#;
     std::fs::write(&consumer_cpp, consumer).unwrap();
 
-    let compile = Command::new("clang++")
+    let compile = Command::new(&tc.compiler)
         .args(["-std=c++17"])
         .arg("-o")
         .arg(&bin)
@@ -473,6 +483,14 @@ fn record_passed_by_value_roundtrips_across_cxx_boundary() {
     // address, and destroys the temp after the call. The forwarder
     // takes `*const T`, `ptr::read`s to take ownership, and hands
     // the owned value to the user's Rust method.
+
+    let tc = match common::find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no C++ compiler available");
+            return;
+        }
+    };
 
     let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
     let i32_ = ctx.intern_type(CxxType::Int {
@@ -617,7 +635,7 @@ int main() {
 "#;
     std::fs::write(&consumer_cpp, consumer).unwrap();
 
-    let compile = Command::new("clang++")
+    let compile = Command::new(&tc.compiler)
         .args(["-std=c++17"])
         .arg("-o")
         .arg(&bin)
@@ -656,6 +674,14 @@ fn panicking_rust_method_aborts_instead_of_unwinding_through_cxx() {
     // a panicking method end-to-end and verifies the process died
     // via SIGABRT.
     use std::os::unix::process::ExitStatusExt as _;
+
+    let tc = match common::find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no C++ compiler available");
+            return;
+        }
+    };
 
     // Build IR: Boom { } with `boom(&self)` that panics in the Rust
     // body.
@@ -788,7 +814,7 @@ int main() {
 
     // Link against the Rust dylib. On macOS the rpath dance is
     // needed so the binary can find the dylib at runtime.
-    let compile = Command::new("clang++")
+    let compile = Command::new(&tc.compiler)
         .args(["-std=c++17"])
         .arg("-o")
         .arg(&bin)

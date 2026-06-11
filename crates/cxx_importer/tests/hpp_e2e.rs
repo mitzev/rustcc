@@ -18,6 +18,8 @@ use rustc_abi_cxx::{
     Virtuality,
 };
 
+mod common;
+
 fn tmpdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir()
         .join(format!("rustcc_hpp_e2e_{}_{}", tag, std::process::id()));
@@ -57,6 +59,14 @@ fn sig(params: Vec<TypeId>, ret: TypeId, is_const: bool) -> FnSig {
 
 #[test]
 fn generated_header_compiles_and_models_layout_faithfully() {
+    let tc = match common::find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no C++ compiler available");
+            return;
+        }
+    };
+
     let dir = tmpdir("widget");
     let hpp_path = dir.join("widget-cxx.hpp");
     let consumer_path = dir.join("consumer.cpp");
@@ -115,7 +125,7 @@ static_assert(alignof(acme::Widget) == 4, \"Widget should align to 4\");
 ";
     write(&consumer_path, consumer_src);
 
-    let status = Command::new("clang++")
+    let status = Command::new(&tc.compiler)
         .args(["-std=c++17", "-c", "-o"])
         .arg(&obj_path)
         .arg(&consumer_path)

@@ -16,6 +16,8 @@ use rustc_abi_cxx::{
     Virtuality,
 };
 
+mod common;
+
 fn tmpdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "rustcc_stubs_e2e_{tag}_{}_{}",
@@ -31,6 +33,14 @@ fn tmpdir(tag: &str) -> PathBuf {
 
 #[test]
 fn hpp_plus_stubs_compile_link_and_abort_on_call() {
+    let tc = match common::find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no C++ compiler available");
+            return;
+        }
+    };
+
     // Build a tiny IR: one Rust-origin Point type with a method.
     let mut ctx = CxxTypeCtx::new(Target::x86_64_apple_darwin());
     let i32_ = ctx.intern_type(CxxType::Int {
@@ -103,7 +113,7 @@ int main() {
 "#;
     std::fs::write(&main_path, main_src).unwrap();
 
-    let out = Command::new("clang++")
+    let out = Command::new(&tc.compiler)
         .args(["-std=c++17", "-o"])
         .arg(&bin_path)
         .arg(&stubs_path)

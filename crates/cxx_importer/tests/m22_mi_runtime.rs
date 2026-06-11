@@ -29,6 +29,8 @@ use cxx_importer::rust_bindings::{
 };
 use rustc_abi_cxx::{CxxTypeCtx, Target};
 
+mod common;
+
 static LIBCLANG: Mutex<()> = Mutex::new(());
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -86,6 +88,15 @@ fn mi_secondary_subtable_dispatches_correctly_at_runtime() {
         eprintln!("skip: rustc doesn't support extern \"C++\" (need fork)");
         return;
     }
+
+    let tc = match common::find_cxx() {
+        Some(c) => c,
+        None => {
+            eprintln!("skip: no C++ compiler available");
+            return;
+        }
+    };
+    let clangpp = tc.compiler.clone();
 
     let dir = tmpdir("mi");
     let header = dir.join("mi.hpp");
@@ -189,11 +200,12 @@ unsigned int C::b_id() const { return c_tag_ + 2000; }
     );
 
     // Step 3: compile the C++ side.
-    let cpp_compile = Command::new("clang++")
-        // -stdlib=libc++ so the C++ object's symbols match the `-lc++`
-        // link below (no-op on macOS; required on Linux, where clang++
-        // defaults to libstdc++).
-        .args(["-c", "-std=c++17", "-stdlib=libc++", "-fPIC"])
+    let cpp_compile = Command::new(&clangpp)
+        // Stdlib must match the link below: clang++ pins libc++,
+        // g++ keeps its libstdc++ default.
+        .args(["-c", "-std=c++17"])
+        .args(tc.stdlib_compile_flags())
+        .arg("-fPIC")
         .arg("-o")
         .arg(&cpp_obj)
         .arg(&cpp)
@@ -263,26 +275,24 @@ fn main() {
 
     // Step 5: compile + link the Rust binary with the C++ object.
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let rust_compile = Command::new(&rustc)
-        .args(["--edition=2021", "--crate-type", "bin"])
+    let mut cmd = Command::new(&rustc);
+    cmd.args(["--edition=2021", "--crate-type", "bin"])
         .arg(&main_rs)
         .arg("-o")
         .arg(&bin)
         .arg("-C")
-        .arg(format!("link-arg={}", cpp_obj.display()))
-        .arg("-lc++")
-        .output()
-        .expect("spawn rustc");
+        .arg(format!("link-arg={}", cpp_obj.display()));
+    if let Some(dir) = tc.lib_search_dir() {
+        cmd.arg("-L").arg(format!("native={}", dir.display()));
+    }
+    cmd.args(tc.link_libs());
+    let rust_compile = cmd.output().expect("spawn rustc");
     if !rust_compile.status.success() {
-        // Skip if the host rustc can't link to libc++ — this is a
-        // known issue on Linux runners that default to libstdc++.
-        // The test's value is on macOS (libc++ default); we soft-fail
-        // on Linux until the runner-side libc++ install lands.
+        // Soft-skip when the selected stdlib's dev package is
+        // missing on this host.
         let stderr = String::from_utf8_lossy(&rust_compile.stderr);
-        if stderr.contains("library 'c++' not found")
-            || stderr.contains("cannot find -lc++")
-        {
-            eprintln!("skip: libc++ not available on this host");
+        if tc.stdlib_missing(&stderr) {
+            eprintln!("skip: C++ stdlib not linkable on this host");
             return;
         }
         panic!("rustc link failed:\n{}", stderr);

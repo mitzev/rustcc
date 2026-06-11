@@ -3,7 +3,13 @@
 # rustc) -> link with the C++ side -> run.
 set -euo pipefail
 cd "$(dirname "$0")"
-export LIBCLANG_PATH="${LIBCLANG_PATH:-/opt/homebrew/opt/llvm/lib}"
+# libclang: explicit on macOS (Homebrew keeps it off the default path);
+# Linux clang-sys autodiscovers from libclang-dev.
+if [[ -z "${LIBCLANG_PATH:-}" && "$(uname)" == "Darwin" ]]; then
+  export LIBCLANG_PATH="/opt/homebrew/opt/llvm/lib"
+fi
+CXX="${CXX:-clang++}"
+CC="${CC:-clang}"
 RUSTC="${RUSTC:-$HOME/rust-lang-rust-fork/build/host/stage1/bin/rustc}"
 mkdir -p target
 echo "==> 1. generate bindings"
@@ -17,7 +23,7 @@ echo "==> 2. build cxx rlib + Rust staticlib (fork rustc)"
 "$RUSTC" --edition 2024 --crate-type staticlib --crate-name member_fn_ptr \
     --extern cxx=target/libcxx.rlib src/roundtrip.rs -o target/libmember_fn_ptr.a
 echo "==> 3. compile C++, link, run"
-clang++ -std=c++17 -c cpp/receiver.cpp -o target/receiver.o
-clang++ -std=c++17 -c caller.cpp -o target/caller.o
-clang++ target/caller.o target/receiver.o target/libmember_fn_ptr.a -o target/demo
+"$CXX" -std=c++17 -c cpp/receiver.cpp -o target/receiver.o
+"$CXX" -std=c++17 -c caller.cpp -o target/caller.o
+"$CXX" target/caller.o target/receiver.o target/libmember_fn_ptr.a -o target/demo
 ./target/demo

@@ -14,6 +14,8 @@ use std::process::Command;
 
 use cxx_importer::{render_all_throws_shims_cpp, ThrowsShimSpec};
 
+mod common;
+
 fn tmpdir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "rustcc_throws_shim_renderer_{tag}_{}_{}",
@@ -27,31 +29,16 @@ fn tmpdir(tag: &str) -> PathBuf {
     dir
 }
 
-fn find_clangpp() -> Option<String> {
-    for cand in ["clang++", "/usr/bin/clang++", "/usr/local/bin/clang++"] {
-        if Command::new(cand)
-            .arg("--version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-        {
-            return Some(cand.into());
-        }
-    }
-    None
-}
-
 #[test]
 fn render_all_throws_shims_emits_compilable_self_contained_tu() {
-    let clangpp = match find_clangpp() {
+    let tc = match common::find_cxx() {
         Some(c) => c,
         None => {
-            eprintln!("skip: clang++ not available");
+            eprintln!("skip: no C++ compiler available");
             return;
         }
     };
+    let clangpp = tc.compiler.clone();
 
     let dir = tmpdir("e2e");
     let hdr = dir.join("user.hpp");
@@ -124,10 +111,11 @@ int do_typed(int selector) {
     std::fs::write(&cpp, &cpp_src).unwrap();
 
     let cxx_compile = Command::new(&clangpp)
-        // -stdlib=libc++ so the shim's symbols match the `-lc++` link
-        // below (no-op on macOS; required on Linux, where clang++
-        // defaults to libstdc++).
-        .args(["-std=c++17", "-stdlib=libc++", "-fexceptions", "-c"])
+        // Stdlib must match the link below: clang++ pins libc++,
+        // g++ keeps its libstdc++ default.
+        .args(["-std=c++17", "-fexceptions"])
+        .args(tc.stdlib_compile_flags())
+        .arg("-c")
         .arg(&cpp)
         .arg("-I")
         .arg(&dir)
@@ -212,22 +200,22 @@ fn main() {
     .unwrap();
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let rust_compile = Command::new(&rustc)
-        .args(["--edition=2021", "--crate-type", "bin"])
+    let mut cmd = Command::new(&rustc);
+    cmd.args(["--edition=2021", "--crate-type", "bin"])
         .arg(&main_rs)
         .arg("-o")
         .arg(&bin)
         .arg("-C")
-        .arg(format!("link-arg={}", obj.display()))
-        .arg("-lc++")
-        .output()
-        .expect("spawn rustc");
+        .arg(format!("link-arg={}", obj.display()));
+    if let Some(dir) = tc.lib_search_dir() {
+        cmd.arg("-L").arg(format!("native={}", dir.display()));
+    }
+    cmd.args(tc.link_libs());
+    let rust_compile = cmd.output().expect("spawn rustc");
     if !rust_compile.status.success() {
         let stderr = String::from_utf8_lossy(&rust_compile.stderr);
-        if stderr.contains("library 'c++' not found")
-            || stderr.contains("cannot find -lc++")
-        {
-            eprintln!("skip: libc++ not available on this host");
+        if tc.stdlib_missing(&stderr) {
+            eprintln!("skip: C++ stdlib not linkable on this host");
             return;
         }
         panic!("rustc link failed:\n{stderr}");
