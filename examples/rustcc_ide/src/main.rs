@@ -105,7 +105,11 @@ static DBG_CAPTURE: Mutex<CapState> = Mutex::new(CapState {
 const VARS_SENTINEL: &str = "--rustcc-vars-end--";
 static DBG_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Tab bar: a slim Fl_Menu_Bar listing open files (click = switch).
-static TABBAR: AtomicPtr<Fl_Menu_Bar> = AtomicPtr::new(core::ptr::null_mut());
+static TABBAR: AtomicPtr<FileTabs> = AtomicPtr::new(core::ptr::null_mut());
+/// Names currently shown as tab pages — rebuild only when the open
+/// set changes; a same-set refresh just syncs the selected tab (so
+/// clicks inside Fl_Tabs::handle never delete live child widgets).
+static TAB_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 const TARGET_NAMES: [&str; 6] = [
     "Host (LLVM backend)",
@@ -151,6 +155,7 @@ const MOD_SHIFT: i32 = FL_SHIFT as i32;
 const KEY_ENTER: i32 = FL_Enter as i32;
 const KEY_ESCAPE: i32 = FL_Escape as i32;
 const EV_RELEASE: i32 = 2; // FL_RELEASE (Fl_Event enum)
+const EV_PUSH: i32 = 1; // FL_PUSH
 // Class-scope enums — generated bindings (v1.14): named nested enums
 // emit as transparent structs with assoc consts; anonymous ones as
 // prefixed plain consts.
@@ -204,8 +209,6 @@ const ACT_DBG_VARS: usize = 55;
 const ACT_DBG_STOP: usize = 56;
 const ACT_DBG_BREAKPOINT: usize = 57;
 const ACT_CLOSE_FILE: usize = 58;
-/// Tab clicks encode the OPEN_FILES index as action TAB_BASE + idx.
-const TAB_BASE: usize = 1000;
 const KEY_F: i32 = FL_F as i32; // F-keys: KEY_F + n
 
 // Super-calls (non-virtual, by mangled symbol).
@@ -220,6 +223,8 @@ unsafe extern "C++" {
     fn base_input_handle(this: *mut Fl_Input, ev: i32) -> i32;
     #[link_name = "_ZN11Fl_Browser_6handleEi"]
     fn base_browser_handle(this: *mut Fl_Browser_, ev: i32) -> i32;
+    #[link_name = "_ZN7Fl_Tabs6handleEi"]
+    fn base_tabs_handle(this: *mut Fl_Tabs, ev: i32) -> i32;
     #[link_name = "_Znwm"]
     fn cxx_operator_new(size: usize) -> *mut u8;
 }
@@ -334,6 +339,40 @@ pub class WatchInput : Fl_Input {
             return 1;
         }
         unsafe { base_input_handle(this, ev) }
+    }
+}
+
+/// The tab strip: a real Fl_Tabs (imported chain Fl_Tabs -> Fl_Group
+/// -> Fl_Widget) whose zero-height child pages carry the file names —
+/// the single shared editor stays OUTSIDE the tabs, so selecting a
+/// tab just swaps the editor's buffer.
+pub class FileTabs : Fl_Tabs {
+    pad: i32,
+
+    pub constructor fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        FileTabs {
+            __base: Fl_Tabs::new(x, y, w, h, ::core::ptr::null()),
+            pad: 0,
+        }
+    }
+
+    pub override fn handle(&self, ev: i32) -> i32 {
+        let this = self as *const Self as *mut Fl_Tabs;
+        let before = unsafe { (*this).value() };
+        let r = unsafe { base_tabs_handle(this, ev) };
+        if ev == EV_PUSH || ev == EV_RELEASE {
+            let after = unsafe { (*this).value() };
+            if !after.is_null() && after != before {
+                let g = unsafe { (*this).as_fl_group() };
+                for i in 0..g.children() {
+                    if g.child(i) == after {
+                        unsafe { switch_to_file(i as usize) };
+                        break;
+                    }
+                }
+            }
+        }
+        r
     }
 }
 
@@ -668,9 +707,6 @@ unsafe fn run_action(act: usize) {
             }
             ACT_DBG_STOP => dbg_stop(),
             ACT_CLOSE_FILE => close_current_file(),
-            a if a >= TAB_BASE => {
-                switch_to_file(a - TAB_BASE);
-            }
             ACT_UPLOAD_CFG => edit_upload_config(),
             ACT_OPEN_PROJECT => {
                 if let Some(dir) = choose_file(CHOOSER_DIR_OPEN, "Open project folder") {
@@ -1920,32 +1956,42 @@ fn pump_debugger() {
 /// Rebuild the tab strip from OPEN_FILES; the active file is marked.
 fn tabs_refresh() {
     unsafe {
-        let bar = TABBAR.load(Relaxed);
-        if bar.is_null() {
+        let tabs = TABBAR.load(Relaxed);
+        if tabs.is_null() {
             return;
         }
-        let m = (*bar).as_fl_menu__mut();
-        m.clear();
         let cur = PATH.lock().unwrap().clone();
         let files = OPEN_FILES.lock().unwrap().clone();
-        for (i, (p, _)) in files.iter().enumerate() {
-            let base = p.rsplit('/').next().unwrap_or(p);
-            let label = if Some(p) == cur.as_ref() {
-                format!("[ {base} ]")
-            } else {
-                base.to_string()
-            };
-            // '/' would create submenus — escape it; '&' would underline.
-            let label = label.replace('/', "\\/").replace('&', "&&");
-            m.add(
-                cstr(&label).as_ptr(),
-                0,
-                Some(menu_cb),
-                (TAB_BASE + i) as *mut (),
-                0,
-            );
+        let names: Vec<String> = files
+            .iter()
+            .map(|(p, _)| p.rsplit('/').next().unwrap_or(p).to_string())
+            .collect();
+        let active = files.iter().position(|(p, _)| Some(p) == cur.as_ref());
+        let t = &mut *(tabs as *mut Fl_Tabs);
+        if *TAB_NAMES.lock().unwrap() != names {
+            // Open set changed: rebuild the pages. clear() C++-deletes
+            // the children — they're plain imported Fl_Groups from
+            // operator new, so that pairing is exact.
+            t.as_fl_group_mut().clear();
+            for name in &names {
+                let pg =
+                    cxx_operator_new(core::mem::size_of::<Fl_Group>()) as *mut Fl_Group;
+                // Zero-height page right under the strip: the widget
+                // is ALL tab bar; the shared editor lives outside.
+                Fl_Group::new_at(pg, 220, 52, 960, 0, core::ptr::null());
+                (*pg).end();
+                (*(pg as *mut Fl_Widget)).copy_label_str(name);
+                t.as_fl_group_mut().add(pg as *mut Fl_Widget);
+            }
+            *TAB_NAMES.lock().unwrap() = names;
         }
-        (*(bar as *mut Fl_Widget)).redraw();
+        if let Some(i) = active {
+            let c = t.as_fl_group().child(i as i32);
+            if !c.is_null() {
+                t.value_mut_fl_widget(c);
+            }
+        }
+        (*(tabs as *mut Fl_Widget)).redraw();
     }
 }
 
@@ -2499,10 +2545,13 @@ unsafe fn build_ui() -> *mut Fl_Window {
              Target menu picks the core (default: RAK11161 STM32WLE5 / CM4).\n",
         );
 
-        // Tab strip for open files (slim second menu bar).
-        let tabs =
-            cxx_operator_new(core::mem::size_of::<Fl_Menu_Bar>()) as *mut Fl_Menu_Bar;
-        Fl_Menu_Bar::new_at(tabs, 220, 28, 960, 24, core::ptr::null());
+        // Tab strip for open files: a real Fl_Tabs via the fork
+        // subclass. Its Fl_Group ctor leaves itself as the "current"
+        // group (begin()), and the by-value construct + move would
+        // leave that pointing at the dead temporary — clear it.
+        let tabs = cxx_operator_new(core::mem::size_of::<FileTabs>()) as *mut FileTabs;
+        tabs.write(FileTabs::new(220, 28, 960, 24));
+        Fl_Group::current_mut_fl_group(core::ptr::null_mut());
         TABBAR.store(tabs, Relaxed);
 
         (*(ed as *mut Fl_Text_Display)).linenumber_width(36);
@@ -2879,14 +2928,40 @@ unsafe fn self_test() -> i32 {
         dbg_toggle_breakpoint();
         check("breakpoint cleared", BREAKPOINTS.lock().unwrap().is_empty());
 
-        // 19. IDE v5: tabs reflect open files; close switches away.
+        // 19. IDE v5/v6: a real Fl_Tabs strip mirrors OPEN_FILES —
+        //     one zero-height page per file, selection == active file.
+        if TABBAR.load(Relaxed).is_null() {
+            let tw = cxx_operator_new(core::mem::size_of::<FileTabs>()) as *mut FileTabs;
+            tw.write(FileTabs::new(220, 28, 960, 24));
+            Fl_Group::current_mut_fl_group(core::ptr::null_mut());
+            TABBAR.store(tw, Relaxed);
+        }
         tabs_refresh();
         let tab_count_before = OPEN_FILES.lock().unwrap().len();
         check("tabs track open files", tab_count_before >= 2);
+        {
+            let tw = TABBAR.load(Relaxed) as *mut Fl_Tabs;
+            check(
+                "Fl_Tabs pages mirror open files",
+                (*tw).as_fl_group().children() as usize == tab_count_before,
+            );
+            let cur = PATH.lock().unwrap().clone();
+            let files = OPEN_FILES.lock().unwrap().clone();
+            let act = files.iter().position(|(p, _)| Some(p) == cur.as_ref());
+            check(
+                "Fl_Tabs selection is the active file",
+                act.is_some_and(|i| (*tw).value() == (*tw).as_fl_group().child(i as i32)),
+            );
+        }
         close_current_file();
         check(
             "close removed a tab",
             OPEN_FILES.lock().unwrap().len() == tab_count_before - 1,
+        );
+        check(
+            "Fl_Tabs page count follows close",
+            (*(TABBAR.load(Relaxed) as *mut Fl_Tabs)).as_fl_group().children() as usize
+                == tab_count_before - 1,
         );
         let _ = std::fs::remove_file(&bf);
 

@@ -88,9 +88,14 @@ cargo +rustcc run --release --bin ide         # the GUI
   and on every stop the IDE parses `… at file:line`, jumps the editor
   there, and tints the current line amber (breakpoint lines red) via
   a style-buffer overlay.
-- **Tabs** — a tab strip above the editor (one `[ name ]` entry per
-  open buffer, click to switch) plus **File ▸ Close File (⌘W)**;
-  Wrap Lines moved to ⌘⇧W. Line numbers are on in the gutter.
+- **Tabs** — a real **`Fl_Tabs`** strip above the editor (a fork
+  `class FileTabs : Fl_Tabs` over the imported chain, one zero-height
+  child page per open buffer; the shared editor stays outside the
+  tabs, so selecting a tab just swaps buffers) plus **File ▸ Close
+  File (⌘W)**; Wrap Lines moved to ⌘⇧W. Line numbers are on in the
+  gutter. Pages rebuild only when the open set changes — a plain
+  click only syncs selection, so `Fl_Tabs::handle` never deletes the
+  widgets it is processing.
 - **File ▸ New Project covers every board family**: Host, RAK11161,
   **STM32**, **ESP32**, Raspberry Pi Pico. The RTOS flavors share one
   self-contained scaffold (all cores' run scripts ship in every
