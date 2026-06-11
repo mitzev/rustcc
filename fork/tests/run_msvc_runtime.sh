@@ -71,6 +71,25 @@ fi
 if [ -z "$LLVM_LIB" ] && [ -x "$HOMEBREW_LLVM_BIN/llvm-lib" ]; then
     LLVM_LIB="$HOMEBREW_LLVM_BIN/llvm-lib"
 fi
+# Debian/Ubuntu (apt.llvm.org) installs version-suffixed binaries
+# only — clang-cl-21, /usr/lib/llvm-21/bin/clang-cl — with no bare
+# `clang-cl` on PATH.
+for v in 22 21 20 19 18; do
+    if [ -z "$CLANG_CL" ]; then
+        if command -v "clang-cl-$v" >/dev/null 2>&1; then
+            CLANG_CL="$(command -v "clang-cl-$v")"
+        elif [ -x "/usr/lib/llvm-$v/bin/clang-cl" ]; then
+            CLANG_CL="/usr/lib/llvm-$v/bin/clang-cl"
+        fi
+    fi
+    if [ -z "$LLVM_LIB" ]; then
+        if command -v "llvm-lib-$v" >/dev/null 2>&1; then
+            LLVM_LIB="$(command -v "llvm-lib-$v")"
+        elif [ -x "/usr/lib/llvm-$v/bin/llvm-lib" ]; then
+            LLVM_LIB="/usr/lib/llvm-$v/bin/llvm-lib"
+        fi
+    fi
+done
 
 # The msvc target's link flags travel ENTIRELY via the cargo env
 # var below (config.toml cannot expand $HOME): xwin import-lib
@@ -92,6 +111,12 @@ if [ -f "cpp/maybe_throws.cpp" ] && [ -n "$CLANG_CL" ]; then
         lld-link /lib "/OUT:${CPP_LIB}" "$CPP_OBJ"
     fi
     EXTRA_RUSTFLAGS="$XWIN_FLAGS -Lnative=$(dirname "$CPP_LIB") -lstatic=maybe_throws"
+elif [ -f "cpp/maybe_throws.cpp" ]; then
+    # The throws bins NEED the stub; a silent skip just moves the
+    # failure to an opaque undefined-symbol link error later.
+    echo "error: clang-cl not found — cannot build cpp/maybe_throws.cpp" >&2
+    echo "hint: brew install llvm (macOS) or apt install clang-NN (Linux)" >&2
+    exit 1
 else
     EXTRA_RUSTFLAGS="$XWIN_FLAGS"
 fi
