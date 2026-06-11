@@ -242,18 +242,32 @@ jobs:
           CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
         run: ./fork/build.sh --apply-only
 
+      - name: Fetch prebuilt libgccjit (pinned, served artifact)
+        run: |
+          # download-ci-gcc has the same unserved-commit heuristic
+          # problem as download-ci-llvm; pin the artifact that is
+          # actually on the bucket (verified 2026-06-11; same one the
+          # dev container resolved and validated against).
+          DEST=/tmp/gccjit-libs/x86_64-unknown-linux-gnu/x86_64-unknown-linux-gnu
+          mkdir -p "$DEST" /tmp/gcc-dev-unpack
+          curl -fL -o /tmp/gcc-dev.tar.xz \
+            https://ci-artifacts.rust-lang.org/rustc-builds/7bee525095c0872e87c038c412c781b9bbb3f5dc/gcc-dev-nightly-x86_64-unknown-linux-gnu.tar.xz
+          tar xJf /tmp/gcc-dev.tar.xz -C /tmp/gcc-dev-unpack
+          find /tmp/gcc-dev-unpack -name "libgccjit.so*" -exec cp -P {} "$DEST"/ \;
+          ls -la "$DEST"
+
       - name: Build stage1 with the gcc codegen backend
         working-directory: ../rust-lang-rust-fork
         run: |
           ./x.py build --stage 1 library \
             --set 'rust.codegen-backends=["llvm","gcc"]' \
-            --set gcc.download-ci-gcc=true \
+            --set gcc.libgccjit-libs-dir=/tmp/gccjit-libs \
             --set llvm.download-ci-llvm=false \
             --set target.x86_64-unknown-linux-gnu.llvm-config=/usr/bin/llvm-config-21
 
       - name: Run subclass_cpp_base under -Zcodegen-backend=gcc
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/../rust-lang-rust-fork/build/x86_64-unknown-linux-gnu/ci-gcc/lib
+          LD_LIBRARY_PATH: /tmp/gccjit-libs/x86_64-unknown-linux-gnu/x86_64-unknown-linux-gnu
         run: |
           R="$GITHUB_WORKSPACE/../rust-lang-rust-fork/build/host/stage1/bin/rustc"
           cd examples/subclass_cpp_base

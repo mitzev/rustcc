@@ -143,11 +143,22 @@ text += (
 if llvm_config:
     # System LLVM: highest priority. Only Linux triples are needed
     # here (the CI runners); macOS/local builds use the defaults.
+    # The template already declares `[target.<triple>]` (TOML forbids
+    # redefining a table), so insert into the existing section when
+    # present, else append a new one.
     triple = machine + '-unknown-linux-gnu'
-    text += (
-        '[target.' + triple + ']\n'
-        'llvm-config = "' + llvm_config + '"\n'
-    )
+    header = '[target.' + triple + ']'
+    line = 'llvm-config = "' + llvm_config + '"'
+    if re.search('^' + re.escape(header) + '$', text, flags=re.M):
+        text = re.sub(
+            '^' + re.escape(header) + '$',
+            header + '\n' + line,
+            text,
+            count=1,
+            flags=re.M,
+        )
+    else:
+        text += header + '\n' + line + '\n'
 with open(path, 'w', encoding='utf-8') as f: f.write(text)
 PY
 fi
