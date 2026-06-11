@@ -75,6 +75,40 @@ cargo +rustcc run --release --bin ide         # the GUI
   the qemu-validated ELFs use the qemu machines' memory maps — point
   the linker scripts at your board before flashing real hardware.
 
+## v5 additions
+
+- **Interactive debugger** (Target = Host) — the **Debug** menu drives
+  a live `lldb` session *inside* the IDE: **Start Session (F5)**
+  builds a debug-profile binary and attaches lldb through a pty
+  (`script -q` — piped stdin would be stolen by the inferior after
+  `run`); **Toggle Breakpoint (F8** or **⌘D** in the editor**)** marks
+  lines red and replays them into any live session; **Step
+  Over/Into/Out (F10/F11/⇧F11)**, **Continue (F9)**, **Show Variables
+  (F7)**, **Stop (⇧F5)**. The console doubles as the lldb transcript,
+  and on every stop the IDE parses `… at file:line`, jumps the editor
+  there, and tints the current line amber (breakpoint lines red) via
+  a style-buffer overlay.
+- **Tabs** — a tab strip above the editor (one `[ name ]` entry per
+  open buffer, click to switch) plus **File ▸ Close File (⌘W)**;
+  Wrap Lines moved to ⌘⇧W. Line numbers are on in the gutter.
+- **Host scaffold is a real Hello World** — a `Greeter` fork class
+  (virtual `excitement_level()`) + a free `greeting() -> String`
+  function, a `build.rs` that links the platform C++ runtime (debug
+  profile keeps `_ZTI*` references), and tasks/build lines that pin
+  `RUSTC` to the fork stage1 so `cargo +nightly` works out of the box.
+  Class methods stay C++-compatible (`i32`), Rust-typed logic lives in
+  free functions — the fork's own diagnostic taught the template that.
+
+The FULL self-test now also drives a complete scripted debug session
+through the IDE engine: set breakpoint → run → hit → **step-in lands
+inside `Greeter::Greeter(excitement=3)` — the fork-emitted C++
+constructor, with its parameter readable in the frame** → `frame
+variable` shows `excitement` → disable → continue → clean exit. Waits
+are stop-synced (each command waits for its own `stop reason =` /
+effect in *new* console output before the next is sent — lldb is
+async, and firing commands mid-step makes them land on a running
+process).
+
 Workflow: **File ▸ New Project ▸ RAK11161 Project…** (pick a folder) →
 edit `src/lib.rs` (a fork `class` crate: `Widget`, `Gauge : Widget`,
 imported `Sensor`, `Reader : Sensor`) → pick a core in **Target** →

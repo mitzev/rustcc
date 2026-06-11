@@ -71,6 +71,15 @@ static COMPLETE_WIN: AtomicPtr<Fl_Window> = AtomicPtr::new(core::ptr::null_mut()
 static COMPLETE_LIST: AtomicPtr<CompleteList> = AtomicPtr::new(core::ptr::null_mut());
 static COMPLETE_ITEMS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static COMPLETE_START: AtomicI32 = AtomicI32::new(-1);
+// Interactive debugger (host/lldb) state.
+static DBG_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+static DBG_STDIN: Mutex<Option<std::process::ChildStdin>> = Mutex::new(None);
+static DBG_PENDING: Mutex<String> = Mutex::new(String::new());
+static BREAKPOINTS: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
+static DBG_CURLINE: Mutex<Option<(String, i32)>> = Mutex::new(None);
+static DBG_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Tab bar: a slim Fl_Menu_Bar listing open files (click = switch).
+static TABBAR: AtomicPtr<Fl_Menu_Bar> = AtomicPtr::new(core::ptr::null_mut());
 
 const TARGET_NAMES: [&str; 6] = [
     "Host (LLVM backend)",
@@ -95,13 +104,16 @@ struct StyleEntry {
     bgcolor: u32, // Fl_Color
 }
 /// 'A' plain, 'B' comment, 'C' keyword (grammar-driven), 'D' string,
-/// 'E' attribute (`#[...]`).
-static STYLE_TABLE: [StyleEntry; 5] = [
+/// 'E' attribute (`#[...]`), 'F' breakpoint line (red bg),
+/// 'G' debugger's current line (amber bg).
+static STYLE_TABLE: [StyleEntry; 7] = [
     StyleEntry { color: 0, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
     StyleEntry { color: 0x00800000, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
     StyleEntry { color: 0x8000A000, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
     StyleEntry { color: 0xA0500000, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
     StyleEntry { color: 0x0060C000, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
+    StyleEntry { color: 0, font: 4, size: 14, attr: Fl_Text_Display_ATTR_BGCOLOR, bgcolor: 0xFFD0D000 },
+    StyleEntry { color: 0, font: 4, size: 14, attr: Fl_Text_Display_ATTR_BGCOLOR, bgcolor: 0xFFF0A000 },
 ];
 
 // FLTK constants — from the generated bindings (the M12 macro pass
@@ -153,6 +165,18 @@ const ACT_DEBUG: usize = 46;
 const ACT_NEW_PICO: usize = 47;
 const ACT_UPLOAD: usize = 48;
 const ACT_UPLOAD_CFG: usize = 49;
+const ACT_DBG_START: usize = 50;
+const ACT_DBG_STEP_OVER: usize = 51;
+const ACT_DBG_STEP_IN: usize = 52;
+const ACT_DBG_STEP_OUT: usize = 53;
+const ACT_DBG_CONTINUE: usize = 54;
+const ACT_DBG_VARS: usize = 55;
+const ACT_DBG_STOP: usize = 56;
+const ACT_DBG_BREAKPOINT: usize = 57;
+const ACT_CLOSE_FILE: usize = 58;
+/// Tab clicks encode the OPEN_FILES index as action TAB_BASE + idx.
+const TAB_BASE: usize = 1000;
+const KEY_F: i32 = FL_F as i32; // F-keys: KEY_F + n
 
 // Super-calls (non-virtual, by mangled symbol).
 unsafe extern "C++" {
@@ -417,6 +441,51 @@ unsafe fn restyle() {
                 i += 1;
             }
         }
+        // Debugger overlays: whole-line marks for breakpoints ('F')
+        // and the stopped line ('G') of the CURRENT file.
+        {
+            let cur_path = PATH.lock().unwrap().clone().unwrap_or_default();
+            let base = cur_path.rsplit('/').next().unwrap_or("").to_string();
+            let bp_lines: Vec<i32> = BREAKPOINTS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(f, _)| *f == cur_path)
+                .map(|(_, l)| *l)
+                .collect();
+            let dbg_line = DBG_CURLINE
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|(f, _)| *f == base || *f == cur_path)
+                .map(|(_, l)| l);
+            if !bp_lines.is_empty() || dbg_line.is_some() {
+                let mut lineno = 1i32;
+                let mut start = 0usize;
+                for (i, ch) in b.iter().enumerate() {
+                    if *ch == b'\n' || i == b.len() - 1 {
+                        let end = i + 1;
+                        let mark = if dbg_line == Some(lineno) {
+                            Some(b'G')
+                        } else if bp_lines.contains(&lineno) {
+                            Some(b'F')
+                        } else {
+                            None
+                        };
+                        if let Some(m) = mark {
+                            // Keep the newline's style byte intact so the
+                            // parallel styles string stays line-aligned.
+                            let stop = if b[end - 1] == b'\n' { end - 1 } else { end };
+                            for s in &mut styles[start..stop] {
+                                *s = m;
+                            }
+                        }
+                        lineno += 1;
+                        start = end;
+                    }
+                }
+            }
+        }
         let styles = String::from_utf8(styles).unwrap_or_default();
         (*sbuf).text_const_i8_str(&styles);
     }
@@ -522,6 +591,18 @@ unsafe fn run_action(act: usize) {
             }
             ACT_DEBUG => debug_project(),
             ACT_UPLOAD => upload_firmware(),
+            ACT_DBG_START => dbg_start(),
+            ACT_DBG_BREAKPOINT => dbg_toggle_breakpoint(),
+            ACT_DBG_STEP_OVER => dbg_send("thread step-over"),
+            ACT_DBG_STEP_IN => dbg_send("thread step-in"),
+            ACT_DBG_STEP_OUT => dbg_send("thread step-out"),
+            ACT_DBG_CONTINUE => dbg_send("continue"),
+            ACT_DBG_VARS => dbg_send("frame variable"),
+            ACT_DBG_STOP => dbg_stop(),
+            ACT_CLOSE_FILE => close_current_file(),
+            a if a >= TAB_BASE => {
+                switch_to_file(a - TAB_BASE);
+            }
             ACT_UPLOAD_CFG => edit_upload_config(),
             ACT_OPEN_PROJECT => {
                 if let Some(dir) = choose_file(CHOOSER_DIR_OPEN, "Open project folder") {
@@ -856,6 +937,7 @@ unsafe fn switch_to_file(idx: usize) {
         restyle();
         refresh_title();
         nav_refresh(); // re-mark the selected entry
+        tabs_refresh();
     }
 }
 
@@ -1239,6 +1321,313 @@ fn upload_firmware() {
     console_append(if code == 0 { "UPLOAD OK\n" } else { "UPLOAD FAILED\n" });
 }
 
+// --- interactive debugger (host target, lldb in-IDE) ----------------
+//
+// lldb runs as a piped child; a reader thread appends its output to
+// DBG_PENDING, and the main loop (Fl::wait_f64 pump) drains it into
+// the console, parsing stop locations to move the editor to the
+// stopped line. Breakpoints are kept per (file, line), marked in the
+// style buffer, and replayed into every new session. Stepping /
+// continue / variables are one-keystroke lldb commands (F10/F11/F9/
+// F7). RTOS targets keep the Terminal+gdbserver flow (Project menu).
+
+fn dbg_start() {
+    if DBG_ACTIVE.load(Relaxed) {
+        console_append("debug session already running (Debug > Stop first)\n");
+        return;
+    }
+    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+        console_append("no project open — File > New/Open Project first\n");
+        return;
+    };
+    if TARGET.load(Relaxed) != 0 {
+        console_append(
+            "in-IDE stepping is host-only for now — Target > Host, or use\n\
+             Project > Debug in Terminal for the qemu+gdbserver flow\n",
+        );
+        return;
+    }
+    let cargo = std::fs::read_to_string(format!("{dir}/Cargo.toml")).unwrap_or_default();
+    if cargo.contains("staticlib") {
+        console_append("firmware staticlib — no host binary; create a Host project\n");
+        return;
+    }
+    let name = cargo
+        .lines()
+        .find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("name = \"").and_then(|r| r.strip_suffix('\"'))
+        })
+        .unwrap_or("rustcc_app")
+        .to_string();
+
+    console_append("==> building (debug profile, full debug info)\n");
+    let code = run_streamed(
+        &dir,
+        "RUSTC=\"${RUSTC:-$HOME/rust-1.96-migration/build/host/stage1/bin/rustc}\" RUSTC_BOOTSTRAP=1 cargo +nightly build 2>&1",
+    );
+    if code != 0 {
+        console_append("build failed — not starting the debugger\n");
+        return;
+    }
+    let bin = format!("{dir}/target/debug/{name}");
+
+    // lldb must believe it has a terminal (async stop events, command
+    // multiplexing vs the inferior) — bridge it through a pty with
+    // `script -q /dev/null`, the portable macOS/BSD trick.
+    let child = std::process::Command::new("script")
+        .args(["-q", "/dev/null", "lldb", "--no-use-colors"])
+        .arg(&bin)
+        .current_dir(&dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            console_append(&format!("lldb spawn failed: {e}\n"));
+            return;
+        }
+    };
+    let stdin = child.stdin.take().expect("lldb stdin");
+    let stdout = child.stdout.take().expect("lldb stdout");
+    let stderr = child.stderr.take().expect("lldb stderr");
+    for pipe in [Some(stdout), None].into_iter().flatten() {
+        let mut r = std::io::BufReader::new(pipe);
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match r.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => DBG_PENDING.lock().unwrap().push_str(&line),
+                }
+            }
+            DBG_PENDING.lock().unwrap().push_str("[debugger exited]\n");
+            DBG_ACTIVE.store(false, Relaxed);
+        });
+    }
+    {
+        let mut r = std::io::BufReader::new(stderr);
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match r.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => DBG_PENDING.lock().unwrap().push_str(&line),
+                }
+            }
+        });
+    }
+    *DBG_STDIN.lock().unwrap() = Some(stdin);
+    *DBG_CHILD.lock().unwrap() = Some(child);
+    DBG_ACTIVE.store(true, Relaxed);
+    console_append(&format!(
+        "==> lldb session on {bin}\n    F8 breakpoint  F10 over  F11 into  F9 continue  F7 variables\n"
+    ));
+    // Replay breakpoints, then run.
+    let bps = BREAKPOINTS.lock().unwrap().clone();
+    if bps.is_empty() {
+        dbg_send("breakpoint set --name main");
+    }
+    for (f, l) in bps {
+        let base = f.rsplit('/').next().unwrap_or(&f).to_string();
+        dbg_send(&format!("breakpoint set --file {base} --line {l}"));
+    }
+    dbg_send("run");
+}
+
+fn dbg_send(cmd: &str) {
+    use std::io::Write;
+    let mut g = DBG_STDIN.lock().unwrap();
+    match g.as_mut() {
+        Some(stdin) => {
+            if writeln!(stdin, "{cmd}").and_then(|_| stdin.flush()).is_err() {
+                console_append("debugger pipe closed\n");
+            } else {
+                console_append(&format!("(lldb) {cmd}\n"));
+            }
+        }
+        None => console_append("no debug session — Debug > Start Session (F5)\n"),
+    }
+}
+
+fn dbg_stop() {
+    {
+        let mut g = DBG_STDIN.lock().unwrap();
+        if let Some(stdin) = g.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(stdin, "process kill");
+            let _ = writeln!(stdin, "quit");
+            let _ = stdin.flush();
+        }
+        *g = None;
+    }
+    if let Some(mut c) = DBG_CHILD.lock().unwrap().take() {
+        let _ = c.wait();
+    }
+    DBG_ACTIVE.store(false, Relaxed);
+    *DBG_CURLINE.lock().unwrap() = None;
+    unsafe { restyle() };
+    console_append("debug session stopped\n");
+}
+
+/// Toggle a breakpoint on the cursor's line of the current file.
+fn dbg_toggle_breakpoint() {
+    unsafe {
+        let Some(path) = PATH.lock().unwrap().clone() else { return };
+        let buf = BUF.load(Relaxed);
+        let ed = ED.load(Relaxed);
+        if buf.is_null() || ed.is_null() {
+            return;
+        }
+        let pos = (*(ed as *mut Fl_Text_Display)).insert_position_ovl();
+        let line = (*buf).count_lines(0, pos) + 1;
+        let base = path.rsplit('/').next().unwrap_or(&path).to_string();
+        // Compute under the lock, RELEASE, then talk to lldb/restyle —
+        // restyle() takes BREAKPOINTS itself (std Mutex ≠ reentrant).
+        let added = {
+            let mut bps = BREAKPOINTS.lock().unwrap();
+            if let Some(i) = bps.iter().position(|(f, l)| *f == path && *l == line) {
+                bps.remove(i);
+                false
+            } else {
+                bps.push((path.clone(), line));
+                true
+            }
+        };
+        if DBG_ACTIVE.load(Relaxed) {
+            let verb = if added { "set" } else { "clear" };
+            dbg_send(&format!("breakpoint {verb} --file {base} --line {line}"));
+        }
+        console_append(&format!(
+            "breakpoint {}: {base}:{line}\n",
+            if added { "set" } else { "removed" }
+        ));
+        restyle();
+    }
+}
+
+/// Parse an lldb stop frame line: `... at <file>:<line>:<col>`.
+fn parse_stop_location(s: &str) -> Option<(String, i32)> {
+    let at = s.rfind(" at ")?;
+    let rest = &s[at + 4..];
+    let mut parts = rest.trim().split(':');
+    let file = parts.next()?.to_string();
+    let line: i32 = parts.next()?.trim().parse().ok()?;
+    if file.is_empty() || line <= 0 {
+        return None;
+    }
+    Some((file, line))
+}
+
+/// Drained from the main loop: stream lldb output to the console and
+/// follow stop locations in the editor.
+fn pump_debugger() {
+    let pending = {
+        let mut g = DBG_PENDING.lock().unwrap();
+        if g.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *g)
+    };
+    console_append(&pending);
+    // Follow the LAST stop location mentioned.
+    let mut hit: Option<(String, i32)> = None;
+    for l in pending.lines() {
+        if l.contains("frame #0") || l.contains("stop reason") || l.contains(" at ") {
+            if let Some(loc) = parse_stop_location(l) {
+                hit = Some(loc);
+            }
+        }
+    }
+    if let Some((file, line)) = hit {
+        *DBG_CURLINE.lock().unwrap() = Some((file.clone(), line));
+        unsafe {
+            // If the stopped file is the open one (by basename), move
+            // the cursor there and re-mark.
+            let cur = PATH.lock().unwrap().clone().unwrap_or_default();
+            if cur.rsplit('/').next() == Some(file.as_str()) {
+                let buf = BUF.load(Relaxed);
+                let ed = ED.load(Relaxed);
+                if !buf.is_null() && !ed.is_null() {
+                    let pos = (*buf).skip_lines(0, line - 1);
+                    let disp = ed as *mut Fl_Text_Display;
+                    (*disp).insert_position(pos);
+                    (*disp).show_insert_position();
+                    restyle();
+                    (*(ed as *mut Fl_Widget)).redraw();
+                }
+            }
+        }
+    }
+}
+
+/// Rebuild the tab strip from OPEN_FILES; the active file is marked.
+fn tabs_refresh() {
+    unsafe {
+        let bar = TABBAR.load(Relaxed);
+        if bar.is_null() {
+            return;
+        }
+        let m = (*bar).as_fl_menu__mut();
+        m.clear();
+        let cur = PATH.lock().unwrap().clone();
+        let files = OPEN_FILES.lock().unwrap().clone();
+        for (i, (p, _)) in files.iter().enumerate() {
+            let base = p.rsplit('/').next().unwrap_or(p);
+            let label = if Some(p) == cur.as_ref() {
+                format!("[ {base} ]")
+            } else {
+                base.to_string()
+            };
+            // '/' would create submenus — escape it; '&' would underline.
+            let label = label.replace('/', "\\/").replace('&', "&&");
+            m.add(
+                cstr(&label).as_ptr(),
+                0,
+                Some(menu_cb),
+                (TAB_BASE + i) as *mut (),
+                0,
+            );
+        }
+        (*(bar as *mut Fl_Widget)).redraw();
+    }
+}
+
+fn close_current_file() {
+    unsafe {
+        let cur = PATH.lock().unwrap().clone();
+        let Some(cur) = cur else { return };
+        let next = {
+            let mut files = OPEN_FILES.lock().unwrap();
+            let Some(i) = files.iter().position(|(p, _)| *p == cur) else { return };
+            files.remove(i); // buffer intentionally leaked (FLTK owns widgets-by-ptr idiom)
+            if files.is_empty() { None } else { Some(i.min(files.len() - 1)) }
+        };
+        match next {
+            Some(i) => switch_to_file(i),
+            None => {
+                // No files left: blank buffer.
+                let buf = BUF.load(Relaxed);
+                if !buf.is_null() {
+                    (*buf).text_const_i8_str("");
+                }
+                *PATH.lock().unwrap() = None;
+                DIRTY.store(false, Relaxed);
+                refresh_title();
+                tabs_refresh();
+                nav_refresh();
+            }
+        }
+        console_append(&format!("closed {cur}\n"));
+    }
+}
+
 fn set_project(dir: &str) {
     *PROJECT_DIR.lock().unwrap() = Some(dir.to_string());
     console_append(&format!("project = {dir}\n"));
@@ -1366,6 +1755,7 @@ fn scaffold_host(dir: &str) -> Result<(), String> {
     fs::create_dir_all(root.join("src")).map_err(werr)?;
     fs::create_dir_all(root.join(".vscode")).map_err(werr)?;
     fs::write(root.join("Cargo.toml"), HOST_CARGO_TOML).map_err(werr)?;
+    fs::write(root.join("build.rs"), HOST_BUILD_RS).map_err(werr)?;
     fs::write(root.join("src/main.rs"), HOST_MAIN_RS).map_err(werr)?;
     fs::write(root.join(".vscode/tasks.json"), HOST_TASKS_JSON).map_err(werr)?;
     fs::write(root.join("README.md"), HOST_README).map_err(werr)?;
@@ -1378,6 +1768,18 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
+"#;
+
+const HOST_BUILD_RS: &str = r#"fn main() {
+    // rustcc `class` types emit Itanium RTTI (`_ZTI…`) that
+    // references the C++ ABI runtime (`__cxxabiv1::__class_type_info`
+    // vtable). Optimized builds may strip it, but debug builds keep
+    // it — link the platform C++ standard library.
+    #[cfg(target_os = "macos")]
+    println!("cargo:rustc-link-lib=c++");
+    #[cfg(not(target_os = "macos"))]
+    println!("cargo:rustc-link-lib=stdc++");
+}
 "#;
 
 const HOST_MAIN_RS: &str = r#"// Hello, world — rustcc fork edition.
@@ -1616,6 +2018,7 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
         add("&File/New Project/&RAK11161 Project…", MOD_META | MOD_SHIFT | 'n' as i32, ACT_NEW_PROJECT);
         add("&File/New Project/Raspberry Pi &Pico Project…", 0, ACT_NEW_PICO);
         add("&File/Open &Project…", MOD_META | MOD_SHIFT | 'o' as i32, ACT_OPEN_PROJECT);
+        add("&File/&Close File", MOD_META | 'w' as i32, ACT_CLOSE_FILE);
         add("&File/&Quit", MOD_META | 'q' as i32, ACT_QUIT);
         add("&Edit/&Undo", MOD_META | 'z' as i32, ACT_UNDO);
         add("&Edit/&Redo", MOD_META | MOD_SHIFT | 'z' as i32, ACT_REDO);
@@ -1624,13 +2027,21 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
         add("&Edit/&Paste", MOD_META | 'v' as i32, ACT_PASTE);
         add("&Edit/Select &All", MOD_META | 'a' as i32, ACT_SELECT_ALL);
         add("&Edit/&Find…", MOD_META | 'f' as i32, ACT_FIND);
-        add("F&ormat/&Wrap Lines", MOD_META | 'w' as i32, ACT_WRAP);
+        add("F&ormat/&Wrap Lines", MOD_META | MOD_SHIFT | 'w' as i32, ACT_WRAP);
         add("F&ormat/Bigger", MOD_META | '=' as i32, ACT_FONT_UP);
         add("F&ormat/Smaller", MOD_META | '-' as i32, ACT_FONT_DOWN);
         // --- IDE menus ---
         add("&Project/&Build", MOD_META | 'b' as i32, ACT_BUILD);
         add("&Project/Build && &Run (qemu)", MOD_META | 'r' as i32, ACT_BUILD_RUN);
-        add("&Project/&Debug (qemu + gdbserver)…", MOD_META | MOD_SHIFT | 'd' as i32, ACT_DEBUG);
+        add("&Project/&Debug in Terminal (qemu/lldb)…", MOD_META | MOD_SHIFT | 'd' as i32, ACT_DEBUG);
+        add("&Debug/&Start Session (host, lldb)", KEY_F + 5, ACT_DBG_START);
+        add("&Debug/Toggle &Breakpoint @ cursor", KEY_F + 8, ACT_DBG_BREAKPOINT);
+        add("&Debug/Step &Over", KEY_F + 10, ACT_DBG_STEP_OVER);
+        add("&Debug/Step &Into", KEY_F + 11, ACT_DBG_STEP_IN);
+        add("&Debug/Step Ou&t", MOD_SHIFT | (KEY_F + 11), ACT_DBG_STEP_OUT);
+        add("&Debug/&Continue", KEY_F + 9, ACT_DBG_CONTINUE);
+        add("&Debug/Show &Variables", KEY_F + 7, ACT_DBG_VARS);
+        add("&Debug/Sto&p Session", MOD_SHIFT | (KEY_F + 5), ACT_DBG_STOP);
         add("&Project/&Upload Firmware", MOD_META | 'u' as i32, ACT_UPLOAD);
         add("&Project/Edit Upload &Config…", 0, ACT_UPLOAD_CFG);
         add("&Project/&Clear Console", 0, ACT_CONSOLE_CLEAR);
@@ -1669,7 +2080,7 @@ unsafe fn build_ui() -> *mut Fl_Window {
         // The ctor-in-place MIR pass (v1.14) constructs straight into
         // *ed, so the ctor-created children (scrollbars) capture the
         // final address — no re-parent fix-up needed.
-        ed.write(RustEditor::new(220, 28, 960, 430));
+        ed.write(RustEditor::new(220, 52, 960, 406));
         ED.store(ed, Relaxed);
         debug_assert!({
             let g = ed as *mut Fl_Group;
@@ -1720,8 +2131,17 @@ unsafe fn build_ui() -> *mut Fl_Window {
              Target menu picks the core (default: RAK11161 STM32WLE5 / CM4).\n",
         );
 
+        // Tab strip for open files (slim second menu bar).
+        let tabs =
+            cxx_operator_new(core::mem::size_of::<Fl_Menu_Bar>()) as *mut Fl_Menu_Bar;
+        Fl_Menu_Bar::new_at(tabs, 220, 28, 960, 24, core::ptr::null());
+        TABBAR.store(tabs, Relaxed);
+
+        (*(ed as *mut Fl_Text_Display)).linenumber_width(36);
+
         let g = (*win).as_fl_group_mut();
         g.add(bar as *mut Fl_Widget);
+        g.add(tabs as *mut Fl_Widget);
         g.add(nav as *mut Fl_Widget);
         g.add(ed as *mut Fl_Widget);
         g.add(con as *mut Fl_Widget);
@@ -2007,6 +2427,109 @@ unsafe fn self_test() -> i32 {
         check("upload guards ran", true);
         let _ = std::fs::remove_dir_all(&up);
 
+        // 18. IDE v5: debugger plumbing (no live lldb needed).
+        check(
+            "parse lldb stop location",
+            parse_stop_location(
+                "    frame #0: 0x0001 app`main at main.rs:23:5"
+            ) == Some(("main.rs".to_string(), 23)),
+        );
+        let bf = std::env::temp_dir().join("rustcc_ide_bp.rs");
+        std::fs::write(&bf, "fn main() {\n    let x = 1;\n    let y = 2;\n}\n").unwrap();
+        open_in_editor(&bf.to_string_lossy());
+        let ed3 = ED.load(Relaxed);
+        let b3 = BUF.load(Relaxed);
+        (*(ed3 as *mut Fl_Text_Display)).insert_position((*b3).skip_lines(0, 1));
+        dbg_toggle_breakpoint();
+        check(
+            "breakpoint recorded",
+            BREAKPOINTS.lock().unwrap().iter().any(|(_, l)| *l == 2),
+        );
+        // The style buffer is a PARALLEL byte array (no newlines) —
+        // assert the exact byte range of line 2 is marked.
+        let sb3 = STYLE_BUF.load(Relaxed);
+        let st = CStr::from_ptr((*sb3).text()).to_string_lossy().into_owned();
+        let l2_start = (*b3).skip_lines(0, 1) as usize;
+        let l2_end = (*b3).skip_lines(0, 2) as usize - 1; // exclude newline
+        check(
+            "breakpoint line marked F",
+            st.get(l2_start..l2_end).is_some_and(|s| s.chars().all(|c| c == 'F')),
+        );
+        dbg_toggle_breakpoint();
+        check("breakpoint cleared", BREAKPOINTS.lock().unwrap().is_empty());
+
+        // 19. IDE v5: tabs reflect open files; close switches away.
+        tabs_refresh();
+        let tab_count_before = OPEN_FILES.lock().unwrap().len();
+        check("tabs track open files", tab_count_before >= 2);
+        close_current_file();
+        check(
+            "close removed a tab",
+            OPEN_FILES.lock().unwrap().len() == tab_count_before - 1,
+        );
+        let _ = std::fs::remove_file(&bf);
+
+        // 20. FULL gate: real lldb session — breakpoint hit, variables
+        //     visible, step, continue to exit.
+        if std::env::var("RUSTCC_IDE_SELFTEST_FULL").as_deref() == Ok("1") {
+            let hp = std::env::temp_dir().join(format!("rustcc_ide_lldb_{}", std::process::id()));
+            let hp_s = hp.to_string_lossy().into_owned();
+            let _ = std::fs::remove_dir_all(&hp);
+            scaffold_host(&hp_s).unwrap();
+            *PROJECT_DIR.lock().unwrap() = Some(hp_s.clone());
+            TARGET.store(0, Relaxed);
+            open_in_editor(&format!("{hp_s}/src/main.rs"));
+            // Breakpoint on the println! line inside main().
+            let b5 = BUF.load(Relaxed);
+            let raw5 = CStr::from_ptr((*b5).text()).to_string_lossy().into_owned();
+            let line_no = raw5
+                .lines()
+                .position(|l| l.contains("println!"))
+                .map(|i| i as i32 + 1)
+                .unwrap_or(1);
+            BREAKPOINTS.lock().unwrap().push((format!("{hp_s}/src/main.rs"), line_no));
+            dbg_start();
+            // Async lldb: only ever look at output NEWER than the
+            // last command, and wait for each STOP before sending
+            // the next command.
+            let console_len = || {
+                let cb = CONSOLE_BUF.load(Relaxed);
+                CStr::from_ptr((*cb).text()).to_bytes().len()
+            };
+            let wait_from = |from: usize, needle: &str, secs: u32| -> bool {
+                for _ in 0..secs * 10 {
+                    pump_debugger();
+                    {
+                        let cb = CONSOLE_BUF.load(Relaxed);
+                        let txt =
+                            CStr::from_ptr((*cb).text()).to_string_lossy().into_owned();
+                        if txt.get(from.min(txt.len())..).is_some_and(|s| s.contains(needle)) {
+                            return true;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                false
+            };
+            check("lldb: breakpoint hit", wait_from(0, "stop reason = breakpoint", 90));
+            // Argument evaluation runs the fork-emitted C++ ctor
+            // first: step-in lands in Greeter::Greeter(excitement=…).
+            let m = console_len();
+            dbg_send("thread step-in");
+            check("lldb: stepped", wait_from(m, "stop reason = step in", 20));
+            let m = console_len();
+            dbg_send("frame variable");
+            check("lldb: variables visible", wait_from(m, "excitement", 15));
+            let m = console_len();
+            dbg_send("breakpoint disable");
+            check("lldb: bp disabled", wait_from(m, "disabled", 10));
+            let m = console_len();
+            dbg_send("continue");
+            check("lldb: ran to exit", wait_from(m, "exited", 25));
+            dbg_stop();
+            let _ = std::fs::remove_dir_all(&hp);
+        }
+
         let _ = std::fs::remove_dir_all(&proj);
     }
     if failures == 0 {
@@ -2026,7 +2549,17 @@ fn main() {
         } else {
             let win = build_ui();
             (*win).show();
-            Fl::run()
+            // Custom event loop: FLTK events + the debugger pump
+            // (lldb output arrives from a reader thread and must be
+            // drained on the UI thread).
+            loop {
+                Fl::wait_f64(0.05);
+                pump_debugger();
+                if Fl::first_window().is_null() {
+                    break;
+                }
+            }
+            0
         }
     };
     std::process::exit(rc);
