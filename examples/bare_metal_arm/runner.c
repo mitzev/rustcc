@@ -9,6 +9,8 @@
 
 extern int demo(int v);                    // caller.cpp — placement-new base
 extern int demo_subclass(int v, int scale); // caller.cpp — Rust factory, Widget*
+extern int demo_imported_override(int id, int off); // Rust override of C++ Sensor
+extern int demo_imported_base(int id, int off);     // inherited C++ Sensor::unit
 
 // --- semihosting -----------------------------------------------------
 static int sh(int op, void* arg) {
@@ -47,18 +49,27 @@ void _reset(void) {
 
     int a = demo(5);             // Widget::foo  -> v + 100      = 105
     int b = demo_subclass(3, 4); // Gauge::foo override -> 4*1000 = 4000
+    int c = demo_imported_override(7, 3); // Reader::read   -> 3+500 = 503
+    int d = demo_imported_base(7, 3);     // Sensor::unit (C++)      = 42
 
-    if (a == 105 && b == 4000) {
-        sh_write0("BARE-METAL SUBCLASS: PASS (demo=105 subclass=4000)\n");
+    if (a == 105 && b == 4000 && c == 503 && d == 42) {
+        sh_write0("BARE-METAL SUBCLASS: PASS "
+                  "(demo=105 subclass=4000 imported=503 inherited=42)\n");
         sh_exit(0);
     }
-    char msg[80], *p = msg;
+    char msg[120], *p = msg;
     const char* pre = "BARE-METAL SUBCLASS: FAIL demo=";
     while (*pre) *p++ = *pre++;
     p = fmt_i32(p, a);
-    const char* mid = " subclass=";
-    while (*mid) *p++ = *mid++;
+    const char* s1 = " subclass=";
+    while (*s1) *p++ = *s1++;
     p = fmt_i32(p, b);
+    const char* s2 = " imported=";
+    while (*s2) *p++ = *s2++;
+    p = fmt_i32(p, c);
+    const char* s3 = " inherited=";
+    while (*s3) *p++ = *s3++;
+    p = fmt_i32(p, d);
     *p++ = '\n'; *p = 0;
     sh_write0(msg);
     sh_exit(1);

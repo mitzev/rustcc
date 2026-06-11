@@ -42,9 +42,59 @@ pub class Gauge : Widget {
     pub virtual fn bar(&self) -> i32 { self.scale + 7 }
 }
 
+// ------------------------------------------------------------------
+// Subclassing an IMPORTED C++ base, heap-free.
+//
+// `Sensor` is defined in sensor.hpp / sensor.cpp and compiled with
+// arm-none-eabi-g++ — Rust never sees the C++ definition. The binding
+// below is exactly what `cxx_importer` emits for it (hand-inlined so
+// the probe stays self-contained / host-toolless): an opaque
+// #[repr(C)] shell carrying the base's vtable slots in
+// #[rustc_cxx_imported_vtable], plus the by-value `new` whose
+// MaybeUninit shape the v1.14 ctor-in-place pass folds into the
+// return slot. Non-virtual dtor → no `vdtor=1`, no heap, no Drop.
+// ------------------------------------------------------------------
+
+#[repr(C)]
+#[repr(align(4))]
+#[rustc_cxx_imported_vtable = "ztv=_ZTV6Sensor;zti=_ZTI6Sensor;slot=read,_ZNK6Sensor4readEv,v;slot=unit,_ZNK6Sensor4unitEv,v"]
+pub struct Sensor {
+    _opaque: [core::mem::MaybeUninit<u8>; 8], // vptr + int32_t id
+    _not_send_sync: core::marker::PhantomData<*mut u8>,
+}
+
+unsafe extern "C++" {
+    #[link_name = "_ZN6SensorC2Ei"]
+    fn __cxx_Sensor_new(this: *mut Sensor, id: i32);
+}
+
+impl Sensor {
+    pub fn new(id: i32) -> Self {
+        unsafe {
+            let mut __slot = core::mem::MaybeUninit::<Self>::uninit();
+            __cxx_Sensor_new(__slot.as_mut_ptr(), id);
+            __slot.assume_init()
+        }
+    }
+}
+
+// Rust subclass of the imported base. `read` overrides the C++ slot;
+// `unit` is NOT overridden, so the derived vtable's slot 1 points
+// straight at the GCC-compiled `_ZNK6Sensor4unitEv`.
+pub class Reader : Sensor {
+    offset: i32,
+
+    pub constructor fn new(id: i32, offset: i32) -> Self {
+        Self { __base: Sensor::new(id), offset }
+    }
+
+    pub override fn read(&self) -> i32 { self.offset + 500 }
+}
+
 // Static storage — no heap on bare-metal.
 static mut SLOT: Option<Widget> = None;
 static mut GAUGE_SLOT: Option<Gauge> = None;
+static mut READER_SLOT: Option<Reader> = None;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn init_widget(v: i32) -> *mut Widget {
@@ -66,6 +116,20 @@ pub extern "C" fn init_gauge(v: i32, scale: i32) -> *mut Widget {
         GAUGE_SLOT = Some(Gauge::new(v, scale));
         match GAUGE_SLOT.as_mut() {
             Some(g) => g as *mut Gauge as *mut Widget,
+            None => core::ptr::null_mut(),
+        }
+    }
+}
+
+/// Same shape over the IMPORTED base: builds a `Reader : Sensor` in
+/// static storage (the C++ ctor runs in place — v1.14) and returns it
+/// as a `Sensor*` for C++-side virtual dispatch.
+#[unsafe(no_mangle)]
+pub extern "C" fn init_reader(id: i32, offset: i32) -> *mut Sensor {
+    unsafe {
+        READER_SLOT = Some(Reader::new(id, offset));
+        match READER_SLOT.as_mut() {
+            Some(r) => r as *mut Reader as *mut Sensor,
             None => core::ptr::null_mut(),
         }
     }

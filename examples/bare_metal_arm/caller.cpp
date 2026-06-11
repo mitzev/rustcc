@@ -36,3 +36,16 @@ extern "C" int demo_subclass(int v, int scale) {
     Widget* w = init_gauge(v, scale);
     return (int)w->foo();                  // expects the Gauge override
 }
+
+// Imported-base flavor: Sensor is a real C++ class (sensor.cpp, GCC-
+// compiled); Rust subclasses it heap-free and hands back a Sensor*.
+#include "sensor.hpp"
+
+extern "C" Sensor* init_reader(int32_t id, int32_t offset);
+
+extern "C" int demo_imported_override(int id, int off) {
+    return (int)init_reader(id, off)->read();   // Rust override
+}
+extern "C" int demo_imported_base(int id, int off) {
+    return (int)init_reader(id, off)->unit();   // inherited C++ impl
+}
