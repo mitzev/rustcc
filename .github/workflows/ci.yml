@@ -139,6 +139,12 @@ jobs:
           # ~90 min from-source LLVM build that exhausts free runners.
           RUSTCC_DOWNLOAD_CI_LLVM: "1"
           CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
+          # Bootstrap's CiEnv::GitHubActions path resolves HEAD^1 as
+          # "the upstream commit" — wrong for our am'd patch stack
+          # (HEAD^1 = previous fork patch). Force the local
+          # author-date-order bors lookup, which resolves the served
+          # LLVM-bump commit.
+          GITHUB_ACTIONS: "false"
         run: ./fork/build.sh
 
       - name: Build the cxx_throws_native example
@@ -183,6 +189,12 @@ jobs:
         env:
           RUSTCC_DOWNLOAD_CI_LLVM: "1"
           CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
+          # Bootstrap's CiEnv::GitHubActions path resolves HEAD^1 as
+          # "the upstream commit" — wrong for our am'd patch stack
+          # (HEAD^1 = previous fork patch). Force the local
+          # author-date-order bors lookup, which resolves the served
+          # LLVM-bump commit.
+          GITHUB_ACTIONS: "false"
         run: ./fork/build.sh
 
       - name: Run the subclass + member-ptr demos with g++
@@ -237,6 +249,8 @@ jobs:
 
       - name: Build stage1 with the gcc codegen backend
         working-directory: ../rust-lang-rust-fork
+        env:
+          GITHUB_ACTIONS: "false"   # see the build.sh steps' note
         run: |
           ./x.py build --stage 1 library \
             --set 'rust.codegen-backends=["llvm","gcc"]' \
@@ -284,6 +298,12 @@ jobs:
         env:
           RUSTCC_DOWNLOAD_CI_LLVM: "1"
           CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
+          # Bootstrap's CiEnv::GitHubActions path resolves HEAD^1 as
+          # "the upstream commit" — wrong for our am'd patch stack
+          # (HEAD^1 = previous fork patch). Force the local
+          # author-date-order bors lookup, which resolves the served
+          # LLVM-bump commit.
+          GITHUB_ACTIONS: "false"
         run: ./fork/build.sh
 
       - name: Run the MSVC runtime smoke suite under Wine
