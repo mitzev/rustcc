@@ -45,6 +45,13 @@ $CM -nostartfiles -nostdlib -T link_arm.ld \
     target/thumbv7em-none-eabihf/release/libfreertos_cpp.a \
     -lgcc -o target/arm/firmware.elf
 
+if [[ "${GDB:-0}" == 1 ]]; then
+  echo "==> qemu (mps2-an386) HALTED, gdbserver on :1234"
+  echo "    attach: arm-none-eabi-gdb target/arm/firmware.elf \\"
+  echo "            -ex 'target remote :1234' -ex 'break main' -ex continue"
+  exec qemu-system-arm -M mps2-an386 -nographic -semihosting -s -S \
+      -kernel target/arm/firmware.elf
+fi
 echo "==> qemu (mps2-an386)"
 qemu-system-arm -M mps2-an386 -nographic -semihosting \
     -kernel target/arm/firmware.elf &

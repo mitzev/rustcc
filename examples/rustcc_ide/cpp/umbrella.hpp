@@ -21,4 +21,5 @@
 #include <FL/Fl_Menu_Bar.H>
 #include <FL/Fl_Menu_Item.H>
 #include <FL/Fl_Native_File_Chooser.H>
+#include <FL/Fl_Hold_Browser.H>
 #include <FL/Enumerations.H>

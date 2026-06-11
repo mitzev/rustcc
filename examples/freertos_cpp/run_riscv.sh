@@ -58,6 +58,13 @@ $RV -nostartfiles -nostdlib -T link_riscv.ld \
     "target/$RV_TARGET/release/libfreertos_cpp.a" \
     -lgcc -o target/$RV_TAG/firmware.elf
 
+if [[ "${GDB:-0}" == 1 ]]; then
+  echo "==> qemu (virt, rv32) HALTED, gdbserver on :1234"
+  echo "    attach: riscv64-elf-gdb target/$RV_TAG/firmware.elf \\"
+  echo "            -ex 'target remote :1234' -ex 'break main' -ex continue"
+  exec qemu-system-riscv32 -M virt -cpu "$RV_QEMU_CPU" -nographic -semihosting -bios none -s -S \
+      -kernel "target/$RV_TAG/firmware.elf"
+fi
 echo "==> qemu (virt, rv32)"
 qemu-system-riscv32 -M virt -cpu "$RV_QEMU_CPU" -nographic -semihosting -bios none \
     -kernel "target/$RV_TAG/firmware.elf" &

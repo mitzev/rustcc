@@ -55,6 +55,16 @@ static CONSOLE_BUF: AtomicPtr<Fl_Text_Buffer> = AtomicPtr::new(core::ptr::null_m
 static TARGET: AtomicI32 = AtomicI32::new(1);
 static PROJECT_DIR: Mutex<Option<String>> = Mutex::new(None);
 static BUILD_RUNNING: AtomicBool = AtomicBool::new(false);
+static FIND_WIN: AtomicPtr<Fl_Window> = AtomicPtr::new(core::ptr::null_mut());
+static NAV: AtomicPtr<FileNav> = AtomicPtr::new(core::ptr::null_mut());
+/// Open files: (path, Fl_Text_Buffer* as usize). One buffer per file;
+/// the single editor view switches between them (nav click / Open).
+static OPEN_FILES: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+static NAV_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Highlight keywords: fork keywords extracted at startup from the
+/// VSCode extension's TextMate grammar (single source of truth) plus
+/// the core Rust keyword set.
+static KEYWORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 const TARGET_NAMES: [&str; 4] = [
     "Host (LLVM backend)",
@@ -76,10 +86,14 @@ struct StyleEntry {
     attr: u32,
     bgcolor: u32, // Fl_Color
 }
-/// 'A' = plain text, 'B' = comment lines (`//` / `#`) in blue.
-static STYLE_TABLE: [StyleEntry; 2] = [
+/// 'A' plain, 'B' comment, 'C' keyword (grammar-driven), 'D' string,
+/// 'E' attribute (`#[...]`).
+static STYLE_TABLE: [StyleEntry; 5] = [
     StyleEntry { color: 0, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
-    StyleEntry { color: 0x0000D000, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
+    StyleEntry { color: 0x00800000, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
+    StyleEntry { color: 0x8000A000, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
+    StyleEntry { color: 0xA0500000, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
+    StyleEntry { color: 0x0060C000, font: 4, size: 14, attr: 0, bgcolor: 0xFFFFFF00 },
 ];
 
 // FLTK constants — from the generated bindings (the M12 macro pass
@@ -89,6 +103,8 @@ const MOD_CTRL: i32 = FL_CTRL as i32;
 const MOD_META: i32 = FL_META as i32; // FL_COMMAND on macOS
 const MOD_SHIFT: i32 = FL_SHIFT as i32;
 const KEY_ENTER: i32 = FL_Enter as i32;
+const KEY_ESCAPE: i32 = FL_Escape as i32;
+const EV_RELEASE: i32 = 2; // FL_RELEASE (Fl_Event enum)
 // Class-scope enums — generated bindings (v1.14): named nested enums
 // emit as transparent structs with assoc consts; anonymous ones as
 // prefixed plain consts.
@@ -121,6 +137,8 @@ const ACT_OPEN_PROJECT: usize = 41;
 const ACT_BUILD: usize = 42;
 const ACT_BUILD_RUN: usize = 43;
 const ACT_CONSOLE_CLEAR: usize = 44;
+const ACT_NEW_HOST: usize = 45;
+const ACT_DEBUG: usize = 46;
 
 // Super-calls (non-virtual, by mangled symbol).
 unsafe extern "C++" {
@@ -132,6 +150,8 @@ unsafe extern "C++" {
     fn base_display_resize(this: *mut Fl_Text_Display, x: i32, y: i32, w: i32, h: i32);
     #[link_name = "_ZN8Fl_Input6handleEi"]
     fn base_input_handle(this: *mut Fl_Input, ev: i32) -> i32;
+    #[link_name = "_ZN11Fl_Browser_6handleEi"]
+    fn base_browser_handle(this: *mut Fl_Browser_, ev: i32) -> i32;
     #[link_name = "_Znwm"]
     fn cxx_operator_new(size: usize) -> *mut u8;
 }
@@ -196,7 +216,39 @@ pub class FindBar : Fl_Input {
             unsafe { find_next() };
             return 1;
         }
+        if ev == EV_KEYDOWN && Fl::event_key() == KEY_ESCAPE {
+            let w = FIND_WIN.load(Relaxed);
+            if !w.is_null() {
+                unsafe { (*(w as *mut Fl_Widget)).hide() };
+            }
+            return 1;
+        }
         unsafe { base_input_handle(this, ev) }
+    }
+}
+
+// ------------------------------------------------------------------
+// File navigator: Rust subclass of the 3-level imported chain
+// Fl_Hold_Browser -> Fl_Browser -> Fl_Browser_. Click (release)
+// opens the selected file in the editor.
+// ------------------------------------------------------------------
+pub class FileNav : Fl_Hold_Browser {
+    pad: i32,
+
+    pub constructor fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        FileNav {
+            __base: Fl_Hold_Browser::new(x, y, w, h, ::core::ptr::null()),
+            pad: 0,
+        }
+    }
+
+    pub override fn handle(&self, ev: i32) -> i32 {
+        let this = self as *const Self as *mut Fl_Browser_;
+        let r = unsafe { base_browser_handle(this, ev) };
+        if ev == EV_RELEASE {
+            unsafe { nav_open_selected(self as *const Self as *mut FileNav) };
+        }
+        r
     }
 }
 
@@ -224,10 +276,11 @@ unsafe extern "C" fn modify_cb(
     }
 }
 
-/// Rebuild the parallel style buffer: comment lines (`//`, `#`)
-/// style 'B', everything else 'A'. TextEdit-grade, not a real lexer —
-/// the point is exercising `highlight_data` + the nested-record
-/// binding end to end.
+/// Rebuild the parallel style buffer with a small tokenizer:
+/// line comments 'B', strings 'D', `#[...]` attributes 'E', and
+/// keyword identifiers 'C' — the keyword set merges the core Rust
+/// keywords with the fork-specific ones extracted at startup from
+/// the VSCode extension's TextMate grammar (see load_keywords).
 unsafe fn restyle() {
     unsafe {
         let buf = BUF.load(Relaxed);
@@ -241,14 +294,77 @@ unsafe fn restyle() {
         }
         let text = CStr::from_ptr(raw).to_string_lossy().into_owned();
         libc_free(raw as *mut ::core::ffi::c_void);
-        let mut styles = String::with_capacity(text.len());
-        for line in text.split_inclusive('\n') {
-            let t = line.trim_start();
-            let s = if t.starts_with("//") || t.starts_with('#') { 'B' } else { 'A' };
-            for _ in 0..line.len() {
-                styles.push(s);
+        let kw = KEYWORDS.lock().unwrap();
+        let b = text.as_bytes();
+        let mut styles = vec![b'A'; b.len()];
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            // line comment
+            if c == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
+                let mut j = i;
+                while j < b.len() && b[j] != b'\n' {
+                    styles[j] = b'B';
+                    j += 1;
+                }
+                i = j;
+            // string literal (no escapes-across-lines ambition)
+            } else if c == b'"' {
+                styles[i] = b'D';
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' && b[j] != b'\n' {
+                    if b[j] == b'\\' && j + 1 < b.len() {
+                        styles[j] = b'D';
+                        j += 1;
+                    }
+                    styles[j] = b'D';
+                    j += 1;
+                }
+                if j < b.len() && b[j] == b'"' {
+                    styles[j] = b'D';
+                    j += 1;
+                }
+                i = j;
+            // attribute: #[...] possibly #![...]
+            } else if c == b'#'
+                && i + 1 < b.len()
+                && (b[i + 1] == b'[' || (b[i + 1] == b'!' && i + 2 < b.len() && b[i + 2] == b'['))
+            {
+                let mut j = i;
+                let mut depth = 0i32;
+                while j < b.len() {
+                    styles[j] = b'E';
+                    if b[j] == b'[' {
+                        depth += 1;
+                    }
+                    if b[j] == b']' {
+                        depth -= 1;
+                        if depth == 0 {
+                            j += 1;
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                i = j;
+            // identifier / keyword
+            } else if c.is_ascii_alphabetic() || c == b'_' {
+                let mut j = i;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                let word = &text[i..j];
+                if kw.iter().any(|k| k == word) {
+                    for s in &mut styles[i..j] {
+                        *s = b'C';
+                    }
+                }
+                i = j;
+            } else {
+                i += 1;
             }
         }
+        let styles = String::from_utf8(styles).unwrap_or_default();
         (*sbuf).text_const_i8_str(&styles);
     }
 }
@@ -317,12 +433,7 @@ unsafe fn run_action(act: usize) {
             ACT_SELECT_ALL => {
                 (*buf).select(0, (*buf).length());
             }
-            ACT_FIND => {
-                let f = FIND.load(Relaxed);
-                if !f.is_null() {
-                    (*(f as *mut Fl_Widget)).take_focus();
-                }
-            }
+            ACT_FIND => show_find_popup(),
             ACT_WRAP => {
                 let on = !WRAP_ON.load(Relaxed);
                 WRAP_ON.store(on, Relaxed);
@@ -338,30 +449,12 @@ unsafe fn run_action(act: usize) {
                 TARGET.store(t, Relaxed);
                 console_append(&format!("target = {}\n", TARGET_NAMES[t as usize]));
             }
-            ACT_NEW_PROJECT => {
-                if let Some(dir) = choose_file(CHOOSER_DIR, "New RAK11161 project folder") {
-                    match scaffold_project(&dir) {
-                        Ok(()) => {
-                            *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
-                            console_append(&format!(
-                                "scaffolded RAK11161 project at {dir}\n\
-                                 (src/lib.rs opened; Target menu picks the core; \
-                                 Cmd+R builds + runs under qemu)\n"
-                            ));
-                            open_in_editor(&format!("{dir}/src/lib.rs"));
-                        }
-                        Err(e) => console_append(&format!("scaffold FAILED: {e}\n")),
-                    }
-                }
-            }
+            ACT_NEW_PROJECT => new_project_flow(false),
+            ACT_NEW_HOST => new_project_flow(true),
+            ACT_DEBUG => debug_project(),
             ACT_OPEN_PROJECT => {
                 if let Some(dir) = choose_file(CHOOSER_DIR, "Open project folder") {
-                    *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
-                    console_append(&format!("project = {dir}\n"));
-                    let lib = format!("{dir}/src/lib.rs");
-                    if std::path::Path::new(&lib).exists() {
-                        open_in_editor(&lib);
-                    }
+                    set_project(&dir);
                 }
             }
             ACT_BUILD => build_project(false),
@@ -501,6 +594,52 @@ unsafe extern "C" {
 // IDE engine: console, streamed process runner, project scaffold.
 // ------------------------------------------------------------------
 
+/// Build the highlight keyword set: core Rust keywords + every
+/// fork-specific identifier found in the vscode-rustcc TextMate
+/// grammar (embedded at compile time — single source of truth with
+/// the editor extension).
+fn load_keywords() {
+    const GRAMMAR: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tools/vscode-rustcc/syntaxes/rustcc-injection.tmLanguage.json"
+    ));
+    let mut kw: Vec<String> = [
+        "fn", "let", "pub", "use", "impl", "struct", "enum", "match", "if", "else", "for",
+        "while", "loop", "return", "unsafe", "mod", "static", "const", "trait", "where",
+        "as", "in", "mut", "ref", "move", "dyn", "self", "Self", "super", "crate", "true",
+        "false",
+        // fork method-modifier keywords (parser-level, not in the
+        // injection grammar which targets attributes):
+        "class", "constructor", "virtual", "override",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // Harvest fork identifiers from the grammar's match patterns:
+    // every word that appears inside the attribute/keyword captures.
+    let mut word = String::new();
+    for ch in GRAMMAR.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            word.push(ch);
+        } else {
+            if word.len() > 2
+                && (word.starts_with("cpp")
+                    || word.starts_with("swift")
+                    || word.starts_with("rustc_")
+                    || word == "repr"
+                    || word == "extern"
+                    || word == "class"
+                    || word == "constructor")
+                && !kw.contains(&word)
+            {
+                kw.push(word.clone());
+            }
+            word.clear();
+        }
+    }
+    *KEYWORDS.lock().unwrap() = kw;
+}
+
 fn console_append(s: &str) {
     unsafe {
         let cb = CONSOLE_BUF.load(Relaxed);
@@ -565,8 +704,11 @@ fn run_streamed(dir: &str, cmdline: &str) -> i32 {
 fn target_cmdline(target: i32, run: bool) -> String {
     let skip = if run { "" } else { "SKIP_QEMU=1 " };
     match target {
-        0 => "RUSTC_BOOTSTRAP=1 cargo +nightly build --release 2>&1 && echo HOST-BUILD-OK"
-            .to_string(),
+        0 => format!(
+            "RUSTC_BOOTSTRAP=1 cargo +nightly {} --release 2>&1 && echo HOST-{}-OK",
+            if run { "run" } else { "build" },
+            if run { "RUN" } else { "BUILD" },
+        ),
         1 => format!("{skip}./run_arm.sh"),
         2 => format!("{skip}./run_riscv_c2.sh"),
         _ => format!("{skip}./run_riscv.sh"),
@@ -595,18 +737,319 @@ fn build_project(run: bool) {
     BUILD_RUNNING.store(false, Relaxed);
 }
 
+/// Multi-buffer open: one Fl_Text_Buffer per file, the single editor
+/// view switches between them. Re-opening an open file just switches.
 fn open_in_editor(path: &str) {
     unsafe {
-        let buf = BUF.load(Relaxed);
-        if buf.is_null() {
-            return;
-        }
-        (*buf).loadfile_with_defaults(cstr(path).as_ptr());
-        *PATH.lock().unwrap() = Some(path.to_string());
-        DIRTY.store(false, Relaxed);
-        refresh_title();
+        let existing = {
+            let files = OPEN_FILES.lock().unwrap();
+            files.iter().position(|(p, _)| p == path)
+        };
+        let idx = match existing {
+            Some(i) => i,
+            None => {
+                let nbuf = cxx_operator_new(core::mem::size_of::<Fl_Text_Buffer>())
+                    as *mut Fl_Text_Buffer;
+                Fl_Text_Buffer::new_at(nbuf, 0, 1024);
+                (*nbuf).loadfile_with_defaults(cstr(path).as_ptr());
+                (*nbuf).add_modify_callback(Some(modify_cb), core::ptr::null_mut());
+                let mut files = OPEN_FILES.lock().unwrap();
+                files.push((path.to_string(), nbuf as usize));
+                files.len() - 1
+            }
+        };
+        switch_to_file(idx);
     }
 }
+
+unsafe fn switch_to_file(idx: usize) {
+    unsafe {
+        let (path, bufp) = {
+            let files = OPEN_FILES.lock().unwrap();
+            match files.get(idx) {
+                Some((p, b)) => (p.clone(), *b as *mut Fl_Text_Buffer),
+                None => return,
+            }
+        };
+        BUF.store(bufp, Relaxed);
+        let ed = ED.load(Relaxed);
+        if !ed.is_null() {
+            (*(ed as *mut Fl_Text_Display)).buffer(bufp);
+        }
+        *PATH.lock().unwrap() = Some(path);
+        DIRTY.store(false, Relaxed);
+        restyle();
+        refresh_title();
+        nav_refresh(); // re-mark the selected entry
+    }
+}
+
+/// Repopulate the navigator from the project dir (2 levels deep,
+/// source-ish files only) + every open file.
+fn nav_refresh() {
+    unsafe {
+        let nav = NAV.load(Relaxed);
+        if nav.is_null() {
+            return;
+        }
+        let b = &mut *(nav as *mut Fl_Browser);
+        b.clear();
+        let mut paths: Vec<String> = Vec::new();
+        if let Some(dir) = PROJECT_DIR.lock().unwrap().clone() {
+            collect_files(&dir, 0, &mut paths);
+        }
+        for (p, _) in OPEN_FILES.lock().unwrap().iter() {
+            if !paths.contains(p) {
+                paths.push(p.clone());
+            }
+        }
+        let cur = PATH.lock().unwrap().clone();
+        let root = PROJECT_DIR.lock().unwrap().clone().unwrap_or_default();
+        for p in &paths {
+            let shown = p.strip_prefix(&format!("{root}/")).unwrap_or(p);
+            let marker = if Some(p) == cur.as_ref() { "@b" } else { "" };
+            b.add_str_with_defaults(&format!("{marker}{shown}"));
+        }
+        *NAV_PATHS.lock().unwrap() = paths;
+        (*(nav as *mut Fl_Widget)).redraw();
+    }
+}
+
+fn collect_files(dir: &str, depth: u32, out: &mut Vec<String>) {
+    if depth > 2 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut entries: Vec<_> = rd.flatten().collect();
+    entries.sort_by_key(|e| e.path());
+    for e in entries {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || name == "target" {
+            continue;
+        }
+        if p.is_dir() {
+            collect_files(&p.to_string_lossy(), depth + 1, out);
+        } else if matches!(
+            p.extension().and_then(|x| x.to_str()),
+            Some("rs" | "c" | "h" | "cpp" | "hpp" | "ld" | "sh" | "toml" | "json" | "md")
+        ) {
+            out.push(p.to_string_lossy().into_owned());
+        }
+    }
+}
+
+unsafe fn nav_open_selected(nav: *mut FileNav) {
+    unsafe {
+        let v = (*(nav as *mut Fl_Browser)).value();
+        if v <= 0 {
+            return;
+        }
+        let path = {
+            let paths = NAV_PATHS.lock().unwrap();
+            paths.get((v - 1) as usize).cloned()
+        };
+        if let Some(p) = path {
+            open_in_editor(&p);
+        }
+    }
+}
+
+/// The Find popup: a small always-on-top-ish window holding the
+/// FindBar. Created lazily; ⌘F shows + focuses, Escape hides.
+fn show_find_popup() {
+    unsafe {
+        let mut w = FIND_WIN.load(Relaxed);
+        if w.is_null() {
+            w = cxx_operator_new(core::mem::size_of::<Fl_Window>()) as *mut Fl_Window;
+            Fl_Window::new_at(w, 380, 44, c"Find".as_ptr());
+            let f = cxx_operator_new(core::mem::size_of::<FindBar>()) as *mut FindBar;
+            f.write(FindBar::new(60, 8, 300, 28));
+            FIND.store(f, Relaxed);
+            (*w).as_fl_group_mut().end();
+            (*w).as_fl_group_mut().add(f as *mut Fl_Widget);
+            FIND_WIN.store(w, Relaxed);
+        }
+        (*(w as *mut Fl_Widget)).show();
+        let f = FIND.load(Relaxed);
+        if !f.is_null() {
+            (*(f as *mut Fl_Widget)).take_focus();
+        }
+    }
+}
+
+fn set_project(dir: &str) {
+    *PROJECT_DIR.lock().unwrap() = Some(dir.to_string());
+    console_append(&format!("project = {dir}\n"));
+    let lib = format!("{dir}/src/lib.rs");
+    let main = format!("{dir}/src/main.rs");
+    if std::path::Path::new(&lib).exists() {
+        open_in_editor(&lib);
+    } else if std::path::Path::new(&main).exists() {
+        open_in_editor(&main);
+    }
+    nav_refresh();
+}
+
+fn new_project_flow(host: bool) {
+    let title = if host { "New Host project folder" } else { "New RAK11161 project folder" };
+    if let Some(dir) = unsafe { choose_file(CHOOSER_DIR, title) } {
+        let r = if host { scaffold_host(&dir) } else { scaffold_project(&dir) };
+        match r {
+            Ok(()) => {
+                console_append(&format!(
+                    "scaffolded {} project at {dir}\n",
+                    if host { "Host" } else { "RAK11161" }
+                ));
+                if host {
+                    TARGET.store(0, Relaxed);
+                    console_append("target = Host (LLVM backend)\n");
+                }
+                set_project(&dir);
+            }
+            Err(e) => console_append(&format!("scaffold FAILED: {e}\n")),
+        }
+    }
+}
+
+/// Debug: launch the firmware under qemu's gdbserver (halted) in a
+/// separate Terminal window — it blocks until a debugger attaches —
+/// and print the exact attach command in the console. Host target:
+/// lldb on the release binary.
+fn debug_project() {
+    let dir = PROJECT_DIR.lock().unwrap().clone();
+    let Some(dir) = dir else {
+        console_append("no project open — File > New/Open Project first\n");
+        return;
+    };
+    let t = TARGET.load(Relaxed);
+    let (launch, attach): (String, String) = match t {
+        0 => (
+            format!("cd '{dir}' && RUSTC_BOOTSTRAP=1 cargo +nightly build --release && lldb target/release/rustcc_app"),
+            "lldb drives the host binary directly in the Terminal window".to_string(),
+        ),
+        1 => (
+            format!("cd '{dir}' && GDB=1 ./run_arm.sh"),
+            format!("arm-none-eabi-gdb '{dir}/target/arm/firmware.elf' -ex 'target remote :1234' -ex 'break main' -ex continue"),
+        ),
+        2 => (
+            format!("cd '{dir}' && GDB=1 ./run_riscv_c2.sh"),
+            format!("riscv64-elf-gdb '{dir}/target/riscv-c2/firmware.elf' -ex 'target remote :1234' -ex 'break main' -ex continue"),
+        ),
+        _ => (
+            format!("cd '{dir}' && GDB=1 ./run_riscv.sh"),
+            format!("riscv64-elf-gdb '{dir}/target/riscv/firmware.elf' -ex 'target remote :1234' -ex 'break main' -ex continue"),
+        ),
+    };
+    let script = format!(
+        "tell application \"Terminal\" to do script \"{}\"",
+        launch.replace('"', "\\\"")
+    );
+    let ok = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        console_append(&format!(
+            "debug session launched in Terminal ({}).\n",
+            TARGET_NAMES[t as usize]
+        ));
+        if t != 0 {
+            console_append(&format!(
+                "qemu is HALTED with gdbserver on :1234 — attach from another shell:\n  {attach}\n"
+            ));
+        }
+    } else {
+        console_append(&format!(
+            "could not open Terminal; run manually:\n  {launch}\n  then attach:\n  {attach}\n"
+        ));
+    }
+}
+
+/// Host project scaffold — mirrors the vscode-rustcc plugin's
+/// "New Project (class surface)" template (Counter class + main).
+fn scaffold_host(dir: &str) -> Result<(), String> {
+    use std::fs;
+    let root = std::path::Path::new(dir);
+    let werr = |e: std::io::Error| e.to_string();
+    fs::create_dir_all(root.join("src")).map_err(werr)?;
+    fs::create_dir_all(root.join(".vscode")).map_err(werr)?;
+    fs::write(root.join("Cargo.toml"), HOST_CARGO_TOML).map_err(werr)?;
+    fs::write(root.join("src/main.rs"), HOST_MAIN_RS).map_err(werr)?;
+    fs::write(root.join(".vscode/tasks.json"), HOST_TASKS_JSON).map_err(werr)?;
+    fs::write(root.join("README.md"), HOST_README).map_err(werr)?;
+    Ok(())
+}
+
+const HOST_CARGO_TOML: &str = r#"[package]
+name = "rustcc_app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+"#;
+
+const HOST_MAIN_RS: &str = r#"// Scaffolded by the rustcc IDE (class-keyword surface) — the same
+// template the vscode-rustcc plugin's "New Project" command emits.
+// The `class` keyword is fork-only; the IDE builds with RUSTC
+// pointed at the fork stage1. Since v1.14 no feature gates or allow
+// attributes are needed.
+
+pub class Counter {
+    n: i64,
+
+    pub constructor fn new() -> Self {
+        Counter { n: 0 }
+    }
+
+    pub fn bump(&mut self, by: i64) {
+        self.n += by;
+    }
+
+    pub fn value(&self) -> i64 {
+        self.n
+    }
+}
+
+fn main() {
+    let mut c = Counter::new();
+    c.bump(41);
+    c.bump(1);
+    println!("counter = {}", c.value());
+}
+"#;
+
+const HOST_TASKS_JSON: &str = r#"{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "rustcc: build (host)",
+      "type": "shell",
+      "command": "RUSTC_BOOTSTRAP=1 cargo +nightly build --release",
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "rustcc: run (host)",
+      "type": "shell",
+      "command": "RUSTC_BOOTSTRAP=1 cargo +nightly run --release",
+      "group": "test"
+    }
+  ]
+}
+"#;
+
+const HOST_README: &str = r#"# rustcc host project
+
+Scaffolded by the rustcc IDE (mirrors the vscode-rustcc plugin's
+class-surface template). Build with the fork:
+
+```sh
+RUSTC=<fork-stage1>/bin/rustc cargo +nightly run --release
+```
+"#;
 
 // --- scaffold: a complete dual-core RAK11161 firmware project -------
 //
@@ -770,10 +1213,13 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
                 0,
             );
         };
-        add("&File/&New", MOD_META | 'n' as i32, ACT_NEW);
-        add("&File/&Open…", MOD_META | 'o' as i32, ACT_OPEN);
+        add("&File/&New File", MOD_META | 'n' as i32, ACT_NEW);
+        add("&File/&Open File…", MOD_META | 'o' as i32, ACT_OPEN);
         add("&File/&Save", MOD_META | 's' as i32, ACT_SAVE);
         add("&File/Save &As…", MOD_META | MOD_SHIFT | 's' as i32, ACT_SAVE_AS);
+        add("&File/New Project/&Host Project…", 0, ACT_NEW_HOST);
+        add("&File/New Project/&RAK11161 Project…", MOD_META | MOD_SHIFT | 'n' as i32, ACT_NEW_PROJECT);
+        add("&File/Open &Project…", MOD_META | MOD_SHIFT | 'o' as i32, ACT_OPEN_PROJECT);
         add("&File/&Quit", MOD_META | 'q' as i32, ACT_QUIT);
         add("&Edit/&Undo", MOD_META | 'z' as i32, ACT_UNDO);
         add("&Edit/&Redo", MOD_META | MOD_SHIFT | 'z' as i32, ACT_REDO);
@@ -786,10 +1232,9 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
         add("F&ormat/Bigger", MOD_META | '=' as i32, ACT_FONT_UP);
         add("F&ormat/Smaller", MOD_META | '-' as i32, ACT_FONT_DOWN);
         // --- IDE menus ---
-        add("&Project/&New RAK11161 Project…", MOD_META | MOD_SHIFT | 'n' as i32, ACT_NEW_PROJECT);
-        add("&Project/&Open Project…", MOD_META | MOD_SHIFT | 'o' as i32, ACT_OPEN_PROJECT);
         add("&Project/&Build", MOD_META | 'b' as i32, ACT_BUILD);
         add("&Project/Build && &Run (qemu)", MOD_META | 'r' as i32, ACT_BUILD_RUN);
+        add("&Project/&Debug (qemu + gdbserver)…", MOD_META | MOD_SHIFT | 'd' as i32, ACT_DEBUG);
         add("&Project/&Clear Console", 0, ACT_CONSOLE_CLEAR);
         add("&Target/&Host (LLVM)", 0, ACT_TGT_BASE + 0);
         add("&Target/RAK11161: &STM32WLE5 (Cortex-M4)", 0, ACT_TGT_BASE + 1);
@@ -806,7 +1251,7 @@ unsafe fn build_ui() -> *mut Fl_Window {
         // silently no-ops (shown() stays 0). Construct at the final
         // heap address instead (v1.13.10 placement ctors).
         let win = cxx_operator_new(core::mem::size_of::<Fl_Window>()) as *mut Fl_Window;
-        Fl_Window::new_at(win, 900, 760, c"rustcc IDE".as_ptr());
+        Fl_Window::new_at(win, 1180, 760, c"rustcc IDE".as_ptr());
         (*win).as_fl_group_mut().end();
         // No implicit group capture while heap-placing the Rust widgets.
         Fl_Group::current_mut_fl_group(core::ptr::null_mut());
@@ -817,14 +1262,14 @@ unsafe fn build_ui() -> *mut Fl_Window {
         (*buf).add_modify_callback(Some(modify_cb), core::ptr::null_mut());
 
         let bar = cxx_operator_new(core::mem::size_of::<Fl_Menu_Bar>()) as *mut Fl_Menu_Bar;
-        Fl_Menu_Bar::new_at(bar, 0, 0, 900, 28, core::ptr::null());
+        Fl_Menu_Bar::new_at(bar, 0, 0, 1180, 28, core::ptr::null());
         add_menu_items(bar);
 
         let ed = cxx_operator_new(core::mem::size_of::<RustEditor>()) as *mut RustEditor;
         // The ctor-in-place MIR pass (v1.14) constructs straight into
         // *ed, so the ctor-created children (scrollbars) capture the
         // final address — no re-parent fix-up needed.
-        ed.write(RustEditor::new(0, 28, 900, 430));
+        ed.write(RustEditor::new(220, 28, 960, 430));
         ED.store(ed, Relaxed);
         debug_assert!({
             let g = ed as *mut Fl_Group;
@@ -852,9 +1297,11 @@ unsafe fn build_ui() -> *mut Fl_Window {
             core::ptr::null_mut(),
         );
 
-        let find = cxx_operator_new(core::mem::size_of::<FindBar>()) as *mut FindBar;
-        find.write(FindBar::new(60, 730, 720, 26));
-        FIND.store(find, Relaxed);
+        // File navigator (left sidebar): Rust subclass of the
+        // 3-level imported Fl_Hold_Browser chain.
+        let nav = cxx_operator_new(core::mem::size_of::<FileNav>()) as *mut FileNav;
+        nav.write(FileNav::new(0, 28, 220, 732));
+        NAV.store(nav, Relaxed);
 
         // Build console: read-only Fl_Text_Display + its own buffer,
         // streamed into by run_streamed() during builds/qemu runs.
@@ -864,7 +1311,7 @@ unsafe fn build_ui() -> *mut Fl_Window {
         CONSOLE_BUF.store(cbuf, Relaxed);
         let con =
             cxx_operator_new(core::mem::size_of::<Fl_Text_Display>()) as *mut Fl_Text_Display;
-        Fl_Text_Display::new_at(con, 0, 462, 900, 264, c"".as_ptr());
+        Fl_Text_Display::new_at(con, 220, 462, 960, 298, c"".as_ptr());
         (*con).buffer(cbuf);
         (*con).textsize_i32(12);
         CONSOLE.store(con, Relaxed);
@@ -875,10 +1322,11 @@ unsafe fn build_ui() -> *mut Fl_Window {
 
         let g = (*win).as_fl_group_mut();
         g.add(bar as *mut Fl_Widget);
+        g.add(nav as *mut Fl_Widget);
         g.add(ed as *mut Fl_Widget);
         g.add(con as *mut Fl_Widget);
-        g.add(find as *mut Fl_Widget);
 
+        load_keywords();
         WIN.store(win, Relaxed);
         refresh_title();
         win
@@ -1013,6 +1461,57 @@ unsafe fn self_test() -> i32 {
                 .into_owned();
             check("full CM4 qemu run PASS", con.contains("PASS (105/4000/503/42"));
         }
+
+        // 10. IDE v2: grammar keywords loaded (incl. fork + plugin set).
+        let kw = KEYWORDS.lock().unwrap().clone();
+        check("keywords loaded", kw.len() > 30);
+        check(
+            "fork keywords present",
+            ["class", "constructor", "override", "cpp_virtual", "swift_value"]
+                .iter()
+                .all(|k| kw.iter().any(|w| w == k)),
+        );
+
+        // 11. IDE v2: multi-buffer open + switch.
+        let f1 = std::env::temp_dir().join("rustcc_ide_a.rs");
+        let f2 = std::env::temp_dir().join("rustcc_ide_b.rs");
+        std::fs::write(&f1, "// file a\n").unwrap();
+        std::fs::write(&f2, "// file b\n").unwrap();
+        open_in_editor(&f1.to_string_lossy());
+        let buf_a = BUF.load(Relaxed);
+        open_in_editor(&f2.to_string_lossy());
+        let buf_b = BUF.load(Relaxed);
+        check("multi-buffer: distinct buffers", buf_a != buf_b && !buf_a.is_null());
+        check("open files tracked", OPEN_FILES.lock().unwrap().len() >= 2);
+        open_in_editor(&f1.to_string_lossy());
+        check("switch back reuses buffer", BUF.load(Relaxed) == buf_a);
+        let _ = std::fs::remove_file(&f1);
+        let _ = std::fs::remove_file(&f2);
+
+        // 12. IDE v2: host scaffold.
+        let hostp = std::env::temp_dir().join(format!("rustcc_ide_host_{}", std::process::id()));
+        let hostp_s = hostp.to_string_lossy().into_owned();
+        let _ = std::fs::remove_dir_all(&hostp);
+        check("host scaffold ok", scaffold_host(&hostp_s).is_ok());
+        for f in ["Cargo.toml", "src/main.rs", ".vscode/tasks.json", "README.md"] {
+            check(&format!("host file {f}"), hostp.join(f).exists());
+        }
+        let hm = std::fs::read_to_string(hostp.join("src/main.rs")).unwrap_or_default();
+        check("host template = plugin class surface", hm.contains("pub class Counter"));
+        let _ = std::fs::remove_dir_all(&hostp);
+
+        // 13. IDE v2: GDB gate present in the scaffolded run scripts.
+        let proj2 = std::env::temp_dir().join(format!("rustcc_ide_gdb_{}", std::process::id()));
+        let proj2_s = proj2.to_string_lossy().into_owned();
+        let _ = std::fs::remove_dir_all(&proj2);
+        check("scaffold (gdb) ok", scaffold_project(&proj2_s).is_ok());
+        let sh = std::fs::read_to_string(proj2.join("run_arm.sh")).unwrap_or_default();
+        check("gdbserver gate in scaffold", sh.contains("GDB") && sh.contains("-s -S"));
+        let _ = std::fs::remove_dir_all(&proj2);
+
+        // 14. IDE v2: find popup constructs.
+        show_find_popup();
+        check("find popup exists", !FIND_WIN.load(Relaxed).is_null());
 
         let _ = std::fs::remove_dir_all(&proj);
     }

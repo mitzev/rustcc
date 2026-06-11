@@ -31,7 +31,31 @@ cargo run --release --bin gen_bindings        # stock toolchain + libclang
 cargo +rustcc run --release --bin ide         # the GUI
 ```
 
-Workflow: **Project ▸ New RAK11161 Project…** (pick a folder) →
+## v2 additions
+
+- **File navigator** (left sidebar, a Rust `class FileNav :
+  Fl_Hold_Browser` over the 3-level imported chain) — click a file to
+  open it; the active file is bolded.
+- **Multiple open files** — one `Fl_Text_Buffer` per file, the editor
+  view switches instantly; re-opening switches instead of reloading.
+- **Find is a popup** (⌘F shows + focuses, Enter finds wrap-around,
+  Escape hides).
+- **File ▸ New Project ▸ {Host, RAK11161}** — the Host scaffold is
+  the vscode-rustcc plugin's class-surface template (Counter class);
+  Open Project also moved to File.
+- **Grammar-driven highlighting** — the tokenizer's keyword set is
+  built at startup from the **VSCode extension's TextMate grammar**
+  (embedded `include_str!`, single source of truth) merged with the
+  core Rust keywords: comments, strings, `#[...]` attributes, and
+  keywords each get their own style.
+- **Project ▸ Debug (qemu + gdbserver)** (⌘⇧D) — launches the
+  firmware HALTED under `qemu -s -S` in a separate Terminal window
+  and prints the exact `arm-none-eabi-gdb` / `riscv64-elf-gdb` attach
+  command in the console (host target: lldb on the binary). The
+  `GDB=1` gate lives in the freertos_cpp run scripts, so scaffolded
+  projects and the standalone probes share it.
+
+Workflow: **File ▸ New Project ▸ RAK11161 Project…** (pick a folder) →
 edit `src/lib.rs` (a fork `class` crate: `Widget`, `Gauge : Widget`,
 imported `Sensor`, `Reader : Sensor`) → pick a core in **Target** →
 **⌘B** builds (link-only via `SKIP_QEMU=1`), **⌘R** builds *and
