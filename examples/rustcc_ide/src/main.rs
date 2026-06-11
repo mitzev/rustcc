@@ -57,6 +57,7 @@ static TARGET: AtomicI32 = AtomicI32::new(1);
 static PROJECT_DIR: Mutex<Option<String>> = Mutex::new(None);
 static BUILD_RUNNING: AtomicBool = AtomicBool::new(false);
 static FIND_WIN: AtomicPtr<Fl_Window> = AtomicPtr::new(core::ptr::null_mut());
+static REPL: AtomicPtr<ReplaceBar> = AtomicPtr::new(core::ptr::null_mut());
 static HELP_WIN: AtomicPtr<Fl_Window> = AtomicPtr::new(core::ptr::null_mut());
 static NAV: AtomicPtr<FileNav> = AtomicPtr::new(core::ptr::null_mut());
 /// Open files: (path, Fl_Text_Buffer* as usize). One buffer per file;
@@ -84,7 +85,7 @@ static DBG_CURLINE: Mutex<Option<(String, i32)>> = Mutex::new(None);
 
 /// Variables window: latest `frame variable` capture (refreshed on
 /// every stop while the window exists) + watch-expression results.
-static VARS_WIN: AtomicPtr<Fl_Window> = AtomicPtr::new(core::ptr::null_mut());
+static WATCHIN: AtomicPtr<WatchInput> = AtomicPtr::new(core::ptr::null_mut());
 static VARS_DISP: AtomicPtr<Fl_Text_Display> = AtomicPtr::new(core::ptr::null_mut());
 static VARS_BUF: AtomicPtr<Fl_Text_Buffer> = AtomicPtr::new(core::ptr::null_mut());
 static VARS_LOCALS: Mutex<String> = Mutex::new(String::new());
@@ -106,6 +107,9 @@ static DBG_CAPTURE: Mutex<CapState> = Mutex::new(CapState {
     cmds: Vec::new(),
 });
 const VARS_SENTINEL: &str = "--rustcc-vars-end--";
+/// Captures requested while one is in flight (auto-refresh vs a
+/// typed watch) queue here and run as the current one finishes.
+static DBG_CAP_QUEUE: Mutex<Vec<(u8, String, String)>> = Mutex::new(Vec::new());
 static DBG_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Tab bar: a slim Fl_Menu_Bar listing open files (click = switch).
 static TABBAR: AtomicPtr<FileTabs> = AtomicPtr::new(core::ptr::null_mut());
@@ -203,6 +207,8 @@ const ACT_HELP: usize = 60;
 const ACT_ABOUT: usize = 61;
 const ACT_REMOVE_FROM_PROJ: usize = 62;
 const ACT_DELETE_FILE: usize = 63;
+const ACT_REPLACE: usize = 64;
+const ACT_REPLACE_ALL: usize = 65;
 const ACT_UPLOAD: usize = 48;
 const ACT_UPLOAD_CFG: usize = 49;
 const ACT_DBG_START: usize = 50;
@@ -337,9 +343,10 @@ pub class WatchInput : Fl_Input {
             return 1;
         }
         if ev == EV_KEYDOWN && Fl::event_key() == KEY_ESCAPE {
-            let w = VARS_WIN.load(Relaxed);
-            if !w.is_null() {
-                unsafe { (*(w as *mut Fl_Widget)).hide() };
+            // Hand focus back to the editor.
+            let ed = ED.load(Relaxed);
+            if !ed.is_null() {
+                unsafe { (*(ed as *mut Fl_Widget)).take_focus() };
             }
             return 1;
         }
@@ -378,6 +385,35 @@ pub class FileTabs : Fl_Tabs {
             }
         }
         r
+    }
+}
+
+/// The Replace field of the find popup: Enter replaces the current
+/// match and finds the next; Escape hides the popup.
+pub class ReplaceBar : Fl_Input {
+    pad: i32,
+
+    pub constructor fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        ReplaceBar {
+            __base: Fl_Input::new(x, y, w, h, c"Replace:".as_ptr()),
+            pad: 0,
+        }
+    }
+
+    pub override fn handle(&self, ev: i32) -> i32 {
+        let this = self as *const Self as *mut Fl_Input;
+        if ev == EV_KEYDOWN && Fl::event_key() == KEY_ENTER {
+            unsafe { replace_next_ui() };
+            return 1;
+        }
+        if ev == EV_KEYDOWN && Fl::event_key() == KEY_ESCAPE {
+            let w = FIND_WIN.load(Relaxed);
+            if !w.is_null() {
+                unsafe { (*(w as *mut Fl_Widget)).hide() };
+            }
+            return 1;
+        }
+        unsafe { base_input_handle(this, ev) }
     }
 }
 
@@ -708,6 +744,8 @@ unsafe fn run_action(act: usize) {
             }
             ACT_DBG_STOP => dbg_stop(),
             ACT_CLOSE_FILE => close_current_file(),
+            ACT_REPLACE => show_replace_popup(),
+            ACT_REPLACE_ALL => replace_all_ui(),
             ACT_REMOVE_FROM_PROJ => remove_from_project(),
             ACT_DELETE_FILE => delete_current_file(true),
             ACT_UPLOAD_CFG => edit_upload_config(),
@@ -842,6 +880,94 @@ unsafe fn find_next() {
             (*disp).show_insert_position();
             (*(ed as *mut Fl_Widget)).redraw();
         }
+    }
+}
+
+/// Replace the current selection (if it equals the needle) and move
+/// to the next occurrence. Returns whether a replacement happened.
+unsafe fn replace_next(needle: &str, repl: &str) -> bool {
+    unsafe {
+        let buf = BUF.load(Relaxed);
+        if buf.is_null() || needle.is_empty() {
+            return false;
+        }
+        let mut s = 0i32;
+        let mut e = 0i32;
+        let mut did = false;
+        if (*buf).selection_position(&mut s as *mut i32, &mut e as *mut i32) != 0 {
+            let mut f = 0i32;
+            let c = cstr(needle);
+            let matches = (*buf).search_forward(s, c.as_ptr(), &mut f as *mut i32, 0) != 0
+                && f == s
+                && e - s == needle.len() as i32;
+            if matches {
+                (*buf).replace_with_defaults(s, e, cstr(repl).as_ptr());
+                let disp = ED.load(Relaxed) as *mut Fl_Text_Display;
+                if !disp.is_null() {
+                    (*disp).insert_position(s + repl.len() as i32);
+                }
+                did = true;
+            }
+        }
+        find_next();
+        if did {
+            restyle();
+        }
+        did
+    }
+}
+
+/// Replace every occurrence from the top. Returns the count.
+unsafe fn replace_all(needle: &str, repl: &str) -> i32 {
+    unsafe {
+        let buf = BUF.load(Relaxed);
+        if buf.is_null() || needle.is_empty() {
+            return 0;
+        }
+        let c = cstr(needle);
+        let r = cstr(repl);
+        let mut pos = 0i32;
+        let mut f = 0i32;
+        let mut n = 0;
+        while (*buf).search_forward(pos, c.as_ptr(), &mut f as *mut i32, 0) != 0 {
+            (*buf).replace_with_defaults(f, f + needle.len() as i32, r.as_ptr());
+            pos = f + repl.len() as i32;
+            n += 1;
+            if n > 100_000 {
+                break; // degenerate needle (e.g. empty-ish) safety
+            }
+        }
+        if n > 0 {
+            restyle();
+        }
+        n
+    }
+}
+
+unsafe fn input_text(w: *mut Fl_Input) -> String {
+    unsafe {
+        if w.is_null() {
+            return String::new();
+        }
+        let p = (*w).as_fl_input_().value_ovl();
+        if p.is_null() { String::new() } else { CStr::from_ptr(p).to_string_lossy().into_owned() }
+    }
+}
+
+unsafe fn replace_next_ui() {
+    unsafe {
+        let n = input_text(FIND.load(Relaxed) as *mut Fl_Input);
+        let r = input_text(REPL.load(Relaxed) as *mut Fl_Input);
+        replace_next(&n, &r);
+    }
+}
+
+unsafe fn replace_all_ui() {
+    unsafe {
+        let n = input_text(FIND.load(Relaxed) as *mut Fl_Input);
+        let r = input_text(REPL.load(Relaxed) as *mut Fl_Input);
+        let count = replace_all(&n, &r);
+        console_append(&format!("replaced {count} occurrence(s)\n"));
     }
 }
 
@@ -1236,15 +1362,22 @@ const HELP_TEXT: &str = concat!(
        F8 / Cmd+D   toggle breakpoint (red lines; replayed live)\n\
        F10          step over             F11       step into\n\
        Shift+F11    step out              F9        continue\n\
-       F7           Variables window — frame locals auto-refresh\n\
-                    on every stop; its watch box reads a global or\n\
-                    static by name (target variable) or evaluates\n\
-                    any expression.\n\
+       F7           Variables pane (right of the console; drag\n\
+                    their shared border to resize) — frame locals\n\
+                    auto-refresh on every stop; its watch box reads\n\
+                    a global/static by name (target variable) or\n\
+                    evaluates any expression.\n\
        Every stop follows in the editor — current line amber,\n\
        breakpoint lines red; stops in other open files switch tabs.\n\
      \n\
+     The toolbar mirrors the everyday actions (New / Save / Run /\n\
+     Debug / Step In / Step Over / Stop); every pane border in the\n\
+     main layout drags, and the window itself is fully resizable.\n\
+     \n\
      Editing\n\
        Cmd+F        find (Enter = next, Escape = close)\n\
+       Cmd+H        replace (Enter in Replace = replace + next;\n\
+                    Cmd+Shift+H or the button = Replace All)\n\
        Ctrl+Space   autocomplete (keywords + open-buffer symbols)\n\
        Cmd+W        close file        Cmd+Shift+W  wrap lines\n\
        Cmd+= / -    font size\n\
@@ -1285,18 +1418,44 @@ fn show_find_popup() {
         let mut w = FIND_WIN.load(Relaxed);
         if w.is_null() {
             w = cxx_operator_new(core::mem::size_of::<Fl_Window>()) as *mut Fl_Window;
-            Fl_Window::new_at(w, 380, 44, c"Find".as_ptr());
+            Fl_Window::new_at(w, 380, 110, c"Find / Replace".as_ptr());
             let f = cxx_operator_new(core::mem::size_of::<FindBar>()) as *mut FindBar;
-            f.write(FindBar::new(60, 8, 300, 28));
+            f.write(FindBar::new(70, 8, 300, 26));
             FIND.store(f, Relaxed);
+            let r = cxx_operator_new(core::mem::size_of::<ReplaceBar>()) as *mut ReplaceBar;
+            r.write(ReplaceBar::new(70, 40, 300, 26));
+            REPL.store(r, Relaxed);
+            // Replace All goes through the same dispatch as the menu.
+            let ab = cxx_operator_new(core::mem::size_of::<Fl_Button>()) as *mut Fl_Button;
+            Fl_Button::new_at(ab, 70, 74, 110, 26, core::ptr::null());
+            (*(ab as *mut Fl_Widget)).copy_label_str("Replace All");
+            (*(ab as *mut Fl_Widget)).labelsize_i32(12);
+            (*(ab as *mut Fl_Widget))
+                .callback_option_unsafe_extern_c_fn_mut_fl_widget_mut_mut(
+                    Some(menu_cb),
+                    ACT_REPLACE_ALL as *mut (),
+                );
             (*w).as_fl_group_mut().end();
             (*w).as_fl_group_mut().add(f as *mut Fl_Widget);
+            (*w).as_fl_group_mut().add(r as *mut Fl_Widget);
+            (*w).as_fl_group_mut().add(ab as *mut Fl_Widget);
             FIND_WIN.store(w, Relaxed);
         }
         (*(w as *mut Fl_Widget)).show();
         let f = FIND.load(Relaxed);
         if !f.is_null() {
             (*(f as *mut Fl_Widget)).take_focus();
+        }
+    }
+}
+
+/// Edit ▸ Replace…: same popup, focus on the Replace field.
+fn show_replace_popup() {
+    show_find_popup();
+    unsafe {
+        let r = REPL.load(Relaxed);
+        if !r.is_null() {
+            (*(r as *mut Fl_Widget)).take_focus();
         }
     }
 }
@@ -1751,7 +1910,13 @@ fn dbg_capture_begin(mode: u8, label: &str, cmd: &str) {
     {
         let mut cap = DBG_CAPTURE.lock().unwrap();
         if cap.mode != 0 {
-            return; // one capture at a time; the next stop re-requests
+            // Busy: queue instead of dropping (locals refreshes are
+            // idempotent — keep at most one queued).
+            let mut q = DBG_CAP_QUEUE.lock().unwrap();
+            if mode != 1 || !q.iter().any(|(m, _, _)| *m == 1) {
+                q.push((mode, label.to_string(), cmd.to_string()));
+            }
+            return;
         }
         cap.mode = mode;
         cap.acc.clear();
@@ -1820,33 +1985,16 @@ fn vars_publish(mode: u8, label: String, acc: String) {
     vars_render();
 }
 
-/// The Variables window: locals view + watch box. F7 opens it; while
-/// it exists, every stop re-captures `frame variable` into it.
+/// Show Variables (F7): the pane lives right of the console in the
+/// main layout (drag their shared border to resize) — this renders
+/// the latest capture and focuses the watch box.
 fn show_vars_window() {
     unsafe {
-        let mut w = VARS_WIN.load(Relaxed);
-        if w.is_null() {
-            w = cxx_operator_new(core::mem::size_of::<Fl_Window>()) as *mut Fl_Window;
-            Fl_Window::new_at(w, 460, 412, c"Variables".as_ptr());
-            let vb = cxx_operator_new(core::mem::size_of::<Fl_Text_Buffer>())
-                as *mut Fl_Text_Buffer;
-            Fl_Text_Buffer::new_at(vb, 0, 1024);
-            let d = cxx_operator_new(core::mem::size_of::<Fl_Text_Display>())
-                as *mut Fl_Text_Display;
-            Fl_Text_Display::new_at(d, 8, 8, 444, 364, c"".as_ptr());
-            (*d).buffer(vb);
-            (*d).textsize_i32(12);
-            let wi = cxx_operator_new(core::mem::size_of::<WatchInput>()) as *mut WatchInput;
-            wi.write(WatchInput::new(70, 378, 382, 26));
-            (*w).as_fl_group_mut().end();
-            (*w).as_fl_group_mut().add(d as *mut Fl_Widget);
-            (*w).as_fl_group_mut().add(wi as *mut Fl_Widget);
-            VARS_BUF.store(vb, Relaxed);
-            VARS_DISP.store(d, Relaxed);
-            VARS_WIN.store(w, Relaxed);
-            vars_render();
+        vars_render();
+        let wi = WATCHIN.load(Relaxed);
+        if !wi.is_null() {
+            (*(wi as *mut Fl_Widget)).take_focus();
         }
-        (*(w as *mut Fl_Widget)).show();
     }
 }
 
@@ -1872,6 +2020,7 @@ fn dbg_stop() {
         cap.acc.clear();
         cap.cmds.clear();
     }
+    DBG_CAP_QUEUE.lock().unwrap().clear();
     unsafe { restyle() };
     console_append("debug session stopped\n");
 }
@@ -1994,6 +2143,11 @@ fn pump_debugger() {
     }
     if let Some((mode, label, acc)) = publish {
         vars_publish(mode, label, acc);
+        // Run the next queued capture, if any.
+        let next = DBG_CAP_QUEUE.lock().unwrap().pop();
+        if let Some((m, l, c)) = next {
+            dbg_capture_begin(m, &l, &c);
+        }
     }
     // Follow the LAST stop location mentioned.
     let mut hit: Option<(String, i32)> = None;
@@ -2034,9 +2188,9 @@ fn pump_debugger() {
                 }
             }
         }
-        // While the Variables window exists, every stop re-captures
-        // the frame's locals into it.
-        if DBG_ACTIVE.load(Relaxed) && !VARS_WIN.load(Relaxed).is_null() {
+        // Every stop re-captures the frame's locals into the
+        // Variables pane.
+        if DBG_ACTIVE.load(Relaxed) {
             dbg_request_vars();
         }
     }
@@ -2049,9 +2203,13 @@ fn pump_debugger() {
 static PENDING_TAB_CLOSE: AtomicI32 = AtomicI32::new(-1);
 
 unsafe extern "C" fn tab_close_cb(w: *mut Fl_Widget, _data: *mut ()) {
-    if Fl::callback_reason() != Fl_Callback_Reason::FL_REASON_CLOSED {
-        return; // selection changes are handled in FileTabs::handle
-    }
+    // Fl_Tabs invokes a PAGE's callback in exactly one place: the
+    // close-button release (Fl_Tabs.cxx, o->do_callback(
+    // FL_REASON_CLOSED)) — selection fires the TABS widget's own
+    // callback instead. Any page callback is therefore a close
+    // request. (Reading Fl::callback_reason() here proved unreliable
+    // — it arrived as CHANGED/RELEASED-class values and silently
+    // discarded genuine closes, the "x does nothing" bug.)
     let tabs = TABBAR.load(Relaxed);
     if tabs.is_null() {
         return;
@@ -2092,12 +2250,16 @@ fn tabs_refresh() {
             // the children — they're plain imported Fl_Groups from
             // operator new, so that pairing is exact.
             t.as_fl_group_mut().clear();
+            let (tx, ty, tw_) = {
+                let w = tabs as *mut Fl_Widget;
+                ((*w).x(), (*w).y() + LY_TABS_H, (*w).w())
+            };
             for name in &names {
                 let pg =
                     cxx_operator_new(core::mem::size_of::<Fl_Group>()) as *mut Fl_Group;
                 // Zero-height page right under the strip: the widget
                 // is ALL tab bar; the shared editor lives outside.
-                Fl_Group::new_at(pg, 220, 52, 960, 0, core::ptr::null());
+                Fl_Group::new_at(pg, tx, ty, tw_, 0, core::ptr::null());
                 (*pg).end();
                 (*(pg as *mut Fl_Widget)).copy_label_str(name);
                 // FL_WHEN_CLOSED puts an x on the tab; clicking it
@@ -2703,6 +2865,8 @@ const MENU_SPEC: &[(&str, i32, usize)] = &[
     ("&Edit/&Paste", MOD_META | 'v' as i32, ACT_PASTE),
     ("&Edit/Select &All", MOD_META | 'a' as i32, ACT_SELECT_ALL),
     ("&Edit/&Find…", MOD_META | 'f' as i32, ACT_FIND),
+    ("&Edit/Re&place…", MOD_META | 'h' as i32, ACT_REPLACE),
+    ("&Edit/Replace &All", MOD_META | MOD_SHIFT | 'h' as i32, ACT_REPLACE_ALL),
     ("F&ormat/&Wrap Lines", MOD_META | MOD_SHIFT | 'w' as i32, ACT_WRAP),
     ("F&ormat/Bigger", MOD_META | '=' as i32, ACT_FONT_UP),
     ("F&ormat/Smaller", MOD_META | '-' as i32, ACT_FONT_DOWN),
@@ -2746,10 +2910,24 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
 const LY_W: i32 = 1180;
 const LY_H: i32 = 760;
 const LY_BAR_H: i32 = 28; // menu bar
+const LY_TOOL_H: i32 = 30; // toolbar (buttons reuse menu actions)
 const LY_NAV_W: i32 = 220;
 const LY_TABS_H: i32 = 24;
-const LY_EDGRP_H: i32 = 434; // tab strip + editor
+const LY_EDGRP_H: i32 = 404; // tab strip + editor
 const LY_CONSOLE_H: i32 = 298;
+const LY_VARS_W: i32 = 300; // variables pane (right of console)
+
+/// The toolbar: every button dispatches the SAME action its menu
+/// item does (menu_cb is an ordinary Fl_Widget callback).
+const TOOLBAR_SPEC: &[(&str, usize, i32)] = &[
+    ("New", ACT_NEW, 52),
+    ("Save", ACT_SAVE, 56),
+    ("Run", ACT_BUILD_RUN, 52),
+    ("Debug", ACT_DBG_START, 64),
+    ("Step In", ACT_DBG_STEP_IN, 70),
+    ("Step Over", ACT_DBG_STEP_OVER, 84),
+    ("Stop", ACT_DBG_STOP, 54),
+];
 
 unsafe fn build_ui() -> *mut Fl_Window {
     unsafe {
@@ -2779,7 +2957,7 @@ unsafe fn build_ui() -> *mut Fl_Window {
         // final address — no re-parent fix-up needed.
         ed.write(RustEditor::new(
             LY_NAV_W,
-            LY_BAR_H + LY_TABS_H,
+            LY_BAR_H + LY_TOOL_H + LY_TABS_H,
             LY_W - LY_NAV_W,
             LY_EDGRP_H - LY_TABS_H,
         ));
@@ -2813,7 +2991,7 @@ unsafe fn build_ui() -> *mut Fl_Window {
         // File navigator (left sidebar): Rust subclass of the
         // 3-level imported Fl_Hold_Browser chain.
         let nav = cxx_operator_new(core::mem::size_of::<FileNav>()) as *mut FileNav;
-        nav.write(FileNav::new(0, 28, 220, 732));
+        nav.write(FileNav::new(0, LY_BAR_H + LY_TOOL_H, LY_NAV_W, LY_H - LY_BAR_H - LY_TOOL_H));
         NAV.store(nav, Relaxed);
 
         // Build console: read-only Fl_Text_Display + its own buffer,
@@ -2827,8 +3005,8 @@ unsafe fn build_ui() -> *mut Fl_Window {
         Fl_Text_Display::new_at(
             con,
             LY_NAV_W,
-            LY_BAR_H + LY_EDGRP_H,
-            LY_W - LY_NAV_W,
+            LY_BAR_H + LY_TOOL_H + LY_EDGRP_H,
+            LY_W - LY_NAV_W - LY_VARS_W,
             LY_CONSOLE_H,
             c"".as_ptr(),
         );
@@ -2845,7 +3023,7 @@ unsafe fn build_ui() -> *mut Fl_Window {
         // group (begin()), and the by-value construct + move would
         // leave that pointing at the dead temporary — clear it.
         let tabs = cxx_operator_new(core::mem::size_of::<FileTabs>()) as *mut FileTabs;
-        tabs.write(FileTabs::new(220, 28, 960, 24));
+        tabs.write(FileTabs::new(LY_NAV_W, LY_BAR_H + LY_TOOL_H, LY_W - LY_NAV_W, LY_TABS_H));
         Fl_Group::current_mut_fl_group(core::ptr::null_mut());
         TABBAR.store(tabs, Relaxed);
 
@@ -2853,11 +3031,38 @@ unsafe fn build_ui() -> *mut Fl_Window {
         // resizable is the EDITOR (the strip keeps its height when
         // the console border drags); nav, that group, and the
         // console tile the Fl_Tile exactly.
+        // Toolbar: one Fl_Button per TOOLBAR_SPEC entry, all wired
+        // to menu_cb with the action as user data — buttons and menu
+        // items share one dispatch. A trailing spacer absorbs
+        // horizontal growth so buttons keep their size.
+        let tbg = cxx_operator_new(core::mem::size_of::<Fl_Group>()) as *mut Fl_Group;
+        Fl_Group::new_at(tbg, 0, LY_BAR_H, LY_W, LY_TOOL_H, core::ptr::null());
+        (*tbg).end();
+        let mut bx = 4;
+        for &(label, act, wpx) in TOOLBAR_SPEC {
+            let b = cxx_operator_new(core::mem::size_of::<Fl_Button>()) as *mut Fl_Button;
+            Fl_Button::new_at(b, bx, LY_BAR_H + 3, wpx, LY_TOOL_H - 6, core::ptr::null());
+            (*(b as *mut Fl_Widget)).copy_label_str(label);
+            (*(b as *mut Fl_Widget)).labelsize_i32(11);
+            (*(b as *mut Fl_Widget))
+                .callback_option_unsafe_extern_c_fn_mut_fl_widget_mut_mut(
+                    Some(menu_cb),
+                    act as *mut (),
+                );
+            (*tbg).add(b as *mut Fl_Widget);
+            bx += wpx + 4;
+        }
+        let sp = cxx_operator_new(core::mem::size_of::<Fl_Group>()) as *mut Fl_Group;
+        Fl_Group::new_at(sp, bx, LY_BAR_H, LY_W - bx, LY_TOOL_H, core::ptr::null());
+        (*sp).end();
+        (*tbg).add(sp as *mut Fl_Widget);
+        (*tbg).resizable(sp as *mut Fl_Widget);
+
         let edgrp = cxx_operator_new(core::mem::size_of::<Fl_Group>()) as *mut Fl_Group;
         Fl_Group::new_at(
             edgrp,
             LY_NAV_W,
-            LY_BAR_H,
+            LY_BAR_H + LY_TOOL_H,
             LY_W - LY_NAV_W,
             LY_EDGRP_H,
             core::ptr::null(),
@@ -2867,17 +3072,54 @@ unsafe fn build_ui() -> *mut Fl_Window {
         (*edgrp).add(ed as *mut Fl_Widget);
         (*edgrp).resizable(ed as *mut Fl_Widget);
 
+        // Variables pane: console's right-hand neighbor in the tile
+        // (their shared border drags). Locals re-capture on every
+        // stop; the watch box reads globals via `target variable`.
+        let vgrp = cxx_operator_new(core::mem::size_of::<Fl_Group>()) as *mut Fl_Group;
+        let vx = LY_W - LY_VARS_W;
+        let vy = LY_BAR_H + LY_TOOL_H + LY_EDGRP_H;
+        Fl_Group::new_at(vgrp, vx, vy, LY_VARS_W, LY_CONSOLE_H, core::ptr::null());
+        (*vgrp).end();
+        let vb = cxx_operator_new(core::mem::size_of::<Fl_Text_Buffer>())
+            as *mut Fl_Text_Buffer;
+        Fl_Text_Buffer::new_at(vb, 0, 1024);
+        let vd = cxx_operator_new(core::mem::size_of::<Fl_Text_Display>())
+            as *mut Fl_Text_Display;
+        Fl_Text_Display::new_at(vd, vx, vy, LY_VARS_W, LY_CONSOLE_H - 28, c"".as_ptr());
+        (*vd).buffer(vb);
+        (*vd).textsize_i32(11);
+        let wi = cxx_operator_new(core::mem::size_of::<WatchInput>()) as *mut WatchInput;
+        wi.write(WatchInput::new(vx + 50, vy + LY_CONSOLE_H - 28, LY_VARS_W - 54, 26));
+        (*vgrp).add(vd as *mut Fl_Widget);
+        (*vgrp).add(wi as *mut Fl_Widget);
+        (*vgrp).resizable(vd as *mut Fl_Widget);
+        VARS_BUF.store(vb, Relaxed);
+        VARS_DISP.store(vd, Relaxed);
+        WATCHIN.store(wi, Relaxed);
+        vars_render();
+
         let tile = cxx_operator_new(core::mem::size_of::<Fl_Tile>()) as *mut Fl_Tile;
-        Fl_Tile::new_at(tile, 0, LY_BAR_H, LY_W, LY_H - LY_BAR_H, core::ptr::null());
+        Fl_Tile::new_at(
+            tile,
+            0,
+            LY_BAR_H + LY_TOOL_H,
+            LY_W,
+            LY_H - LY_BAR_H - LY_TOOL_H,
+            core::ptr::null(),
+        );
         (*tile).as_fl_group_mut().end();
         (*tile).as_fl_group_mut().add(nav as *mut Fl_Widget);
         (*tile).as_fl_group_mut().add(edgrp as *mut Fl_Widget);
         (*tile).as_fl_group_mut().add(con as *mut Fl_Widget);
+        (*tile).as_fl_group_mut().add(vgrp as *mut Fl_Widget);
 
         let g = (*win).as_fl_group_mut();
         g.add(bar as *mut Fl_Widget);
+        g.add(tbg as *mut Fl_Widget);
         g.add(tile as *mut Fl_Widget);
         g.resizable(tile as *mut Fl_Widget);
+        // Fully resizable window (min size keeps the layout sane).
+        (*win).size_range(700, 480, 0, 0, 0, 0, 0);
 
         load_keywords();
         WIN.store(win, Relaxed);
@@ -2989,7 +3231,7 @@ unsafe fn self_test() -> i32 {
         );
         check(
             "help text covers projects/debugger/editing bindings",
-            ["Cmd+B", "Cmd+R", "Cmd+U", "F5", "F8", "F10", "Ctrl+Space", "Cmd+W"]
+            ["Cmd+B", "Cmd+R", "Cmd+U", "F5", "F8", "F10", "Ctrl+Space", "Cmd+W", "Cmd+H"]
                 .iter()
                 .all(|n| HELP_TEXT.contains(n)),
         );
@@ -3299,27 +3541,28 @@ unsafe fn self_test() -> i32 {
                 && *PATH.lock().unwrap() == active,
         );
         tabs_refresh();
+        // Regression: a SYNTHETIC x click through the full FLTK
+        // path (which/hit_close/do_callback) must close the tab —
+        // this is the user-visible "x on the tab" feature.
         {
-            let tw = TABBAR.load(Relaxed) as *mut Fl_Tabs;
-            let g = (*tw).as_fl_group();
+            let tw = TABBAR.load(Relaxed);
+            let nfiles = OPEN_FILES.lock().unwrap().len();
+            PENDING_TAB_CLOSE.store(-1, Relaxed);
+            // Aim at tab 0's x strip wherever the bar sits.
+            *Fl::e_x_ptr() = (*(tw as *mut Fl_Widget)).x() + 6;
+            *Fl::e_y_ptr() = (*(tw as *mut Fl_Widget)).y() + 12;
+            (*(tw as *mut FileTabs)).handle(EV_PUSH);
+            (*(tw as *mut FileTabs)).handle(EV_RELEASE);
             check(
-                "tab pages are closable (when + callback wired)",
-                g.children() > 0
-                    && (0..g.children()).all(|i| {
-                        let w = &*g.child(i);
-                        w.when() == Fl_When::FL_WHEN_CLOSED && w.callback().is_some()
-                    }),
+                "tab x click records a pending close",
+                PENDING_TAB_CLOSE.load(Relaxed) >= 0,
+            );
+            tabs_pump();
+            check(
+                "tab x click closes the file",
+                OPEN_FILES.lock().unwrap().len() == nfiles - 1,
             );
         }
-        PENDING_TAB_CLOSE.store(
-            OPEN_FILES.lock().unwrap().len() as i32 - 1,
-            Relaxed,
-        );
-        tabs_pump();
-        check(
-            "deferred x close drains via tabs_pump",
-            OPEN_FILES.lock().unwrap().len() == n0 - 2,
-        );
         let _ = std::fs::remove_file(&xf);
         let _ = std::fs::remove_file(&bf);
 
@@ -3352,6 +3595,27 @@ unsafe fn self_test() -> i32 {
         close_current_file(); // the saved one
         close_current_file(); // the remaining unsaved
         let _ = std::fs::remove_file(&sv);
+
+        // Replace: replace_all rewrites every hit; replace_next swaps
+        // a matching selection and moves on.
+        {
+            let b_cur = BUF.load(Relaxed);
+            (*b_cur).text_const_i8_str("alpha beta alpha\n");
+            let n = replace_all("alpha", "gamma");
+            let txt = CStr::from_ptr((*b_cur).text()).to_string_lossy().into_owned();
+            check(
+                "replace_all rewrites every hit",
+                n == 2 && txt == "gamma beta gamma\n",
+            );
+            (*b_cur).select(6, 10); // "beta"
+            let did = replace_next("beta", "delta");
+            let txt = CStr::from_ptr((*b_cur).text()).to_string_lossy().into_owned();
+            check(
+                "replace_next swaps the matching selection",
+                did && txt == "gamma delta gamma\n",
+            );
+            (*b_cur).text_const_i8_str("");
+        }
 
         // Target persists per-project: seeding on first open, save on
         // change, restore on reopen.
@@ -3413,8 +3677,16 @@ unsafe fn self_test() -> i32 {
         // Splitter layout: the Fl_Tile children must tile exactly.
         check(
             "tile layout tiles exactly",
-            LY_EDGRP_H + LY_CONSOLE_H == LY_H - LY_BAR_H && LY_TABS_H < LY_EDGRP_H
-                && LY_NAV_W < LY_W,
+            LY_EDGRP_H + LY_CONSOLE_H == LY_H - LY_BAR_H - LY_TOOL_H
+                && LY_TABS_H < LY_EDGRP_H
+                && LY_NAV_W + LY_VARS_W < LY_W,
+        );
+        check(
+            "toolbar covers the everyday actions",
+            TOOLBAR_SPEC.len() == 7
+                && TOOLBAR_SPEC.iter().any(|&(l, a, _)| l == "Run" && a == ACT_BUILD_RUN)
+                && TOOLBAR_SPEC.iter().any(|&(l, a, _)| l == "Debug" && a == ACT_DBG_START)
+                && TOOLBAR_SPEC.iter().all(|&(_, _, w)| w > 0),
         );
 
         // 20. FULL gate: real lldb session — breakpoint hit, variables

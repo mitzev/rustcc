@@ -142,6 +142,26 @@ cargo +rustcc run --release --bin ide         # the GUI
   to `<project>/.rustcc_ide.toml` (stable slugs, not indices) on every
   Target-menu change; Open Project restores it. Fresh projects are
   seeded with their flavor's default.
+- **Toolbar** — New / Save / Run / Debug / Step In / Step Over /
+  Stop as one-click `Fl_Button`s; every button dispatches the *same*
+  action its menu item does (one `menu_cb`, actions as user data —
+  possible because M15.c gave inline fn-ptr methods real shims).
+- **Variables pane in the main layout** — the console's right-hand
+  neighbor inside the tile (drag their shared border); locals
+  auto-refresh on every stop, the watch box reads globals. Captures
+  requested while one is in flight (auto-refresh vs a typed watch)
+  queue instead of dropping. The window is fully resizable
+  (`size_range` + tile as the window's resizable).
+- **Find / Replace (⌘H)** — the Find popup gains a Replace field
+  (Enter = replace current match + find next) and a Replace All
+  button (⌘⇧H from the menu too).
+- **Tab × actually closes** — the close callback fired all along;
+  reading `Fl::callback_reason()` at callback time returned skewed
+  values and the filter discarded genuine closes. Per Fl_Tabs source
+  a page callback only fires for the close button, so the filter is
+  gone. The self-test drives a synthetic ×-click through the real
+  `which`/`hit_close`/`do_callback` path (aimed by widget geometry,
+  not constants — that aim drift was a second masking bug).
 - **Help menu** — *rustcc IDE Help… (F1)* opens a cheat-sheet window
   (projects/targets, debugger keys, editing keys); *About* prints
   version + links to the console. The whole menu is now a `MENU_SPEC`
