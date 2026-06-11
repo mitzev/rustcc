@@ -97,6 +97,16 @@ cargo +rustcc run --release --bin ide         # the GUI
   project) and differ only in the default Target they select — so a
   "STM32 project" can still be rebuilt for the ESP32-C2 core from the
   Target menu without rescaffolding.
+- **Variables window (F7)** — frame locals re-capture automatically
+  on **every stop** (a sentinel-bracketed `frame variable` round-trip
+  through the lldb pty; the prompt is newline-less, so the sentinel
+  match is `ends_with`), and a **watch box**: type a global/static's
+  name (read via `target variable` — works from any frame) or any
+  expression (via `expression --`), Enter appends the result. The
+  Host template ships a `static EXCITEMENT_BASE: i32` to try it on.
+  Capture payloads stay out of the console; process events (stops,
+  exits) still stream there. Stops in *other* open files now switch
+  tabs before the amber current-line tint lands.
 - **Help menu** — *rustcc IDE Help… (F1)* opens a cheat-sheet window
   (projects/targets, debugger keys, editing keys); *About* prints
   version + links to the console. The whole menu is now a `MENU_SPEC`

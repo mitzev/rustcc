@@ -78,6 +78,31 @@ static DBG_STDIN: Mutex<Option<std::process::ChildStdin>> = Mutex::new(None);
 static DBG_PENDING: Mutex<String> = Mutex::new(String::new());
 static BREAKPOINTS: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 static DBG_CURLINE: Mutex<Option<(String, i32)>> = Mutex::new(None);
+
+/// Variables window: latest `frame variable` capture (refreshed on
+/// every stop while the window exists) + watch-expression results.
+static VARS_WIN: AtomicPtr<Fl_Window> = AtomicPtr::new(core::ptr::null_mut());
+static VARS_DISP: AtomicPtr<Fl_Text_Display> = AtomicPtr::new(core::ptr::null_mut());
+static VARS_BUF: AtomicPtr<Fl_Text_Buffer> = AtomicPtr::new(core::ptr::null_mut());
+static VARS_LOCALS: Mutex<String> = Mutex::new(String::new());
+static VARS_WATCH: Mutex<String> = Mutex::new(String::new());
+
+/// One in-flight lldb output capture (locals or watch). lldb output
+/// is a single async stream, so a capture brackets it: payload =
+/// lines after the request until the `script print` sentinel line.
+struct CapState {
+    mode: u8, // 0 idle, 1 locals, 2 watch
+    acc: String,
+    label: String,
+    cmds: Vec<String>, // sent commands, to suppress their pty echoes
+}
+static DBG_CAPTURE: Mutex<CapState> = Mutex::new(CapState {
+    mode: 0,
+    acc: String::new(),
+    label: String::new(),
+    cmds: Vec::new(),
+});
+const VARS_SENTINEL: &str = "--rustcc-vars-end--";
 static DBG_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Tab bar: a slim Fl_Menu_Bar listing open files (click = switch).
 static TABBAR: AtomicPtr<Fl_Menu_Bar> = AtomicPtr::new(core::ptr::null_mut());
@@ -265,6 +290,44 @@ pub class FindBar : Fl_Input {
         }
         if ev == EV_KEYDOWN && Fl::event_key() == KEY_ESCAPE {
             let w = FIND_WIN.load(Relaxed);
+            if !w.is_null() {
+                unsafe { (*(w as *mut Fl_Widget)).hide() };
+            }
+            return 1;
+        }
+        unsafe { base_input_handle(this, ev) }
+    }
+}
+
+/// The Variables window's watch box: Enter evaluates the expression
+/// in the live lldb session (bare identifiers — e.g. a GLOBAL — via
+/// `target variable`, anything else via `expression --`).
+pub class WatchInput : Fl_Input {
+    pad: i32,
+
+    pub constructor fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        WatchInput {
+            __base: Fl_Input::new(x, y, w, h, c"watch:".as_ptr()),
+            pad: 0,
+        }
+    }
+
+    pub override fn handle(&self, ev: i32) -> i32 {
+        let this = self as *const Self as *mut Fl_Input;
+        if ev == EV_KEYDOWN && Fl::event_key() == KEY_ENTER {
+            let v = unsafe {
+                CStr::from_ptr((*this).as_fl_input_().value_ovl())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let v = v.trim();
+            if !v.is_empty() {
+                watch_eval(v);
+            }
+            return 1;
+        }
+        if ev == EV_KEYDOWN && Fl::event_key() == KEY_ESCAPE {
+            let w = VARS_WIN.load(Relaxed);
             if !w.is_null() {
                 unsafe { (*(w as *mut Fl_Widget)).hide() };
             }
@@ -597,7 +660,12 @@ unsafe fn run_action(act: usize) {
             ACT_DBG_STEP_IN => dbg_send("thread step-in"),
             ACT_DBG_STEP_OUT => dbg_send("thread step-out"),
             ACT_DBG_CONTINUE => dbg_send("continue"),
-            ACT_DBG_VARS => dbg_send("frame variable"),
+            ACT_DBG_VARS => {
+                show_vars_window();
+                if DBG_ACTIVE.load(Relaxed) {
+                    dbg_request_vars();
+                }
+            }
             ACT_DBG_STOP => dbg_stop(),
             ACT_CLOSE_FILE => close_current_file(),
             a if a >= TAB_BASE => {
@@ -1043,8 +1111,12 @@ const HELP_TEXT: &str = concat!(
        F8 / Cmd+D   toggle breakpoint (red lines; replayed live)\n\
        F10          step over             F11       step into\n\
        Shift+F11    step out              F9        continue\n\
-       F7           show variables\n\
-       Every stop follows in the editor — current line is amber.\n\
+       F7           Variables window — frame locals auto-refresh\n\
+                    on every stop; its watch box reads a global or\n\
+                    static by name (target variable) or evaluates\n\
+                    any expression.\n\
+       Every stop follows in the editor — current line amber,\n\
+       breakpoint lines red; stops in other open files switch tabs.\n\
      \n\
      Editing\n\
        Cmd+F        find (Enter = next, Escape = close)\n\
@@ -1510,18 +1582,146 @@ fn dbg_start() {
     dbg_send("run");
 }
 
-fn dbg_send(cmd: &str) {
+fn dbg_send_impl(cmd: &str, echo: bool) {
     use std::io::Write;
     let mut g = DBG_STDIN.lock().unwrap();
     match g.as_mut() {
         Some(stdin) => {
             if writeln!(stdin, "{cmd}").and_then(|_| stdin.flush()).is_err() {
                 console_append("debugger pipe closed\n");
-            } else {
+            } else if echo {
                 console_append(&format!("(lldb) {cmd}\n"));
             }
         }
         None => console_append("no debug session — Debug > Start Session (F5)\n"),
+    }
+}
+
+fn dbg_send(cmd: &str) {
+    dbg_send_impl(cmd, true);
+}
+
+/// Map a watch-box entry to an lldb command: a bare identifier path
+/// (global / static / local name) reads best via `target variable`;
+/// anything with operators goes through the expression evaluator.
+fn watch_cmd(expr: &str) -> String {
+    let ident = !expr.is_empty()
+        && expr.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':' || c == '.');
+    if ident {
+        format!("target variable {expr}")
+    } else {
+        format!("expression -- {expr}")
+    }
+}
+
+/// Begin a sentinel-bracketed capture: `cmds` run back-to-back and
+/// everything they print (minus pty echoes/prompts) lands in the
+/// capture accumulator until the sentinel line arrives.
+fn dbg_capture_begin(mode: u8, label: &str, cmd: &str) {
+    if !DBG_ACTIVE.load(Relaxed) {
+        console_append("no debug session — Debug > Start Session (F5)\n");
+        return;
+    }
+    let sentinel_cmd = format!("script print(\"{VARS_SENTINEL}\")");
+    {
+        let mut cap = DBG_CAPTURE.lock().unwrap();
+        if cap.mode != 0 {
+            return; // one capture at a time; the next stop re-requests
+        }
+        cap.mode = mode;
+        cap.acc.clear();
+        cap.label = label.to_string();
+        cap.cmds = vec![cmd.to_string(), sentinel_cmd.clone()];
+    }
+    dbg_send_impl(cmd, false);
+    dbg_send_impl(&sentinel_cmd, false);
+}
+
+fn dbg_request_vars() {
+    dbg_capture_begin(1, "", "frame variable");
+}
+
+fn watch_eval(expr: &str) {
+    dbg_capture_begin(2, expr, &watch_cmd(expr));
+}
+
+/// Rebuild the Variables window text from the latest captures.
+fn vars_render() {
+    unsafe {
+        let vb = VARS_BUF.load(Relaxed);
+        if vb.is_null() {
+            return;
+        }
+        let locals = VARS_LOCALS.lock().unwrap().clone();
+        let watch = VARS_WATCH.lock().unwrap().clone();
+        let mut t = String::from("== locals @ last stop (auto-refreshes) ==\n");
+        if locals.trim().is_empty() {
+            t.push_str("(none — hit a breakpoint or step; F5 starts a session)\n");
+        } else {
+            t.push_str(&locals);
+        }
+        t.push_str("\n== watch — type a global/expression below, Enter ==\n");
+        if watch.is_empty() {
+            t.push_str("(none yet — e.g. a static's name; uses `target variable`)\n");
+        } else {
+            t.push_str(&watch);
+        }
+        (*vb).text_const_i8_str(&t);
+        let d = VARS_DISP.load(Relaxed);
+        if !d.is_null() {
+            (*(d as *mut Fl_Widget)).redraw();
+        }
+    }
+}
+
+/// A finished capture lands here (UI thread, from the pump).
+fn vars_publish(mode: u8, label: String, acc: String) {
+    if mode == 1 {
+        *VARS_LOCALS.lock().unwrap() =
+            if acc.trim().is_empty() { "(no locals in this frame)\n".into() } else { acc };
+    } else {
+        let mut w = VARS_WATCH.lock().unwrap();
+        w.push_str(&format!(
+            "{label} ->\n{}",
+            if acc.trim().is_empty() { "  (no value — symbol not found?)\n".into() } else { acc }
+        ));
+        // Keep the tail; old watch results scroll away.
+        if w.len() > 4000 {
+            let cut = w.len() - 4000;
+            let cut = w[cut..].find('\n').map(|i| cut + i + 1).unwrap_or(cut);
+            *w = w[cut..].to_string();
+        }
+    }
+    vars_render();
+}
+
+/// The Variables window: locals view + watch box. F7 opens it; while
+/// it exists, every stop re-captures `frame variable` into it.
+fn show_vars_window() {
+    unsafe {
+        let mut w = VARS_WIN.load(Relaxed);
+        if w.is_null() {
+            w = cxx_operator_new(core::mem::size_of::<Fl_Window>()) as *mut Fl_Window;
+            Fl_Window::new_at(w, 460, 412, c"Variables".as_ptr());
+            let vb = cxx_operator_new(core::mem::size_of::<Fl_Text_Buffer>())
+                as *mut Fl_Text_Buffer;
+            Fl_Text_Buffer::new_at(vb, 0, 1024);
+            let d = cxx_operator_new(core::mem::size_of::<Fl_Text_Display>())
+                as *mut Fl_Text_Display;
+            Fl_Text_Display::new_at(d, 8, 8, 444, 364, c"".as_ptr());
+            (*d).buffer(vb);
+            (*d).textsize_i32(12);
+            let wi = cxx_operator_new(core::mem::size_of::<WatchInput>()) as *mut WatchInput;
+            wi.write(WatchInput::new(70, 378, 382, 26));
+            (*w).as_fl_group_mut().end();
+            (*w).as_fl_group_mut().add(d as *mut Fl_Widget);
+            (*w).as_fl_group_mut().add(wi as *mut Fl_Widget);
+            VARS_BUF.store(vb, Relaxed);
+            VARS_DISP.store(d, Relaxed);
+            VARS_WIN.store(w, Relaxed);
+            vars_render();
+        }
+        (*(w as *mut Fl_Widget)).show();
     }
 }
 
@@ -1541,6 +1741,12 @@ fn dbg_stop() {
     }
     DBG_ACTIVE.store(false, Relaxed);
     *DBG_CURLINE.lock().unwrap() = None;
+    {
+        let mut cap = DBG_CAPTURE.lock().unwrap();
+        cap.mode = 0;
+        cap.acc.clear();
+        cap.cmds.clear();
+    }
     unsafe { restyle() };
     console_append("debug session stopped\n");
 }
@@ -1594,8 +1800,9 @@ fn parse_stop_location(s: &str) -> Option<(String, i32)> {
     Some((file, line))
 }
 
-/// Drained from the main loop: stream lldb output to the console and
-/// follow stop locations in the editor.
+/// Drained from the main loop: stream lldb output to the console
+/// (minus capture payloads), feed any active locals/watch capture,
+/// and follow stop locations in the editor.
 fn pump_debugger() {
     let pending = {
         let mut g = DBG_PENDING.lock().unwrap();
@@ -1604,7 +1811,65 @@ fn pump_debugger() {
         }
         std::mem::take(&mut *g)
     };
-    console_append(&pending);
+    // Route: with no capture in flight the raw stream goes straight
+    // to the console. During a capture, payload lines accumulate for
+    // the Variables window; pty echoes / prompts / the sentinel are
+    // dropped; process events still pass through.
+    let mut publish: Option<(u8, String, String)> = None;
+    {
+        let mut cap = DBG_CAPTURE.lock().unwrap();
+        if cap.mode == 0 {
+            console_append(&pending);
+        } else {
+            let mut to_console = String::new();
+            for l in pending.lines() {
+                let tt = l.trim_end_matches('\r').trim();
+                if cap.mode != 0 {
+                    // The prompt is written without a newline, so the
+                    // sentinel often shares its line: "(lldb) --…end--".
+                    // ends_with matches that but NOT the command echo,
+                    // which ends in `")`. Must run before the echo skip.
+                    if tt.ends_with(VARS_SENTINEL) && !tt.contains("script print(") {
+                        publish = Some((
+                            cap.mode,
+                            std::mem::take(&mut cap.label),
+                            std::mem::take(&mut cap.acc),
+                        ));
+                        cap.mode = 0;
+                        cap.cmds.clear();
+                        continue;
+                    }
+                    let echo = tt.starts_with("(lldb)")
+                        || tt.contains("script print(")
+                        || cap.cmds.iter().any(|c| tt == c || tt.ends_with(c.as_str()));
+                    if echo {
+                        continue;
+                    }
+                    let event = tt.starts_with("Process ")
+                        || tt.starts_with("* thread")
+                        || tt.starts_with("frame #")
+                        || tt.starts_with("Target ")
+                        || tt.starts_with("[debugger exited]");
+                    if event {
+                        to_console.push_str(l);
+                        to_console.push('\n');
+                    } else {
+                        cap.acc.push_str(l.trim_end_matches('\r'));
+                        cap.acc.push('\n');
+                    }
+                } else {
+                    to_console.push_str(l);
+                    to_console.push('\n');
+                }
+            }
+            if !to_console.is_empty() {
+                console_append(&to_console);
+            }
+        }
+    }
+    if let Some((mode, label, acc)) = publish {
+        vars_publish(mode, label, acc);
+    }
     // Follow the LAST stop location mentioned.
     let mut hit: Option<(String, i32)> = None;
     for l in pending.lines() {
@@ -1617,8 +1882,19 @@ fn pump_debugger() {
     if let Some((file, line)) = hit {
         *DBG_CURLINE.lock().unwrap() = Some((file.clone(), line));
         unsafe {
-            // If the stopped file is the open one (by basename), move
-            // the cursor there and re-mark.
+            // Land the editor on the stopped line: if the stop is in
+            // a different OPEN file, switch tabs to it first.
+            let cur = PATH.lock().unwrap().clone().unwrap_or_default();
+            if cur.rsplit('/').next() != Some(file.as_str()) {
+                let idx = OPEN_FILES
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .position(|(p, _)| p.rsplit('/').next() == Some(file.as_str()));
+                if let Some(i) = idx {
+                    switch_to_file(i);
+                }
+            }
             let cur = PATH.lock().unwrap().clone().unwrap_or_default();
             if cur.rsplit('/').next() == Some(file.as_str()) {
                 let buf = BUF.load(Relaxed);
@@ -1632,6 +1908,11 @@ fn pump_debugger() {
                     (*(ed as *mut Fl_Widget)).redraw();
                 }
             }
+        }
+        // While the Variables window exists, every stop re-captures
+        // the frame's locals into it.
+        if DBG_ACTIVE.load(Relaxed) && !VARS_WIN.load(Relaxed).is_null() {
+            dbg_request_vars();
         }
     }
 }
@@ -1888,8 +2169,12 @@ fn greeting(g: &Greeter) -> String {
     format!("Hello, world{bangs}")
 }
 
+// A global the debugger can read: type EXCITEMENT_BASE into the
+// Variables window's watch box (F7) while stopped.
+static EXCITEMENT_BASE: i32 = 2;
+
 fn main() {
-    println!("{}", greeting(&Greeter::new(3))); // → Hello, world!!!
+    println!("{}", greeting(&Greeter::new(EXCITEMENT_BASE + 1))); // → Hello, world!!!
     println!("{}", greeting(&Greeter::new(1))); // → Hello, world!
 }
 "#;
@@ -2343,6 +2628,15 @@ unsafe fn self_test() -> i32 {
                 .iter()
                 .all(|n| HELP_TEXT.contains(n)),
         );
+        // Watch-box command mapping: bare identifier paths (globals)
+        // read via `target variable`; expressions via `expression`.
+        check(
+            "watch cmd mapping",
+            watch_cmd("EXCITEMENT_BASE") == "target variable EXCITEMENT_BASE"
+                && watch_cmd("foo::BAR") == "target variable foo::BAR"
+                && watch_cmd("g.excitement") == "target variable g.excitement"
+                && watch_cmd("1 + 2") == "expression -- 1 + 2",
+        );
         // New Project must offer every board family the Target menu
         // knows, each mapped to a valid default target.
         check("new-project flavors cover STM32/ESP32/Pico/RAK/Host", {
@@ -2639,6 +2933,16 @@ unsafe fn self_test() -> i32 {
                 false
             };
             check("lldb: breakpoint hit", wait_from(0, "stop reason = breakpoint", 90));
+            // The stop must paint: editor follows the location and the
+            // style overlay marks the stopped line 'G' (amber).
+            check("lldb: stopped line tinted amber", {
+                let b5b = BUF.load(Relaxed);
+                let sb = STYLE_BUF.load(Relaxed);
+                let st = CStr::from_ptr((*sb).text()).to_string_lossy().into_owned();
+                let ls = (*b5b).skip_lines(0, line_no - 1) as usize;
+                let le = (*b5b).skip_lines(0, line_no) as usize - 1;
+                ls < le && st.get(ls..le).is_some_and(|s| s.chars().all(|c| c == 'G'))
+            });
             // Argument evaluation runs the fork-emitted C++ ctor
             // first: step-in lands in Greeter::Greeter(excitement=…).
             let m = console_len();
@@ -2647,6 +2951,29 @@ unsafe fn self_test() -> i32 {
             let m = console_len();
             dbg_send("frame variable");
             check("lldb: variables visible", wait_from(m, "excitement", 15));
+            // Variables window: capture the ctor frame's locals, then
+            // watch the template's GLOBAL via `target variable`.
+            show_vars_window();
+            dbg_request_vars();
+            let wait_text = |get: &dyn Fn() -> String, needle: &str, secs: u32| -> bool {
+                for _ in 0..secs * 10 {
+                    pump_debugger();
+                    if get().contains(needle) {
+                        return true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                false
+            };
+            check(
+                "vars window captured frame locals",
+                wait_text(&|| VARS_LOCALS.lock().unwrap().clone(), "excitement", 15),
+            );
+            watch_eval("EXCITEMENT_BASE");
+            check(
+                "watch read a global (target variable)",
+                wait_text(&|| VARS_WATCH.lock().unwrap().clone(), "EXCITEMENT_BASE = 2", 15),
+            );
             let m = console_len();
             dbg_send("breakpoint disable");
             check("lldb: bp disabled", wait_from(m, "disabled", 10));
