@@ -130,6 +130,15 @@ Cumulative across the v1.0x–v1.14x line. Everything below is shipped.
   Stock RA chokes on the `class` keyword; this fork doesn't.
 - **`rustcc-cli`** (`crates/rustcc-cli/`) — `rustcc install` / `doctor`
   / `init` for toolchain install + project scaffolding.
+- **rustcc IDE** (`examples/rustcc_ide/`) — the capstone sample: a
+  full embedded-RTOS IDE *written in fork Rust* (the `class` keyword
+  subclassing FLTK across imported C++ chains). Scaffolds, builds,
+  runs (qemu), debugs (in-IDE lldb: breakpoints, stepping, a live
+  Variables window with a globals watch) and flashes firmware for
+  RAK11161 (STM32WLE5 + ESP32-C2), STM32, ESP32 and Raspberry Pi
+  Pico — plus host-side fork programs. One binary exercises most of
+  the fork surface end to end; see
+  [`examples/rustcc_ide/README.md`](examples/rustcc_ide/README.md).
 
 ## Remaining gaps
 
@@ -280,7 +289,10 @@ int main(void) {
 }
 ```
 
-More examples in [`examples/`](examples/). Full walkthrough:
+More examples in [`examples/`](examples/) — including
+[`examples/rustcc_ide/`](examples/rustcc_ide/), a complete
+embedded-RTOS IDE written in fork Rust that doubles as the project's
+broadest end-to-end test. Full walkthrough:
 [`fork/getting-started.html`](fork/getting-started.html).
 
 ## Editor setup (VS Code + rust-analyzer)
@@ -347,7 +359,8 @@ Full reference: [`docs/swift.md`](docs/swift.md).
 - **`crates/`** — the workspace that predates the fork. Hosts shared
   infrastructure (`rustc_abi_cxx` layout/mangling, the proc-macro
   crate, `cxx` runtime types). Still exercised by integration tests.
-- **`examples/`** — runnable demos showcasing v1 features.
+- **`examples/`** — runnable demos showcasing v1 features, capped by
+  `rustcc_ide/` (an FLTK IDE in fork Rust targeting RTOS boards).
 - **`docs/`** — per-crate design docs (Itanium ABI, codegen,
   ownership, exception boundary, `repr(cpp)`, build integration).
 

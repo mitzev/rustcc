@@ -120,6 +120,10 @@ cargo +rustcc run --release --bin ide         # the GUI
   Capture payloads stay out of the console; process events (stops,
   exits) still stream there. Stops in *other* open files now switch
   tabs before the amber current-line tint lands.
+- **Per-project Target persistence** — the selected Target is written
+  to `<project>/.rustcc_ide.toml` (stable slugs, not indices) on every
+  Target-menu change; Open Project restores it. Fresh projects are
+  seeded with their flavor's default.
 - **Help menu** — *rustcc IDE Help… (F1)* opens a cheat-sheet window
   (projects/targets, debugger keys, editing keys); *About* prints
   version + links to the console. The whole menu is now a `MENU_SPEC`

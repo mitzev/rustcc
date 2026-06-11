@@ -676,6 +676,7 @@ unsafe fn run_action(act: usize) {
             a if (ACT_TGT_BASE..ACT_TGT_BASE + 6).contains(&a) => {
                 let t = (a - ACT_TGT_BASE) as i32;
                 TARGET.store(t, Relaxed);
+                project_save_target();
                 console_append(&format!("target = {}\n", TARGET_NAMES[t as usize]));
             }
             ACT_NEW_HOST => new_project_flow(0),
@@ -2086,9 +2087,52 @@ fn close_current_file() {
     }
 }
 
+/// Stable per-target slugs for the project config (indices would
+/// silently re-map if the Target menu is ever reordered).
+const TARGET_SLUGS: [&str; 6] =
+    ["host", "rak11161-cm4", "rak11161-c2", "esp32-c3", "stm32f4", "pico"];
+
+fn project_cfg_path(dir: &str) -> String {
+    format!("{dir}/.rustcc_ide.toml")
+}
+
+/// Persist the selected Target into the open project.
+fn project_save_target() {
+    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
+    let t = TARGET.load(Relaxed) as usize;
+    let slug = TARGET_SLUGS.get(t).copied().unwrap_or("host");
+    let body = format!(
+        "# rustcc IDE project state (written on Target changes)\ntarget = \"{slug}\"\n"
+    );
+    let _ = std::fs::write(project_cfg_path(dir.as_str()), body);
+}
+
+fn project_load_target(dir: &str) -> Option<i32> {
+    let txt = std::fs::read_to_string(project_cfg_path(dir)).ok()?;
+    let slug = txt.lines().find_map(|l| {
+        let l = l.trim();
+        l.strip_prefix("target")
+            .map(|r| r.trim_start_matches(['=', ' ']).trim_matches('"'))
+    })?;
+    TARGET_SLUGS.iter().position(|s| *s == slug).map(|i| i as i32)
+}
+
 fn set_project(dir: &str) {
     *PROJECT_DIR.lock().unwrap() = Some(dir.to_string());
     console_append(&format!("project = {dir}\n"));
+    // Restore the project's saved Target; a project without a config
+    // (fresh scaffold / pre-existing folder) is seeded with the
+    // current selection.
+    match project_load_target(dir) {
+        Some(t) => {
+            TARGET.store(t, Relaxed);
+            console_append(&format!(
+                "target = {} (restored from project)\n",
+                TARGET_NAMES[t as usize]
+            ));
+        }
+        None => project_save_target(),
+    }
     let lib = format!("{dir}/src/lib.rs");
     let main = format!("{dir}/src/main.rs");
     if std::path::Path::new(&lib).exists() {
@@ -3068,6 +3112,22 @@ unsafe fn self_test() -> i32 {
         );
         let _ = std::fs::remove_file(&xf);
         let _ = std::fs::remove_file(&bf);
+
+        // Target persists per-project: seeding on first open, save on
+        // change, restore on reopen.
+        TARGET.store(4, Relaxed); // STM32F4-class
+        set_project(&proj_s); // fresh project: seeds with current
+        check(
+            "project cfg seeded with stable slug",
+            std::fs::read_to_string(project_cfg_path(&proj_s))
+                .unwrap_or_default()
+                .contains("\"stm32f4\""),
+        );
+        TARGET.store(2, Relaxed); // simulate Target menu pick
+        project_save_target();
+        TARGET.store(0, Relaxed);
+        set_project(&proj_s); // reopen: restores the saved target
+        check("project target restored on reopen", TARGET.load(Relaxed) == 2);
 
         // 20. FULL gate: real lldb session — breakpoint hit, variables
         //     visible, step, continue to exit.
