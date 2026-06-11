@@ -169,6 +169,103 @@ pub unsafe extern "C" fn __rustcc_cxx_catch_unknown(
     }
 }
 
+/// P09.x (v1.15) / P09.68-gcc: typed-catch SELECTOR computation for
+/// backends without LLVM's `llvm.eh.typeid.for` (the GCC backend).
+///
+/// The LLVM path lets the personality function match landingpad
+/// clauses and translates the raw type-id into a small 1-based index.
+/// gccjit's try/catch region is catch-all only, so the fork's GCC
+/// backend calls THIS helper from the landing pad instead: walk the
+/// `typeinfos` array (the `#[rustc_cxx_throws_typeinfos]` list, in
+/// clause order) and return `i + 1` for the first entry matching the
+/// in-flight exception's `std::type_info`, or `0` when nothing
+/// matches (→ the catch-all path). The result feeds the same
+/// `__rustcc_cxx_catch_typed(exn, selector)` contract as LLVM.
+///
+/// # Itanium layout contract
+///
+/// `exc_ptr` is the `_Unwind_Exception*` the personality produced.
+/// Per the Itanium C++ ABI, it is embedded at the END of
+/// `__cxa_exception`, whose `exceptionType: *const std::type_info`
+/// field sits at a fixed negative offset on LP64: the fields between
+/// it and `unwindHeader` are 4 pointers (dtor, unexpectedHandler,
+/// terminateHandler, nextException), 2 ints (handlerCount,
+/// handlerSwitchValue) and 4 pointers (actionRecord,
+/// languageSpecificData, catchTemp, adjustedPtr) = 72 bytes, plus
+/// the field itself → −80. Both libsupc++ and libc++abi share this
+/// layout (libc++abi mirrors it deliberately for cross-runtime
+/// compat). Type equality follows the runtimes' own rule: a name
+/// starting with `'*'` compares by pointer identity, anything else
+/// by `strcmp` (cross-DSO safe).
+///
+/// Non-Itanium or non-64-bit targets return 0 (typed catches degrade
+/// to the catch-all `Unknown` path — never UB).
+///
+/// # Safety
+///
+/// `exc_ptr` must be a live personality-produced exception pointer;
+/// `typeinfos` must point at `n` valid `_ZTI…` addresses.
+#[no_mangle]
+pub unsafe extern "C" fn __rustcc_cxx_match_typeinfo(
+    exc_ptr: *mut c_void,
+    typeinfos: *const *const c_void,
+    n: u32,
+) -> u32 {
+    #[cfg(all(not(all(windows, target_env = "msvc")), target_pointer_width = "64"))]
+    unsafe {
+        if exc_ptr.is_null() || typeinfos.is_null() {
+            return 0;
+        }
+        // exceptionType at unwindHeader − 80 (see layout contract).
+        let thrown_ti =
+            *((exc_ptr as *const u8).offset(-80) as *const *const c_void);
+        if thrown_ti.is_null() {
+            return 0;
+        }
+        // Itanium std::type_info: { vptr, const char* __name }.
+        let name_of = |ti: *const c_void| -> *const u8 {
+            *((ti as *const u8).add(8) as *const *const u8)
+        };
+        let thrown_name = name_of(thrown_ti);
+        for i in 0..n {
+            let want = *typeinfos.add(i as usize);
+            if want.is_null() {
+                continue;
+            }
+            if want == thrown_ti {
+                return i + 1;
+            }
+            let want_name = name_of(want);
+            if thrown_name.is_null() || want_name.is_null() {
+                continue;
+            }
+            // '*'-prefixed names are pointer-unique by contract.
+            if *thrown_name == b'*' || *want_name == b'*' {
+                continue;
+            }
+            let mut a = thrown_name;
+            let mut b = want_name;
+            loop {
+                let (ca, cb) = (*a, *b);
+                if ca != cb {
+                    break;
+                }
+                if ca == 0 {
+                    return i + 1;
+                }
+                a = a.add(1);
+                b = b.add(1);
+            }
+        }
+        0
+    }
+    #[cfg(not(all(not(all(windows, target_env = "msvc")), target_pointer_width = "64")))]
+    {
+        let _ = (exc_ptr, typeinfos, n);
+        0
+    }
+}
+
 /// Convenience wrapper: same as [`__rustcc_cxx_catch_unknown`]
 /// but returns a fully-constructed `Result::Err(CxxException)`.
 /// Useful for hand-written FFI integrations that don't need the

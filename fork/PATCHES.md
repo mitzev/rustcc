@@ -3511,6 +3511,26 @@ on `aarch64-apple-darwin` and `x86_64-apple-darwin`.
   concrete overrides, new virtual, virtual dtor via the deleting
   thunk) passes on the pure-GCC pipeline.
 
+- **49 (`49-v1.15-cg_gcc-cxx_throws-landing-pads-M5`)** — cg_gcc
+  `#[rustc_cxx_throws]`, catch-all AND typed. The landing pad sets
+  the SSA-chosen personality (`__gxx_personality_v0` for typed),
+  reads the exception via `__builtin_eh_pointer(0)`, and — since
+  gccjit lacks `llvm.eh.typeid.for` — computes the selector by
+  calling the `cxx` runtime's new `__rustcc_cxx_match_typeinfo(exn,
+  tis, n)` over a per-pad static array of the clause `_ZTI`
+  addresses (same 1-based contract as LLVM's typeid translation; the
+  matcher compares the thrown `std::type_info` by pointer then by
+  name, honoring the `'*'`-prefix pointer-unique rule; the
+  `exceptionType` field sits at `_Unwind_Exception* − 80` on LP64 in
+  both libsupc++ and libc++abi). Context grows real
+  `cxx_throws_catch_fn`/`_typed_fn`/`cxx_typeinfo_global`/
+  `cxx_typeinfo_personality`. Also fixes `function_ptr_call` to
+  prefer the SSA-provided fn type when the value's declared type
+  disagrees (the throws wrap changes a foreign fn's ABI to sret;
+  gccjit's typed pointers ICEd where LLVM's opaque ones shrugged).
+  Probes: `cxx_throws_native` + the typed smoke pass identically on
+  both backends.
+
 ---
 
 ## Build & test

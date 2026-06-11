@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Thu, 11 Jun 2026 17:07:03 +0300
+Subject: [PATCH] =?UTF-8?q?P09.x=20(v1.15):=20cg=5Fgcc=20=E2=80=94=20cxx?=
+ =?UTF-8?q?=5Fthrows=20landing=20pads=20(M5)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Real GCC-backend support for #[rustc_cxx_throws], catch-all AND
+typed (P09.62-gcc / P09.64-gcc / P09.68-gcc all closed):
+
+- cxx_catch_landing_pad (master feature): set the personality the
+  SSA layer picked (__gxx_personality_v0 for typed catches), read
+  the in-flight exception via __builtin_eh_pointer(0), and compute
+  the selector. gccjit has no llvm.eh.typeid.for, so typed selection
+  calls the cxx runtime's __rustcc_cxx_match_typeinfo(exn, tis, n)
+  over a per-pad static array of the clause _ZTI addresses — it
+  returns the same 1-based index LLVM's typeid translation yields,
+  feeding the unchanged __rustcc_cxx_catch_typed contract. Args are
+  cast to the matcher's own param types (it may be declared from its
+  Rust definition in the same CGU with different nominal pointers).
+- context: real cxx_throws_catch_fn / cxx_throws_catch_typed_fn
+  (CxxRawError {i32, char*} by-value returns; address + fn-ptr type
+  so call() routes via function_ptr_call), cxx_typeinfo_global
+  (imported _ZTI), cxx_typeinfo_personality (__gxx_personality_v0).
+- function_ptr_call: when the SSA-provided fn type disagrees with
+  the value's declared type (param count), the SSA type wins — the
+  throws wrap changes a foreign fn's call ABI (sret CxxRawError)
+  while its decl keeps the source signature; LLVM's opaque pointers
+  hid this, gccjit's typed pointers ICEd
+  (new_call_through_ptr: got 1 args, expected 2).
+
+Probes (container, pure-GCC pipeline, LLVM controls identical):
+- cxx_throws_native: ok=10, Err(Unknown), phase-2 passed
+- typed smoke: ok=10, Err(Domain), Err(Range) — both clause matches
+- subclass demo + class smoke re-verified on both backends
+---
+ compiler/rustc_codegen_gcc/src/builder.rs | 135 +++++++++++++++++++---
+ compiler/rustc_codegen_gcc/src/context.rs | 119 ++++++++++++++-----
+ 2 files changed, 207 insertions(+), 47 deletions(-)
+
+diff --git a/compiler/rustc_codegen_gcc/src/builder.rs b/compiler/rustc_codegen_gcc/src/builder.rs
+index 4d67829eb9f..b2687c5a6fb 100644
+--- a/compiler/rustc_codegen_gcc/src/builder.rs
++++ b/compiler/rustc_codegen_gcc/src/builder.rs
+@@ -4,8 +4,8 @@
+ use std::ops::Deref;
+ 
+ use gccjit::{
+-    BinaryOp, Block, ComparisonOp, Context, Function, LValue, Location, RValue, ToRValue, Type,
+-    UnaryOp,
++    BinaryOp, Block, ComparisonOp, Context, Function, FunctionType, LValue, Location, RValue,
++    ToRValue, Type, UnaryOp,
+ };
+ use rustc_abi as abi;
+ use rustc_abi::{Align, HasDataLayout, Size, TargetDataLayout, WrappingRange};
+@@ -356,7 +356,22 @@ fn function_ptr_call(
+         _funclet: Option<&Funclet>,
+     ) -> RValue<'gcc> {
+         let gcc_func = match func_ptr.get_type().dyncast_function_ptr_type() {
+-            Some(func) => func,
++            Some(func) => {
++                // P09.x (v1.15): when the SSA layer supplies a fn type
++                // that DISAGREES with the value's declared type, the
++                // SSA type wins — rustcc's `#[rustc_cxx_throws]`
++                // wrapping changes a foreign fn's call ABI (sret
++                // CxxRawError out-param) while the foreign decl kept
++                // the source signature. LLVM's opaque pointers make
++                // this moot; gccjit's typed pointers need the cast.
++                match typ.dyncast_function_ptr_type() {
++                    Some(expected) if expected.get_param_count() != func.get_param_count() => {
++                        func_ptr = self.context.new_cast(self.location, func_ptr, typ);
++                        expected
++                    }
++                    _ => func,
++                }
++            }
+             None => {
+                 // NOTE: due to opaque pointers now being used, we need to cast here.
+                 let new_func_type = typ.dyncast_function_ptr_type().expect("function ptr");
+@@ -1626,28 +1641,110 @@ fn cleanup_landing_pad(&mut self, _pers_fn: Function<'gcc>) -> (RValue<'gcc>, RV
+         (value1, value2)
+     }
+ 
+-    // P09.62: GCC backend stub for cxx_catch_landing_pad. The
+-    // LLVM backend's catch-all landingpad (1 clause, null
+-    // type-info) doesn't map cleanly to libgccjit's
+-    // try/catch shape — that path is the libgccjit master
+-    // branch's job and is out of scope for this patch. The
+-    // implementation here mirrors `cleanup_landing_pad`'s
+-    // GCC stub for consistency: same shape, no real catch
+-    // semantics until libgccjit grows the matching API.
++    // P09.x (v1.15) / P09.62-gcc + P09.68-gcc: real GCC-backend
++    // catch landing pad for `#[rustc_cxx_throws]`.
+     //
+-    // Real users of `#[rustc_cxx_throws]` will be on the LLVM
+-    // backend; the GCC backend stub exists only so the trait
+-    // compiles.
++    // The catch BB is reached through `invoke`'s
++    // `add_try_catch` region (gccjit master API); here we set
++    // the personality (the C++ `__gxx_personality_v0` for typed
++    // catches — passed in by the SSA layer), read the in-flight
++    // exception with `__builtin_eh_pointer(0)`, and compute the
++    // SELECTOR. gccjit has no `llvm.eh.typeid.for`, so typed
++    // selection is delegated to the `cxx` runtime:
++    // `__rustcc_cxx_match_typeinfo(exn, tis, n)` compares the
++    // thrown exception's `std::type_info` against a static array
++    // of the clause typeinfos and returns the same small 1-based
++    // index the LLVM landingpad path produces (0 = no typed
++    // match → catch-all).
++    #[cfg(feature = "master")]
++    fn cxx_catch_landing_pad(
++        &mut self,
++        pers_fn: Function<'gcc>,
++        typeinfos: &[RValue<'gcc>],
++    ) -> (RValue<'gcc>, RValue<'gcc>) {
++        self.set_personality_fn(pers_fn);
++
++        let eh_pointer_builtin =
++            self.cx.context.get_target_builtin_function("__builtin_eh_pointer");
++        let zero = self.cx.context.new_rvalue_zero(self.int_type);
++        let ptr = self.cx.context.new_call(self.location, eh_pointer_builtin, &[zero]);
++        let ptr_ty = self.u8_type.make_pointer();
++        let exn = self.cx.context.new_cast(self.location, ptr, ptr_ty);
++
++        let selector = if typeinfos.is_empty() {
++            self.cx.context.new_rvalue_zero(self.i32_type)
++        } else {
++            // Static array of the clause typeinfo addresses, in
++            // clause order. Unique name per landing pad.
++            let n = typeinfos.len();
++            let idx = self.cx.cxx_throws_pad_counter.get();
++            self.cx.cxx_throws_pad_counter.set(idx + 1);
++            let arr_name = format!("__rustcc_cxx_tis_{idx}");
++            let arr_ty = self.cx.context.new_array_type(None, ptr_ty, n as u64);
++            let arr = self.cx.context.new_global(
++                None,
++                gccjit::GlobalKind::Internal,
++                arr_ty,
++                &arr_name,
++            );
++            let elems: Vec<RValue<'gcc>> = typeinfos
++                .iter()
++                .map(|ti| self.cx.context.new_cast(None, *ti, ptr_ty))
++                .collect();
++            let init = self.cx.context.new_array_constructor(None, arr_ty, &elems);
++            arr.global_set_initializer_rvalue(init);
++
++            let matcher = *self
++                .cx
++                .functions
++                .borrow_mut()
++                .entry("__rustcc_cxx_match_typeinfo".to_string())
++                .or_insert_with(|| {
++                    let p_exn = self.cx.context.new_parameter(None, ptr_ty, "exn");
++                    let tis_ty = ptr_ty.make_pointer();
++                    let p_tis = self.cx.context.new_parameter(None, tis_ty, "tis");
++                    let p_n =
++                        self.cx.context.new_parameter(None, self.cx.type_u32(), "n");
++                    self.cx.context.new_function(
++                        None,
++                        FunctionType::Extern,
++                        self.cx.type_u32(),
++                        &[p_exn, p_tis, p_n],
++                        "__rustcc_cxx_match_typeinfo",
++                        false,
++                    )
++                });
++            // The matcher may have been declared from its Rust
++            // definition in this very CGU (different nominal pointer
++            // types) — cast every argument to the function's own
++            // parameter types.
++            let cast_to_param = |i: i32, v: RValue<'gcc>| {
++                let want = matcher.get_param(i).to_rvalue().get_type();
++                self.cx.context.new_cast(self.location, v, want)
++            };
++            let tis_ptr = arr.get_address(None);
++            let n_val =
++                self.cx.context.new_rvalue_from_int(self.cx.type_u32(), n as i32);
++            let sel_u32 = self.cx.context.new_call(
++                self.location,
++                matcher,
++                &[cast_to_param(0, exn), cast_to_param(1, tis_ptr), cast_to_param(2, n_val)],
++            );
++            self.cx.context.new_cast(self.location, sel_u32, self.i32_type)
++        };
++
++        (exn, selector)
++    }
++
++    #[cfg(not(feature = "master"))]
+     fn cxx_catch_landing_pad(
+         &mut self,
+         pers_fn: Function<'gcc>,
+         _typeinfos: &[RValue<'gcc>],
+     ) -> (RValue<'gcc>, RValue<'gcc>) {
+-        // Delegate to cleanup_landing_pad — it's not a real
+-        // catch, but the trait must be satisfied. P09.62-gcc
+-        // tracks a proper impl when libgccjit's try-catch
+-        // surface lands. Typed catches (P09.68) are also
+-        // stubbed here.
++        // Without the master-feature try/catch + EH builtins this
++        // can't be a real catch; mirror cleanup_landing_pad's
++        // non-master stub.
+         self.cleanup_landing_pad(pers_fn)
+     }
+ 
+diff --git a/compiler/rustc_codegen_gcc/src/context.rs b/compiler/rustc_codegen_gcc/src/context.rs
+index b50c5a1bcdc..736ed00d10a 100644
+--- a/compiler/rustc_codegen_gcc/src/context.rs
++++ b/compiler/rustc_codegen_gcc/src/context.rs
+@@ -2,7 +2,8 @@
+ use std::collections::HashMap;
+ 
+ use gccjit::{
+-    Block, CType, Context, Function, FunctionPtrType, FunctionType, LValue, Location, RValue, Type,
++    Block, CType, Context, Function, FunctionPtrType, FunctionType, GlobalKind, LValue, Location,
++    RValue, Type,
+ };
+ use rustc_abi::{Align, HasDataLayout, PointeeInfo, Size, TargetDataLayout, VariantIdx};
+ use rustc_codegen_ssa::base::wants_msvc_seh;
+@@ -47,6 +48,13 @@ pub struct CodegenCx<'gcc, 'tcx> {
+     /// P09.x (v1.15): per-CGU dedup for emitted `#[repr(cpp)]` class
+     /// metadata (`_ZTV`/`_ZTI`/`_ZTS`) — see `cxx_vtable`.
+     pub cxx_emitted_vtables: RefCell<FxHashSet<rustc_hir::def_id::DefId>>,
++    /// P09.x (v1.15): unique-name counter for the per-landing-pad
++    /// typeinfo arrays emitted by `cxx_catch_landing_pad`.
++    pub cxx_throws_pad_counter: Cell<usize>,
++    /// P09.x (v1.15): cached `CxxRawError` gccjit struct type
++    /// (`{ i32 kind, const char* msg }`) — gccjit rejects
++    /// re-creating a named struct in one context.
++    pub cxx_raw_error_type: Cell<Option<Type<'gcc>>>,
+ 
+     pub tls_model: gccjit::TlsModel,
+ 
+@@ -253,6 +261,8 @@ pub fn new(
+             functions: RefCell::new(functions),
+             intrinsics: RefCell::new(FxHashMap::default()),
+             cxx_emitted_vtables: RefCell::new(FxHashSet::default()),
++            cxx_throws_pad_counter: Cell::new(0),
++            cxx_raw_error_type: Cell::new(None),
+ 
+             tls_model,
+ 
+@@ -381,6 +391,59 @@ pub fn bitcast_if_needed(
+             value
+         }
+     }
++
++    /// P09.x (v1.15): declare (or look up) a `__rustcc_cxx_catch_*`
++    /// runtime helper — `fn(ptr [, i32]) -> CxxRawError` where
++    /// `CxxRawError` is `{ i32 kind, const char* msg }` returned by
++    /// value. Returns the function's address plus the fn-POINTER
++    /// type, so the SSA layer's `bx.call(ty, …, value, …)` routes
++    /// through `function_ptr_call` correctly.
++    fn cxx_throws_helper(
++        &self,
++        name: &str,
++        with_selector: bool,
++    ) -> (RValue<'gcc>, Type<'gcc>) {
++        let char_ptr = self.type_i8().make_pointer();
++        let raw_err_ty = match self.cxx_raw_error_type.get() {
++            Some(t) => t,
++            None => {
++                let kind_field = self.context.new_field(None, self.type_i32(), "kind");
++                let msg_field = self.context.new_field(None, char_ptr, "message");
++                let t = self
++                    .context
++                    .new_struct_type(None, "__rustcc_CxxRawError", &[kind_field, msg_field])
++                    .as_type();
++                self.cxx_raw_error_type.set(Some(t));
++                t
++            }
++        };
++
++        let void_ptr = self.type_i8().make_pointer();
++        let mut param_tys: Vec<Type<'gcc>> = vec![void_ptr];
++        if with_selector {
++            param_tys.push(self.type_i32());
++        }
++
++        let func = *self.functions.borrow_mut().entry(name.to_string()).or_insert_with(|| {
++            let mut params =
++                vec![self.context.new_parameter(None, void_ptr, "exn")];
++            if with_selector {
++                params.push(self.context.new_parameter(None, self.type_i32(), "selector"));
++            }
++            self.context.new_function(
++                None,
++                FunctionType::Extern,
++                raw_err_ty,
++                &params,
++                name,
++                false,
++            )
++        });
++
++        let fn_ptr_ty =
++            self.context.new_function_pointer_type(None, raw_err_ty, &param_tys, false);
++        (func.get_address(None), fn_ptr_ty)
++    }
+ }
+ 
+ impl<'gcc, 'tcx> BackendTypes for CodegenCx<'gcc, 'tcx> {
+@@ -481,47 +544,47 @@ fn eh_personality(&self) -> Function<'gcc> {
+         func
+     }
+ 
+-    // P09.64 / 1.13 throws Phase 1D: GCC backend stub.
+-    // `#[rustc_cxx_throws]` codegen targets the LLVM backend
+-    // exclusively for v1.13.0; the GCC backend's path through
+-    // the catch BB is gated by P09.62-gcc's stub (which already
+-    // delegates to `cleanup_landing_pad`), so this method is
+-    // never reached on the GCC backend in practice. A real GCC
+-    // impl needs libgccjit's external-fn-by-name declaration
+-    // surface and the struct-by-value return-shape work.
++    // P09.x (v1.15) / P09.64-gcc + P09.68-gcc: real GCC-backend
++    // declarations for the `#[rustc_cxx_throws]` runtime helpers.
++    // Both return `CxxRawError` — `{ i32 kind, const char* msg }` —
++    // by value; gccjit models that as a two-field struct return.
+     fn cxx_throws_catch_fn(&self) -> (Self::Value, Self::FunctionSignature) {
+-        unimplemented!(
+-            "cxx_throws codegen path is LLVM-only for v1.13.0; \
+-             GCC backend support is queued as P09.64-gcc"
+-        );
++        self.cxx_throws_helper("__rustcc_cxx_catch_unknown", /* with_selector: */ false)
+     }
+ 
+     fn cxx_throws_catch_typed_fn(&self) -> (Self::Value, Self::FunctionSignature) {
+-        unimplemented!(
+-            "cxx_throws typed catches are LLVM-only for v1.13.0; \
+-             GCC backend support is queued as P09.68-gcc"
+-        );
++        self.cxx_throws_helper("__rustcc_cxx_catch_typed", /* with_selector: */ true)
+     }
+ 
+-    fn cxx_typeinfo_global(&self, _name: &str) -> Self::Value {
+-        unimplemented!(
+-            "cxx_throws typed catches are LLVM-only for v1.13.0; \
+-             GCC backend support is queued as P09.68-gcc"
+-        );
++    fn cxx_typeinfo_global(&self, name: &str) -> Self::Value {
++        // External Itanium `_ZTI…` — only the address matters.
++        // Reuse the cached lvalue when this CGU already touched the
++        // symbol (also covers a class whose typeinfo this CGU
++        // DEFINES via cxx_vtable); else declare imported.
++        if self.globals.borrow().contains_key(name) {
++            self.get_or_insert_global(name, self.type_i8(), false, None).get_address(None)
++        } else {
++            self.context
++                .new_global(None, GlobalKind::Imported, self.type_i8(), name)
++                .get_address(None)
++        }
+     }
+ 
+     fn cxx_typedesc_global_msvc(&self, _name: &str) -> Self::Value {
+         unimplemented!(
+-            "MSVC typed catches are LLVM-only for v1.13.0; \
+-             GCC backend doesn't target MSVC"
++            "MSVC typed catches are LLVM-only; the GCC backend doesn't target MSVC"
+         );
+     }
+ 
+     fn cxx_typeinfo_personality(&self) -> Self::Function {
+-        unimplemented!(
+-            "cxx_throws typed catches are LLVM-only for v1.13.0; \
+-             GCC backend support is queued as P09.68-gcc"
+-        );
++        // `__gxx_personality_v0` — the Itanium C++ personality, so
++        // typed-catch regions perform real typeinfo matching.
++        // Declared `int(...)` like `eh_personality`'s GCC fallback.
++        let name = "__gxx_personality_v0";
++        if let Some(func) = self.functions.borrow().get(name) {
++            return *func;
++        }
++        self.declare_func(name, self.type_i32(), &[], true)
+     }
+ 
+     fn sess(&self) -> &Session {

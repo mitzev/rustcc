@@ -73,7 +73,11 @@ re-verified on the same probes from the same stage1. CI: the
 Discovered + fixed along the way: gccjit declare-then-define
 ordering, `void*`/struct-stride constant arithmetic, and the
 shared `transmute_scalar` strict type pre-check (see patch 0048).
-Remaining: M5 (cxx_throws).
+M5 (cxx_throws) is DONE too — catch-all AND typed pass on the
+pure-GCC pipeline (patch 0049): gccjit try/catch + __gxx personality
++ the cxx runtime typeinfo matcher replacing llvm.eh.typeid.for.
+All five milestones complete; MSVC funclets remain LLVM-only by
+design.
 
 ## Milestones
 
