@@ -110,7 +110,10 @@ const EV_RELEASE: i32 = 2; // FL_RELEASE (Fl_Event enum)
 // prefixed plain consts.
 const CHOOSER_OPEN: i32 = Fl_Native_File_Chooser_Type::BROWSE_FILE.0 as i32;
 const CHOOSER_SAVE: i32 = Fl_Native_File_Chooser_Type::BROWSE_SAVE_FILE.0 as i32;
-const CHOOSER_DIR: i32 = Fl_Native_File_Chooser_Type::BROWSE_SAVE_DIRECTORY.0 as i32;
+// New Project: SAVE_DIRECTORY (lets you name a new folder; native
+// dialog shows "Save"). Open Project: plain DIRECTORY ("Open").
+const CHOOSER_DIR_NEW: i32 = Fl_Native_File_Chooser_Type::BROWSE_SAVE_DIRECTORY.0 as i32;
+const CHOOSER_DIR_OPEN: i32 = Fl_Native_File_Chooser_Type::BROWSE_DIRECTORY.0 as i32;
 const WRAP_NONE: i32 = Fl_Text_Display_WRAP_NONE as i32;
 const WRAP_AT_BOUNDS: i32 = Fl_Text_Display_WRAP_AT_BOUNDS as i32;
 
@@ -453,7 +456,7 @@ unsafe fn run_action(act: usize) {
             ACT_NEW_HOST => new_project_flow(true),
             ACT_DEBUG => debug_project(),
             ACT_OPEN_PROJECT => {
-                if let Some(dir) = choose_file(CHOOSER_DIR, "Open project folder") {
+                if let Some(dir) = choose_file(CHOOSER_DIR_OPEN, "Open project folder") {
                     set_project(&dir);
                 }
             }
@@ -893,7 +896,7 @@ fn set_project(dir: &str) {
 
 fn new_project_flow(host: bool) {
     let title = if host { "New Host project folder" } else { "New RAK11161 project folder" };
-    if let Some(dir) = unsafe { choose_file(CHOOSER_DIR, title) } {
+    if let Some(dir) = unsafe { choose_file(CHOOSER_DIR_NEW, title) } {
         let r = if host { scaffold_host(&dir) } else { scaffold_project(&dir) };
         match r {
             Ok(()) => {
