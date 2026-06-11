@@ -163,6 +163,8 @@ const ACT_CONSOLE_CLEAR: usize = 44;
 const ACT_NEW_HOST: usize = 45;
 const ACT_DEBUG: usize = 46;
 const ACT_NEW_PICO: usize = 47;
+const ACT_NEW_STM32: usize = 58;
+const ACT_NEW_ESP32: usize = 59;
 const ACT_UPLOAD: usize = 48;
 const ACT_UPLOAD_CFG: usize = 49;
 const ACT_DBG_START: usize = 50;
@@ -571,24 +573,11 @@ unsafe fn run_action(act: usize) {
                 TARGET.store(t, Relaxed);
                 console_append(&format!("target = {}\n", TARGET_NAMES[t as usize]));
             }
-            ACT_NEW_PROJECT => new_project_flow(false),
-            ACT_NEW_HOST => new_project_flow(true),
-            ACT_NEW_PICO => {
-                if let Some(dir) =
-                    choose_file(CHOOSER_DIR_NEW, "New Raspberry Pi Pico project folder")
-                {
-                    match scaffold_project(&dir) {
-                        Ok(()) => {
-                            TARGET.store(5, Relaxed);
-                            console_append(
-                                "scaffolded Pico-ready RTOS project; target = Raspberry Pi Pico\n",
-                            );
-                            set_project(&dir);
-                        }
-                        Err(e) => console_append(&format!("scaffold FAILED: {e}\n")),
-                    }
-                }
-            }
+            ACT_NEW_HOST => new_project_flow(0),
+            ACT_NEW_PROJECT => new_project_flow(1),
+            ACT_NEW_STM32 => new_project_flow(2),
+            ACT_NEW_ESP32 => new_project_flow(3),
+            ACT_NEW_PICO => new_project_flow(4),
             ACT_DEBUG => debug_project(),
             ACT_UPLOAD => upload_firmware(),
             ACT_DBG_START => dbg_start(),
@@ -1641,20 +1630,29 @@ fn set_project(dir: &str) {
     nav_refresh();
 }
 
-fn new_project_flow(host: bool) {
-    let title = if host { "New Host project folder" } else { "New RAK11161 project folder" };
-    if let Some(dir) = unsafe { choose_file(CHOOSER_DIR_NEW, title) } {
-        let r = if host { scaffold_host(&dir) } else { scaffold_project(&dir) };
+/// File ▸ New Project flavors. Every RTOS flavor emits the same
+/// self-contained scaffold (it carries all cores' run scripts and
+/// linker maps); flavors differ only in the default Target selected.
+const NEW_FLAVORS: [(&str, i32); 5] = [
+    ("Host", 0),
+    ("RAK11161", 1),             // dual-core: start on the STM32WLE5 side
+    ("STM32", 4),
+    ("ESP32", 3),                // C3-class default; Target menu flips to C2
+    ("Raspberry Pi Pico", 5),
+];
+
+fn new_project_flow(flavor: usize) {
+    let (name, tgt) = NEW_FLAVORS[flavor];
+    let title = format!("New {name} project folder");
+    if let Some(dir) = unsafe { choose_file(CHOOSER_DIR_NEW, &title) } {
+        let r = if tgt == 0 { scaffold_host(&dir) } else { scaffold_project(&dir) };
         match r {
             Ok(()) => {
+                TARGET.store(tgt, Relaxed);
                 console_append(&format!(
-                    "scaffolded {} project at {dir}\n",
-                    if host { "Host" } else { "RAK11161" }
+                    "scaffolded {name} project at {dir}\ntarget = {}\n",
+                    TARGET_NAMES[tgt as usize]
                 ));
-                if host {
-                    TARGET.store(0, Relaxed);
-                    console_append("target = Host (LLVM backend)\n");
-                }
                 set_project(&dir);
             }
             Err(e) => console_append(&format!("scaffold FAILED: {e}\n")),
@@ -2016,6 +2014,8 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
         add("&File/Save &As…", MOD_META | MOD_SHIFT | 's' as i32, ACT_SAVE_AS);
         add("&File/New Project/&Host Project…", 0, ACT_NEW_HOST);
         add("&File/New Project/&RAK11161 Project…", MOD_META | MOD_SHIFT | 'n' as i32, ACT_NEW_PROJECT);
+        add("&File/New Project/&STM32 Project…", 0, ACT_NEW_STM32);
+        add("&File/New Project/&ESP32 Project…", 0, ACT_NEW_ESP32);
         add("&File/New Project/Raspberry Pi &Pico Project…", 0, ACT_NEW_PICO);
         add("&File/Open &Project…", MOD_META | MOD_SHIFT | 'o' as i32, ACT_OPEN_PROJECT);
         add("&File/&Close File", MOD_META | 'w' as i32, ACT_CLOSE_FILE);
@@ -2227,6 +2227,17 @@ unsafe fn self_test() -> i32 {
         let proj_s = proj.to_string_lossy().into_owned();
         let _ = std::fs::remove_dir_all(&proj);
         check("scaffold ok", scaffold_project(&proj_s).is_ok());
+        // New Project must offer every board family the Target menu
+        // knows, each mapped to a valid default target.
+        check("new-project flavors cover STM32/ESP32/Pico/RAK/Host", {
+            let names: Vec<&str> = NEW_FLAVORS.iter().map(|f| f.0).collect();
+            ["Host", "RAK11161", "STM32", "ESP32"].iter().all(|n| names.contains(n))
+                && names.iter().any(|n| n.contains("Pico"))
+                && NEW_FLAVORS
+                    .iter()
+                    .all(|&(_, t)| (t as usize) < TARGET_NAMES.len())
+                && NEW_FLAVORS.iter().filter(|&&(_, t)| t == 0).count() == 1
+        });
         for f in [
             "src/lib.rs",
             "cpp/caller.cpp",

@@ -91,6 +91,12 @@ cargo +rustcc run --release --bin ide         # the GUI
 - **Tabs** — a tab strip above the editor (one `[ name ]` entry per
   open buffer, click to switch) plus **File ▸ Close File (⌘W)**;
   Wrap Lines moved to ⌘⇧W. Line numbers are on in the gutter.
+- **File ▸ New Project covers every board family**: Host, RAK11161,
+  **STM32**, **ESP32**, Raspberry Pi Pico. The RTOS flavors share one
+  self-contained scaffold (all cores' run scripts ship in every
+  project) and differ only in the default Target they select — so a
+  "STM32 project" can still be rebuilt for the ESP32-C2 core from the
+  Target menu without rescaffolding.
 - **Host scaffold is a real Hello World** — a `Greeter` fork class
   (virtual `excitement_level()`) + a free `greeting() -> String`
   function, a `build.rs` that links the platform C++ runtime (debug
