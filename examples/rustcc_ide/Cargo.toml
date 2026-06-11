@@ -1,0 +1,34 @@
+# Standalone manifest for the FLTK text-editor example. Lives outside
+# the workspace so its `clang`-feature dependency on cxx_importer
+# doesn't bleed into the main workspace's crate graph.
+
+[package]
+name = "rustcc_ide"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# `cargo run --bin gen_bindings --release` regenerates bindings.rs +
+# cxx_shims.cpp + libfltk_text_editor.a in target/m26-out/. This step
+# only needs libclang + FLTK installed; it does NOT need the rustcc
+# fork toolchain.
+[[bin]]
+name = "gen_bindings"
+path = "gen_bindings.rs"
+
+# `cargo +rustcc run --bin editor --release` builds + runs the actual
+# editor binary. Requires the rustcc fork rustc (for `extern "C++"`).
+[[bin]]
+name = "ide"
+path = "src/main.rs"
+
+[dependencies]
+cxx_importer = { path = "../../crates/cxx_importer", features = ["libclang", "build"] }
+rustc_abi_cxx = { path = "../../crates/rustc_abi_cxx" }
+# The generated bindings emit `::cxx::CxxBase<Base>` upcast impls for
+# imported inheritance chains, so the `editor` bin links the runtime
+# support crate. (`gen_bindings` doesn't need it, but one dep table is
+# simplest.)
+cxx = { path = "../../crates/cxx" }
+
+[workspace]
