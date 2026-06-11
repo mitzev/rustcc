@@ -138,6 +138,7 @@ jobs:
           # 1.96.0 release-tag CI LLVM is still served — skip the
           # ~90 min from-source LLVM build that exhausts free runners.
           RUSTCC_DOWNLOAD_CI_LLVM: "1"
+          CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
         run: ./fork/build.sh
 
       - name: Build the cxx_throws_native example
@@ -181,6 +182,7 @@ jobs:
       - name: Build fork rustc stage-1
         env:
           RUSTCC_DOWNLOAD_CI_LLVM: "1"
+          CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
         run: ./fork/build.sh
 
       - name: Run the subclass + member-ptr demos with g++
@@ -229,6 +231,8 @@ jobs:
                                   pkg-config libssl-dev
 
       - name: Clone rust 1.96.0 + apply fork patches
+        env:
+          CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
         run: ./fork/build.sh --apply-only
 
       - name: Build stage1 with the gcc codegen backend
@@ -279,6 +283,7 @@ jobs:
       - name: Build fork rustc stage-1
         env:
           RUSTCC_DOWNLOAD_CI_LLVM: "1"
+          CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
         run: ./fork/build.sh
 
       - name: Run the MSVC runtime smoke suite under Wine
