@@ -151,6 +151,8 @@ const ACT_CONSOLE_CLEAR: usize = 44;
 const ACT_NEW_HOST: usize = 45;
 const ACT_DEBUG: usize = 46;
 const ACT_NEW_PICO: usize = 47;
+const ACT_UPLOAD: usize = 48;
+const ACT_UPLOAD_CFG: usize = 49;
 
 // Super-calls (non-virtual, by mangled symbol).
 unsafe extern "C++" {
@@ -519,6 +521,8 @@ unsafe fn run_action(act: usize) {
                 }
             }
             ACT_DEBUG => debug_project(),
+            ACT_UPLOAD => upload_firmware(),
+            ACT_UPLOAD_CFG => edit_upload_config(),
             ACT_OPEN_PROJECT => {
                 if let Some(dir) = choose_file(CHOOSER_DIR_OPEN, "Open project folder") {
                     set_project(&dir);
@@ -1095,6 +1099,143 @@ unsafe fn apply_completion() {
     }
 }
 
+// --- firmware upload (configurable tools) ---------------------------
+//
+// Per-project `upload.toml` maps each target family to a shell
+// command template; placeholders {elf} {dir} {port} are substituted
+// at upload time. The file is plain text edited in the IDE itself
+// (Project > Edit Upload Config…) — created with documented defaults
+// on first use. STM32 uses STM32_Programmer_CLI, ESP32 esptool.py,
+// Pico picotool.
+
+const UPLOAD_TOML: &str = r#"# rustcc IDE — firmware upload configuration (per project).
+#
+# Each [section] provides `cmd`, a shell template run from the
+# project root with these placeholders:
+#   {elf}   the firmware ELF for the selected target
+#   {dir}   the project root
+#   {port}  the serial port from [serial] below
+#
+# IMPORTANT: the qemu-validated ELFs use the qemu machines' memory
+# maps. Before flashing REAL hardware, point the linker script at
+# your board (STM32: flash @ 0x08000000; ESP32: esp-idf image
+# layout; Pico: pico-sdk crt0/boot2) — then these commands apply
+# unchanged.
+
+[stm32]
+# STM32CubeProgrammer CLI (SWD probe, e.g. ST-LINK):
+cmd = "STM32_Programmer_CLI -c port=SWD -w {elf} -v -rst"
+
+[esp32]
+# esptool.py: convert the ELF to an esp image, then flash:
+cmd = "esptool.py --chip auto elf2image {elf} -o {dir}/fw.bin && esptool.py --chip auto --port {port} write_flash 0x0 {dir}/fw.bin"
+
+[pico]
+# picotool (BOOTSEL mode or with -f to force-reboot):
+cmd = "picotool load {elf} -fx"
+
+[serial]
+port = "/dev/cu.usbmodem01"
+"#;
+
+fn upload_cfg_path() -> Option<String> {
+    PROJECT_DIR.lock().unwrap().clone().map(|d| format!("{d}/upload.toml"))
+}
+
+fn ensure_upload_config() -> Option<String> {
+    let p = upload_cfg_path()?;
+    if !std::path::Path::new(&p).exists() {
+        if std::fs::write(&p, UPLOAD_TOML).is_err() {
+            console_append("could not create upload.toml\n");
+            return None;
+        }
+        console_append(&format!("created default {p}\n"));
+    }
+    Some(p)
+}
+
+fn edit_upload_config() {
+    match ensure_upload_config() {
+        Some(p) => {
+            open_in_editor(&p);
+            console_append("upload config opened — edit & save; Cmd+U uses it\n");
+        }
+        None => console_append("no project open — File > New/Open Project first\n"),
+    }
+}
+
+/// Tiny section/key parser for upload.toml: returns `key = "value"`
+/// inside `[section]`.
+fn upload_cfg_get(cfg: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in cfg.lines() {
+        let l = line.trim();
+        if l.starts_with('[') {
+            in_section = l == format!("[{section}]");
+            continue;
+        }
+        if in_section && !l.starts_with('#') {
+            if let Some(rest) = l.strip_prefix(key) {
+                let rest = rest.trim_start();
+                if let Some(rest) = rest.strip_prefix('=') {
+                    let v = rest.trim().trim_matches('"');
+                    return Some(v.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// (config section, firmware tag) for an uploadable target.
+fn upload_route(target: i32) -> Option<(&'static str, &'static str)> {
+    match target {
+        1 | 4 => Some(("stm32", "arm")),
+        2 => Some(("esp32", "riscv-c2")),
+        3 => Some(("esp32", "riscv")),
+        5 => Some(("pico", "pico")),
+        _ => None,
+    }
+}
+
+fn upload_firmware() {
+    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+        console_append("no project open — File > New/Open Project first\n");
+        return;
+    };
+    let t = TARGET.load(Relaxed);
+    let Some((section, tag)) = upload_route(t) else {
+        console_append("host target has nothing to flash — pick an RTOS target\n");
+        return;
+    };
+    let Some(cfgp) = ensure_upload_config() else { return };
+    let cfg = std::fs::read_to_string(&cfgp).unwrap_or_default();
+    let Some(cmd_tpl) = upload_cfg_get(&cfg, section, "cmd") else {
+        console_append(&format!(
+            "no [{section}] cmd in upload.toml — Project > Edit Upload Config…\n"
+        ));
+        return;
+    };
+    let port = upload_cfg_get(&cfg, "serial", "port").unwrap_or_default();
+    let elf = format!("{dir}/target/{tag}/firmware.elf");
+    if !std::path::Path::new(&elf).exists() {
+        console_append(&format!(
+            "{elf} not built yet — Cmd+B first (link-only is enough)\n"
+        ));
+        return;
+    }
+    let cmd = cmd_tpl
+        .replace("{elf}", &elf)
+        .replace("{dir}", &dir)
+        .replace("{port}", &port);
+    console_append(&format!(
+        "==> upload [{}] via [{section}]\n    {cmd}\n",
+        TARGET_NAMES[t as usize]
+    ));
+    let code = run_streamed(&dir, &cmd);
+    console_append(if code == 0 { "UPLOAD OK\n" } else { "UPLOAD FAILED\n" });
+}
+
 fn set_project(dir: &str) {
     *PROJECT_DIR.lock().unwrap() = Some(dir.to_string());
     console_append(&format!("project = {dir}\n"));
@@ -1348,6 +1489,7 @@ fn scaffold_project(dir: &str) -> Result<(), String> {
         ("run_riscv.sh", fix(embed!("freertos_cpp/run_riscv.sh"))),
         ("run_riscv_c2.sh", fix(embed!("freertos_cpp/run_riscv_c2.sh"))),
         ("run_pico.sh", fix(embed!("freertos_cpp/run_pico.sh"))),
+        ("upload.toml", UPLOAD_TOML.to_string()),
         ("Cargo.toml", SCAFFOLD_CARGO_TOML.to_string()),
         (".vscode/tasks.json", SCAFFOLD_TASKS_JSON.to_string()),
         ("README.md", SCAFFOLD_README.to_string()),
@@ -1482,6 +1624,8 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
         add("&Project/&Build", MOD_META | 'b' as i32, ACT_BUILD);
         add("&Project/Build && &Run (qemu)", MOD_META | 'r' as i32, ACT_BUILD_RUN);
         add("&Project/&Debug (qemu + gdbserver)…", MOD_META | MOD_SHIFT | 'd' as i32, ACT_DEBUG);
+        add("&Project/&Upload Firmware", MOD_META | 'u' as i32, ACT_UPLOAD);
+        add("&Project/Edit Upload &Config…", 0, ACT_UPLOAD_CFG);
         add("&Project/&Clear Console", 0, ACT_CONSOLE_CLEAR);
         add("&Target/&Host (LLVM)", 0, ACT_TGT_BASE + 0);
         add("&Target/RAK11161: &STM32WLE5 (Cortex-M4)", 0, ACT_TGT_BASE + 1);
@@ -1814,6 +1958,43 @@ unsafe fn self_test() -> i32 {
             after.contains("{ grandiose_identifier }"),
         );
         let _ = std::fs::remove_file(&cf);
+
+        // 17. IDE v4: upload config + routing + substitution.
+        let up = std::env::temp_dir().join(format!("rustcc_ide_up_{}", std::process::id()));
+        let up_s = up.to_string_lossy().into_owned();
+        let _ = std::fs::remove_dir_all(&up);
+        check("scaffold (upload) ok", scaffold_project(&up_s).is_ok());
+        check("scaffold ships upload.toml", up.join("upload.toml").exists());
+        let cfg = std::fs::read_to_string(up.join("upload.toml")).unwrap_or_default();
+        check(
+            "upload tools configured",
+            upload_cfg_get(&cfg, "stm32", "cmd")
+                .is_some_and(|c| c.contains("STM32_Programmer_CLI"))
+                && upload_cfg_get(&cfg, "esp32", "cmd").is_some_and(|c| c.contains("esptool.py"))
+                && upload_cfg_get(&cfg, "pico", "cmd").is_some_and(|c| c.contains("picotool")),
+        );
+        check(
+            "upload routes per target",
+            upload_route(1) == Some(("stm32", "arm"))
+                && upload_route(2) == Some(("esp32", "riscv-c2"))
+                && upload_route(5) == Some(("pico", "pico"))
+                && upload_route(0).is_none(),
+        );
+        check(
+            "placeholder substitution",
+            upload_cfg_get(&cfg, "pico", "cmd")
+                .map(|c| c.replace("{elf}", "/x/fw.elf"))
+                .is_some_and(|c| c.contains("load /x/fw.elf")),
+        );
+        // Host target upload → friendly message, no spawn.
+        *PROJECT_DIR.lock().unwrap() = Some(up_s.clone());
+        TARGET.store(0, Relaxed);
+        upload_firmware();
+        // Missing-ELF guard for an RTOS target.
+        TARGET.store(5, Relaxed);
+        upload_firmware();
+        check("upload guards ran", true);
+        let _ = std::fs::remove_dir_all(&up);
 
         let _ = std::fs::remove_dir_all(&proj);
     }

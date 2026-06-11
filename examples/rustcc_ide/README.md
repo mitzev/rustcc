@@ -55,6 +55,26 @@ cargo +rustcc run --release --bin ide         # the GUI
   `GDB=1` gate lives in the freertos_cpp run scripts, so scaffolded
   projects and the standalone probes share it.
 
+## v3/v4 additions
+
+- **Targets**: + STM32F4-class (Cortex-M4F) and **Raspberry Pi Pico**
+  (RP2040, Cortex-M0+ → `thumbv6m` + FreeRTOS `ARM_CM0` port, qemu
+  `mps2-an385` ISA-superset stand-in); File ▸ New Project gains a
+  Pico flavor.
+- **Local host debug** — Target=Host ⌘⇧D builds and opens `lldb` on
+  the project's own binary (no qemu anywhere).
+- **Autocompletion** — Ctrl+Space pops candidates (grammar/Rust
+  keywords + every identifier from all open buffers) next to the
+  cursor; Enter/click inserts, Escape dismisses.
+- **Firmware upload (⌘U)** with **configurable tools**: per-project
+  `upload.toml` (Project ▸ Edit Upload Config… opens/creates it)
+  maps target families to shell templates with `{elf}`/`{dir}`/
+  `{port}` placeholders — defaults: `STM32_Programmer_CLI` (STM32),
+  `esptool.py` elf2image + write_flash (ESP32), `picotool load`
+  (Pico). Output streams to the console. Caveat in the file itself:
+  the qemu-validated ELFs use the qemu machines' memory maps — point
+  the linker scripts at your board before flashing real hardware.
+
 Workflow: **File ▸ New Project ▸ RAK11161 Project…** (pick a folder) →
 edit `src/lib.rs` (a fork `class` crate: `Widget`, `Gauge : Widget`,
 imported `Sensor`, `Reader : Sensor`) → pick a core in **Target** →
