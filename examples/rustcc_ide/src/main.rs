@@ -775,8 +775,11 @@ fn run_streamed(dir: &str, cmdline: &str) -> i32 {
 fn target_cmdline(target: i32, run: bool) -> String {
     let skip = if run { "" } else { "SKIP_QEMU=1 " };
     match target {
+        // Host builds need the FORK rustc for the `class` keyword —
+        // default RUSTC exactly like the RTOS run scripts do.
         0 => format!(
-            "RUSTC_BOOTSTRAP=1 cargo +nightly {} --release 2>&1 && echo HOST-{}-OK",
+            "RUSTC=\"${{RUSTC:-$HOME/rust-1.96-migration/build/host/stage1/bin/rustc}}\" \
+             RUSTC_BOOTSTRAP=1 cargo +nightly {} --release 2>&1 && echo HOST-{}-OK",
             if run { "run" } else { "build" },
             if run { "RUN" } else { "BUILD" },
         ),
@@ -1305,7 +1308,7 @@ fn debug_project() {
                 .to_string();
             (
                 format!(
-                    "cd '{dir}' && RUSTC_BOOTSTRAP=1 cargo +nightly build --release && lldb target/release/{name}"
+                    "cd '{dir}' && RUSTC=\"${{RUSTC:-$HOME/rust-1.96-migration/build/host/stage1/bin/rustc}}\" RUSTC_BOOTSTRAP=1 cargo +nightly build --release && lldb target/release/{name}"
                 ),
                 format!("lldb drives target/release/{name} directly in the Terminal window"),
             )
@@ -1377,33 +1380,37 @@ edition = "2021"
 [workspace]
 "#;
 
-const HOST_MAIN_RS: &str = r#"// Scaffolded by the rustcc IDE (class-keyword surface) — the same
-// template the vscode-rustcc plugin's "New Project" command emits.
-// The `class` keyword is fork-only; the IDE builds with RUSTC
-// pointed at the fork stage1. Since v1.14 no feature gates or allow
-// attributes are needed.
+const HOST_MAIN_RS: &str = r#"// Hello, world — rustcc fork edition.
+//
+// An ordinary Rust program whose greeter is a C++-ABI `class` (the
+// fork's headline feature; vtable-real, zero crate-root boilerplate
+// since v1.14). Build & run: Cmd+R in the rustcc IDE, or:
+//   RUSTC=<fork-stage1>/bin/rustc cargo +nightly run --release
 
-pub class Counter {
-    n: i64,
+pub class Greeter {
+    excitement: i32,
 
-    pub constructor fn new() -> Self {
-        Counter { n: 0 }
+    pub constructor fn new(excitement: i32) -> Self {
+        Greeter { excitement }
     }
 
-    pub fn bump(&mut self, by: i64) {
-        self.n += by;
-    }
-
-    pub fn value(&self) -> i64 {
-        self.n
+    // Class methods are real C++ member functions (Itanium-mangled,
+    // virtual = vtable slot), so their signatures use C++-compatible
+    // types like i32…
+    pub virtual fn excitement_level(&self) -> i32 {
+        self.excitement
     }
 }
 
+// …while free functions live in ordinary Rust land — any types.
+fn greeting(g: &Greeter) -> String {
+    let bangs = "!".repeat(g.excitement_level().max(0) as usize);
+    format!("Hello, world{bangs}")
+}
+
 fn main() {
-    let mut c = Counter::new();
-    c.bump(41);
-    c.bump(1);
-    println!("counter = {}", c.value());
+    println!("{}", greeting(&Greeter::new(3))); // → Hello, world!!!
+    println!("{}", greeting(&Greeter::new(1))); // → Hello, world!
 }
 "#;
 
@@ -1413,14 +1420,14 @@ const HOST_TASKS_JSON: &str = r#"{
     {
       "label": "rustcc: build (host)",
       "type": "shell",
-      "command": "RUSTC_BOOTSTRAP=1 cargo +nightly build --release",
+      "command": "RUSTC=\"${RUSTC:-$HOME/rust-1.96-migration/build/host/stage1/bin/rustc}\" RUSTC_BOOTSTRAP=1 cargo +nightly build --release",
       "group": "build",
       "problemMatcher": ["$rustc"]
     },
     {
       "label": "rustcc: run (host)",
       "type": "shell",
-      "command": "RUSTC_BOOTSTRAP=1 cargo +nightly run --release",
+      "command": "RUSTC=\"${RUSTC:-$HOME/rust-1.96-migration/build/host/stage1/bin/rustc}\" RUSTC_BOOTSTRAP=1 cargo +nightly run --release",
       "group": "test"
     }
   ]
@@ -1890,7 +1897,11 @@ unsafe fn self_test() -> i32 {
             check(&format!("host file {f}"), hostp.join(f).exists());
         }
         let hm = std::fs::read_to_string(hostp.join("src/main.rs")).unwrap_or_default();
-        check("host template = plugin class surface", hm.contains("pub class Counter"));
+        check("host template = hello-world class", hm.contains("pub class Greeter") && hm.contains("Hello, world"));
+        check(
+            "host build cmd carries fork RUSTC",
+            target_cmdline(0, false).contains("RUSTC="),
+        );
         let _ = std::fs::remove_dir_all(&hostp);
 
         // 13. IDE v2: GDB gate present in the scaffolded run scripts.
