@@ -19,14 +19,22 @@ reuse — `Widget`, `Gauge : Widget`, imported `Sensor`,
 | Variant | Core | FreeRTOS port | qemu machine | Run |
 |---|---|---|---|---|
 | **STM32-class** | Cortex-M4F (`thumbv7em-none-eabihf`) | `GCC/ARM_CM4F` | `mps2-an386` | `./run_arm.sh` |
-| **ESP32-class** | rv32imac (`riscv32imac-unknown-none-elf`) | `GCC/RISC-V` + CLINT | `virt` | `./run_riscv.sh` |
+| **ESP32-C3-class** | rv32imac (`riscv32imac-unknown-none-elf`) | `GCC/RISC-V` + CLINT | `virt` | `./run_riscv.sh` |
+| **ESP32-C2-class** | rv32**imc** (`riscv32imc-unknown-none-elf`) | `GCC/RISC-V` + CLINT | `virt`, `-cpu rv32,a=false,zawrs=false` | `./run_riscv_c2.sh` |
 
-Expected output:
+Expected output (same line from each):
 
 ```
-FREERTOS CXX PROBE (ARM CM4):    PASS (105/4000/503/42 across tasks)
+FREERTOS CXX PROBE (ARM CM4):     PASS (105/4000/503/42 across tasks)
 FREERTOS CXX PROBE (RISC-V rv32): PASS (105/4000/503/42 across tasks)
 ```
+
+The C2 flavor is ISA-exact: ESP32-C2 (ESP8684) has **no atomic
+extension**, so everything — Rust `core`, the kernel, the C++ side —
+is built `rv32imc`, and qemu's CPU runs with the A extension
+*disabled*: a single stray `lr.w`/`sc.w`/`amo*` would trap instead of
+silently passing (also verified statically: `objdump` finds zero
+atomic instructions in the ELF).
 
 The four values: Rust base class virtual (105), Rust subclass override
 through an opaque base pointer (4000), Rust override of an imported
