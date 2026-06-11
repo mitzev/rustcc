@@ -128,23 +128,20 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go || true
           sudo docker image prune --all --force || true
 
-      - name: System deps (clang + C++ runtime)
+      - name: System deps (clang + C++ runtime + LLVM 21 for rustc)
         run: |
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev libc++-dev libc++abi-dev
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          sudo apt-get install -y llvm-21-dev llvm-21-tools libpolly-21-dev libzstd-dev
 
       - name: Build fork rustc stage-1
         env:
-          # 1.96.0 release-tag CI LLVM is still served — skip the
-          # ~90 min from-source LLVM build that exhausts free runners.
-          RUSTCC_DOWNLOAD_CI_LLVM: "1"
+          # System LLVM (>=21): deterministic — download-ci-llvm's
+          # commit heuristic resolves release-branch backports the
+          # artifact bucket never serves for stable-tag pins.
+          RUSTCC_LLVM_CONFIG: /usr/bin/llvm-config-21
           CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
-          # Bootstrap's CiEnv::GitHubActions path resolves HEAD^1 as
-          # "the upstream commit" — wrong for our am'd patch stack
-          # (HEAD^1 = previous fork patch). Force the local
-          # author-date-order bors lookup, which resolves the served
-          # LLVM-bump commit.
-          GITHUB_ACTIONS: "false"
         run: ./fork/build.sh
 
       - name: Build the cxx_throws_native example
@@ -180,21 +177,17 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go || true
           sudo docker image prune --all --force || true
 
-      - name: System deps (libclang for parsing; g++ for codegen)
+      - name: System deps (libclang for parsing; g++ for codegen; LLVM 21 for rustc)
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ clang libclang-dev
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          sudo apt-get install -y llvm-21-dev llvm-21-tools libpolly-21-dev libzstd-dev
 
       - name: Build fork rustc stage-1
         env:
-          RUSTCC_DOWNLOAD_CI_LLVM: "1"
+          RUSTCC_LLVM_CONFIG: /usr/bin/llvm-config-21
           CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
-          # Bootstrap's CiEnv::GitHubActions path resolves HEAD^1 as
-          # "the upstream commit" — wrong for our am'd patch stack
-          # (HEAD^1 = previous fork patch). Force the local
-          # author-date-order bors lookup, which resolves the served
-          # LLVM-bump commit.
-          GITHUB_ACTIONS: "false"
         run: ./fork/build.sh
 
       - name: Run the subclass + member-ptr demos with g++
@@ -236,11 +229,13 @@ jobs:
                       /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go || true
           sudo docker image prune --all --force || true
 
-      - name: System deps
+      - name: System deps (incl. LLVM 21 for rustc)
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ clang libclang-dev cmake ninja-build \
                                   pkg-config libssl-dev
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          sudo apt-get install -y llvm-21-dev llvm-21-tools libpolly-21-dev libzstd-dev
 
       - name: Clone rust 1.96.0 + apply fork patches
         env:
@@ -249,13 +244,12 @@ jobs:
 
       - name: Build stage1 with the gcc codegen backend
         working-directory: ../rust-lang-rust-fork
-        env:
-          GITHUB_ACTIONS: "false"   # see the build.sh steps' note
         run: |
           ./x.py build --stage 1 library \
             --set 'rust.codegen-backends=["llvm","gcc"]' \
             --set gcc.download-ci-gcc=true \
-            --set llvm.download-ci-llvm=true
+            --set llvm.download-ci-llvm=false \
+            --set target.x86_64-unknown-linux-gnu.llvm-config=/usr/bin/llvm-config-21
 
       - name: Run subclass_cpp_base under -Zcodegen-backend=gcc
         env:
@@ -291,19 +285,15 @@ jobs:
           sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y wine wine64 clang lld
+          wget -qO- https://apt.llvm.org/llvm.sh | sudo bash -s -- 21
+          sudo apt-get install -y llvm-21-dev llvm-21-tools libpolly-21-dev libzstd-dev
           cargo install xwin --locked
           xwin --accept-license splat --output ~/.xwin
 
       - name: Build fork rustc stage-1
         env:
-          RUSTCC_DOWNLOAD_CI_LLVM: "1"
+          RUSTCC_LLVM_CONFIG: /usr/bin/llvm-config-21
           CLONE_DIR: ${{ github.workspace }}/../rust-lang-rust-fork
-          # Bootstrap's CiEnv::GitHubActions path resolves HEAD^1 as
-          # "the upstream commit" — wrong for our am'd patch stack
-          # (HEAD^1 = previous fork patch). Force the local
-          # author-date-order bors lookup, which resolves the served
-          # LLVM-bump commit.
-          GITHUB_ACTIONS: "false"
         run: ./fork/build.sh
 
       - name: Run the MSVC runtime smoke suite under Wine

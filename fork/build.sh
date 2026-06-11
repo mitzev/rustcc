@@ -92,19 +92,26 @@ fi
 
 # 4. Copy the stock config template and build.
 #
-# LLVM source: by default we BUILD LLVM from source (slow but never
-# bit-rots — rust-lang CI eventually prunes download-ci-llvm
-# artifacts for old pins). For the 1.96.0 *release tag* base the CI
-# artifacts are still served (verified 2026-06): set
-# `RUSTCC_DOWNLOAD_CI_LLVM=1` to download instead — saves ~90 min and
-# most of the disk pressure on CI runners.
+# LLVM source, in priority order:
+#   1. RUSTCC_LLVM_CONFIG=<path to llvm-config>  — link a SYSTEM LLVM
+#      (>= 21; e.g. apt.llvm.org's llvm-config-21). Deterministic and
+#      fast; the right choice on CI runners.
+#   2. RUSTCC_DOWNLOAD_CI_LLVM=1 — bootstrap's download-ci-llvm.
+#      Works only when the git ancestry resolves a SERVED commit;
+#      for stable-tag pins the heuristic lands on release-branch
+#      backports the artifact bucket never carries, so don't rely on
+#      this outside trees where it's been seen to work.
+#   3. default — build LLVM from source (slow but never bit-rots).
 : "${RUSTCC_DOWNLOAD_CI_LLVM:=0}"
+: "${RUSTCC_LLVM_CONFIG:=}"
 if [[ ! -f "$CLONE_DIR/bootstrap.toml" ]]; then
   cp "$CLONE_DIR/bootstrap.example.toml" "$CLONE_DIR/bootstrap.toml"
-  python3 - "$CLONE_DIR/bootstrap.toml" "$RUSTCC_DOWNLOAD_CI_LLVM" <<'PY'
+  python3 - "$CLONE_DIR/bootstrap.toml" "$RUSTCC_DOWNLOAD_CI_LLVM" "$RUSTCC_LLVM_CONFIG" "$(uname -m)" <<'PY'
 import sys, re
 path = sys.argv[1]
 download_ci_llvm = 'true' if sys.argv[2] == '1' else 'false'
+llvm_config = sys.argv[3]
+machine = sys.argv[4]
 # Explicit UTF-8 encoding on both read + write — Python on Windows
 # defaults to cp1252 which encodes ASCII-only safely but emits
 # Latin-1 bytes for any non-ASCII character. bootstrap.py opens
@@ -125,9 +132,6 @@ if not text.endswith('\n'):
     text += '\n'
 text += (
     '\n# rustcc fork override (Rust 1.96.0 base).\n'
-    '# LLVM: from-source by default (never bit-rots); CI download\n'
-    '# opt-in via RUSTCC_DOWNLOAD_CI_LLVM=1 (release-tag artifacts\n'
-    '# are still served -- saves ~90 min on CI runners).\n'
     '# 1.96.0 is a *stable* channel, which forbids `#![feature(...)]`;\n'
     '# the fork needs `feature(rustc_attrs)`, so force the nightly\n'
     '# channel on the built toolchain.\n'
@@ -136,6 +140,14 @@ text += (
     '[rust]\n'
     'channel = "nightly"\n'
 )
+if llvm_config:
+    # System LLVM: highest priority. Only Linux triples are needed
+    # here (the CI runners); macOS/local builds use the defaults.
+    triple = machine + '-unknown-linux-gnu'
+    text += (
+        '[target.' + triple + ']\n'
+        'llvm-config = "' + llvm_config + '"\n'
+    )
 with open(path, 'w', encoding='utf-8') as f: f.write(text)
 PY
 fi
