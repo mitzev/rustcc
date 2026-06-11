@@ -57,6 +57,7 @@ static TARGET: AtomicI32 = AtomicI32::new(1);
 static PROJECT_DIR: Mutex<Option<String>> = Mutex::new(None);
 static BUILD_RUNNING: AtomicBool = AtomicBool::new(false);
 static FIND_WIN: AtomicPtr<Fl_Window> = AtomicPtr::new(core::ptr::null_mut());
+static HELP_WIN: AtomicPtr<Fl_Window> = AtomicPtr::new(core::ptr::null_mut());
 static NAV: AtomicPtr<FileNav> = AtomicPtr::new(core::ptr::null_mut());
 /// Open files: (path, Fl_Text_Buffer* as usize). One buffer per file;
 /// the single editor view switches between them (nav click / Open).
@@ -165,6 +166,8 @@ const ACT_DEBUG: usize = 46;
 const ACT_NEW_PICO: usize = 47;
 const ACT_NEW_STM32: usize = 58;
 const ACT_NEW_ESP32: usize = 59;
+const ACT_HELP: usize = 60;
+const ACT_ABOUT: usize = 61;
 const ACT_UPLOAD: usize = 48;
 const ACT_UPLOAD_CFG: usize = 49;
 const ACT_DBG_START: usize = 50;
@@ -578,6 +581,14 @@ unsafe fn run_action(act: usize) {
             ACT_NEW_STM32 => new_project_flow(2),
             ACT_NEW_ESP32 => new_project_flow(3),
             ACT_NEW_PICO => new_project_flow(4),
+            ACT_HELP => show_help_popup(),
+            ACT_ABOUT => console_append(&format!(
+                "rustcc IDE {} — fork-Rust FLTK IDE (class keyword over an \
+                 imported C++ widget chain).\nRepo: \
+                 https://github.com/mitzev/rustcc — docs: \
+                 examples/rustcc_ide/README.md (or press F1)\n",
+                env!("CARGO_PKG_VERSION")
+            )),
             ACT_DEBUG => debug_project(),
             ACT_UPLOAD => upload_firmware(),
             ACT_DBG_START => dbg_start(),
@@ -998,6 +1009,75 @@ unsafe fn nav_open_selected(nav: *mut FileNav) {
         if let Some(p) = path {
             open_in_editor(&p);
         }
+    }
+}
+
+/// Help ▸ rustcc IDE Help (F1): a lazily-built window with a
+/// read-only text view of the cheat sheet. Escape / close hides it.
+const HELP_TEXT: &str = concat!(
+    "rustcc IDE ",
+    env!("CARGO_PKG_VERSION"),
+    " — an embedded-RTOS IDE written in fork Rust\n",
+    "=========================================================\n\
+     The IDE itself is a fork-Rust program (the `class` keyword\n\
+     subclassing FLTK across an imported C++ chain). It scaffolds,\n\
+     builds, runs (qemu), debugs and flashes RTOS firmware for\n\
+     RAK11161 (STM32WLE5 + ESP8684/ESP32-C2), STM32, ESP32 and\n\
+     Raspberry Pi Pico — plus host-side fork programs.\n\
+     \n\
+     Projects\n\
+       File > New Project > Host / RAK11161 / STM32 / ESP32 / Pico\n\
+         RTOS flavors share one self-contained scaffold (every\n\
+         core's run script ships) and differ only in the default\n\
+         Target. Switch cores anytime in the Target menu.\n\
+       Cmd+B        build (link-only for RTOS targets)\n\
+       Cmd+R        build + run (qemu for RTOS, cargo run for Host)\n\
+       Cmd+U        upload firmware (tools configured in upload.toml\n\
+                    via Project > Edit Upload Config…)\n\
+       Cmd+Shift+D  Project > Debug…: RTOS targets boot qemu HALTED\n\
+                    (-s -S) and print the gdb attach command; Host\n\
+                    opens lldb in a Terminal window.\n\
+     \n\
+     In-IDE debugger (Target = Host)\n\
+       F5           start lldb session    Shift+F5  stop\n\
+       F8 / Cmd+D   toggle breakpoint (red lines; replayed live)\n\
+       F10          step over             F11       step into\n\
+       Shift+F11    step out              F9        continue\n\
+       F7           show variables\n\
+       Every stop follows in the editor — current line is amber.\n\
+     \n\
+     Editing\n\
+       Cmd+F        find (Enter = next, Escape = close)\n\
+       Ctrl+Space   autocomplete (keywords + open-buffer symbols)\n\
+       Cmd+W        close file        Cmd+Shift+W  wrap lines\n\
+       Cmd+= / -    font size\n\
+       Tabs above the editor switch open files; the left sidebar\n\
+       lists and opens project files.\n\
+     \n\
+     More: examples/rustcc_ide/README.md\n\
+     Repo: https://github.com/mitzev/rustcc\n"
+);
+
+fn show_help_popup() {
+    unsafe {
+        let mut w = HELP_WIN.load(Relaxed);
+        if w.is_null() {
+            w = cxx_operator_new(core::mem::size_of::<Fl_Window>()) as *mut Fl_Window;
+            Fl_Window::new_at(w, 640, 560, c"rustcc IDE — Help".as_ptr());
+            let hb = cxx_operator_new(core::mem::size_of::<Fl_Text_Buffer>())
+                as *mut Fl_Text_Buffer;
+            Fl_Text_Buffer::new_at(hb, 0, 1024);
+            (*hb).text_const_i8_str(HELP_TEXT);
+            let d = cxx_operator_new(core::mem::size_of::<Fl_Text_Display>())
+                as *mut Fl_Text_Display;
+            Fl_Text_Display::new_at(d, 10, 10, 620, 540, c"".as_ptr());
+            (*d).buffer(hb);
+            (*d).textsize_i32(12);
+            (*w).as_fl_group_mut().end();
+            (*w).as_fl_group_mut().add(d as *mut Fl_Widget);
+            HELP_WIN.store(w, Relaxed);
+        }
+        (*(w as *mut Fl_Widget)).show();
     }
 }
 
@@ -1996,61 +2076,64 @@ work needs hardware or vendor simulators.
 // UI assembly
 // ------------------------------------------------------------------
 
+/// The whole menu as data: (path, shortcut, action). FLTK treats
+/// EVERY '/' in the path as a submenu separator — a slash inside a
+/// label like "(qemu/lldb)" silently splits into a bogus submenu, so
+/// the self-test rejects any '/' between parentheses.
+const MENU_SPEC: &[(&str, i32, usize)] = &[
+    ("&File/&New File", MOD_META | 'n' as i32, ACT_NEW),
+    ("&File/&Open File…", MOD_META | 'o' as i32, ACT_OPEN),
+    ("&File/&Save", MOD_META | 's' as i32, ACT_SAVE),
+    ("&File/Save &As…", MOD_META | MOD_SHIFT | 's' as i32, ACT_SAVE_AS),
+    ("&File/New Project/&Host Project…", 0, ACT_NEW_HOST),
+    ("&File/New Project/&RAK11161 Project…", MOD_META | MOD_SHIFT | 'n' as i32, ACT_NEW_PROJECT),
+    ("&File/New Project/&STM32 Project…", 0, ACT_NEW_STM32),
+    ("&File/New Project/&ESP32 Project…", 0, ACT_NEW_ESP32),
+    ("&File/New Project/Raspberry Pi &Pico Project…", 0, ACT_NEW_PICO),
+    ("&File/Open &Project…", MOD_META | MOD_SHIFT | 'o' as i32, ACT_OPEN_PROJECT),
+    ("&File/&Close File", MOD_META | 'w' as i32, ACT_CLOSE_FILE),
+    ("&File/&Quit", MOD_META | 'q' as i32, ACT_QUIT),
+    ("&Edit/&Undo", MOD_META | 'z' as i32, ACT_UNDO),
+    ("&Edit/&Redo", MOD_META | MOD_SHIFT | 'z' as i32, ACT_REDO),
+    ("&Edit/Cu&t", MOD_META | 'x' as i32, ACT_CUT),
+    ("&Edit/&Copy", MOD_META | 'c' as i32, ACT_COPY),
+    ("&Edit/&Paste", MOD_META | 'v' as i32, ACT_PASTE),
+    ("&Edit/Select &All", MOD_META | 'a' as i32, ACT_SELECT_ALL),
+    ("&Edit/&Find…", MOD_META | 'f' as i32, ACT_FIND),
+    ("F&ormat/&Wrap Lines", MOD_META | MOD_SHIFT | 'w' as i32, ACT_WRAP),
+    ("F&ormat/Bigger", MOD_META | '=' as i32, ACT_FONT_UP),
+    ("F&ormat/Smaller", MOD_META | '-' as i32, ACT_FONT_DOWN),
+    // --- IDE menus ---
+    ("&Project/&Build", MOD_META | 'b' as i32, ACT_BUILD),
+    ("&Project/Build && &Run", MOD_META | 'r' as i32, ACT_BUILD_RUN),
+    ("&Project/&Debug…", MOD_META | MOD_SHIFT | 'd' as i32, ACT_DEBUG),
+    ("&Project/&Upload Firmware", MOD_META | 'u' as i32, ACT_UPLOAD),
+    ("&Project/Edit Upload Co&nfig…", 0, ACT_UPLOAD_CFG),
+    ("&Project/&Clear Console", 0, ACT_CONSOLE_CLEAR),
+    ("&Debug/&Start Session", KEY_F + 5, ACT_DBG_START),
+    ("&Debug/Toggle &Breakpoint @ cursor", KEY_F + 8, ACT_DBG_BREAKPOINT),
+    ("&Debug/Step &Over", KEY_F + 10, ACT_DBG_STEP_OVER),
+    ("&Debug/Step &Into", KEY_F + 11, ACT_DBG_STEP_IN),
+    ("&Debug/Step Ou&t", MOD_SHIFT | (KEY_F + 11), ACT_DBG_STEP_OUT),
+    ("&Debug/&Continue", KEY_F + 9, ACT_DBG_CONTINUE),
+    ("&Debug/Show &Variables", KEY_F + 7, ACT_DBG_VARS),
+    ("&Debug/Sto&p Session", MOD_SHIFT | (KEY_F + 5), ACT_DBG_STOP),
+    ("&Target/&Host (LLVM)", 0, ACT_TGT_BASE),
+    ("&Target/RAK11161: &STM32WLE5 (Cortex-M4)", 0, ACT_TGT_BASE + 1),
+    ("&Target/RAK11161: &ESP8684 (ESP32-C2, rv32imc)", 0, ACT_TGT_BASE + 2),
+    ("&Target/ESP32-&C3-class (rv32imac)", 0, ACT_TGT_BASE + 3),
+    ("&Target/STM32&F4-class (Cortex-M4F)", 0, ACT_TGT_BASE + 4),
+    ("&Target/Raspberry Pi &Pico (RP2040)", 0, ACT_TGT_BASE + 5),
+    ("&Help/rustcc IDE &Help…", KEY_F + 1, ACT_HELP),
+    ("&Help/&About rustcc IDE", 0, ACT_ABOUT),
+];
+
 unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
     unsafe {
         let m = (*bar).as_fl_menu__mut();
-        let mut add = |label: &str, shortcut: i32, act: usize| {
-            m.add(
-                cstr(label).as_ptr(),
-                shortcut,
-                Some(menu_cb),
-                act as *mut (),
-                0,
-            );
-        };
-        add("&File/&New File", MOD_META | 'n' as i32, ACT_NEW);
-        add("&File/&Open File…", MOD_META | 'o' as i32, ACT_OPEN);
-        add("&File/&Save", MOD_META | 's' as i32, ACT_SAVE);
-        add("&File/Save &As…", MOD_META | MOD_SHIFT | 's' as i32, ACT_SAVE_AS);
-        add("&File/New Project/&Host Project…", 0, ACT_NEW_HOST);
-        add("&File/New Project/&RAK11161 Project…", MOD_META | MOD_SHIFT | 'n' as i32, ACT_NEW_PROJECT);
-        add("&File/New Project/&STM32 Project…", 0, ACT_NEW_STM32);
-        add("&File/New Project/&ESP32 Project…", 0, ACT_NEW_ESP32);
-        add("&File/New Project/Raspberry Pi &Pico Project…", 0, ACT_NEW_PICO);
-        add("&File/Open &Project…", MOD_META | MOD_SHIFT | 'o' as i32, ACT_OPEN_PROJECT);
-        add("&File/&Close File", MOD_META | 'w' as i32, ACT_CLOSE_FILE);
-        add("&File/&Quit", MOD_META | 'q' as i32, ACT_QUIT);
-        add("&Edit/&Undo", MOD_META | 'z' as i32, ACT_UNDO);
-        add("&Edit/&Redo", MOD_META | MOD_SHIFT | 'z' as i32, ACT_REDO);
-        add("&Edit/Cu&t", MOD_META | 'x' as i32, ACT_CUT);
-        add("&Edit/&Copy", MOD_META | 'c' as i32, ACT_COPY);
-        add("&Edit/&Paste", MOD_META | 'v' as i32, ACT_PASTE);
-        add("&Edit/Select &All", MOD_META | 'a' as i32, ACT_SELECT_ALL);
-        add("&Edit/&Find…", MOD_META | 'f' as i32, ACT_FIND);
-        add("F&ormat/&Wrap Lines", MOD_META | MOD_SHIFT | 'w' as i32, ACT_WRAP);
-        add("F&ormat/Bigger", MOD_META | '=' as i32, ACT_FONT_UP);
-        add("F&ormat/Smaller", MOD_META | '-' as i32, ACT_FONT_DOWN);
-        // --- IDE menus ---
-        add("&Project/&Build", MOD_META | 'b' as i32, ACT_BUILD);
-        add("&Project/Build && &Run (qemu)", MOD_META | 'r' as i32, ACT_BUILD_RUN);
-        add("&Project/&Debug in Terminal (qemu/lldb)…", MOD_META | MOD_SHIFT | 'd' as i32, ACT_DEBUG);
-        add("&Debug/&Start Session (host, lldb)", KEY_F + 5, ACT_DBG_START);
-        add("&Debug/Toggle &Breakpoint @ cursor", KEY_F + 8, ACT_DBG_BREAKPOINT);
-        add("&Debug/Step &Over", KEY_F + 10, ACT_DBG_STEP_OVER);
-        add("&Debug/Step &Into", KEY_F + 11, ACT_DBG_STEP_IN);
-        add("&Debug/Step Ou&t", MOD_SHIFT | (KEY_F + 11), ACT_DBG_STEP_OUT);
-        add("&Debug/&Continue", KEY_F + 9, ACT_DBG_CONTINUE);
-        add("&Debug/Show &Variables", KEY_F + 7, ACT_DBG_VARS);
-        add("&Debug/Sto&p Session", MOD_SHIFT | (KEY_F + 5), ACT_DBG_STOP);
-        add("&Project/&Upload Firmware", MOD_META | 'u' as i32, ACT_UPLOAD);
-        add("&Project/Edit Upload &Config…", 0, ACT_UPLOAD_CFG);
-        add("&Project/&Clear Console", 0, ACT_CONSOLE_CLEAR);
-        add("&Target/&Host (LLVM)", 0, ACT_TGT_BASE + 0);
-        add("&Target/RAK11161: &STM32WLE5 (Cortex-M4)", 0, ACT_TGT_BASE + 1);
-        add("&Target/RAK11161: &ESP8684 (ESP32-C2, rv32imc)", 0, ACT_TGT_BASE + 2);
-        add("&Target/ESP32-&C3-class (rv32imac)", 0, ACT_TGT_BASE + 3);
-        add("&Target/STM32&F4-class (Cortex-M4F)", 0, ACT_TGT_BASE + 4);
-        add("&Target/Raspberry Pi &Pico (RP2040)", 0, ACT_TGT_BASE + 5);
+        for &(label, shortcut, act) in MENU_SPEC {
+            m.add(cstr(label).as_ptr(), shortcut, Some(menu_cb), act as *mut (), 0);
+        }
     }
 }
 
@@ -2227,6 +2310,39 @@ unsafe fn self_test() -> i32 {
         let proj_s = proj.to_string_lossy().into_owned();
         let _ = std::fs::remove_dir_all(&proj);
         check("scaffold ok", scaffold_project(&proj_s).is_ok());
+        // Menu invariants: FLTK splits labels at EVERY '/', so a
+        // slash inside a parenthesized label (e.g. "(qemu/lldb)")
+        // silently becomes a bogus submenu — reject it. Also pin the
+        // Help menu + a slash-free Project ▸ Debug… leaf.
+        check("menu labels: no '/' inside parentheses", {
+            MENU_SPEC.iter().all(|&(label, _, _)| {
+                let mut depth = 0i32;
+                label.chars().all(|c| match c {
+                    '(' => {
+                        depth += 1;
+                        true
+                    }
+                    ')' => {
+                        depth -= 1;
+                        true
+                    }
+                    '/' => depth == 0,
+                    _ => true,
+                })
+            })
+        });
+        check(
+            "menu: Help present, Project Debug is short",
+            MENU_SPEC.iter().any(|&(l, _, a)| l.starts_with("&Help/") && a == ACT_HELP)
+                && MENU_SPEC.iter().any(|&(l, _, a)| a == ACT_ABOUT && l.starts_with("&Help/"))
+                && MENU_SPEC.iter().any(|&(l, _, a)| a == ACT_DEBUG && l == "&Project/&Debug…"),
+        );
+        check(
+            "help text covers projects/debugger/editing bindings",
+            ["Cmd+B", "Cmd+R", "Cmd+U", "F5", "F8", "F10", "Ctrl+Space", "Cmd+W"]
+                .iter()
+                .all(|n| HELP_TEXT.contains(n)),
+        );
         // New Project must offer every board family the Target menu
         // knows, each mapped to a valid default target.
         check("new-project flavors cover STM32/ESP32/Pico/RAK/Host", {

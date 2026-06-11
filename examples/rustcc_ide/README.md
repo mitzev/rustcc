@@ -97,6 +97,13 @@ cargo +rustcc run --release --bin ide         # the GUI
   project) and differ only in the default Target they select — so a
   "STM32 project" can still be rebuilt for the ESP32-C2 core from the
   Target menu without rescaffolding.
+- **Help menu** — *rustcc IDE Help… (F1)* opens a cheat-sheet window
+  (projects/targets, debugger keys, editing keys); *About* prints
+  version + links to the console. The whole menu is now a `MENU_SPEC`
+  const table, and the self-test rejects any label with a `/` inside
+  parentheses — FLTK treats every slash as a submenu separator, which
+  is how *Project ▸ Debug in Terminal (qemu/lldb)…* used to render as
+  a broken nested submenu (now just *Project ▸ Debug…*, ⌘⇧D).
 - **Host scaffold is a real Hello World** — a `Greeter` fork class
   (virtual `excitement_level()`) + a free `greeting() -> String`
   function, a `build.rs` that links the platform C++ runtime (debug
