@@ -1,0 +1,16 @@
+# FreeRTOS C++ interop probe — the Rust side is the SAME proven
+# class/subclass/imported-base crate as examples/bare_metal_arm
+# (single source of truth); only the scheduler glue differs.
+[workspace]
+
+[package]
+name = "freertos_cpp"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "../bare_metal_arm/src/lib.rs"
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"

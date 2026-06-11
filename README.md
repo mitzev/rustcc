@@ -12,9 +12,15 @@ the fork links directly against Clang-compiled C++ and
 constructors, destructors, single inheritance, `dynamic_cast`, ARC,
 and Swift value-witness tables.
 
-> **Status — v1.14.0 (current).** v1 shipped 2026-04-21; the feature
-> matrix below is the cumulative state of the v1.0x–v1.14x line, on a
-> **Rust 1.96.0 stable** base. Supported hosts: x86_64/aarch64 Linux &
+> **Status — v1.14.0 (released); `main` carries v1.15 development.**
+> v1 shipped 2026-04-21; the feature matrix below is the cumulative
+> state of the v1.0x–v1.15x line, on a **Rust 1.96.0 stable** base.
+> New since the v1.14.0 tag (patches 0047–0049): the **GCC codegen
+> backend** — `rustc -Zcodegen-backend=gcc` (libgccjit) emits the full
+> Itanium class machinery (vtables/RTTI, ctor vptr install, virtual
+> dtors, `cxx_throws` catch-all + typed), giving a pure-GCC pipeline
+> (GCC-compiled Rust + g++ C++); plus first-class g++/libstdc++ on
+> Linux for the C++ side, with CI legs for both. Supported hosts: x86_64/aarch64 Linux &
 > macOS, x86_64/aarch64 Windows MSVC, i686 Linux, and bare-metal ARM
 > Cortex-M. Major additions since v1: the full `cxx_importer` C++→Rust
 > binding generator, the Windows MSVC C++ ABI, C++ exception catching
@@ -70,6 +76,8 @@ Cumulative across the v1.0x–v1.14x line. Everything below is shipped.
 | **Zero-boilerplate crate roots** | fork attrs are ungated built-ins — no `#![feature(rustc_attrs)]` / `allow(internal_features)` / `allow(dead_code)` (v1.14) |
 | **Construct-in-place** | the `cxx_ctor_inplace` MIR pass builds class values at their final address (write-dest fold, `__base` de-aggregation, importer-`new` sret rewrite) — C++ ctors that escape `this` are safe with no fix-ups (v1.14) |
 | **Member function pointers** | `CxxMemberFnPtr<T>` — Itanium `{ptr, adj}` pair, `M<class>F…E` mangling, by-value ABI parity with clang; virtual + null member ptrs (v1.14) |
+| **GCC codegen backend** | `-Zcodegen-backend=gcc` (libgccjit): vtables/RTTI via top-level-asm weak linkage, ctor vptr install, deleting-dtor thunks, `cxx_throws` catch-all + typed (runtime typeinfo matcher replaces `llvm.eh.typeid.for`) — pure-GCC pipeline validated against g++ (v1.15-dev) |
+| **g++/libstdc++ first-class (C++ side)** | toolchain-aware test harnesses + demo scripts honor `$CXX`; throws interop against libstdc++; dedicated CI legs (v1.15-dev) |
 
 ### C++ — binding generation & interop
 
