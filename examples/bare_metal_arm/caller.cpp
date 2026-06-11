@@ -25,3 +25,14 @@ extern "C" int demo(int v) {
     Widget* w = new (storage) Widget(v);   // references _ZN6WidgetC1Ei
     return (int)w->foo();                  // virtual dispatch through vtable
 }
+
+// Rust factory: constructs a DERIVED Rust class (Gauge : Widget) in
+// static storage and returns it upcast to the base. g++ cannot see
+// the dynamic type, so the call below is a genuine indirect dispatch
+// through the vtable — it must land in Rust's `override fn foo`.
+extern "C" Widget* init_gauge(int32_t v, int32_t scale);
+
+extern "C" int demo_subclass(int v, int scale) {
+    Widget* w = init_gauge(v, scale);
+    return (int)w->foo();                  // expects the Gauge override
+}

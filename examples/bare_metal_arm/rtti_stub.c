@@ -8,3 +8,8 @@
 
 __attribute__((weak))
 void* _ZTVN10__cxxabiv117__class_type_infoE[4] = { 0 };
+
+// Same for __si_class_type_info — referenced by the _ZTI of a
+// DERIVED class (single inheritance chains base typeinfo through it).
+__attribute__((weak))
+void* _ZTVN10__cxxabiv120__si_class_type_infoE[4] = { 0 };

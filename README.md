@@ -227,16 +227,29 @@ produces the exact Itanium symbol Clang emits on the C++ side.
 ### A polymorphic class defined in Rust, called from C++
 
 ```rust
-// widget.rs — no crate-root attributes needed (v1.14+)
+// widget.rs — no crate-root attributes needed (v1.14+). The
+// `constructor` / `virtual` / `override` method-modifier keywords are
+// the idiomatic surface; the attribute spellings (`#[constructor]`,
+// `#[cpp_virtual]`) remain equivalent.
 
 pub class Widget {
     v: i32,
 
-    #[constructor]
-    pub fn new(v: i32) -> Self { Widget { v } }
+    pub constructor fn new(v: i32) -> Self { Widget { v } }
 
-    #[cpp_virtual]
-    pub fn foo(&self) -> i32 { self.v + 100 }
+    pub virtual fn foo(&self) -> i32 { self.v + 100 }
+}
+
+// Single inheritance: `Gauge` shares Widget's vptr at offset 0; C++
+// calling foo() through a Widget* lands in the Rust override.
+pub class Gauge : Widget {
+    scale: i32,
+
+    pub constructor fn new(v: i32, scale: i32) -> Self {
+        Self { __base: Widget::new(v), scale }
+    }
+
+    pub override fn foo(&self) -> i32 { self.scale * 1000 }
 }
 
 #[unsafe(no_mangle)]

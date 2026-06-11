@@ -1,8 +1,10 @@
 # bare_metal_arm
 
-Polymorphic Rust class on bare-metal ARM Cortex-M — `#![no_std]`,
-no heap, static storage. Demonstrates that the fork's C++-ABI code
-path works unchanged on 32-bit ARM (P09.35 target-awareness + P09.36).
+Polymorphic Rust classes — **including a Rust subclass** — on
+bare-metal ARM Cortex-M: `#![no_std]`, no heap, static storage,
+**executed under qemu**. Demonstrates that the fork's C++-ABI code
+path works unchanged on 32-bit ARM (P09.35 target-awareness + P09.36),
+using the `constructor` / `virtual` / `override` keyword surface.
 
 ## What this proves
 
@@ -13,6 +15,9 @@ path works unchanged on 32-bit ARM (P09.35 target-awareness + P09.36).
 | Calling convention: Rust sret+void return matches GCC call site | ✓ |
 | Vtable shape `{ i32, ptr, ptr }` with 4-byte slots | ✓ |
 | Vptr address-point offset `i32 8` (2 × 4 bytes) | ✓ |
+| **Subclassing** `Gauge : Widget` (shared vptr, override by slot) heap-free | ✓ executed |
+| C++ `Widget*` indirect dispatch (`ldr vptr; ldr slot; bx`) lands in the Rust `override fn` | ✓ executed |
+| Runs on emulated Cortex-M4 (qemu `mps2-an386`, semihosting) | ✓ `PASS (demo=105 subclass=4000)` |
 
 ## Prerequisites
 
@@ -22,6 +27,7 @@ path works unchanged on 32-bit ARM (P09.35 target-awareness + P09.36).
 - `thumbv7em-none-eabihf` std — build via `./x.py build --stage 1
   library --target thumbv7em-none-eabihf`, or use
   `-Zbuild-std=core,compiler_builtins` with a nightly cargo driver.
+- For the runtime test: `qemu-system-arm` (`brew install qemu`).
 
 ## Build
 
@@ -41,21 +47,40 @@ arm-none-eabi-g++ -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 \
     -mfloat-abi=hard -O2 -ffreestanding -fno-exceptions -fno-rtti \
     -c caller.cpp -o caller.o
 
-# RTTI stub (3 lines; satisfies libc++abi symbol without pulling
-# in libsupc++). Omit if you link libsupc++-nano and want real
-# typeid / dynamic_cast.
-arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -c rtti_stub.c -o rtti_stub.o
+# RTTI stubs (weak __class_type_info / __si_class_type_info vtables;
+# satisfy libc++abi symbols without pulling in libsupc++). Omit if
+# you link libsupc++-nano and want real typeid / dynamic_cast.
+arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 \
+    -mfloat-abi=hard -c rtti_stub.c -o rtti_stub.o
 
-# Partial-relocatable link — combine into a single firmware blob.
-arm-none-eabi-ld -r \
-    caller.o rtti_stub.o \
+# Freestanding runner (vector table + .data/.bss init + semihosting):
+arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 \
+    -mfloat-abi=hard -O2 -ffreestanding -c runner.c -o runner.o
+
+# Full firmware ELF for qemu's mps2-an386 (Cortex-M4):
+arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 \
+    -mfloat-abi=hard -nostartfiles -nostdlib -T link.ld \
+    runner.o caller.o rtti_stub.o \
     target/thumbv7em-none-eabihf/release/libbare_metal_arm.a \
-    -o firmware.o
+    -lgcc -o firmware.elf
+
+# Execute on an emulated Cortex-M4:
+qemu-system-arm -M mps2-an386 -nographic -semihosting -kernel firmware.elf
+# -> BARE-METAL SUBCLASS: PASS (demo=105 subclass=4000), exit 0
 ```
 
-Inspect with `arm-none-eabi-objdump -d firmware.o | grep -A8 foo` —
-you should see a single-instruction load of the vtable pointer
-followed by a tail-call through slot 0.
+`demo` placement-news the Rust base `Widget` from C++ and virtual-calls
+`foo()` (g++ devirtualizes to the direct `_ZNK6Widget3fooEv`). 
+`demo_subclass` receives an opaque `Widget*` from the Rust factory
+`init_gauge` — which constructed a `Gauge : Widget` in **static
+storage** (no heap) — so g++ must dispatch indirectly:
+
+```text
+bl   init_gauge      ; r0 = Widget* (really a Gauge)
+ldr  r3, [r0, #0]    ; load vptr
+ldr  r3, [r3, #0]    ; load slot 0 (foo)
+bx   r3              ; lands in Rust's `override fn foo`
+```
 
 ## Supported targets
 
