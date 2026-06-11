@@ -68,7 +68,7 @@ static void prvReportTask(void* params) {
             sh_exit(3);
         }
     }
-    sh_write0("FREERTOS CXX PROBE (ARM CM4): PASS "
+    sh_write0("FREERTOS CXX PROBE (ARM Cortex-M): PASS "
               "(105/4000/503/42 across tasks)\n");
     sh_exit(0);
 }

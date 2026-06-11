@@ -32,6 +32,7 @@ INC="-I. -Ilibc_stub -I$K/include -I$PORT \
      -I$PORT/chip_specific_extensions/RISCV_MTIME_CLINT_no_extensions"
 
 mkdir -p "target/$RV_TAG"
+rm -f "target/$RV_TAG"/*.o
 
 echo "==> Rust staticlib (fork rustc, $RV_TARGET)"
 RUSTC="$RUSTC" RUSTC_BOOTSTRAP=1 cargo +nightly build --release \

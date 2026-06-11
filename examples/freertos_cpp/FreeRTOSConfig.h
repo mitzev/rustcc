@@ -36,6 +36,12 @@
 #define configGENERATE_RUN_TIME_STATS           0
 #define configUSE_TIMERS                        0
 #define configUSE_TASK_NOTIFICATIONS            1
+/* ARM_CM0 port (Raspberry Pi Pico flavor) requires these to be
+ * stated explicitly; no MPU, no TrustZone on RP2040. */
+#define configENABLE_MPU                        0
+#define configENABLE_TRUSTZONE                  0
+#define configENABLE_FPU                        0
+#define configRUN_FREERTOS_SECURE_ONLY          0
 
 /* No coroutines. */
 #define configUSE_CO_ROUTINES                   0

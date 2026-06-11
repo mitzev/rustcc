@@ -51,7 +51,8 @@ static STYLE_BUF: AtomicPtr<Fl_Text_Buffer> = AtomicPtr::new(core::ptr::null_mut
 static CONSOLE: AtomicPtr<Fl_Text_Display> = AtomicPtr::new(core::ptr::null_mut());
 static CONSOLE_BUF: AtomicPtr<Fl_Text_Buffer> = AtomicPtr::new(core::ptr::null_mut());
 /// 0 = host, 1 = RAK11161/STM32WLE5 (CM4), 2 = RAK11161/ESP8684
-/// (ESP32-C2, rv32imc), 3 = ESP32-C3-class (rv32imac).
+/// (ESP32-C2, rv32imc), 3 = ESP32-C3-class (rv32imac),
+/// 4 = STM32F4-class (CM4F), 5 = Raspberry Pi Pico (RP2040, CM0+).
 static TARGET: AtomicI32 = AtomicI32::new(1);
 static PROJECT_DIR: Mutex<Option<String>> = Mutex::new(None);
 static BUILD_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -65,12 +66,19 @@ static NAV_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// VSCode extension's TextMate grammar (single source of truth) plus
 /// the core Rust keyword set.
 static KEYWORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+// Autocompletion popup state.
+static COMPLETE_WIN: AtomicPtr<Fl_Window> = AtomicPtr::new(core::ptr::null_mut());
+static COMPLETE_LIST: AtomicPtr<CompleteList> = AtomicPtr::new(core::ptr::null_mut());
+static COMPLETE_ITEMS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static COMPLETE_START: AtomicI32 = AtomicI32::new(-1);
 
-const TARGET_NAMES: [&str; 4] = [
+const TARGET_NAMES: [&str; 6] = [
     "Host (LLVM backend)",
     "RAK11161 — STM32WLE5 core (Cortex-M4, FreeRTOS, qemu mps2)",
     "RAK11161 — ESP8684 / ESP32-C2 (rv32imc, FreeRTOS, qemu virt)",
     "ESP32-C3-class (rv32imac, FreeRTOS, qemu virt)",
+    "STM32F4-class (Cortex-M4F, FreeRTOS, qemu mps2)",
+    "Raspberry Pi Pico (RP2040, Cortex-M0+, FreeRTOS, qemu mps2)",
 ];
 
 /// repr(C) twin of `Fl_Text_Display_Style_Table_Entry` (the nested
@@ -134,7 +142,7 @@ const ACT_WRAP: usize = 20;
 const ACT_FONT_UP: usize = 21;
 const ACT_FONT_DOWN: usize = 22;
 // IDE actions.
-const ACT_TGT_BASE: usize = 30; // 30..=33 → TARGET 0..=3
+const ACT_TGT_BASE: usize = 30; // 30..=35 → TARGET 0..=5
 const ACT_NEW_PROJECT: usize = 40;
 const ACT_OPEN_PROJECT: usize = 41;
 const ACT_BUILD: usize = 42;
@@ -142,6 +150,7 @@ const ACT_BUILD_RUN: usize = 43;
 const ACT_CONSOLE_CLEAR: usize = 44;
 const ACT_NEW_HOST: usize = 45;
 const ACT_DEBUG: usize = 46;
+const ACT_NEW_PICO: usize = 47;
 
 // Super-calls (non-virtual, by mangled symbol).
 unsafe extern "C++" {
@@ -180,6 +189,10 @@ pub class RustEditor : Fl_Text_Editor {
             let cmd = Fl::event_state() & (MOD_CTRL | MOD_META) != 0;
             if cmd && key as u8 == b'd' {
                 unsafe { duplicate_current_line(this) };
+                return 1;
+            }
+            if key == ' ' as i32 && Fl::event_state() & MOD_CTRL != 0 {
+                unsafe { show_completions() };
                 return 1;
             }
         }
@@ -250,6 +263,41 @@ pub class FileNav : Fl_Hold_Browser {
         let r = unsafe { base_browser_handle(this, ev) };
         if ev == EV_RELEASE {
             unsafe { nav_open_selected(self as *const Self as *mut FileNav) };
+        }
+        r
+    }
+}
+
+// ------------------------------------------------------------------
+// Autocompletion list: fourth browser-chain subclass. Enter or a
+// click applies the selected completion; Escape dismisses.
+// ------------------------------------------------------------------
+pub class CompleteList : Fl_Hold_Browser {
+    pad: i32,
+
+    pub constructor fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+        CompleteList {
+            __base: Fl_Hold_Browser::new(x, y, w, h, ::core::ptr::null()),
+            pad: 0,
+        }
+    }
+
+    pub override fn handle(&self, ev: i32) -> i32 {
+        if ev == EV_KEYDOWN {
+            let k = Fl::event_key();
+            if k == KEY_ENTER {
+                unsafe { apply_completion() };
+                return 1;
+            }
+            if k == KEY_ESCAPE {
+                hide_completions();
+                return 1;
+            }
+        }
+        let this = self as *const Self as *mut Fl_Browser_;
+        let r = unsafe { base_browser_handle(this, ev) };
+        if ev == EV_RELEASE {
+            unsafe { apply_completion() };
         }
         r
     }
@@ -447,13 +495,29 @@ unsafe fn run_action(act: usize) {
             ACT_FONT_UP => bump_textsize(ed as *mut Fl_Text_Editor, 2),
             ACT_FONT_DOWN => bump_textsize(ed as *mut Fl_Text_Editor, -2),
             // --- IDE actions ---
-            a if (ACT_TGT_BASE..ACT_TGT_BASE + 4).contains(&a) => {
+            a if (ACT_TGT_BASE..ACT_TGT_BASE + 6).contains(&a) => {
                 let t = (a - ACT_TGT_BASE) as i32;
                 TARGET.store(t, Relaxed);
                 console_append(&format!("target = {}\n", TARGET_NAMES[t as usize]));
             }
             ACT_NEW_PROJECT => new_project_flow(false),
             ACT_NEW_HOST => new_project_flow(true),
+            ACT_NEW_PICO => {
+                if let Some(dir) =
+                    choose_file(CHOOSER_DIR_NEW, "New Raspberry Pi Pico project folder")
+                {
+                    match scaffold_project(&dir) {
+                        Ok(()) => {
+                            TARGET.store(5, Relaxed);
+                            console_append(
+                                "scaffolded Pico-ready RTOS project; target = Raspberry Pi Pico\n",
+                            );
+                            set_project(&dir);
+                        }
+                        Err(e) => console_append(&format!("scaffold FAILED: {e}\n")),
+                    }
+                }
+            }
             ACT_DEBUG => debug_project(),
             ACT_OPEN_PROJECT => {
                 if let Some(dir) = choose_file(CHOOSER_DIR_OPEN, "Open project folder") {
@@ -712,8 +776,9 @@ fn target_cmdline(target: i32, run: bool) -> String {
             if run { "run" } else { "build" },
             if run { "RUN" } else { "BUILD" },
         ),
-        1 => format!("{skip}./run_arm.sh"),
+        1 | 4 => format!("{skip}./run_arm.sh"),
         2 => format!("{skip}./run_riscv_c2.sh"),
+        5 => format!("{skip}./run_pico.sh"),
         _ => format!("{skip}./run_riscv.sh"),
     }
 }
@@ -881,6 +946,155 @@ fn show_find_popup() {
     }
 }
 
+/// Word-based autocompletion: candidates = grammar/Rust keyword set
+/// plus every identifier (len > 2) in every OPEN buffer — so project
+/// symbols (class names, fns, fields) complete as soon as their file
+/// is open. Triggered with Ctrl+Space; Enter/click inserts, Escape
+/// dismisses.
+unsafe fn show_completions() {
+    unsafe {
+        let buf = BUF.load(Relaxed);
+        let ed = ED.load(Relaxed);
+        if buf.is_null() || ed.is_null() {
+            return;
+        }
+        let disp = ed as *mut Fl_Text_Display;
+        let pos = (*disp).insert_position_ovl();
+        let raw = (*buf).text();
+        if raw.is_null() {
+            return;
+        }
+        let text = CStr::from_ptr(raw).to_string_lossy().into_owned();
+        libc_free(raw as *mut ::core::ffi::c_void);
+        let b = text.as_bytes();
+        let mut start = pos as usize;
+        while start > 0
+            && start <= b.len()
+            && (b[start - 1].is_ascii_alphanumeric() || b[start - 1] == b'_')
+        {
+            start -= 1;
+        }
+        let prefix = &text[start..pos as usize];
+        if prefix.is_empty() {
+            console_append("completion: type a word prefix first\n");
+            return;
+        }
+
+        // Harvest candidates.
+        let mut cands: Vec<String> = Vec::new();
+        for k in KEYWORDS.lock().unwrap().iter() {
+            if k.starts_with(prefix) && k != prefix {
+                cands.push(k.clone());
+            }
+        }
+        for (_, bufp) in OPEN_FILES.lock().unwrap().iter() {
+            let ob = *bufp as *mut Fl_Text_Buffer;
+            let oraw = (*ob).text();
+            if oraw.is_null() {
+                continue;
+            }
+            let otext = CStr::from_ptr(oraw).to_string_lossy().into_owned();
+            libc_free(oraw as *mut ::core::ffi::c_void);
+            let mut w = String::new();
+            for ch in otext.chars() {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    w.push(ch);
+                } else {
+                    if w.len() > 2 && w.starts_with(prefix) && w != prefix && !cands.contains(&w)
+                    {
+                        cands.push(w.clone());
+                    }
+                    w.clear();
+                }
+            }
+        }
+        cands.sort();
+        cands.truncate(60);
+        if cands.is_empty() {
+            console_append(&format!("no completions for '{prefix}'\n"));
+            return;
+        }
+        COMPLETE_START.store(start as i32, Relaxed);
+        *COMPLETE_ITEMS.lock().unwrap() = cands.clone();
+
+        // Popup near the cursor (screen coords = window + widget +
+        // glyph position).
+        let mut cx = 0i32;
+        let mut cy = 0i32;
+        (*disp).position_to_xy(pos, &mut cx as *mut i32, &mut cy as *mut i32);
+        let win = WIN.load(Relaxed);
+        let (wx, wy) = if win.is_null() {
+            (100, 100)
+        } else {
+            let w = win as *mut Fl_Widget;
+            ((*w).x(), (*w).y())
+        };
+
+        let mut cw = COMPLETE_WIN.load(Relaxed);
+        if cw.is_null() {
+            cw = cxx_operator_new(core::mem::size_of::<Fl_Window>()) as *mut Fl_Window;
+            Fl_Window::new_at(cw, 260, 180, c"".as_ptr());
+            let l = cxx_operator_new(core::mem::size_of::<CompleteList>()) as *mut CompleteList;
+            l.write(CompleteList::new(0, 0, 260, 180));
+            COMPLETE_LIST.store(l, Relaxed);
+            (*cw).as_fl_group_mut().end();
+            (*cw).as_fl_group_mut().add(l as *mut Fl_Widget);
+            COMPLETE_WIN.store(cw, Relaxed);
+        }
+        let l = COMPLETE_LIST.load(Relaxed);
+        let lb = &mut *(l as *mut Fl_Browser);
+        lb.clear();
+        for c in &cands {
+            lb.add_str_with_defaults(c);
+        }
+        (*(l as *mut Fl_Browser)).value_i32(1);
+        // cx/cy are editor-relative... position_to_xy returns window
+        // coords; offset by the top-level window's screen position.
+        (*(cw as *mut Fl_Widget)).resize(wx + cx, wy + cy + 18, 260, 180);
+        (*(cw as *mut Fl_Widget)).show();
+        (*(l as *mut Fl_Widget)).take_focus();
+    }
+}
+
+fn hide_completions() {
+    let cw = COMPLETE_WIN.load(Relaxed);
+    if !cw.is_null() {
+        unsafe { (*(cw as *mut Fl_Widget)).hide() };
+    }
+}
+
+unsafe fn apply_completion() {
+    unsafe {
+        let l = COMPLETE_LIST.load(Relaxed);
+        if l.is_null() {
+            return;
+        }
+        let v = (*(l as *mut Fl_Browser)).value();
+        let item = {
+            let items = COMPLETE_ITEMS.lock().unwrap();
+            if v <= 0 {
+                None
+            } else {
+                items.get((v - 1) as usize).cloned()
+            }
+        };
+        let Some(word) = item else { return };
+        let buf = BUF.load(Relaxed);
+        let ed = ED.load(Relaxed);
+        let start = COMPLETE_START.load(Relaxed);
+        if buf.is_null() || ed.is_null() || start < 0 {
+            return;
+        }
+        let disp = ed as *mut Fl_Text_Display;
+        let pos = (*disp).insert_position_ovl();
+        (*buf).replace_with_defaults(start, pos, cstr(&word).as_ptr());
+        (*disp).insert_position(start + word.len() as i32);
+        hide_completions();
+        (*(ed as *mut Fl_Widget)).take_focus();
+        (*(ed as *mut Fl_Widget)).redraw();
+    }
+}
+
 fn set_project(dir: &str) {
     *PROJECT_DIR.lock().unwrap() = Some(dir.to_string());
     console_append(&format!("project = {dir}\n"));
@@ -927,13 +1141,41 @@ fn debug_project() {
     };
     let t = TARGET.load(Relaxed);
     let (launch, attach): (String, String) = match t {
-        0 => (
-            format!("cd '{dir}' && RUSTC_BOOTSTRAP=1 cargo +nightly build --release && lldb target/release/rustcc_app"),
-            "lldb drives the host binary directly in the Terminal window".to_string(),
-        ),
-        1 => (
+        0 => {
+            // Local debugging, no qemu: build, then lldb the project's
+            // own binary (name from Cargo.toml). Staticlib-only RTOS
+            // projects have no host binary — say so instead.
+            let cargo = std::fs::read_to_string(format!("{dir}/Cargo.toml")).unwrap_or_default();
+            if cargo.contains("staticlib") {
+                console_append(
+                    "this project builds a firmware staticlib — no host binary to debug.\n\
+                     Pick an RTOS target for qemu+gdb, or create a Host project.\n",
+                );
+                return;
+            }
+            let name = cargo
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    l.strip_prefix("name = \"")
+                        .and_then(|r| r.strip_suffix('\"'))
+                })
+                .unwrap_or("rustcc_app")
+                .to_string();
+            (
+                format!(
+                    "cd '{dir}' && RUSTC_BOOTSTRAP=1 cargo +nightly build --release && lldb target/release/{name}"
+                ),
+                format!("lldb drives target/release/{name} directly in the Terminal window"),
+            )
+        }
+        1 | 4 => (
             format!("cd '{dir}' && GDB=1 ./run_arm.sh"),
             format!("arm-none-eabi-gdb '{dir}/target/arm/firmware.elf' -ex 'target remote :1234' -ex 'break main' -ex continue"),
+        ),
+        5 => (
+            format!("cd '{dir}' && GDB=1 ./run_pico.sh"),
+            format!("arm-none-eabi-gdb '{dir}/target/pico/firmware.elf' -ex 'target remote :1234' -ex 'break main' -ex continue"),
         ),
         2 => (
             format!("cd '{dir}' && GDB=1 ./run_riscv_c2.sh"),
@@ -1105,6 +1347,7 @@ fn scaffold_project(dir: &str) -> Result<(), String> {
         ("run_arm.sh", fix(embed!("freertos_cpp/run_arm.sh"))),
         ("run_riscv.sh", fix(embed!("freertos_cpp/run_riscv.sh"))),
         ("run_riscv_c2.sh", fix(embed!("freertos_cpp/run_riscv_c2.sh"))),
+        ("run_pico.sh", fix(embed!("freertos_cpp/run_pico.sh"))),
         ("Cargo.toml", SCAFFOLD_CARGO_TOML.to_string()),
         (".vscode/tasks.json", SCAFFOLD_TASKS_JSON.to_string()),
         ("README.md", SCAFFOLD_README.to_string()),
@@ -1115,7 +1358,7 @@ fn scaffold_project(dir: &str) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for s in ["run_arm.sh", "run_riscv.sh", "run_riscv_c2.sh"] {
+        for s in ["run_arm.sh", "run_riscv.sh", "run_riscv_c2.sh", "run_pico.sh"] {
             fs::set_permissions(root.join(s), fs::Permissions::from_mode(0o755))
                 .map_err(werr)?;
         }
@@ -1222,6 +1465,7 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
         add("&File/Save &As…", MOD_META | MOD_SHIFT | 's' as i32, ACT_SAVE_AS);
         add("&File/New Project/&Host Project…", 0, ACT_NEW_HOST);
         add("&File/New Project/&RAK11161 Project…", MOD_META | MOD_SHIFT | 'n' as i32, ACT_NEW_PROJECT);
+        add("&File/New Project/Raspberry Pi &Pico Project…", 0, ACT_NEW_PICO);
         add("&File/Open &Project…", MOD_META | MOD_SHIFT | 'o' as i32, ACT_OPEN_PROJECT);
         add("&File/&Quit", MOD_META | 'q' as i32, ACT_QUIT);
         add("&Edit/&Undo", MOD_META | 'z' as i32, ACT_UNDO);
@@ -1243,6 +1487,8 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
         add("&Target/RAK11161: &STM32WLE5 (Cortex-M4)", 0, ACT_TGT_BASE + 1);
         add("&Target/RAK11161: &ESP8684 (ESP32-C2, rv32imc)", 0, ACT_TGT_BASE + 2);
         add("&Target/ESP32-&C3-class (rv32imac)", 0, ACT_TGT_BASE + 3);
+        add("&Target/STM32&F4-class (Cortex-M4F)", 0, ACT_TGT_BASE + 4);
+        add("&Target/Raspberry Pi &Pico (RP2040)", 0, ACT_TGT_BASE + 5);
     }
 }
 
@@ -1515,6 +1761,59 @@ unsafe fn self_test() -> i32 {
         // 14. IDE v2: find popup constructs.
         show_find_popup();
         check("find popup exists", !FIND_WIN.load(Relaxed).is_null());
+
+        // 15. IDE v3: new targets routed to the right scripts.
+        check(
+            "STM32F4 target -> run_arm.sh",
+            target_cmdline(4, true).contains("run_arm.sh"),
+        );
+        check(
+            "Pico target -> run_pico.sh",
+            target_cmdline(5, true).contains("run_pico.sh"),
+        );
+        check(
+            "scaffold ships run_pico.sh",
+            {
+                let p3 = std::env::temp_dir().join(format!("rustcc_ide_pico_{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&p3);
+                let ok = scaffold_project(&p3.to_string_lossy()).is_ok()
+                    && p3.join("run_pico.sh").exists();
+                let _ = std::fs::remove_dir_all(&p3);
+                ok
+            },
+        );
+
+        // 16. IDE v3: completion — open a buffer with known idents,
+        //     place the cursor after a prefix, complete, apply.
+        let cf = std::env::temp_dir().join("rustcc_ide_complete.rs");
+        std::fs::write(&cf, "fn grandiose_identifier() {}\nfn main() { gran }\n").unwrap();
+        open_in_editor(&cf.to_string_lossy());
+        let ed2 = ED.load(Relaxed);
+        let text_now = {
+            let b = BUF.load(Relaxed);
+            CStr::from_ptr((*b).text()).to_string_lossy().into_owned()
+        };
+        let cursor = text_now.find("gran }").unwrap() as i32 + 4;
+        (*(ed2 as *mut Fl_Text_Display)).insert_position(cursor);
+        show_completions();
+        check(
+            "completion candidates found",
+            COMPLETE_ITEMS
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c == "grandiose_identifier"),
+        );
+        apply_completion();
+        let after = {
+            let b = BUF.load(Relaxed);
+            CStr::from_ptr((*b).text()).to_string_lossy().into_owned()
+        };
+        check(
+            "completion applied",
+            after.contains("{ grandiose_identifier }"),
+        );
+        let _ = std::fs::remove_file(&cf);
 
         let _ = std::fs::remove_dir_all(&proj);
     }
