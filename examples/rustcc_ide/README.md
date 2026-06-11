@@ -120,6 +120,10 @@ cargo +rustcc run --release --bin ide         # the GUI
   Capture payloads stay out of the console; process events (stops,
   exits) still stream there. Stops in *other* open files now switch
   tabs before the amber current-line tint lands.
+- **File ▸ New opens an "unsaved" tab** — each ⌘N is its own buffer
+  + tab (unsaved, unsaved-2, …); Save / Save As renames the tab in
+  place to the real file. File ▸ Open also routes through the
+  multi-buffer path now (it used to load into the current view).
 - **Per-project Target persistence** — the selected Target is written
   to `<project>/.rustcc_ide.toml` (stable slugs, not indices) on every
   Target-menu change; Open Project restores it. Fresh projects are

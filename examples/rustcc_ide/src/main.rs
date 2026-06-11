@@ -609,38 +609,33 @@ unsafe fn run_action(act: usize) {
         let ed = ED.load(Relaxed);
         let buf = BUF.load(Relaxed);
         match act {
-            ACT_NEW => {
-                (*buf).text_const_i8_str("");
-                *PATH.lock().unwrap() = None;
-                DIRTY.store(false, Relaxed);
-                refresh_title();
-            }
+            ACT_NEW => new_unsaved_file(),
             ACT_OPEN => {
                 if let Some(p) = choose_file(CHOOSER_OPEN, "Open") {
-                    (*buf).loadfile_with_defaults(cstr(&p).as_ptr());
-                    *PATH.lock().unwrap() = Some(p);
-                    DIRTY.store(false, Relaxed);
-                    refresh_title();
+                    // Through the multi-buffer path: own buffer + tab.
+                    open_in_editor(&p);
+                    nav_refresh();
                 }
             }
             ACT_SAVE => {
                 let existing = PATH.lock().unwrap().clone();
                 match existing {
-                    Some(p) => save_to(&p),
-                    None => {
+                    Some(p) if !is_unsaved(&p) => {
+                        save_to(&p);
+                        refresh_title();
+                    }
+                    // Unsaved tab (or no buffer entry yet): pick a
+                    // real path and rename the tab to it.
+                    _ => {
                         if let Some(p) = choose_file(CHOOSER_SAVE, "Save") {
-                            save_to(&p);
-                            *PATH.lock().unwrap() = Some(p);
+                            save_rename_to(&p);
                         }
                     }
                 }
-                refresh_title();
             }
             ACT_SAVE_AS => {
                 if let Some(p) = choose_file(CHOOSER_SAVE, "Save As") {
-                    save_to(&p);
-                    *PATH.lock().unwrap() = Some(p);
-                    refresh_title();
+                    save_rename_to(&p);
                 }
             }
             ACT_QUIT => std::process::exit(0),
@@ -1000,6 +995,66 @@ fn build_project(run: bool) {
 
 /// Multi-buffer open: one Fl_Text_Buffer per file, the single editor
 /// view switches between them. Re-opening an open file just switches.
+/// Unsaved buffers carry a sentinel name with no '/' (real paths are
+/// always absolute here) — the tab shows it verbatim.
+fn is_unsaved(path: &str) -> bool {
+    !path.starts_with('/')
+}
+
+/// File ▸ New: a fresh buffer in its own tab, named "unsaved" (then
+/// "unsaved-2", …). Save / Save As renames the tab to the real file.
+fn new_unsaved_file() {
+    unsafe {
+        let name = {
+            let files = OPEN_FILES.lock().unwrap();
+            let mut n = 1usize;
+            loop {
+                let cand = if n == 1 {
+                    "unsaved".to_string()
+                } else {
+                    format!("unsaved-{n}")
+                };
+                if !files.iter().any(|(p, _)| *p == cand) {
+                    break cand;
+                }
+                n += 1;
+            }
+        };
+        let nbuf =
+            cxx_operator_new(core::mem::size_of::<Fl_Text_Buffer>()) as *mut Fl_Text_Buffer;
+        Fl_Text_Buffer::new_at(nbuf, 0, 1024);
+        (*nbuf).add_modify_callback(Some(modify_cb), core::ptr::null_mut());
+        let idx = {
+            let mut files = OPEN_FILES.lock().unwrap();
+            files.push((name, nbuf as usize));
+            files.len() - 1
+        };
+        switch_to_file(idx);
+        nav_refresh();
+    }
+}
+
+/// Save the CURRENT buffer to `p` and point its tab at the real
+/// file: the unsaved sentinel (or old name) is renamed in place; a
+/// buffer with no entry yet (the startup welcome buffer) gets one.
+unsafe fn save_rename_to(p: &str) {
+    unsafe {
+        save_to(p);
+        let bufp = BUF.load(Relaxed) as usize;
+        {
+            let mut files = OPEN_FILES.lock().unwrap();
+            match files.iter_mut().find(|(_, b)| *b == bufp) {
+                Some(e) => e.0 = p.to_string(),
+                None => files.push((p.to_string(), bufp)),
+            }
+        }
+        *PATH.lock().unwrap() = Some(p.to_string());
+        refresh_title();
+        tabs_refresh();
+        nav_refresh();
+    }
+}
+
 fn open_in_editor(path: &str) {
     unsafe {
         let existing = {
@@ -3112,6 +3167,36 @@ unsafe fn self_test() -> i32 {
         );
         let _ = std::fs::remove_file(&xf);
         let _ = std::fs::remove_file(&bf);
+
+        // File > New: a fresh "unsaved" tab; Save As renames it in
+        // place (tab follows the real file name).
+        let n_before = OPEN_FILES.lock().unwrap().len();
+        new_unsaved_file();
+        let first = PATH.lock().unwrap().clone().unwrap_or_default();
+        new_unsaved_file();
+        let second = PATH.lock().unwrap().clone().unwrap_or_default();
+        check(
+            "new file opens unsaved tabs with distinct names",
+            OPEN_FILES.lock().unwrap().len() == n_before + 2
+                && is_unsaved(&first)
+                && is_unsaved(&second)
+                && first.starts_with("unsaved")
+                && first != second,
+        );
+        let sv = std::env::temp_dir().join(format!("rustcc_ide_sv_{}.rs", std::process::id()));
+        let sv_s = sv.to_string_lossy().into_owned();
+        let _ = std::fs::remove_file(&sv);
+        save_rename_to(&sv_s);
+        check(
+            "save-as renames the unsaved tab to the file",
+            std::path::Path::new(&sv_s).exists()
+                && *PATH.lock().unwrap() == Some(sv_s.clone())
+                && OPEN_FILES.lock().unwrap().iter().any(|(p, _)| *p == sv_s)
+                && !OPEN_FILES.lock().unwrap().iter().any(|(p, _)| *p == second),
+        );
+        close_current_file(); // the saved one
+        close_current_file(); // the remaining unsaved
+        let _ = std::fs::remove_file(&sv);
 
         // Target persists per-project: seeding on first open, save on
         // change, restore on reopen.
