@@ -27,7 +27,7 @@
 use std::fmt::Write as _;
 
 use rustc_abi_cxx::{
-    Access, ClassId, CvQual, CxxType, CxxTypeCtx, FloatKind, IntWidth, MethodDef,
+    Access, ClassId, CvQual, CxxType, CxxTypeCtx, FloatKind, FnSig, IntWidth, MethodDef,
     MethodName, NameSegment, NestedName, OperatorKind, RefKind, SpecialMember,
     Symbol, TemplateArg, TypeId, Virtuality,
 };
@@ -245,12 +245,13 @@ fn render_heap_ctor_shim(
     let mut params: Vec<String> = Vec::with_capacity(method.sig.params.len());
     let mut args: Vec<String> = Vec::with_capacity(method.sig.params.len());
     for (i, &ty_id) in method.sig.params.iter().enumerate() {
-        let ty = render_cxx_type(
+        let ty = render_cxx_param(
             ctx,
             ty_id,
+            &format!("arg{i}"),
             &format!("{class_source}::ctor[{ctor_idx}] arg {i}"),
         )?;
-        params.push(format!("{ty} arg{i}"));
+        params.push(ty);
         args.push(format!("arg{i}"));
     }
     let param_list = params.join(", ");
@@ -297,8 +298,7 @@ fn render_method_shim(
     let mut params = vec![self_param];
     let mut arg_list = Vec::with_capacity(method.sig.params.len());
     for (i, p) in method.sig.params.iter().enumerate() {
-        let ty_src = render_cxx_type(ctx, *p, "parameter")?;
-        params.push(format!("{ty_src} arg{i}"));
+        params.push(render_cxx_param(ctx, *p, &format!("arg{i}"), "parameter")?);
         arg_list.push(format!("arg{i}"));
     }
     let param_list = params.join(", ");
@@ -330,9 +330,13 @@ fn render_method_shim(
         )
     };
 
-    let signature = format!(
-        "extern \"C\" {ret_src} {shim_sym}({param_list}) noexcept"
-    );
+    // A fn-ptr type-id can't lead a declaration — use a trailing
+    // return (`auto f(...) -> R (*)(A, B)`).
+    let signature = if is_fn_ptr(ctx, method.sig.ret) {
+        format!("extern \"C\" auto {shim_sym}({param_list}) noexcept -> {ret_src}")
+    } else {
+        format!("extern \"C\" {ret_src} {shim_sym}({param_list}) noexcept")
+    };
     Ok(format!("{signature} {{\n{body}}}\n"))
 }
 
@@ -387,10 +391,30 @@ pub(crate) fn render_cxx_type(
             FloatKind::LongDouble => "long double".to_string(),
         }),
         CxxType::Ptr { pointee, cv } => {
+            // M15.c: a pointer-to-function renders as the TYPE-ID
+            // `R (*)(A, B)` — valid in casts and trailing-return
+            // position. (The `<type> <name>` declarator juxtaposition
+            // is the one place this string can't be used; parameters
+            // go through `render_cxx_param`, which splices the name.)
+            if let CxxType::Fn(sig) = ctx.type_of(*pointee) {
+                return render_fn_ptr(ctx, sig, "", where_);
+            }
             let inner = render_cxx_type(ctx, *pointee, where_)?;
             Ok(apply_cv_prefix(&inner, *cv) + "*")
         }
         CxxType::Ref { pointee, kind, cv } => {
+            // A reference to a function POINTER can't take the
+            // postfix-& spelling (`R (*)(A)&` is ill-formed) — only
+            // the named declarator form works, which lives in
+            // `render_cxx_param`. Standalone type-id: unsupported.
+            if let CxxType::Ptr { pointee: inner, .. } = ctx.type_of(*pointee) {
+                if matches!(ctx.type_of(*inner), CxxType::Fn(_)) {
+                    return Err(ShimError::UnsupportedType {
+                        where_: where_.to_string(),
+                        kind: "reference-to-function-pointer type-id".to_string(),
+                    });
+                }
+            }
             let inner = render_cxx_type(ctx, *pointee, where_)?;
             let sigil = match kind {
                 RefKind::Lvalue => "&",
@@ -402,16 +426,11 @@ pub(crate) fn render_cxx_type(
             render_nested_name(ctx, &ctx.class(*class_id).name)
         }
         CxxType::Enum { name, .. } => render_nested_name(ctx, name),
-        // M15 function-pointer types are deliberately *not*
-        // rendered here. The C++ syntax for a function-pointer
-        // parameter (`void (*name)(args)`) splices the
-        // declarator name *inside* the type, which our
-        // single-pass `<type> arg<N>` parameter renderer can't
-        // produce. The shim emitter's per-method skip path
-        // catches this `UnsupportedType` and emits a
-        // `// shim skipped: …` comment so the rest of the
-        // class still trampolines cleanly. Proper function-
-        // pointer parameter support is tracked as M15.c.
+        // A BARE function type (not behind a pointer) still has no
+        // standalone spelling here; pointer-to-function is handled in
+        // the `Ptr` arm above (M15.c), and named fn-ptr parameters go
+        // through `render_cxx_param`. Arrays / member pointers keep
+        // the per-method skip path (`// shim skipped: …`).
         CxxType::Array { .. }
         | CxxType::Fn(_)
         | CxxType::MemberPtr { .. } => Err(ShimError::UnsupportedType {
@@ -419,6 +438,79 @@ pub(crate) fn render_cxx_type(
             kind: format!("{t:?}"),
         }),
     }
+}
+
+/// Spell a function-pointer type. With an empty `name` this is the
+/// type-id `R (*)(A, B)`; with a name it's the parameter declarator
+/// `R (*name)(A, B)` — C++ splices the name inside the type.
+fn render_fn_ptr(
+    ctx: &CxxTypeCtx,
+    sig: &FnSig,
+    name: &str,
+    where_: &str,
+) -> Result<String, ShimError> {
+    let inner = |ty: TypeId| -> Result<String, ShimError> {
+        // The IR collapses `long` and `long long` into I64. As a
+        // VALUE parameter that's fine (implicit conversion), but
+        // inside a function-pointer type the spelling must match
+        // exactly — reject rather than guess (the Rust decl stays
+        // an unused extern, exactly the pre-M15.c status quo).
+        if matches!(ctx.type_of(ty), CxxType::Int { width: IntWidth::I64, .. }) {
+            return Err(ShimError::UnsupportedType {
+                where_: where_.to_string(),
+                kind: "ambiguous long/long long inside function-pointer type".to_string(),
+            });
+        }
+        render_cxx_type(ctx, ty, where_)
+    };
+    let ret = inner(sig.ret)?;
+    let mut ps = Vec::with_capacity(sig.params.len());
+    for p in &sig.params {
+        ps.push(inner(*p)?);
+    }
+    if sig.variadic {
+        ps.push("...".to_string());
+    }
+    Ok(format!("{ret} (*{name})({})", ps.join(", ")))
+}
+
+/// Render a parameter DECLARATION (`<type> <name>`), routing
+/// pointer-to-function parameters through the name-splicing form.
+fn render_cxx_param(
+    ctx: &CxxTypeCtx,
+    ty: TypeId,
+    name: &str,
+    where_: &str,
+) -> Result<String, ShimError> {
+    match ctx.type_of(ty) {
+        CxxType::Ptr { pointee, .. } => {
+            if let CxxType::Fn(sig) = ctx.type_of(*pointee) {
+                return render_fn_ptr(ctx, sig, name, where_);
+            }
+        }
+        // Reference to function pointer (`R (*&name)(A)`), e.g.
+        // Fl::get_awake_handler_(Fl_Awake_Handler&, void*&).
+        CxxType::Ref { pointee, kind, .. } => {
+            if let CxxType::Ptr { pointee: inner, .. } = ctx.type_of(*pointee) {
+                if let CxxType::Fn(sig) = ctx.type_of(*inner) {
+                    let amp = match kind {
+                        RefKind::Lvalue => "&",
+                        RefKind::Rvalue => "&&",
+                    };
+                    return render_fn_ptr(ctx, sig, &format!("{amp}{name}"), where_);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(format!("{} {name}", render_cxx_type(ctx, ty, where_)?))
+}
+
+/// Is `ty` a pointer-to-function? (Its type-id can't lead a
+/// declaration — the shim signature must use a trailing return.)
+fn is_fn_ptr(ctx: &CxxTypeCtx, ty: TypeId) -> bool {
+    matches!(ctx.type_of(ty), CxxType::Ptr { pointee, .. }
+        if matches!(ctx.type_of(*pointee), CxxType::Fn(_)))
 }
 
 fn int_cpp(signed: bool, width: IntWidth) -> &'static str {

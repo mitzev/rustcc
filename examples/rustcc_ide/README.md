@@ -95,7 +95,15 @@ cargo +rustcc run --release --bin ide         # the GUI
   File (⌘W)**; Wrap Lines moved to ⌘⇧W. Line numbers are on in the
   gutter. Pages rebuild only when the open set changes — a plain
   click only syncs selection, so `Fl_Tabs::handle` never deletes the
-  widgets it is processing.
+  widgets it is processing. **Every tab has an × close button**
+  (FLTK 1.4's `FL_WHEN_CLOSED`): the × fires the page's callback
+  with `FL_REASON_CLOSED`, which only *records* the index — the
+  main loop performs the close (`tabs_pump`), since the click is
+  still inside `Fl_Tabs::handle`. Closing a background tab keeps
+  the current view. Wiring the callback surfaced an importer gap,
+  now fixed (M15.c): inline methods with function-pointer params/
+  returns previously got a Rust decl but no C++ shim — undefined
+  symbol the moment they were used.
 - **File ▸ New Project covers every board family**: Host, RAK11161,
   **STM32**, **ESP32**, Raspberry Pi Pico. The RTOS flavors share one
   self-contained scaffold (all cores' run scripts ship in every

@@ -539,6 +539,21 @@ handle `CxxType::Fn(_)` (the `MemberPtr` arm rejects it as
 unsupported). FLTK's API is callback-driven; without renderable
 function pointer types, nothing useful compiles.
 
+> **M15.c (shipped):** the C++ *shim* emitter now also renders
+> function-pointer types, so header-inline methods taking or
+> returning callbacks (`Fl_Widget::callback(Fl_Callback*, void*)`,
+> the getter) trampoline correctly instead of silently emitting a
+> Rust decl with no shim body (a link error the moment the wrapper
+> was called). Mechanics: a pointer-to-function renders as the
+> type-id `R (*)(A, B)` (valid in casts and trailing returns — a
+> fn-ptr return uses `extern "C" auto f(...) -> R (*)(A, B)`), and
+> parameter declarators go through a name-splicing renderer
+> (`R (*name)(A, B)`; reference-to-fn-ptr: `R (*&name)(A)`). One
+> deliberate refusal: the IR collapses `long`/`long long` into
+> `I64`, and inside a function-pointer type that spelling must be
+> exact, so such signatures (e.g. FLTK's `Fl_Callback1`, `long`
+> user data) keep the skip path.
+
 **The shape.** Two layers:
 
 1. **Type rendering.** Add a `CxxType::Fn` arm in `render_rust_type`

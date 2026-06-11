@@ -1954,6 +1954,36 @@ fn pump_debugger() {
 }
 
 /// Rebuild the tab strip from OPEN_FILES; the active file is marked.
+/// Tab × clicks arrive mid-Fl_Tabs::handle — deleting pages there
+/// would pull the widgets out from under FLTK, so the callback only
+/// records the index and the main loop performs the close.
+static PENDING_TAB_CLOSE: AtomicI32 = AtomicI32::new(-1);
+
+unsafe extern "C" fn tab_close_cb(w: *mut Fl_Widget, _data: *mut ()) {
+    if Fl::callback_reason() != Fl_Callback_Reason::FL_REASON_CLOSED {
+        return; // selection changes are handled in FileTabs::handle
+    }
+    let tabs = TABBAR.load(Relaxed);
+    if tabs.is_null() {
+        return;
+    }
+    let g = unsafe { (*(tabs as *mut Fl_Tabs)).as_fl_group() };
+    for i in 0..g.children() {
+        if g.child(i) == w {
+            PENDING_TAB_CLOSE.store(i, Relaxed);
+            break;
+        }
+    }
+}
+
+/// Drained from the main loop, next to pump_debugger().
+fn tabs_pump() {
+    let i = PENDING_TAB_CLOSE.swap(-1, Relaxed);
+    if i >= 0 {
+        close_file_at(i as usize);
+    }
+}
+
 fn tabs_refresh() {
     unsafe {
         let tabs = TABBAR.load(Relaxed);
@@ -1981,6 +2011,14 @@ fn tabs_refresh() {
                 Fl_Group::new_at(pg, 220, 52, 960, 0, core::ptr::null());
                 (*pg).end();
                 (*(pg as *mut Fl_Widget)).copy_label_str(name);
+                // FL_WHEN_CLOSED puts an x on the tab; clicking it
+                // fires the page's callback with FL_REASON_CLOSED.
+                (*(pg as *mut Fl_Widget)).when_u8(Fl_When::FL_WHEN_CLOSED.0 as u8);
+                (*(pg as *mut Fl_Widget))
+                    .callback_option_unsafe_extern_c_fn_mut_fl_widget_mut_mut(
+                        Some(tab_close_cb),
+                        core::ptr::null_mut(),
+                    );
                 t.as_fl_group_mut().add(pg as *mut Fl_Widget);
             }
             *TAB_NAMES.lock().unwrap() = names;
@@ -1995,19 +2033,32 @@ fn tabs_refresh() {
     }
 }
 
-fn close_current_file() {
+/// Close the open file at `idx` — the active one (⌘W) or any tab's
+/// × button. Closing a background tab keeps the current view.
+fn close_file_at(idx: usize) {
     unsafe {
         let cur = PATH.lock().unwrap().clone();
-        let Some(cur) = cur else { return };
-        let next = {
+        let (closed, next) = {
             let mut files = OPEN_FILES.lock().unwrap();
-            let Some(i) = files.iter().position(|(p, _)| *p == cur) else { return };
-            files.remove(i); // buffer intentionally leaked (FLTK owns widgets-by-ptr idiom)
-            if files.is_empty() { None } else { Some(i.min(files.len() - 1)) }
+            let Some((p, _)) = files.get(idx).cloned() else { return };
+            files.remove(idx); // buffer intentionally leaked (FLTK owns widgets-by-ptr idiom)
+            let was_active = Some(&p) == cur.as_ref();
+            let next = if !was_active {
+                None // background tab: view unchanged
+            } else if files.is_empty() {
+                Some(None)
+            } else {
+                Some(Some(idx.min(files.len() - 1)))
+            };
+            (p, next)
         };
         match next {
-            Some(i) => switch_to_file(i),
             None => {
+                tabs_refresh();
+                nav_refresh();
+            }
+            Some(Some(i)) => switch_to_file(i),
+            Some(None) => {
                 // No files left: blank buffer.
                 let buf = BUF.load(Relaxed);
                 if !buf.is_null() {
@@ -2020,7 +2071,18 @@ fn close_current_file() {
                 nav_refresh();
             }
         }
-        console_append(&format!("closed {cur}\n"));
+        console_append(&format!("closed {closed}\n"));
+    }
+}
+
+fn close_current_file() {
+    let idx = {
+        let cur = PATH.lock().unwrap().clone();
+        let Some(cur) = cur else { return };
+        OPEN_FILES.lock().unwrap().iter().position(|(p, _)| *p == cur)
+    };
+    if let Some(i) = idx {
+        close_file_at(i);
     }
 }
 
@@ -2963,6 +3025,48 @@ unsafe fn self_test() -> i32 {
             (*(TABBAR.load(Relaxed) as *mut Fl_Tabs)).as_fl_group().children() as usize
                 == tab_count_before - 1,
         );
+        // Tab x: closing a BACKGROUND tab keeps the current view;
+        // the x callback only defers — tabs_pump performs the close.
+        let xf = std::env::temp_dir().join(format!("rustcc_ide_x_{}.rs", std::process::id()));
+        std::fs::write(&xf, "// tab x probe\n").unwrap();
+        open_in_editor(&xf.to_string_lossy());
+        let active = PATH.lock().unwrap().clone();
+        let n0 = OPEN_FILES.lock().unwrap().len();
+        let bg = OPEN_FILES
+            .lock()
+            .unwrap()
+            .iter()
+            .position(|(p, _)| Some(p) != active.as_ref())
+            .unwrap_or(0);
+        close_file_at(bg);
+        check(
+            "x on background tab keeps the active file",
+            OPEN_FILES.lock().unwrap().len() == n0 - 1
+                && *PATH.lock().unwrap() == active,
+        );
+        tabs_refresh();
+        {
+            let tw = TABBAR.load(Relaxed) as *mut Fl_Tabs;
+            let g = (*tw).as_fl_group();
+            check(
+                "tab pages are closable (when + callback wired)",
+                g.children() > 0
+                    && (0..g.children()).all(|i| {
+                        let w = &*g.child(i);
+                        w.when() == Fl_When::FL_WHEN_CLOSED && w.callback().is_some()
+                    }),
+            );
+        }
+        PENDING_TAB_CLOSE.store(
+            OPEN_FILES.lock().unwrap().len() as i32 - 1,
+            Relaxed,
+        );
+        tabs_pump();
+        check(
+            "deferred x close drains via tabs_pump",
+            OPEN_FILES.lock().unwrap().len() == n0 - 2,
+        );
+        let _ = std::fs::remove_file(&xf);
         let _ = std::fs::remove_file(&bf);
 
         // 20. FULL gate: real lldb session — breakpoint hit, variables
@@ -3084,6 +3188,7 @@ fn main() {
             loop {
                 Fl::wait_f64(0.05);
                 pump_debugger();
+                tabs_pump();
                 if Fl::first_window().is_null() {
                     break;
                 }
