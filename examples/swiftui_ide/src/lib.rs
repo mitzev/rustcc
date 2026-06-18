@@ -59,6 +59,16 @@ static PROJECT_DIR: Mutex<Option<String>> = Mutex::new(None);
 static CONSOLE: Mutex<String> = Mutex::new(String::new());
 static RUNNING: AtomicBool = AtomicBool::new(false);
 
+// --- debugger (host-only lldb session over a pty) --------------------
+static DBG_ACTIVE: AtomicBool = AtomicBool::new(false);
+static DBG_CHILD: Mutex<Option<std::process::Child>> = Mutex::new(None);
+static DBG_STDIN: Mutex<Option<std::process::ChildStdin>> = Mutex::new(None);
+/// Current stop as `(basename, line)` — what lldb reports in its
+/// `… at file:line:col` frame line. The SwiftUI editor highlights it.
+static DBG_CURLINE: Mutex<Option<(String, i32)>> = Mutex::new(None);
+/// Breakpoints as `(project-relative path, line)`.
+static BREAKPOINTS: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
+
 // ---------------------------------------------------------------------
 // Pure-logic core (no ABI concerns — unit-testable as plain Rust)
 // ---------------------------------------------------------------------
@@ -179,6 +189,176 @@ mod engine {
                 Err(e) => console_append(&format!("spawn failed: {e}\n")),
             }
             RUNNING.store(false, Relaxed);
+        });
+    }
+
+    /// Parse an lldb stop frame line: `… at <file>:<line>:<col>`.
+    pub fn parse_stop_location(s: &str) -> Option<(String, i32)> {
+        let at = s.rfind(" at ")?;
+        let rest = &s[at + 4..];
+        let mut parts = rest.trim().split(':');
+        let file = parts.next()?.to_string();
+        let line: i32 = parts.next()?.trim().parse().ok()?;
+        if file.is_empty() || line <= 0 {
+            return None;
+        }
+        Some((file, line))
+    }
+
+    /// Run `cmdline` in `dir` BLOCKING, streaming merged output into
+    /// the console drain. Returns the exit code. (Used for the debug-
+    /// profile build that precedes the lldb spawn.)
+    pub fn run_blocking(dir: &str, cmdline: &str) -> i32 {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let child = Command::new("bash")
+            .arg("-c")
+            .arg(format!("cd '{dir}' && {cmdline} 2>&1"))
+            .stdout(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn();
+        let mut child = match child {
+            Ok(c) => c,
+            Err(e) => {
+                console_append(&format!("spawn failed: {e}\n"));
+                return -1;
+            }
+        };
+        if let Some(out) = child.stdout.take() {
+            let mut reader = BufReader::new(out);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => console_append(&line),
+                }
+            }
+        }
+        child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1)
+    }
+
+    /// Send a raw command to the live lldb session (echoes it to the
+    /// console transcript). No-op with a clear note if no session.
+    pub fn dbg_send(cmd: &str) {
+        use std::io::Write;
+        let mut g = DBG_STDIN.lock().unwrap();
+        match g.as_mut() {
+            Some(stdin) => {
+                if writeln!(stdin, "{cmd}").and_then(|_| stdin.flush()).is_err() {
+                    console_append("debugger pipe closed\n");
+                } else {
+                    console_append(&format!("(lldb) {cmd}\n"));
+                }
+            }
+            None => console_append("no debug session — Debug ▸ Start first\n"),
+        }
+    }
+
+    /// The crate name from the open project's Cargo.toml (host bin).
+    pub fn project_bin_name(dir: &str) -> String {
+        std::fs::read_to_string(format!("{dir}/Cargo.toml"))
+            .unwrap_or_default()
+            .lines()
+            .find_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("name = \"").and_then(|r| r.strip_suffix('\"')).map(str::to_string)
+            })
+            .unwrap_or_else(|| "rustcc_app".to_string())
+    }
+
+    /// Build the host project (debug profile) then attach lldb over a
+    /// pty, replay breakpoints, and `run`. Runs entirely on a
+    /// background thread so the UI never blocks; the reader thread
+    /// streams the transcript into the console and tracks stop
+    /// locations in `DBG_CURLINE`.
+    pub fn dbg_start_session(dir: String) {
+        std::thread::spawn(move || {
+            console_append("==> building (debug profile, full debug info)\n");
+            let code = run_blocking(
+                &dir,
+                "RUSTC=\"${RUSTC:-$HOME/rust-1.96-migration/build/host/stage1/bin/rustc}\" \
+                 RUSTC_BOOTSTRAP=1 cargo +nightly build 2>&1",
+            );
+            if code != 0 {
+                console_append("build failed — not starting the debugger\n");
+                return;
+            }
+            let bin = format!("{dir}/target/debug/{}", project_bin_name(&dir));
+
+            // lldb needs to believe it owns a terminal (async stop
+            // events, command multiplexing vs the inferior) — bridge
+            // it through a pty with `script -q /dev/null`.
+            let child = std::process::Command::new("script")
+                .args(["-q", "/dev/null", "lldb", "--no-use-colors"])
+                .arg(&bin)
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) => {
+                    console_append(&format!("lldb spawn failed: {e}\n"));
+                    return;
+                }
+            };
+            let stdin = child.stdin.take().expect("lldb stdin");
+            let stdout = child.stdout.take().expect("lldb stdout");
+            let stderr = child.stderr.take().expect("lldb stderr");
+            // stdout reader: transcript → console, frames → DBG_CURLINE.
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                let mut r = std::io::BufReader::new(stdout);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            console_append(&line);
+                            if line.contains(" at ") {
+                                if let Some(loc) = parse_stop_location(&line) {
+                                    *DBG_CURLINE.lock().unwrap() = Some(loc);
+                                }
+                            }
+                            if line.contains("Process") && line.contains("exited") {
+                                *DBG_CURLINE.lock().unwrap() = None;
+                            }
+                        }
+                    }
+                }
+                console_append("[debugger exited]\n");
+                DBG_ACTIVE.store(false, Relaxed);
+                *DBG_CURLINE.lock().unwrap() = None;
+            });
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                let mut r = std::io::BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => console_append(&line),
+                    }
+                }
+            });
+            *DBG_STDIN.lock().unwrap() = Some(stdin);
+            *DBG_CHILD.lock().unwrap() = Some(child);
+            DBG_ACTIVE.store(true, Relaxed);
+            console_append(&format!("==> lldb session on {bin}\n"));
+            // Replay breakpoints (basename + line), then run.
+            let bps = BREAKPOINTS.lock().unwrap().clone();
+            if bps.is_empty() {
+                dbg_send("breakpoint set --name main");
+            }
+            for (f, l) in bps {
+                let base = f.rsplit('/').next().unwrap_or(&f);
+                dbg_send(&format!("breakpoint set --file {base} --line {l}"));
+            }
+            dbg_send("run");
         });
     }
 }
@@ -425,6 +605,129 @@ pub extern "Swift" fn rc_console_drain() -> *mut c_char {
     out_cstring(taken)
 }
 
+// --- debugger API (host target only) ---------------------------------
+
+/// Start an in-IDE lldb session on the open Host project. Builds the
+/// debug profile, attaches lldb, replays breakpoints, runs — all on a
+/// background thread. Returns 0 if starting, -1 if busy / no project /
+/// non-host target.
+#[export_name = "rc_dbg_start"]
+pub extern "Swift" fn rc_dbg_start(target: i64) -> i64 {
+    if DBG_ACTIVE.load(Relaxed) {
+        engine::console_append("debug session already running — Stop first\n");
+        return -1;
+    }
+    if target != 0 {
+        engine::console_append(
+            "in-IDE stepping is host-only; pick the Host target (RTOS uses qemu+gdb)\n",
+        );
+        return -1;
+    }
+    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+        engine::console_append("no project open\n");
+        return -1;
+    };
+    if std::fs::read_to_string(format!("{dir}/Cargo.toml"))
+        .unwrap_or_default()
+        .contains("staticlib")
+    {
+        engine::console_append("firmware staticlib — no host binary to debug\n");
+        return -1;
+    }
+    engine::dbg_start_session(dir);
+    0
+}
+
+/// Send a raw command to the live lldb session (step/continue/etc.).
+#[export_name = "rc_dbg_send"]
+pub extern "Swift" fn rc_dbg_send(cmd: *const c_char) {
+    let cmd = unsafe { in_str(cmd) };
+    engine::dbg_send(&cmd);
+}
+
+/// Kill the lldb session and clear debug state.
+#[export_name = "rc_dbg_stop"]
+pub extern "Swift" fn rc_dbg_stop() {
+    {
+        let mut g = DBG_STDIN.lock().unwrap();
+        if let Some(stdin) = g.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(stdin, "process kill");
+            let _ = writeln!(stdin, "quit");
+            let _ = stdin.flush();
+        }
+        *g = None;
+    }
+    if let Some(mut c) = DBG_CHILD.lock().unwrap().take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    DBG_ACTIVE.store(false, Relaxed);
+    *DBG_CURLINE.lock().unwrap() = None;
+    engine::console_append("debug session stopped\n");
+}
+
+/// Toggle a breakpoint at project-relative `rel`:`line`. Returns 1 if
+/// added, 0 if removed. Replays into a live session immediately.
+#[export_name = "rc_dbg_toggle_breakpoint"]
+pub extern "Swift" fn rc_dbg_toggle_breakpoint(rel: *const c_char, line: i64) -> i64 {
+    let rel = unsafe { in_str(rel) };
+    if rel.is_empty() || line <= 0 {
+        return 0;
+    }
+    let line = line as i32;
+    let added = {
+        let mut bps = BREAKPOINTS.lock().unwrap();
+        if let Some(i) = bps.iter().position(|(f, l)| *f == rel && *l == line) {
+            bps.remove(i);
+            false
+        } else {
+            bps.push((rel.clone(), line));
+            true
+        }
+    };
+    let base = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+    if DBG_ACTIVE.load(Relaxed) {
+        let verb = if added { "set" } else { "clear" };
+        engine::dbg_send(&format!("breakpoint {verb} --file {base} --line {line}"));
+    }
+    engine::console_append(&format!(
+        "breakpoint {}: {base}:{line}\n",
+        if added { "set" } else { "removed" }
+    ));
+    added as i64
+}
+
+/// 1 while an lldb session is live, else 0.
+#[export_name = "rc_dbg_active"]
+pub extern "Swift" fn rc_dbg_active() -> i64 {
+    DBG_ACTIVE.load(Relaxed) as i64
+}
+
+/// Current stop as `basename:line` (e.g. `main.rs:30`), or empty if
+/// not stopped. Caller frees.
+#[export_name = "rc_dbg_curline"]
+pub extern "Swift" fn rc_dbg_curline() -> *mut c_char {
+    let s = match &*DBG_CURLINE.lock().unwrap() {
+        Some((f, l)) => format!("{f}:{l}"),
+        None => String::new(),
+    };
+    out_cstring(s)
+}
+
+/// All breakpoints as newline-joined `rel:line` rows. Caller frees.
+#[export_name = "rc_dbg_breakpoints"]
+pub extern "Swift" fn rc_dbg_breakpoints() -> *mut c_char {
+    let body = BREAKPOINTS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(f, l)| format!("{f}:{l}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    out_cstring(body)
+}
+
 /// Free a C-string previously returned by an `rc_*` function.
 ///
 /// # Safety
@@ -514,6 +817,85 @@ mod tests {
         assert!(acc.contains("swiftui-ide-stream-probe"), "no streamed output: {acc:?}");
         assert!(acc.contains("[exit 0]"), "no exit marker: {acc:?}");
         assert_eq!(rc_is_running(), 0);
+    }
+
+    #[test]
+    fn breakpoint_toggle_and_stop_parser() {
+        BREAKPOINTS.lock().unwrap().clear();
+        // add → remove round-trip, reported via the return code.
+        assert_eq!(rc_dbg_toggle_breakpoint(cstr("src/main.rs").as_ptr(), 30), 1);
+        assert_eq!(rc_dbg_toggle_breakpoint(cstr("src/main.rs").as_ptr(), 42), 1);
+        let bps = unsafe { take(rc_dbg_breakpoints()) };
+        assert!(bps.lines().any(|l| l == "src/main.rs:30"));
+        assert!(bps.lines().any(|l| l == "src/main.rs:42"));
+        assert_eq!(rc_dbg_toggle_breakpoint(cstr("src/main.rs").as_ptr(), 30), 0);
+        let bps = unsafe { take(rc_dbg_breakpoints()) };
+        assert!(!bps.lines().any(|l| l == "src/main.rs:30"));
+        assert!(bps.lines().any(|l| l == "src/main.rs:42"));
+        BREAKPOINTS.lock().unwrap().clear();
+
+        // stop-frame parsing (basename:line) from real lldb output.
+        let loc = engine::parse_stop_location(
+            "    frame #0: 0x0001 rustcc_app`main at main.rs:30:5",
+        );
+        assert_eq!(loc, Some(("main.rs".to_string(), 30)));
+        assert_eq!(engine::parse_stop_location("Process 1 resuming"), None);
+
+        // start refuses non-host + no-session sends are safe.
+        assert_eq!(rc_dbg_active(), 0);
+        assert_eq!(rc_dbg_start(1), -1); // non-host target rejected
+    }
+
+    /// Full lldb session against a scaffolded host binary. Slow (builds
+    /// the debug profile with the fork), so gated. Mirrors the FLTK
+    /// IDE's FULL gate, pull-based on the console drain.
+    #[test]
+    fn full_lldb_session() {
+        if std::env::var("RUSTCC_SWIFTUI_IDE_FULL").as_deref() != Ok("1") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("swiftui_ide_dbg{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dirc = cstr(dir.to_str().unwrap());
+        assert_eq!(rc_scaffold(0, dirc.as_ptr()), 0);
+
+        // Breakpoint on the first println! line of the scaffold.
+        let main_rs = unsafe { take(rc_read_file(cstr("src/main.rs").as_ptr())) };
+        let line = main_rs
+            .lines()
+            .position(|l| l.contains("println!"))
+            .map(|i| i as i64 + 1)
+            .unwrap_or(1);
+        BREAKPOINTS.lock().unwrap().clear();
+        assert_eq!(rc_dbg_toggle_breakpoint(cstr("src/main.rs").as_ptr(), line), 1);
+
+        let mut acc = String::new();
+        let wait = |acc: &mut String, needle: &str, secs: u32| -> bool {
+            for _ in 0..secs * 10 {
+                acc.push_str(&unsafe { take(rc_console_drain()) });
+                if acc.contains(needle) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
+        };
+
+        assert_eq!(rc_dbg_start(0), 0);
+        assert!(wait(&mut acc, "stop reason = breakpoint", 120), "no bp hit:\n{acc}");
+        assert!(
+            DBG_CURLINE.lock().unwrap().is_some(),
+            "curline not tracked after stop"
+        );
+        rc_dbg_send(cstr("frame variable").as_ptr());
+        let m = acc.len();
+        let _ = m;
+        rc_dbg_send(cstr("breakpoint disable").as_ptr());
+        rc_dbg_send(cstr("continue").as_ptr());
+        assert!(wait(&mut acc, "exited", 30), "did not run to exit:\n{acc}");
+        rc_dbg_stop();
+        assert_eq!(rc_dbg_active(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

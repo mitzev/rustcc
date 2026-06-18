@@ -65,6 +65,15 @@ bound on the Swift side as:
   the FLTK IDE's `target_cmdline`, so a project scaffolded by either
   tool builds the same way), streaming toolchain output live into the
   console pane.
+- **Debug** (Host target) — an in-IDE `lldb` session: **Start Debug**
+  builds the debug profile and attaches lldb over a pty (the engine
+  spawns it on a background thread; the transcript streams into the
+  console). **Step Over/Into/Out**, **Continue**, **Variables**, and
+  **Stop**; a **⏸ file:line** banner shows the current stop. Set
+  breakpoints with the **BP line** stepper + **Toggle BP** (SwiftUI's
+  `TextEditor` exposes no gutter or cursor line, so breakpoints are
+  placed by line number — set ones show as red ● chips you click to
+  remove); they replay into a live session.
 
 ## Build & run (macOS)
 
@@ -88,10 +97,19 @@ The engine is validated **headlessly** through the exact `extern
 "Swift"` entry points the app links against (no Swift toolchain, no
 GUI): the target table, a scaffold → list → read → edit → save → reopen
 round-trip, the streamed-console drain (a real subprocess, polled the
-way the SwiftUI timer does), and the per-target command shapes. The
-GUI itself is verified by the build linking cleanly against the
-staticlib (all `rc_*` symbols resolved) — the same bar as
-`swiftui_counter`.
+way the SwiftUI timer does), the per-target command shapes, and the
+breakpoint bookkeeping + lldb stop-frame parser. The GUI itself is
+verified by the build linking cleanly against the staticlib (all
+`rc_*` symbols resolved) — the same bar as `swiftui_counter`.
+
+A **gated** end-to-end test drives a real lldb session against a
+scaffolded host binary (set breakpoint → run → hit → `frame variable`
+→ continue → exit), mirroring the FLTK IDE's FULL gate:
+
+```sh
+RUSTCC_SWIFTUI_IDE_FULL=1 RUSTC=<fork-stage1>/bin/rustc \
+    RUSTC_BOOTSTRAP=1 cargo +nightly test full_lldb_session
+```
 
 ## Scope
 

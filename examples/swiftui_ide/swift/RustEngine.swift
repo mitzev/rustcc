@@ -25,6 +25,14 @@ import Combine
 @_silgen_name("rc_console_drain") func rc_console_drain() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("rc_string_free") func rc_string_free(_ p: UnsafeMutablePointer<CChar>?)
 
+@_silgen_name("rc_dbg_start") func rc_dbg_start(_ target: Int64) -> Int64
+@_silgen_name("rc_dbg_send") func rc_dbg_send(_ cmd: UnsafePointer<CChar>?)
+@_silgen_name("rc_dbg_stop") func rc_dbg_stop()
+@_silgen_name("rc_dbg_toggle_breakpoint") func rc_dbg_toggle_breakpoint(_ rel: UnsafePointer<CChar>?, _ line: Int64) -> Int64
+@_silgen_name("rc_dbg_active") func rc_dbg_active() -> Int64
+@_silgen_name("rc_dbg_curline") func rc_dbg_curline() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rc_dbg_breakpoints") func rc_dbg_breakpoints() -> UnsafeMutablePointer<CChar>?
+
 /// Consume a Rust-owned C-string into a Swift `String`, freeing it the
 /// way the engine's `rc_string_free` contract requires.
 private func takeRustString(_ p: UnsafeMutablePointer<CChar>?) -> String {
@@ -51,6 +59,12 @@ final class IDEEngine: ObservableObject {
     @Published var console: String = ""
     @Published var running: Bool = false
 
+    // Debugger
+    @Published var debugActive: Bool = false
+    @Published var stopFile: String? = nil   // basename lldb reported
+    @Published var stopLine: Int? = nil
+    @Published var breakpoints: [String] = [] // "rel:line"
+
     private var pollTimer: Timer?
 
     init() {
@@ -70,6 +84,44 @@ final class IDEEngine: ObservableObject {
         let chunk = takeRustString(rc_console_drain())
         if !chunk.isEmpty { console += chunk }
         running = rc_is_running() != 0
+        debugActive = rc_dbg_active() != 0
+        let loc = takeRustString(rc_dbg_curline())
+        if let colon = loc.lastIndex(of: ":"), let n = Int(loc[loc.index(after: colon)...]) {
+            stopFile = String(loc[..<colon]); stopLine = n
+        } else {
+            stopFile = nil; stopLine = nil
+        }
+    }
+
+    // MARK: - Debugger (host target only)
+
+    func dbgStart() {
+        if openRel != nil { save() }
+        _ = rc_dbg_start(Int64(target))
+    }
+    func dbgStop() { rc_dbg_stop() }
+    func dbgSend(_ cmd: String) { cmd.withCString { rc_dbg_send($0) } }
+    func stepOver() { dbgSend("thread step-over") }
+    func stepInto() { dbgSend("thread step-in") }
+    func stepOut()  { dbgSend("thread step-out") }
+    func continueRun() { dbgSend("continue") }
+    func variables() { dbgSend("frame variable") }
+
+    /// Toggle a breakpoint at `rel:line` (replayed into a live session
+    /// by the engine).
+    func toggleBreakpoint(rel: String, line: Int) {
+        _ = rel.withCString { rc_dbg_toggle_breakpoint($0, Int64(line)) }
+        refreshBreakpoints()
+    }
+    func refreshBreakpoints() {
+        let s = takeRustString(rc_dbg_breakpoints())
+        breakpoints = s.isEmpty ? [] : s.split(separator: "\n").map(String.init)
+    }
+
+    /// Is the stopped line in the file currently open in the editor?
+    func stopInOpenFile() -> Bool {
+        guard let f = stopFile, let rel = openRel else { return false }
+        return rel.hasSuffix(f)
     }
 
     func scaffoldHost(into dir: String) {

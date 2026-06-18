@@ -6,10 +6,10 @@ import AppKit
 
 struct ContentView: View {
     @StateObject private var eng = IDEEngine()
+    @State private var bpLine: Int = 1
 
     var body: some View {
         NavigationSplitView {
-            // Sidebar: the open project's file list.
             List(eng.files, id: \.self, selection: Binding(
                 get: { eng.openRel },
                 set: { if let rel = $0 { eng.openFile(rel) } }
@@ -19,55 +19,114 @@ struct ContentView: View {
             .navigationTitle("Files")
             .frame(minWidth: 200)
         } detail: {
-            VSplitView {
-                // Editor
-                Group {
-                    if eng.openRel != nil {
-                        TextEditor(text: $eng.source)
-                            .font(.system(.body, design: .monospaced))
-                            .autocorrectionDisabled()
-                    } else {
-                        ContentUnavailableView(
-                            "rustcc SwiftUI IDE",
-                            systemImage: "swift",
-                            description: Text("New ▸ a Host project, or Open a folder. "
-                                + "The engine is fork-Rust, reached over extern \"Swift\".")
-                        )
-                    }
+            VStack(spacing: 0) {
+                VSplitView {
+                    editorPane.frame(minHeight: 220)
+                    consolePane.frame(minHeight: 110)
                 }
-                .frame(minHeight: 240)
-
-                // Console
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack {
-                        Text("Console").font(.headline)
-                        if eng.running {
-                            ProgressView().controlSize(.small).padding(.leading, 4)
-                        }
-                        Spacer()
-                        Button("Clear") { eng.clearConsole() }.buttonStyle(.borderless)
-                    }
-                    .padding(.horizontal, 8).padding(.vertical, 4)
-                    ScrollViewReader { proxy in
-                        ScrollView {
-                            Text(eng.console.isEmpty ? "—" : eng.console)
-                                .font(.system(.caption, design: .monospaced))
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .textSelection(.enabled)
-                                .padding(8)
-                                .id("end")
-                        }
-                        .onChange(of: eng.console) { _, _ in
-                            proxy.scrollTo("end", anchor: .bottom)
-                        }
-                    }
-                }
-                .frame(minHeight: 120)
-                .background(Color(nsColor: .textBackgroundColor))
+                Divider()
+                debugBar
             }
             .navigationTitle(eng.openRel ?? "rustcc IDE")
             .toolbar { toolbar }
+            .onAppear { eng.refreshBreakpoints() }
         }
+    }
+
+    // MARK: - Panes
+
+    private var editorPane: some View {
+        Group {
+            if eng.openRel != nil {
+                TextEditor(text: $eng.source)
+                    .font(.system(.body, design: .monospaced))
+                    .autocorrectionDisabled()
+            } else {
+                ContentUnavailableView(
+                    "rustcc SwiftUI IDE",
+                    systemImage: "swift",
+                    description: Text("New ▸ a Host project, or Open a folder. The "
+                        + "engine is fork-Rust, reached over extern \"Swift\".")
+                )
+            }
+        }
+    }
+
+    private var consolePane: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Console").font(.headline)
+                if eng.running { ProgressView().controlSize(.small).padding(.leading, 4) }
+                Spacer()
+                Button("Clear") { eng.clearConsole() }.buttonStyle(.borderless)
+            }
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(eng.console.isEmpty ? "—" : eng.console)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .id("end")
+                }
+                .onChange(of: eng.console) { _, _ in proxy.scrollTo("end", anchor: .bottom) }
+            }
+        }
+        .background(Color(nsColor: .textBackgroundColor))
+    }
+
+    // MARK: - Debug bar (host target only)
+
+    private var debugBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "ladybug").foregroundStyle(eng.debugActive ? .green : .secondary)
+
+            if eng.debugActive {
+                Button { eng.dbgStop() } label: { Label("Stop", systemImage: "stop.fill") }
+                ControlGroup {
+                    Button { eng.stepOver() } label: { Image(systemName: "arrow.turn.down.right") }
+                    Button { eng.stepInto() } label: { Image(systemName: "arrow.down.to.line") }
+                    Button { eng.stepOut() } label: { Image(systemName: "arrow.up.to.line") }
+                    Button { eng.continueRun() } label: { Image(systemName: "play.fill") }
+                    Button { eng.variables() } label: { Image(systemName: "list.bullet.rectangle") }
+                }
+                .frame(width: 190)
+                if let f = eng.stopFile, let l = eng.stopLine {
+                    Text("⏸ \(f):\(l)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.orange)
+                }
+            } else {
+                Button { eng.dbgStart() } label: { Label("Start Debug", systemImage: "ladybug.fill") }
+                    .disabled(eng.projectDir == nil || eng.target != 0)
+                Text(eng.target == 0 ? "host lldb" : "host target only")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            // Breakpoints: SwiftUI's TextEditor has no gutter/cursor
+            // API, so place them by line number.
+            Stepper("BP line \(bpLine)", value: $bpLine, in: 1...100_000)
+                .fixedSize()
+            Button("Toggle BP") {
+                if let rel = eng.openRel { eng.toggleBreakpoint(rel: rel, line: bpLine) }
+            }
+            .disabled(eng.openRel == nil)
+            ForEach(eng.breakpoints, id: \.self) { bp in
+                Button {
+                    if let c = bp.lastIndex(of: ":"), let n = Int(bp[bp.index(after: c)...]) {
+                        eng.toggleBreakpoint(rel: String(bp[..<c]), line: n)
+                    }
+                } label: {
+                    Text("● \(shortBP(bp))").font(.caption2.monospaced())
+                }
+                .buttonStyle(.borderless).foregroundStyle(.red)
+                .help("Remove breakpoint \(bp)")
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
     }
 
     @ToolbarContentBuilder
@@ -91,6 +150,14 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Helpers
+
+    private func shortBP(_ bp: String) -> String {
+        guard let c = bp.lastIndex(of: ":") else { return bp }
+        let base = bp[..<c].split(separator: "/").last.map(String.init) ?? String(bp[..<c])
+        return base + bp[c...]
+    }
+
     private func icon(for rel: String) -> String {
         if rel.hasSuffix(".rs") { return "r.square" }
         if rel.hasSuffix(".toml") || rel.hasSuffix(".json") { return "gearshape" }
@@ -98,20 +165,12 @@ struct ContentView: View {
         return "doc"
     }
 
-    // MARK: - AppKit folder pickers
-
     private func newHostProject() {
-        if let dir = pickFolder(prompt: "Create Host Project In…") {
-            eng.scaffoldHost(into: dir)
-        }
+        if let dir = pickFolder(prompt: "Create Host Project In…") { eng.scaffoldHost(into: dir) }
     }
-
     private func openProject() {
-        if let dir = pickFolder(prompt: "Open Project Folder") {
-            eng.open(dir)
-        }
+        if let dir = pickFolder(prompt: "Open Project Folder") { eng.open(dir) }
     }
-
     private func pickFolder(prompt: String) -> String? {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
