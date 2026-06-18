@@ -33,6 +33,8 @@ import Combine
 @_silgen_name("rc_dbg_curline") func rc_dbg_curline() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("rc_dbg_breakpoints") func rc_dbg_breakpoints() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("rc_upload") func rc_upload(_ target: Int64) -> Int64
+@_silgen_name("rc_dbg_request_vars") func rc_dbg_request_vars()
+@_silgen_name("rc_dbg_vars") func rc_dbg_vars() -> UnsafeMutablePointer<CChar>?
 
 /// Consume a Rust-owned C-string into a Swift `String`, freeing it the
 /// way the engine's `rc_string_free` contract requires.
@@ -68,6 +70,9 @@ final class IDEEngine: ObservableObject {
     @Published var stopFile: String? = nil   // basename lldb reported
     @Published var stopLine: Int? = nil
     @Published var breakpoints: [String] = [] // "rel:line"
+    @Published var variables: String = ""     // latest `frame variable`
+    var autoVars = false                      // recapture vars on each stop
+    private var lastStopSig = ""
 
     private var pollTimer: Timer?
 
@@ -95,7 +100,18 @@ final class IDEEngine: ObservableObject {
         } else {
             stopFile = nil; stopLine = nil
         }
+        // On a NEW stop, recapture variables if the pane wants them.
+        let sig = "\(stopFile ?? ""):\(stopLine ?? 0)"
+        if sig != lastStopSig {
+            lastStopSig = sig
+            if autoVars && debugActive && stopLine != nil { rc_dbg_request_vars() }
+        }
+        let v = takeRustString(rc_dbg_vars())
+        if v != variables { variables = v }
     }
+
+    /// Ask the live session for a fresh `frame variable` capture.
+    func requestVars() { rc_dbg_request_vars() }
 
     // MARK: - Debugger (host target only)
 
@@ -109,7 +125,6 @@ final class IDEEngine: ObservableObject {
     func stepInto() { dbgSend("thread step-in") }
     func stepOut()  { dbgSend("thread step-out") }
     func continueRun() { dbgSend("continue") }
-    func variables() { dbgSend("frame variable") }
 
     /// Toggle a breakpoint at `rel:line` (replayed into a live session
     /// by the engine).

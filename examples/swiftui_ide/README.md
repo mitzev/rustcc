@@ -69,7 +69,8 @@ bound on the Swift side as:
   and Find scrolls/selects matches. **Save** writes back through the
   engine. **Tabs** above the editor hold multiple open files (each
   with its own unsaved-edit buffer; × to close). **Find** has a live
-  match count, **Find Next** (wraps), and **Replace All**.
+  match count, **Find Next** (wraps), **Replace** (current match), and
+  **Replace All**.
 - **Target picker** — the same six targets as the FLTK IDE (Host,
   RAK11161 ×2, ESP32-C3, STM32F4, Pico).
 - **Build / Run** — runs the engine's per-target command (identical to
@@ -86,9 +87,12 @@ bound on the Swift side as:
   spawns it on a background thread; the transcript streams into the
   console). **Step Over/Into/Out**, **Continue**, **Variables**, and
   **Stop**; a **⏸ file:line** banner shows the current stop and the
-  stop line is highlighted amber in the editor. Set breakpoints by
-  **clicking the editor gutter** (red dot; also listed as removable ●
-  chips); they replay into a live session.
+  stop line is highlighted amber in the editor. **Variables** toggles
+  a trailing inspector pane that shows `frame variable` for the
+  current frame, auto-refreshing on every stop (a sentinel-bracketed
+  capture in the engine keeps it out of the console transcript). Set
+  breakpoints by **clicking the editor gutter** (red dot; also listed
+  as removable ● chips); they replay into a live session.
 
 ## Build & run (macOS)
 
@@ -138,9 +142,10 @@ scaffold embeds the same validated firmware as the FLTK IDE, so a
 `PASS (105/4000/503/42)` line — proven by the gated `full_rtos_arm`
 test. The editor is an `NSTextView`-backed `CodeEditorView` with a
 line-number gutter, click-to-toggle breakpoints, and an amber
-current-line highlight that follows the debugger. Remaining FLTK-IDE
-niceties (a dedicated variables pane, single-match Replace) are
-follow-ups; each maps onto an `rc_*` engine call plus SwiftUI views.
+current-line highlight that follows the debugger; the debugger has a
+Variables inspector pane (auto-refreshing `frame variable` capture).
+The SwiftUI IDE is now at feature parity with the FLTK IDE for the
+host + RTOS workflow.
 
 ## Why this is a good fork test
 

@@ -11,6 +11,7 @@ struct ContentView: View {
     @State private var replaceText = ""
     @State private var selectRange: NSRange? = nil
     @State private var findAnchor: Int = 0   // NSString offset for Find Next
+    @State private var showVars = false
 
     var body: some View {
         NavigationSplitView {
@@ -42,7 +43,40 @@ struct ContentView: View {
             .navigationTitle(eng.openRel ?? "rustcc IDE")
             .toolbar { toolbar }
             .onAppear { eng.refreshBreakpoints() }
+            .inspector(isPresented: $showVars) { varsInspector }
         }
+    }
+
+    // MARK: - Variables inspector
+
+    private var varsInspector: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Label("Variables", systemImage: "list.bullet.rectangle").font(.headline)
+                Spacer()
+                Button {
+                    eng.requestVars()
+                } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless).disabled(!eng.debugActive)
+                    .help("Re-capture frame variables")
+            }
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            Divider()
+            ScrollView {
+                Text(varsText)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(8)
+            }
+        }
+        .inspectorColumnWidth(min: 220, ideal: 300, max: 480)
+    }
+
+    private var varsText: String {
+        if !eng.debugActive { return "(no debug session — Start Debug, then stop at a breakpoint)" }
+        let v = eng.variables.trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty ? "(no locals in this frame — step into a call)" : eng.variables
     }
 
     // MARK: - Find / Replace
@@ -60,6 +94,7 @@ struct ContentView: View {
             Divider().frame(height: 16)
             TextField("Replace", text: $replaceText)
                 .textFieldStyle(.roundedBorder).frame(width: 180)
+            Button("Replace") { replaceCurrent() }.disabled(findText.isEmpty || matchCount == 0)
             Button("Replace All") { replaceAll() }.disabled(findText.isEmpty || matchCount == 0)
             Spacer()
             Button("Done") { showFind = false }
@@ -84,6 +119,22 @@ struct ContentView: View {
             selectRange = r
             findAnchor = r.location + r.length
         }
+    }
+
+    /// Replace the current match (the one Find Next selected), then
+    /// advance to the next. Falls back to Find Next if nothing is
+    /// currently on a match.
+    private func replaceCurrent() {
+        guard !findText.isEmpty else { return }
+        let ns = eng.source as NSString
+        if let r = selectRange, r.location != NSNotFound, NSMaxRange(r) <= ns.length,
+            ns.substring(with: r) == findText
+        {
+            eng.source = ns.replacingCharacters(in: r, with: replaceText)
+            findAnchor = r.location + (replaceText as NSString).length
+            selectRange = nil
+        }
+        findNext()
     }
 
     private func replaceAll() {
@@ -201,7 +252,11 @@ struct ContentView: View {
                     Button { eng.stepInto() } label: { Image(systemName: "arrow.down.to.line") }
                     Button { eng.stepOut() } label: { Image(systemName: "arrow.up.to.line") }
                     Button { eng.continueRun() } label: { Image(systemName: "play.fill") }
-                    Button { eng.variables() } label: { Image(systemName: "list.bullet.rectangle") }
+                    Button {
+                    showVars.toggle()
+                    eng.autoVars = showVars
+                    if showVars { eng.requestVars() }
+                } label: { Image(systemName: "list.bullet.rectangle") }
                 }
                 .frame(width: 190)
                 if let f = eng.stopFile, let l = eng.stopLine {

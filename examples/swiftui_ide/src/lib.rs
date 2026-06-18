@@ -79,6 +79,17 @@ static DBG_CURLINE: Mutex<Option<(String, i32)>> = Mutex::new(None);
 /// Breakpoints as `(project-relative path, line)`.
 static BREAKPOINTS: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 
+/// `frame variable` capture: while `active`, the lldb reader thread
+/// routes payload lines into `acc` (instead of the console) until the
+/// sentinel arrives; the result is published to `DBG_VARS`.
+struct VarCap {
+    active: bool,
+    acc: String,
+}
+static DBG_VARCAP: Mutex<VarCap> = Mutex::new(VarCap { active: false, acc: String::new() });
+static DBG_VARS: Mutex<String> = Mutex::new(String::new());
+const VARS_SENTINEL: &str = "<<RUSTCC_VARS_END>>";
+
 // ---------------------------------------------------------------------
 // Pure-logic core (no ABI concerns — unit-testable as plain Rust)
 // ---------------------------------------------------------------------
@@ -358,6 +369,16 @@ mod engine {
         }
     }
 
+    /// Send a command WITHOUT echoing it to the console — used for the
+    /// `frame variable` capture so the transcript stays clean.
+    pub fn dbg_send_quiet(cmd: &str) {
+        use std::io::Write;
+        if let Some(stdin) = DBG_STDIN.lock().unwrap().as_mut() {
+            let _ = writeln!(stdin, "{cmd}");
+            let _ = stdin.flush();
+        }
+    }
+
     /// The crate name from the open project's Cargo.toml (host bin).
     pub fn project_bin_name(dir: &str) -> String {
         std::fs::read_to_string(format!("{dir}/Cargo.toml"))
@@ -420,14 +441,42 @@ mod engine {
                     match r.read_line(&mut line) {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {
-                            console_append(&line);
-                            if line.contains(" at ") {
-                                if let Some(loc) = parse_stop_location(&line) {
-                                    *DBG_CURLINE.lock().unwrap() = Some(loc);
+                            // During a `frame variable` capture, route
+                            // payload lines into the vars buffer (drop
+                            // command echoes + the sentinel); otherwise
+                            // stream to the console and track stops.
+                            let captured = {
+                                let mut cap = DBG_VARCAP.lock().unwrap();
+                                if cap.active {
+                                    let t = line.trim();
+                                    // `ends_with`, NOT `contains`: the
+                                    // command echo `(lldb) script
+                                    // print("<<…>>")` contains the
+                                    // sentinel but ends in `")`; the
+                                    // real sentinel line ends in it.
+                                    if t.ends_with(VARS_SENTINEL) {
+                                        cap.active = false;
+                                        *DBG_VARS.lock().unwrap() = std::mem::take(&mut cap.acc);
+                                    } else if t.starts_with("(lldb)") || t.contains("script print(") {
+                                        // command echo — drop
+                                    } else {
+                                        cap.acc.push_str(&line);
+                                    }
+                                    true
+                                } else {
+                                    false
                                 }
-                            }
-                            if line.contains("Process") && line.contains("exited") {
-                                *DBG_CURLINE.lock().unwrap() = None;
+                            };
+                            if !captured {
+                                console_append(&line);
+                                if line.contains(" at ") {
+                                    if let Some(loc) = parse_stop_location(&line) {
+                                        *DBG_CURLINE.lock().unwrap() = Some(loc);
+                                    }
+                                }
+                                if line.contains("Process") && line.contains("exited") {
+                                    *DBG_CURLINE.lock().unwrap() = None;
+                                }
                             }
                         }
                     }
@@ -879,6 +928,8 @@ pub extern "Swift" fn rc_dbg_stop() {
     }
     DBG_ACTIVE.store(false, Relaxed);
     *DBG_CURLINE.lock().unwrap() = None;
+    DBG_VARCAP.lock().unwrap().active = false;
+    DBG_VARS.lock().unwrap().clear();
     engine::console_append("debug session stopped\n");
 }
 
@@ -928,6 +979,32 @@ pub extern "Swift" fn rc_dbg_curline() -> *mut c_char {
         None => String::new(),
     };
     out_cstring(s)
+}
+
+/// Request a fresh `frame variable` capture from the live session
+/// (sentinel-bracketed; the reader thread fills DBG_VARS). No-op if no
+/// session or a capture is already in flight.
+#[export_name = "rc_dbg_request_vars"]
+pub extern "Swift" fn rc_dbg_request_vars() {
+    if !DBG_ACTIVE.load(Relaxed) {
+        return;
+    }
+    {
+        let mut cap = DBG_VARCAP.lock().unwrap();
+        if cap.active {
+            return;
+        }
+        cap.active = true;
+        cap.acc.clear();
+    }
+    engine::dbg_send_quiet("frame variable");
+    engine::dbg_send_quiet(&format!("script print(\"{VARS_SENTINEL}\")"));
+}
+
+/// The latest captured `frame variable` output (caller frees).
+#[export_name = "rc_dbg_vars"]
+pub extern "Swift" fn rc_dbg_vars() -> *mut c_char {
+    out_cstring(DBG_VARS.lock().unwrap().clone())
 }
 
 /// All breakpoints as newline-joined `rel:line` rows. Caller frees.
@@ -1131,9 +1208,26 @@ mod tests {
             DBG_CURLINE.lock().unwrap().is_some(),
             "curline not tracked after stop"
         );
-        rc_dbg_send(cstr("frame variable").as_ptr());
-        let m = acc.len();
-        let _ = m;
+        // main's println! line has no locals — step into the call so
+        // there's a variable to capture (the FLTK IDE's lesson too).
+        rc_dbg_send(cstr("thread step-in").as_ptr());
+        assert!(wait(&mut acc, "stop reason = step", 20), "step-in did not stop:\n{acc}");
+        // Variables pane: the sentinel capture fills DBG_VARS without
+        // polluting the console transcript.
+        rc_dbg_request_vars();
+        let mut vars = String::new();
+        for _ in 0..150 {
+            vars = unsafe { take(rc_dbg_vars()) };
+            if !vars.trim().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(!vars.trim().is_empty(), "frame-variable capture was empty");
+        assert!(
+            !acc.contains(VARS_SENTINEL),
+            "capture sentinel leaked into the console"
+        );
         rc_dbg_send(cstr("breakpoint disable").as_ptr());
         rc_dbg_send(cstr("continue").as_ptr());
         assert!(wait(&mut acc, "exited", 30), "did not run to exit:\n{acc}");
