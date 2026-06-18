@@ -99,8 +99,13 @@ static mut READER_SLOT: Option<Reader> = None;
 #[unsafe(no_mangle)]
 pub extern "C" fn init_widget(v: i32) -> *mut Widget {
     unsafe {
-        SLOT = Some(Widget::new(v));
-        match SLOT.as_mut() {
+        // Go through a raw pointer (`&raw mut`) rather than `&mut SLOT`:
+        // a reference to a `static mut` trips the `static_mut_refs`
+        // lint (a hard error in edition 2024). The deref-of-raw-pointer
+        // reference is fine, and the place semantics are identical.
+        let slot = &raw mut SLOT;
+        *slot = Some(Widget::new(v));
+        match (*slot).as_mut() {
             Some(w) => w as *mut Widget,
             None => core::ptr::null_mut(),
         }
@@ -113,8 +118,9 @@ pub extern "C" fn init_widget(v: i32) -> *mut Widget {
 #[unsafe(no_mangle)]
 pub extern "C" fn init_gauge(v: i32, scale: i32) -> *mut Widget {
     unsafe {
-        GAUGE_SLOT = Some(Gauge::new(v, scale));
-        match GAUGE_SLOT.as_mut() {
+        let slot = &raw mut GAUGE_SLOT;
+        *slot = Some(Gauge::new(v, scale));
+        match (*slot).as_mut() {
             Some(g) => g as *mut Gauge as *mut Widget,
             None => core::ptr::null_mut(),
         }
@@ -127,8 +133,9 @@ pub extern "C" fn init_gauge(v: i32, scale: i32) -> *mut Widget {
 #[unsafe(no_mangle)]
 pub extern "C" fn init_reader(id: i32, offset: i32) -> *mut Sensor {
     unsafe {
-        READER_SLOT = Some(Reader::new(id, offset));
-        match READER_SLOT.as_mut() {
+        let slot = &raw mut READER_SLOT;
+        *slot = Some(Reader::new(id, offset));
+        match (*slot).as_mut() {
             Some(r) => r as *mut Reader as *mut Sensor,
             None => core::ptr::null_mut(),
         }
