@@ -1,0 +1,36 @@
+# SwiftUI rustcc IDE — engine half.
+#
+# A SwiftUI app (Swift `@main`, Swift views) drives a fork-Rust IDE
+# engine through the rustcc fork's Swift `swiftcc` ABI. The INVERSE of
+# `examples/rustcc_ide` (the FLTK IDE), where Rust subclasses C++
+# widgets and IS the UI; here Swift owns the UI and Rust is the engine
+# (scaffold / build / run / project model), reached over `extern "Swift"`.
+#
+# Build the engine static library for the Swift app:
+#   RUSTC=<fork-stage1>/bin/rustc RUSTC_BOOTSTRAP=1 cargo +nightly build --release
+# Validate the engine (no Swift toolchain needed):
+#   RUSTC=<fork-stage1>/bin/rustc RUSTC_BOOTSTRAP=1 cargo +nightly test
+# Build + launch the whole app (macOS):
+#   ./build.sh run
+
+[package]
+name = "swiftui_ide"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "swiftui_ide"
+path = "src/lib.rs"
+# `staticlib` for the Swift app to link; `rlib` so `cargo test` can
+# exercise the engine in-process.
+crate-type = ["staticlib", "rlib"]
+# stock `rustdoc` can't compile `extern "Swift"` (a fork-only ABI), so
+# doctests would break `cargo test`.
+doctest = false
+
+[profile.release]
+# Keep the `extern "Swift"` symbols; the Swift linker resolves them.
+opt-level = 2
+
+[workspace]
