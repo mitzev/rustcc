@@ -53,9 +53,14 @@ bound on the Swift side as:
 
 ## What it does
 
-- **File ▸ New Host** — scaffolds a fork-Rust Hello-World project (a
+- **New ▸ Host** — scaffolds a fork-Rust Hello-World project (a
   `class Greeter` with a virtual method + a free `greeting() -> String`)
   and opens it.
+- **New ▸ RAK11161 RTOS** — scaffolds a complete dual-core FreeRTOS
+  firmware project (the Rust `class` crate + C++ side + FreeRTOS glue +
+  per-core qemu run scripts), embedded at compile time from the
+  validated `bare_metal_arm` / `freertos_cpp` examples so it can't
+  drift, and defaults the target to the STM32WLE5 (CM4) core.
 - **Open** — pick any folder; the sidebar lists its source files.
 - **Editor** — a `TextEditor` bound to the selected file; **Save**
   writes it back through the engine.
@@ -98,30 +103,32 @@ The engine is validated **headlessly** through the exact `extern
 GUI): the target table, a scaffold → list → read → edit → save → reopen
 round-trip, the streamed-console drain (a real subprocess, polled the
 way the SwiftUI timer does), the per-target command shapes, and the
-breakpoint bookkeeping + lldb stop-frame parser. The GUI itself is
-verified by the build linking cleanly against the staticlib (all
-`rc_*` symbols resolved) — the same bar as `swiftui_counter`.
+breakpoint bookkeeping + lldb stop-frame parser, and the RTOS scaffold
+file set + injected `SKIP_QEMU` gate. The GUI itself is verified by the
+build linking cleanly against the staticlib (all `rc_*` symbols
+resolved) — the same bar as `swiftui_counter`.
 
-A **gated** end-to-end test drives a real lldb session against a
-scaffolded host binary (set breakpoint → run → hit → `frame variable`
-→ continue → exit), mirroring the FLTK IDE's FULL gate:
+Two **gated** end-to-end tests (mirroring the FLTK IDE's FULL gate)
+drive real toolchains through the engine:
 
 ```sh
 RUSTCC_SWIFTUI_IDE_FULL=1 RUSTC=<fork-stage1>/bin/rustc \
-    RUSTC_BOOTSTRAP=1 cargo +nightly test full_lldb_session
+    RUSTC_BOOTSTRAP=1 cargo +nightly test
+# full_lldb_session — host: bp → run → hit → frame variable → continue → exit
+# full_rtos_arm     — RTOS: scaffold → run_arm.sh on qemu → PASS (105/4000/503/42)
 ```
 
 ## Scope
 
-This is the **MVP**: scaffold/open/edit/save + build/run a **Host**
-project end to end. The FLTK IDE's later features — RTOS project
-scaffolds (the `include_str!` firmware embeds), the in-IDE lldb
-debugger, tabs, find/replace, firmware upload — are deliberately left
-as follow-ups; each maps onto an additional `rc_*` engine call plus
-SwiftUI views, exactly as they were added to `rustcc_ide` iteratively.
-The Target menu lists all six cores; building an RTOS target requires a
-project scaffolded with the run scripts (today: scaffold those with the
-FLTK IDE, open the folder here).
+Landed: scaffold/open/edit/save + build/run for **both** Host and
+**RTOS** projects (all six cores), plus an in-IDE **lldb debugger**
+(host). The RTOS scaffold embeds the same validated firmware as the
+FLTK IDE, so a `New ▸ RAK11161 RTOS` project builds and runs on qemu to
+the `PASS (105/4000/503/42)` line — proven by the gated `full_rtos_arm`
+test. The FLTK IDE's remaining conveniences — tabs, find/replace,
+firmware upload, a dedicated variables pane — are the natural next
+follow-ups; each maps onto an `rc_*` engine call plus SwiftUI views,
+exactly as they were added to `rustcc_ide` iteratively.
 
 ## Why this is a good fork test
 

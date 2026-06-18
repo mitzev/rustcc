@@ -124,10 +124,17 @@ final class IDEEngine: ObservableObject {
         return rel.hasSuffix(f)
     }
 
-    func scaffoldHost(into dir: String) {
-        let rc = dir.withCString { rc_scaffold(0, $0) }
+    func scaffoldHost(into dir: String) { scaffold(kind: 0, into: dir, defaultTarget: 0) }
+
+    /// RAK11161 dual-core FreeRTOS firmware; default to the STM32WLE5
+    /// (CM4) core so Build/Run picks `run_arm.sh`.
+    func scaffoldRTOS(into dir: String) { scaffold(kind: 1, into: dir, defaultTarget: 1) }
+
+    private func scaffold(kind: Int64, into dir: String, defaultTarget: Int) {
+        let rc = dir.withCString { rc_scaffold(kind, $0) }
         if rc == 0 {
             projectDir = dir
+            target = defaultTarget
             refreshFiles()
             openFirstSource()
         }

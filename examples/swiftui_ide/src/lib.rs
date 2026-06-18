@@ -40,6 +40,16 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Mutex;
 
+/// Embed a sibling-example source at COMPILE TIME, so a scaffolded
+/// RTOS project can never drift from the qemu-validated probes (same
+/// trick the FLTK IDE uses; `swiftui_ide` sits next to them under
+/// `examples/`, so the `/../` paths resolve identically).
+macro_rules! embed {
+    ($p:literal) => {
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../", $p))
+    };
+}
+
 // ---------------------------------------------------------------------
 // Engine state
 // ---------------------------------------------------------------------
@@ -115,6 +125,66 @@ mod engine {
         std::fs::write(root.join("src/main.rs"), HOST_MAIN_RS).map_err(werr)?;
         std::fs::write(root.join(".vscode/tasks.json"), HOST_TASKS_JSON).map_err(werr)?;
         std::fs::write(root.join("README.md"), HOST_README).map_err(werr)?;
+        Ok(())
+    }
+
+    /// Scaffold a complete RAK11161 dual-core FreeRTOS firmware
+    /// project — the Rust `class` crate + C++ side + FreeRTOS glue +
+    /// per-core qemu run scripts — embedded at compile time from the
+    /// validated `bare_metal_arm` / `freertos_cpp` examples (so it
+    /// can't drift). Byte-identical to the FLTK IDE's `scaffold_project`.
+    pub fn scaffold_rtos(dir: &str) -> Result<(), String> {
+        let root = Path::new(dir);
+        let werr = |e: std::io::Error| e.to_string();
+        for sub in ["src", "cpp", "libc_stub", ".vscode"] {
+            std::fs::create_dir_all(root.join(sub)).map_err(werr)?;
+        }
+        // examples-tree relative paths → project-local, and inject the
+        // SKIP_QEMU link-only gate into the run scripts.
+        let fix = |s: &str| -> String {
+            s.replace("../bare_metal_arm/caller.cpp", "cpp/caller.cpp")
+                .replace("../bare_metal_arm/sensor.cpp", "cpp/sensor.cpp")
+                .replace("../bare_metal_arm/rtti_stub.c", "cpp/rtti_stub.c")
+                .replace("libfreertos_cpp.a", "librak11161_fw.a")
+                .replace(
+                    "echo \"==> qemu",
+                    "[[ \"${SKIP_QEMU:-0}\" == 1 ]] && { echo \"(SKIP_QEMU=1 — link-only build done)\"; exit 0; }\necho \"==> qemu",
+                )
+        };
+        let files: &[(&str, String)] = &[
+            ("src/lib.rs", embed!("bare_metal_arm/src/lib.rs").to_string()),
+            ("cpp/caller.cpp", embed!("bare_metal_arm/caller.cpp").to_string()),
+            ("cpp/sensor.cpp", embed!("bare_metal_arm/sensor.cpp").to_string()),
+            ("cpp/sensor.hpp", embed!("bare_metal_arm/sensor.hpp").to_string()),
+            ("cpp/rtti_stub.c", embed!("bare_metal_arm/rtti_stub.c").to_string()),
+            ("FreeRTOSConfig.h", embed!("freertos_cpp/FreeRTOSConfig.h").to_string()),
+            ("main_arm.c", embed!("freertos_cpp/main_arm.c").to_string()),
+            ("main_riscv.c", embed!("freertos_cpp/main_riscv.c").to_string()),
+            ("link_arm.ld", embed!("freertos_cpp/link_arm.ld").to_string()),
+            ("link_riscv.ld", embed!("freertos_cpp/link_riscv.ld").to_string()),
+            ("libc_stub/string.h", embed!("freertos_cpp/libc_stub/string.h").to_string()),
+            ("libc_stub/stdlib.h", embed!("freertos_cpp/libc_stub/stdlib.h").to_string()),
+            ("libc_stub/tinylibc.c", embed!("freertos_cpp/libc_stub/tinylibc.c").to_string()),
+            ("run_arm.sh", fix(embed!("freertos_cpp/run_arm.sh"))),
+            ("run_riscv.sh", fix(embed!("freertos_cpp/run_riscv.sh"))),
+            ("run_riscv_c2.sh", fix(embed!("freertos_cpp/run_riscv_c2.sh"))),
+            ("run_pico.sh", fix(embed!("freertos_cpp/run_pico.sh"))),
+            ("upload.toml", UPLOAD_TOML.to_string()),
+            ("Cargo.toml", SCAFFOLD_CARGO_TOML.to_string()),
+            (".vscode/tasks.json", SCAFFOLD_TASKS_JSON.to_string()),
+            ("README.md", SCAFFOLD_README.to_string()),
+        ];
+        for (rel, content) in files {
+            std::fs::write(root.join(rel), content).map_err(werr)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for s in ["run_arm.sh", "run_riscv.sh", "run_riscv_c2.sh", "run_pico.sh"] {
+                std::fs::set_permissions(root.join(s), std::fs::Permissions::from_mode(0o755))
+                    .map_err(werr)?;
+            }
+        }
         Ok(())
     }
 
@@ -442,6 +512,77 @@ RUSTC=<fork-stage1>/bin/rustc RUSTC_BOOTSTRAP=1 cargo +nightly run --release
 ```
 "#;
 
+const SCAFFOLD_CARGO_TOML: &str = r#"# RAK11161 dual-core firmware — scaffolded by the rustcc SwiftUI IDE.
+# The Rust side is a fork `class` crate (Widget/Gauge + imported
+# Sensor/Reader); per-core builds are driven by the run scripts.
+[workspace]
+
+[package]
+name = "rak11161_fw"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+"#;
+
+const SCAFFOLD_TASKS_JSON: &str = r#"{
+  "version": "2.0.0",
+  "tasks": [
+    { "label": "rustcc: build (RAK11161 STM32WLE5 / CM4)", "type": "shell",
+      "command": "SKIP_QEMU=1 ./run_arm.sh", "group": "build" },
+    { "label": "rustcc: run on qemu (RAK11161 STM32WLE5 / CM4)", "type": "shell",
+      "command": "./run_arm.sh", "group": "test" },
+    { "label": "rustcc: build (RAK11161 ESP8684 / ESP32-C2)", "type": "shell",
+      "command": "SKIP_QEMU=1 ./run_riscv_c2.sh", "group": "build" },
+    { "label": "rustcc: run on qemu (RAK11161 ESP8684 / ESP32-C2)", "type": "shell",
+      "command": "./run_riscv_c2.sh", "group": "test" }
+  ]
+}
+"#;
+
+const SCAFFOLD_README: &str = r#"# RAK11161 dual-core firmware (rustcc)
+
+Scaffolded by the **rustcc SwiftUI IDE** for the RAKwireless RAK11161
+WisDuo breakout: STM32WLE5 (Arm Cortex-M4, LoRa side) + ESP8684 =
+ESP32-C2 (RISC-V rv32imc, WiFi/BLE side). One Rust `class` crate
+(`src/lib.rs`) is built per-core and runs under FreeRTOS on qemu:
+
+```sh
+./run_arm.sh        # STM32WLE5 core  (ARM_CM4F port, qemu mps2-an386)
+./run_riscv_c2.sh   # ESP8684 core    (RISC-V port, rv32imc, A ext OFF)
+SKIP_QEMU=1 ./run_arm.sh   # build + link only
+```
+
+Expected: `FREERTOS CXX PROBE (…): PASS (105/4000/503/42 across tasks)`.
+The qemu machines model the CORES, not RAK's radios.
+"#;
+
+const UPLOAD_TOML: &str = r#"# rustcc IDE — firmware upload configuration (per project).
+# Each [section]'s `cmd` is a shell template run from the project root
+# with {elf}/{dir}/{port} placeholders. The qemu-validated ELFs use the
+# qemu memory maps — point the linker scripts at your board before
+# flashing real hardware.
+
+[stm32]
+cmd = "STM32_Programmer_CLI -c port=SWD -w {elf} -v -rst"
+
+[esp32]
+cmd = "esptool.py --chip auto elf2image {elf} -o {dir}/fw.bin && esptool.py --chip auto --port {port} write_flash 0x0 {dir}/fw.bin"
+
+[pico]
+cmd = "picotool load {elf} -fx"
+
+[serial]
+port = "/dev/cu.usbmodem01"
+"#;
+
 // ---------------------------------------------------------------------
 // C-string marshaling helpers
 // ---------------------------------------------------------------------
@@ -494,14 +635,15 @@ pub extern "Swift" fn rc_scaffold(kind: i64, dir: *const c_char) -> i64 {
     if dir.is_empty() {
         return -1;
     }
-    let r = match kind {
-        0 => engine::scaffold_host(&dir),
-        _ => Err(format!("scaffold kind {kind} not yet ported to the SwiftUI IDE")),
+    let (r, label) = match kind {
+        0 => (engine::scaffold_host(&dir), "host"),
+        1 => (engine::scaffold_rtos(&dir), "RAK11161 dual-core FreeRTOS"),
+        _ => (Err(format!("unknown scaffold kind {kind}")), ""),
     };
     match r {
         Ok(()) => {
             *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
-            engine::console_append(&format!("scaffolded host project at {dir}\n"));
+            engine::console_append(&format!("scaffolded {label} project at {dir}\n"));
             0
         }
         Err(e) => {
@@ -820,6 +962,35 @@ mod tests {
     }
 
     #[test]
+    fn scaffold_rtos_file_set_and_skip_gate() {
+        let dir = std::env::temp_dir().join(format!("swiftui_ide_rtos{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rc_scaffold(1, cstr(dir.to_str().unwrap()).as_ptr()), 0);
+        let files = unsafe { take(rc_list_files()) };
+        // The dual-core firmware set the run scripts need.
+        for want in [
+            "src/lib.rs", "cpp/caller.cpp", "cpp/sensor.cpp", "FreeRTOSConfig.h",
+            "main_arm.c", "link_arm.ld", "run_arm.sh", "run_riscv_c2.sh", "Cargo.toml",
+        ] {
+            assert!(files.lines().any(|l| l == want), "missing {want} in:\n{files}");
+        }
+        // The Rust side is the validated fork `class` crate.
+        let lib = unsafe { take(rc_read_file(cstr("src/lib.rs").as_ptr())) };
+        assert!(lib.contains("class") && lib.contains("Sensor"), "scaffold lost the class crate");
+        // The SKIP_QEMU link-only gate was injected into run_arm.sh.
+        let run = unsafe { take(rc_read_file(cstr("run_arm.sh").as_ptr())) };
+        assert!(run.contains("SKIP_QEMU"), "run_arm.sh missing the SKIP_QEMU gate");
+        // run scripts are executable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let m = std::fs::metadata(dir.join("run_arm.sh")).unwrap().permissions().mode();
+            assert!(m & 0o111 != 0, "run_arm.sh not executable");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn breakpoint_toggle_and_stop_parser() {
         BREAKPOINTS.lock().unwrap().clear();
         // add → remove round-trip, reported via the return code.
@@ -895,6 +1066,38 @@ mod tests {
         assert!(wait(&mut acc, "exited", 30), "did not run to exit:\n{acc}");
         rc_dbg_stop();
         assert_eq!(rc_dbg_active(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scaffold an RTOS project and run its STM32WLE5 (CM4) core under
+    /// qemu through the engine, asserting the FreeRTOS probe PASS line.
+    /// Gated (needs arm-none-eabi-gcc + qemu + the FreeRTOS kernel).
+    #[test]
+    fn full_rtos_arm() {
+        if std::env::var("RUSTCC_SWIFTUI_IDE_FULL").as_deref() != Ok("1") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("swiftui_ide_rtosrun{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rc_scaffold(1, cstr(dir.to_str().unwrap()).as_ptr()), 0);
+
+        // Drive the CM4 core (target 1 → run_arm.sh) via the build API.
+        let _ = unsafe { take(rc_console_drain()) };
+        assert_eq!(rc_build(1, 1), 0); // run on qemu
+        let mut acc = String::new();
+        let mut ok = false;
+        for _ in 0..1800 {
+            acc.push_str(&unsafe { take(rc_console_drain()) });
+            if acc.contains("FREERTOS CXX PROBE") && acc.contains("PASS (105/4000/503/42") {
+                ok = true;
+                break;
+            }
+            if acc.contains("[exit") && !acc.contains("PASS (105/4000/503/42") {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(ok, "RTOS CM4 qemu run did not reach the PASS line:\n{acc}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -132,7 +132,12 @@ struct ContentView: View {
     @ToolbarContentBuilder
     private var toolbar: some ToolbarContent {
         ToolbarItemGroup(placement: .primaryAction) {
-            Button { newHostProject() } label: { Label("New Host", systemImage: "doc.badge.plus") }
+            Menu {
+                Button("Host Project…") { newProject { eng.scaffoldHost(into: $0) } }
+                Button("RAK11161 RTOS Project…") { newProject { eng.scaffoldRTOS(into: $0) } }
+            } label: {
+                Label("New", systemImage: "doc.badge.plus")
+            }
             Button { openProject() } label: { Label("Open", systemImage: "folder") }
             Button { eng.save() } label: { Label("Save", systemImage: "square.and.arrow.down") }
                 .disabled(eng.openRel == nil)
@@ -165,8 +170,8 @@ struct ContentView: View {
         return "doc"
     }
 
-    private func newHostProject() {
-        if let dir = pickFolder(prompt: "Create Host Project In…") { eng.scaffoldHost(into: dir) }
+    private func newProject(_ scaffold: (String) -> Void) {
+        if let dir = pickFolder(prompt: "Create Project In…") { scaffold(dir) }
     }
     private func openProject() {
         if let dir = pickFolder(prompt: "Open Project Folder") { eng.open(dir) }
