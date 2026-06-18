@@ -31,7 +31,8 @@ int main(void)
 			return 0;
 		}
 	}
-	printk("ZEPHYR CXX PROBE (Cortex-M3): PASS "
-	       "(105/4000/503/42 — class, subclass, imported override + inherited)\n");
+	printk("ZEPHYR CXX PROBE (%s): PASS "
+	       "(105/4000/503/42 — class, subclass, imported override + inherited)\n",
+	       CONFIG_BOARD);
 	return 0;
 }

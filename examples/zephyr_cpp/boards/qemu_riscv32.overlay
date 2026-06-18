@@ -1,0 +1,20 @@
+/*
+ * ESP32-C2 (ESP8684) ISA profile for the qemu_riscv32 board.
+ *
+ * The RAK11161's second core is the ESP8684 = ESP32-C2: RISC-V
+ * rv32**imc** — NO atomic (A) and no float (F/D) extensions. The
+ * stock qemu_riscv32 cpu@0 is rv32imafdc; override its extension list
+ * to rv32imc. Zephyr derives BOTH the build ISA (soft-float,
+ * software atomics) AND the qemu `-cpu` string from this devicetree
+ * property (see boards/qemu/riscv32/board.cmake), so a single stray
+ * `amo*`/`lr`/`sc` or hardware-float op would trap under qemu instead
+ * of silently passing — the same ISA-exact guarantee the FreeRTOS
+ * ESP32-C2 flavor gets from `-cpu rv32,a=false`.
+ */
+/ {
+	cpus {
+		cpu@0 {
+			riscv,isa-extensions = "i", "m", "c", "zicsr", "zifencei";
+		};
+	};
+};

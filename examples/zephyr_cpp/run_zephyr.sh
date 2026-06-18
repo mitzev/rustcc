@@ -16,6 +16,7 @@ VENV="${ZEPHYR_VENV:-$HOME/zephyr-venv}"
 WEST="$VENV/bin/west"
 BOARD="${ZEPHYR_BOARD:-qemu_cortex_m3}"
 RTARGET="${RTARGET:-thumbv7m-none-eabi}"   # Cortex-M3, soft-float
+BDIR="build/$BOARD"                        # per-board (the two cores don't collide)
 
 echo "==> Rust class staticlib (fork rustc, $RTARGET)"
 ( cd ../bare_metal_arm
@@ -25,7 +26,7 @@ RUST_LIB="$(cd ../bare_metal_arm && pwd)/target/$RTARGET/release/libbare_metal_a
 
 export ZEPHYR_BASE="$ZBASE"
 echo "==> west build ($BOARD)"
-"$WEST" build -b "$BOARD" -p auto . -- -DRUSTCC_RUST_LIB="$RUST_LIB"
+"$WEST" build -b "$BOARD" -p auto -d "$BDIR" . -- -DRUSTCC_RUST_LIB="$RUST_LIB"
 
 if [[ "${SKIP_QEMU:-0}" == 1 ]]; then
   echo "(SKIP_QEMU=1 — built only)"
@@ -33,9 +34,9 @@ if [[ "${SKIP_QEMU:-0}" == 1 ]]; then
 fi
 
 echo "==> qemu run ($BOARD)"
-LOG="$(pwd)/build/zephyr-run.log"
+LOG="$(pwd)/$BDIR/zephyr-run.log"
 : > "$LOG"
-"$WEST" build -t run > "$LOG" 2>&1 &
+"$WEST" build -d "$BDIR" -t run > "$LOG" 2>&1 &
 WPID=$!
 for _ in $(seq 1 40); do
   grep -q "ZEPHYR CXX PROBE" "$LOG" && break
