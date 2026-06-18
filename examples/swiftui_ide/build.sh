@@ -31,12 +31,24 @@ OUT=build
 APP="$OUT/RustccIDE.app"
 echo "==> app: swiftc link against libswiftui_ide.a"
 rm -rf "$OUT"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 swiftc -O -parse-as-library \
     swift/*.swift \
     -L target/release -lswiftui_ide \
     -o "$APP/Contents/MacOS/RustccIDE"
+
+# --- app icon: render the source PNG, build the iconset, make .icns ---
+echo "==> icon: render + iconutil"
+swift icon/make_icon.swift "$OUT/icon_1024.png"
+ICONSET="$OUT/RustccIDE.iconset"
+mkdir -p "$ICONSET"
+for s in 16 32 128 256 512; do
+    sips -z "$s" "$s" "$OUT/icon_1024.png" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+    d=$((s * 2))
+    sips -z "$d" "$d" "$OUT/icon_1024.png" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/RustccIDE.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -46,6 +58,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>RustccIDE</string>
   <key>CFBundleIdentifier</key><string>com.rustcc.swiftui-ide</string>
   <key>CFBundleName</key><string>rustcc IDE</string>
+  <key>CFBundleIconFile</key><string>RustccIDE</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>

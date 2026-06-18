@@ -104,7 +104,11 @@ bound on the Swift side as:
 
 `build.sh` builds `libswiftui_ide.a` with the fork rustc (`RUSTC=` env
 or the default migration-tree path), links the SwiftUI sources against
-it with `swiftc`, and wraps the result in a minimal `.app` bundle.
+it with `swiftc`, and wraps the result in a minimal `.app` bundle. The
+app icon is generated, not a binary asset: `icon/make_icon.swift`
+renders a 1024px tile (Swift-orange gradient + a cream `</>` glyph)
+with CoreGraphics, and `build.sh` turns it into `RustccIDE.icns` via
+`sips` + `iconutil`.
 
 ## Self-test
 
