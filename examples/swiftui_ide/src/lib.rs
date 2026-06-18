@@ -90,6 +90,17 @@ static DBG_VARCAP: Mutex<VarCap> = Mutex::new(VarCap { active: false, acc: Strin
 static DBG_VARS: Mutex<String> = Mutex::new(String::new());
 const VARS_SENTINEL: &str = "<<RUSTCC_VARS_END>>";
 
+// --- serial monitor (talk to the dev board over USB-serial) ----------
+/// The selected serial device (e.g. `/dev/cu.usbserial-xxxx`). Feeds
+/// the upload `{port}` and the monitor.
+static SERIAL_PORT: Mutex<String> = Mutex::new(String::new());
+/// Open monitor handle (a cloned fd is read by the reader thread; this
+/// one is for sending).
+static SERIAL_TX: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static SERIAL_OPEN: AtomicBool = AtomicBool::new(false);
+/// Bytes received from the board, drained by the UI (like the console).
+static SERIAL_RX: Mutex<String> = Mutex::new(String::new());
+
 // ---------------------------------------------------------------------
 // Pure-logic core (no ABI concerns — unit-testable as plain Rust)
 // ---------------------------------------------------------------------
@@ -142,6 +153,92 @@ mod engine {
             }
         }
         None
+    }
+
+    /// Enumerate likely serial devices for talking to a board: macOS
+    /// callout devices (`/dev/cu.*`) and Linux USB CDC/ACM/serial
+    /// (`ttyUSB*`/`ttyACM*`). `cu.*` (not `tty.*`) is the right macOS
+    /// node — it doesn't block on carrier-detect.
+    pub fn serial_ports() -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir("/dev") {
+            for ent in rd.flatten() {
+                let name = ent.file_name().to_string_lossy().into_owned();
+                let pick = name.starts_with("cu.")
+                    || name.starts_with("ttyUSB")
+                    || name.starts_with("ttyACM");
+                if pick {
+                    out.push(format!("/dev/{name}"));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Configure `port` for raw N81 at `baud` with a ~1s read timeout
+    /// (`stty`), then open it read+write. Using stty avoids a
+    /// platform-specific termios FFI; `cu.*` opens without blocking.
+    pub fn serial_open(port: &str, baud: i64) -> Result<std::fs::File, String> {
+        if port.is_empty() {
+            return Err("no serial port selected".into());
+        }
+        // macOS: `stty -f <port>`; Linux: `stty -F <port>`.
+        let flag = if cfg!(target_os = "macos") { "-f" } else { "-F" };
+        let stty = std::process::Command::new("stty")
+            .arg(flag)
+            .arg(port)
+            .args([&baud.to_string(), "raw", "-echo", "min", "0", "time", "10"])
+            .status();
+        match stty {
+            Ok(s) if s.success() => {}
+            Ok(s) => return Err(format!("stty failed ({s}) — is {port} a serial device?")),
+            Err(e) => return Err(format!("stty not runnable: {e}")),
+        }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(port)
+            .map_err(|e| format!("open {port}: {e}"))
+    }
+
+    /// Rewrite the `[serial] port = "…"` line of the open project's
+    /// upload.toml so the choice persists (best-effort; no-op if there
+    /// is no project / no upload.toml).
+    pub fn persist_serial_port(port: &str) {
+        let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
+        let path = format!("{dir}/upload.toml");
+        let Ok(cfg) = std::fs::read_to_string(&path) else { return };
+        let mut in_serial = false;
+        let mut wrote = false;
+        let mut out = String::new();
+        for line in cfg.lines() {
+            let l = line.trim();
+            if l.starts_with('[') {
+                in_serial = l == "[serial]";
+            }
+            if in_serial && l.starts_with("port") && l.contains('=') && !wrote {
+                out.push_str(&format!("port = \"{port}\"\n"));
+                wrote = true;
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        let _ = std::fs::write(&path, out);
+    }
+
+    /// Load the project's saved serial port (upload.toml `[serial]`)
+    /// into the live selection, so the picker reflects it on open.
+    pub fn load_serial_from_project() {
+        let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
+        if let Ok(cfg) = std::fs::read_to_string(format!("{dir}/upload.toml")) {
+            if let Some(p) = upload_cfg_get(&cfg, "serial", "port") {
+                if !p.is_empty() {
+                    *SERIAL_PORT.lock().unwrap() = p;
+                }
+            }
+        }
     }
 
     /// Map a target to its upload `(section, elf-tag)`; None for host.
@@ -725,6 +822,7 @@ pub extern "Swift" fn rc_scaffold(kind: i64, dir: *const c_char) -> i64 {
     match r {
         Ok(()) => {
             *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
+            engine::load_serial_from_project();
             engine::console_append(&format!("scaffolded {label} project at {dir}\n"));
             0
         }
@@ -745,6 +843,7 @@ pub extern "Swift" fn rc_open(dir: *const c_char) -> i64 {
     }
     let n = engine::list_files(&dir).len() as i64;
     *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
+    engine::load_serial_from_project();
     engine::console_append(&format!("project = {dir} ({n} files)\n"));
     n
 }
@@ -857,7 +956,13 @@ pub extern "Swift" fn rc_upload(target: i64) -> i64 {
         engine::console_append(&format!("no [{section}] cmd in upload.toml\n"));
         return -1;
     };
-    let port = engine::upload_cfg_get(&cfg, "serial", "port").unwrap_or_default();
+    // The live selection wins over upload.toml's stored value.
+    let selected = SERIAL_PORT.lock().unwrap().clone();
+    let port = if selected.is_empty() {
+        engine::upload_cfg_get(&cfg, "serial", "port").unwrap_or_default()
+    } else {
+        selected
+    };
     let elf = format!("{dir}/target/{tag}/firmware.elf");
     if !std::path::Path::new(&elf).exists() {
         engine::console_append(&format!("{elf} not built yet — Build first (link-only is enough)\n"));
@@ -1018,6 +1123,114 @@ pub extern "Swift" fn rc_dbg_breakpoints() -> *mut c_char {
         .collect::<Vec<_>>()
         .join("\n");
     out_cstring(body)
+}
+
+// --- serial port selection + monitor ---------------------------------
+
+/// Newline-joined list of available serial devices (caller frees).
+#[export_name = "rc_serial_ports"]
+pub extern "Swift" fn rc_serial_ports() -> *mut c_char {
+    out_cstring(engine::serial_ports().join("\n"))
+}
+
+/// The currently selected serial port (caller frees).
+#[export_name = "rc_serial_port"]
+pub extern "Swift" fn rc_serial_port() -> *mut c_char {
+    out_cstring(SERIAL_PORT.lock().unwrap().clone())
+}
+
+/// Select the serial port used by upload + the monitor; persists into
+/// the open project's upload.toml.
+#[export_name = "rc_set_serial_port"]
+pub extern "Swift" fn rc_set_serial_port(port: *const c_char) {
+    let port = unsafe { in_str(port) };
+    *SERIAL_PORT.lock().unwrap() = port.clone();
+    engine::persist_serial_port(&port);
+    engine::console_append(&format!("serial port = {}\n", if port.is_empty() { "(none)" } else { &port }));
+}
+
+/// Open the selected port at `baud` and start streaming RX into the
+/// serial drain. Returns 0 on success, -1 on error.
+#[export_name = "rc_serial_open"]
+pub extern "Swift" fn rc_serial_open(baud: i64) -> i64 {
+    use std::io::Read;
+    if SERIAL_OPEN.load(Relaxed) {
+        return 0;
+    }
+    let port = SERIAL_PORT.lock().unwrap().clone();
+    let file = match engine::serial_open(&port, baud) {
+        Ok(f) => f,
+        Err(e) => {
+            engine::console_append(&format!("serial open FAILED: {e}\n"));
+            return -1;
+        }
+    };
+    let reader = match file.try_clone() {
+        Ok(r) => r,
+        Err(e) => {
+            engine::console_append(&format!("serial clone FAILED: {e}\n"));
+            return -1;
+        }
+    };
+    *SERIAL_TX.lock().unwrap() = Some(file);
+    SERIAL_OPEN.store(true, Relaxed);
+    engine::console_append(&format!("==> serial open: {port} @ {baud} (raw, read-timeout)\n"));
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut buf = [0u8; 512];
+        loop {
+            if !SERIAL_OPEN.load(Relaxed) {
+                break;
+            }
+            match reader.read(&mut buf) {
+                Ok(0) => {} // `min 0 time 10` read timeout — no data
+                Ok(n) => SERIAL_RX
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    0
+}
+
+/// Close the serial monitor.
+#[export_name = "rc_serial_close"]
+pub extern "Swift" fn rc_serial_close() {
+    SERIAL_OPEN.store(false, Relaxed);
+    *SERIAL_TX.lock().unwrap() = None;
+    engine::console_append("serial closed\n");
+}
+
+/// 1 while the monitor is open, else 0.
+#[export_name = "rc_serial_is_open"]
+pub extern "Swift" fn rc_serial_is_open() -> i64 {
+    SERIAL_OPEN.load(Relaxed) as i64
+}
+
+/// Return and CLEAR pending bytes received from the board (caller frees).
+#[export_name = "rc_serial_recv"]
+pub extern "Swift" fn rc_serial_recv() -> *mut c_char {
+    let mut g = SERIAL_RX.lock().unwrap();
+    out_cstring(std::mem::take(&mut *g))
+}
+
+/// Send `text` (a CR/LF is appended) to the board over the open port.
+#[export_name = "rc_serial_send"]
+pub extern "Swift" fn rc_serial_send(text: *const c_char) {
+    use std::io::Write;
+    let text = unsafe { in_str(text) };
+    if let Some(f) = SERIAL_TX.lock().unwrap().as_mut() {
+        let _ = f.write_all(text.as_bytes());
+        let _ = f.write_all(b"\r\n");
+        let _ = f.flush();
+    } else {
+        engine::console_append("serial not open\n");
+    }
 }
 
 /// Free a C-string previously returned by an `rc_*` function.
@@ -1287,6 +1500,22 @@ mod tests {
         assert_eq!(rc_upload(0), -1); // host
         assert_eq!(rc_upload(1), -1); // RTOS but firmware.elf not built
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serial_enumerate_select_open() {
+        // Enumeration must not panic (it reads /dev).
+        let _ = engine::serial_ports();
+        let _ = unsafe { take(rc_serial_ports()) };
+        // Select / read-back roundtrip.
+        rc_set_serial_port(cstr("/dev/cu.unit-test-sel").as_ptr());
+        assert_eq!(unsafe { take(rc_serial_port()) }, "/dev/cu.unit-test-sel");
+        // A bogus port fails cleanly (stty errors) — no hang, returns -1.
+        rc_set_serial_port(cstr("/dev/cu.nonexistent-xyz-123").as_ptr());
+        assert_eq!(rc_serial_open(115_200), -1);
+        assert_eq!(rc_serial_is_open(), 0);
+        assert!(unsafe { take(rc_serial_recv()) }.is_empty());
+        rc_set_serial_port(cstr("").as_ptr()); // reset shared state
     }
 
     #[test]

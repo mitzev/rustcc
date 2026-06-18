@@ -80,8 +80,17 @@ bound on the Swift side as:
 - **Upload** (RTOS targets) — flashes the built firmware via the
   per-project `upload.toml` (configurable shell templates with
   `{elf}`/`{dir}`/`{port}` placeholders: `STM32_Programmer_CLI` /
-  `esptool.py` / `picotool`), routed by target and streamed. Host has
-  nothing to flash, so the button disables.
+  `esptool.py` / `picotool`), routed by target and streamed. `{port}`
+  is the selected serial port (below). Host has nothing to flash, so
+  the button disables.
+- **Serial monitor** — a bottom bar to talk to the dev board: a
+  **port picker** enumerating `/dev/cu.*` (macOS) / `ttyUSB*`·`ttyACM*`
+  (Linux) with a rescan button, a **baud** picker, and
+  **Connect/Disconnect**. The engine configures the line with `stty`
+  (raw N81, read-timeout) and opens it; board output streams into the
+  console and a send field writes a line back. The selection persists
+  to `upload.toml`'s `[serial] port` and feeds Upload, so picking it
+  once covers both flashing and monitoring.
 - **Debug** (Host target) — an in-IDE `lldb` session: **Start Debug**
   builds the debug profile and attaches lldb over a pty (the engine
   spawns it on a background thread; the transcript streams into the

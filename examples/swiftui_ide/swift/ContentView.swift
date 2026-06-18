@@ -12,6 +12,8 @@ struct ContentView: View {
     @State private var selectRange: NSRange? = nil
     @State private var findAnchor: Int = 0   // NSString offset for Find Next
     @State private var showVars = false
+    @State private var baud = 115_200
+    @State private var serialSend = ""
 
     var body: some View {
         NavigationSplitView {
@@ -39,12 +41,63 @@ struct ContentView: View {
                 }
                 Divider()
                 debugBar
+                Divider()
+                serialBar
             }
             .navigationTitle(eng.openRel ?? "rustcc IDE")
             .toolbar { toolbar }
             .onAppear { eng.refreshBreakpoints() }
             .inspector(isPresented: $showVars) { varsInspector }
         }
+    }
+
+    // MARK: - Serial monitor
+
+    private let bauds = [9_600, 19_200, 57_600, 115_200, 230_400, 460_800, 921_600]
+
+    private var serialBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "cable.connector")
+                .foregroundStyle(eng.serialOpen ? .green : .secondary)
+            Picker("Port", selection: Binding(
+                get: { eng.serialPort },
+                set: { eng.selectPort($0) }
+            )) {
+                Text("— no port —").tag("")
+                ForEach(eng.serialPorts, id: \.self) { p in
+                    Text(p.replacingOccurrences(of: "/dev/", with: "")).tag(p)
+                }
+            }
+            .labelsHidden().frame(maxWidth: 240).disabled(eng.serialOpen)
+            Button { eng.refreshPorts() } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless).help("Rescan serial ports")
+            Picker("Baud", selection: $baud) {
+                ForEach(bauds, id: \.self) { Text("\($0)").tag($0) }
+            }
+            .labelsHidden().frame(maxWidth: 110).disabled(eng.serialOpen)
+
+            if eng.serialOpen {
+                Button { eng.closeSerial() } label: {
+                    Label("Disconnect", systemImage: "xmark.circle")
+                }
+                TextField("send to board…", text: $serialSend)
+                    .textFieldStyle(.roundedBorder).frame(width: 220)
+                    .onSubmit {
+                        eng.sendSerial(serialSend)
+                        serialSend = ""
+                    }
+            } else {
+                Button { eng.openSerial(baud: baud) } label: {
+                    Label("Connect", systemImage: "cable.connector.horizontal")
+                }
+                .disabled(eng.serialPort.isEmpty)
+            }
+            Spacer()
+            if eng.serialOpen {
+                Text("monitor → console").font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
     }
 
     // MARK: - Variables inspector

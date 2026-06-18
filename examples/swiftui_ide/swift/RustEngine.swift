@@ -36,6 +36,15 @@ import Combine
 @_silgen_name("rc_dbg_request_vars") func rc_dbg_request_vars()
 @_silgen_name("rc_dbg_vars") func rc_dbg_vars() -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("rc_serial_ports") func rc_serial_ports() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rc_serial_port") func rc_serial_port() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rc_set_serial_port") func rc_set_serial_port(_ p: UnsafePointer<CChar>?)
+@_silgen_name("rc_serial_open") func rc_serial_open(_ baud: Int64) -> Int64
+@_silgen_name("rc_serial_close") func rc_serial_close()
+@_silgen_name("rc_serial_is_open") func rc_serial_is_open() -> Int64
+@_silgen_name("rc_serial_recv") func rc_serial_recv() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rc_serial_send") func rc_serial_send(_ t: UnsafePointer<CChar>?)
+
 /// Consume a Rust-owned C-string into a Swift `String`, freeing it the
 /// way the engine's `rc_string_free` contract requires.
 private func takeRustString(_ p: UnsafeMutablePointer<CChar>?) -> String {
@@ -74,11 +83,17 @@ final class IDEEngine: ObservableObject {
     var autoVars = false                      // recapture vars on each stop
     private var lastStopSig = ""
 
+    // Serial monitor
+    @Published var serialPorts: [String] = []
+    @Published var serialPort: String = ""
+    @Published var serialOpen: Bool = false
+
     private var pollTimer: Timer?
 
     init() {
         let n = rc_target_count()
         targets = (0..<n).map { takeRustString(rc_target_name($0)) }
+        refreshPorts()
         // Poll the engine's console drain on the main thread (there is
         // no FLTK event loop; the build runs on a Rust background
         // thread and we pull its output).
@@ -108,6 +123,31 @@ final class IDEEngine: ObservableObject {
         }
         let v = takeRustString(rc_dbg_vars())
         if v != variables { variables = v }
+        // Serial: stream board output into the console; track open state.
+        let rx = takeRustString(rc_serial_recv())
+        if !rx.isEmpty { console += rx }
+        serialOpen = rc_serial_is_open() != 0
+    }
+
+    // MARK: - Serial monitor
+
+    func refreshPorts() {
+        let s = takeRustString(rc_serial_ports())
+        serialPorts = s.isEmpty ? [] : s.split(separator: "\n").map(String.init)
+        serialPort = takeRustString(rc_serial_port())   // engine may have loaded one
+    }
+    func selectPort(_ p: String) {
+        serialPort = p
+        p.withCString { rc_set_serial_port($0) }
+    }
+    func openSerial(baud: Int) {
+        if rc_serial_open(Int64(baud)) == 0 { serialOpen = true }
+    }
+    func closeSerial() {
+        rc_serial_close(); serialOpen = false
+    }
+    func sendSerial(_ text: String) {
+        text.withCString { rc_serial_send($0) }
     }
 
     /// Ask the live session for a fresh `frame variable` capture.
@@ -156,6 +196,7 @@ final class IDEEngine: ObservableObject {
             target = defaultTarget
             refreshFiles()
             openFirstSource()
+            refreshPorts()
         }
         pump()
     }
@@ -165,6 +206,7 @@ final class IDEEngine: ObservableObject {
             projectDir = dir
             refreshFiles()
             openFirstSource()
+            refreshPorts()
         }
         pump()
     }
