@@ -6,12 +6,11 @@ import AppKit
 
 struct ContentView: View {
     @StateObject private var eng = IDEEngine()
-    @State private var bpLine: Int = 1
     @State private var showFind = false
     @State private var findText = ""
     @State private var replaceText = ""
-    @State private var editorSelection: TextSelection? = nil
-    @State private var findAnchor: String.Index? = nil
+    @State private var selectRange: NSRange? = nil
+    @State private var findAnchor: Int = 0   // NSString offset for Find Next
 
     var body: some View {
         NavigationSplitView {
@@ -53,7 +52,7 @@ struct ContentView: View {
             Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
             TextField("Find", text: $findText)
                 .textFieldStyle(.roundedBorder).frame(width: 180)
-                .onChange(of: findText) { _, _ in findAnchor = nil }
+                .onChange(of: findText) { _, _ in findAnchor = 0 }
                 .onSubmit { findNext() }
             Text(findText.isEmpty ? "" : "\(matchCount)")
                 .font(.caption).foregroundStyle(.secondary).frame(minWidth: 24)
@@ -73,24 +72,38 @@ struct ContentView: View {
         findText.isEmpty ? 0 : eng.source.components(separatedBy: findText).count - 1
     }
 
-    /// Select the next match (wrapping), scrolling the editor to it via
-    /// the selection binding. Anchor advances so repeated Next walks
-    /// through all matches.
+    /// Select the next match (wrapping), scrolling the editor to it.
+    /// The anchor advances so repeated Next walks all matches.
     private func findNext() {
         guard !findText.isEmpty else { return }
-        let s = eng.source
-        let from = findAnchor ?? s.startIndex
-        let hit = s.range(of: findText, range: from..<s.endIndex) ?? s.range(of: findText)
-        if let r = hit {
-            editorSelection = TextSelection(range: r)
-            findAnchor = r.upperBound
+        let ns = eng.source as NSString
+        let from = findAnchor <= ns.length ? findAnchor : 0
+        var r = ns.range(of: findText, options: [], range: NSRange(location: from, length: ns.length - from))
+        if r.location == NSNotFound { r = ns.range(of: findText) } // wrap
+        if r.location != NSNotFound {
+            selectRange = r
+            findAnchor = r.location + r.length
         }
     }
 
     private func replaceAll() {
         guard !findText.isEmpty else { return }
         eng.source = eng.source.replacingOccurrences(of: findText, with: replaceText)
-        findAnchor = nil
+        findAnchor = 0
+        selectRange = nil
+    }
+
+    private var currentBreakpointLines: Set<Int> {
+        guard let rel = eng.openRel else { return [] }
+        var out = Set<Int>()
+        for bp in eng.breakpoints {   // "rel:line"
+            if let c = bp.lastIndex(of: ":"), let n = Int(bp[bp.index(after: c)...]),
+                String(bp[..<c]) == rel
+            {
+                out.insert(n)
+            }
+        }
+        return out
     }
 
     // MARK: - Tabs
@@ -131,9 +144,15 @@ struct ContentView: View {
     private var editorPane: some View {
         Group {
             if eng.openRel != nil {
-                TextEditor(text: $eng.source, selection: $editorSelection)
-                    .font(.system(.body, design: .monospaced))
-                    .autocorrectionDisabled()
+                CodeEditorView(
+                    text: $eng.source,
+                    breakpointLines: currentBreakpointLines,
+                    stopLine: eng.stopInOpenFile() ? eng.stopLine : nil,
+                    selectRange: selectRange,
+                    onToggleBreakpoint: { line in
+                        if let rel = eng.openRel { eng.toggleBreakpoint(rel: rel, line: line) }
+                    }
+                )
             } else {
                 ContentUnavailableView(
                     "rustcc SwiftUI IDE",
@@ -199,14 +218,12 @@ struct ContentView: View {
 
             Spacer()
 
-            // Breakpoints: SwiftUI's TextEditor has no gutter/cursor
-            // API, so place them by line number.
-            Stepper("BP line \(bpLine)", value: $bpLine, in: 1...100_000)
-                .fixedSize()
-            Button("Toggle BP") {
-                if let rel = eng.openRel { eng.toggleBreakpoint(rel: rel, line: bpLine) }
+            // Breakpoints are set by clicking the editor gutter; the
+            // chips below mirror them and remove on click.
+            if eng.breakpoints.isEmpty {
+                Text("click the gutter to set a breakpoint")
+                    .font(.caption2).foregroundStyle(.tertiary)
             }
-            .disabled(eng.openRel == nil)
             ForEach(eng.breakpoints, id: \.self) { bp in
                 Button {
                     if let c = bp.lastIndex(of: ":"), let n = Int(bp[bp.index(after: c)...]) {

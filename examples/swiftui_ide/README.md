@@ -62,12 +62,14 @@ bound on the Swift side as:
   validated `bare_metal_arm` / `freertos_cpp` examples so it can't
   drift, and defaults the target to the STM32WLE5 (CM4) core.
 - **Open** — pick any folder; the sidebar lists its source files.
-- **Editor** — a `TextEditor` bound to the selected file; **Save**
-  writes it back through the engine. **Tabs** above the editor hold
-  multiple open files (each with its own unsaved-edit buffer; × to
-  close). **Find** (toolbar / the find bar) navigates matches by
-  selecting them via the `TextSelection` binding, with a live match
-  count and **Replace All**.
+- **Editor** — a real code editor: an `NSTextView` (AppKit) wrapped as
+  a SwiftUI `NSViewRepresentable` with a **line-number gutter**, so it
+  has what `TextEditor` lacks — click the gutter to toggle a
+  breakpoint, the debugger's current stop line is highlighted amber,
+  and Find scrolls/selects matches. **Save** writes back through the
+  engine. **Tabs** above the editor hold multiple open files (each
+  with its own unsaved-edit buffer; × to close). **Find** has a live
+  match count, **Find Next** (wraps), and **Replace All**.
 - **Target picker** — the same six targets as the FLTK IDE (Host,
   RAK11161 ×2, ESP32-C3, STM32F4, Pico).
 - **Build / Run** — runs the engine's per-target command (identical to
@@ -83,11 +85,10 @@ bound on the Swift side as:
   builds the debug profile and attaches lldb over a pty (the engine
   spawns it on a background thread; the transcript streams into the
   console). **Step Over/Into/Out**, **Continue**, **Variables**, and
-  **Stop**; a **⏸ file:line** banner shows the current stop. Set
-  breakpoints with the **BP line** stepper + **Toggle BP** (SwiftUI's
-  `TextEditor` exposes no gutter or cursor line, so breakpoints are
-  placed by line number — set ones show as red ● chips you click to
-  remove); they replay into a live session.
+  **Stop**; a **⏸ file:line** banner shows the current stop and the
+  stop line is highlighted amber in the editor. Set breakpoints by
+  **clicking the editor gutter** (red dot; also listed as removable ●
+  chips); they replay into a live session.
 
 ## Build & run (macOS)
 
@@ -135,10 +136,11 @@ upload** (RTOS), and an in-IDE **lldb debugger** (host). The RTOS
 scaffold embeds the same validated firmware as the FLTK IDE, so a
 `New ▸ RAK11161 RTOS` project builds and runs on qemu to the
 `PASS (105/4000/503/42)` line — proven by the gated `full_rtos_arm`
-test. Remaining FLTK-IDE niceties (a dedicated variables pane, single-
-match Replace, a real gutter via an `NSTextView` representable) are
-follow-ups; each maps onto an `rc_*` engine call plus SwiftUI views,
-exactly as features were added to `rustcc_ide` iteratively.
+test. The editor is an `NSTextView`-backed `CodeEditorView` with a
+line-number gutter, click-to-toggle breakpoints, and an amber
+current-line highlight that follows the debugger. Remaining FLTK-IDE
+niceties (a dedicated variables pane, single-match Replace) are
+follow-ups; each maps onto an `rc_*` engine call plus SwiftUI views.
 
 ## Why this is a good fork test
 

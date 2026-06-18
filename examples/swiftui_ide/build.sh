@@ -34,7 +34,7 @@ rm -rf "$OUT"
 mkdir -p "$APP/Contents/MacOS"
 
 swiftc -O -parse-as-library \
-    swift/IDEApp.swift swift/ContentView.swift swift/RustEngine.swift \
+    swift/*.swift \
     -L target/release -lswiftui_ide \
     -o "$APP/Contents/MacOS/RustccIDE"
 
