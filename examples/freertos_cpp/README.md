@@ -2,7 +2,9 @@
 
 Validates that rustcc's C++ machinery — `class`, subclassing, and
 subclassing an **imported g++-compiled C++ base** — behaves under a
-preemptive RTOS scheduler, not just in a bare `main()`. Two FreeRTOS
+preemptive RTOS scheduler, not just in a bare `main()`. (For the same
+checks under **Zephyr RTOS** — CMake/`west`, run on qemu — see
+[`examples/zephyr_cpp`](../zephyr_cpp).) Two FreeRTOS
 tasks split the work: one runs the dispatch checks (with `vTaskDelay`
 between them to force real context switches through the port's
 PendSV/trap machinery), the other receives each result over a queue
