@@ -111,6 +111,39 @@ mod engine {
         }
     }
 
+    /// Minimal TOML reader: value of `key` in `[section]` of an
+    /// upload.toml (the scaffold writes one). Ports the FLTK IDE's
+    /// `upload_cfg_get`.
+    pub fn upload_cfg_get(cfg: &str, section: &str, key: &str) -> Option<String> {
+        let mut in_section = false;
+        for line in cfg.lines() {
+            let l = line.trim();
+            if l.starts_with('[') {
+                in_section = l == format!("[{section}]");
+                continue;
+            }
+            if in_section && !l.starts_with('#') {
+                if let Some(rest) = l.strip_prefix(key) {
+                    if let Some(rest) = rest.trim_start().strip_prefix('=') {
+                        return Some(rest.trim().trim_matches('"').to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Map a target to its upload `(section, elf-tag)`; None for host.
+    pub fn upload_route(target: i64) -> Option<(&'static str, &'static str)> {
+        match target {
+            1 | 4 => Some(("stm32", "arm")),
+            2 => Some(("esp32", "riscv-c2")),
+            3 => Some(("esp32", "riscv")),
+            5 => Some(("pico", "pico")),
+            _ => None,
+        }
+    }
+
     /// Scaffold a host (LLVM-target) fork-Rust project: a `class
     /// Greeter` Hello World + a build.rs linking the C++ runtime +
     /// VSCode tasks pinning the fork `RUSTC`. Mirrors the FLTK IDE's
@@ -747,6 +780,46 @@ pub extern "Swift" fn rc_console_drain() -> *mut c_char {
     out_cstring(taken)
 }
 
+/// Flash the built firmware for `target` using the per-project
+/// upload.toml (configurable shell template with {elf}/{dir}/{port}),
+/// streaming the tool's output. Returns 0 if started, -1 on any
+/// precondition failure (no project / host target / no config / ELF
+/// not built). Mirrors the FLTK IDE's Upload (⌘U).
+#[export_name = "rc_upload"]
+pub extern "Swift" fn rc_upload(target: i64) -> i64 {
+    if RUNNING.load(Relaxed) {
+        engine::console_append("a build/run is in flight — wait for it to finish\n");
+        return -1;
+    }
+    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+        engine::console_append("no project open\n");
+        return -1;
+    };
+    let Some((section, tag)) = engine::upload_route(target) else {
+        engine::console_append("host target has nothing to flash — pick an RTOS target\n");
+        return -1;
+    };
+    let cfg = std::fs::read_to_string(format!("{dir}/upload.toml")).unwrap_or_default();
+    if cfg.is_empty() {
+        engine::console_append("no upload.toml in project (scaffold an RTOS project)\n");
+        return -1;
+    }
+    let Some(tpl) = engine::upload_cfg_get(&cfg, section, "cmd") else {
+        engine::console_append(&format!("no [{section}] cmd in upload.toml\n"));
+        return -1;
+    };
+    let port = engine::upload_cfg_get(&cfg, "serial", "port").unwrap_or_default();
+    let elf = format!("{dir}/target/{tag}/firmware.elf");
+    if !std::path::Path::new(&elf).exists() {
+        engine::console_append(&format!("{elf} not built yet — Build first (link-only is enough)\n"));
+        return -1;
+    }
+    let cmd = tpl.replace("{elf}", &elf).replace("{dir}", &dir).replace("{port}", &port);
+    engine::console_append(&format!("==> upload via [{section}]\n    {cmd}\n"));
+    engine::spawn_streamed(&dir, &cmd);
+    0
+}
+
 // --- debugger API (host target only) ---------------------------------
 
 /// Start an in-IDE lldb session on the open Host project. Builds the
@@ -1098,6 +1171,27 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         assert!(ok, "RTOS CM4 qemu run did not reach the PASS line:\n{acc}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upload_routing_and_config() {
+        // target → (section, elf-tag); host has nothing to flash.
+        assert_eq!(engine::upload_route(1), Some(("stm32", "arm")));
+        assert_eq!(engine::upload_route(2), Some(("esp32", "riscv-c2")));
+        assert_eq!(engine::upload_route(5), Some(("pico", "pico")));
+        assert_eq!(engine::upload_route(0), None);
+        // upload.toml parsing.
+        let cfg = "[stm32]\ncmd = \"prog -w {elf}\"\n[serial]\nport = \"/dev/x\"\n";
+        assert_eq!(engine::upload_cfg_get(cfg, "stm32", "cmd").as_deref(), Some("prog -w {elf}"));
+        assert_eq!(engine::upload_cfg_get(cfg, "serial", "port").as_deref(), Some("/dev/x"));
+        assert_eq!(engine::upload_cfg_get(cfg, "esp32", "cmd"), None);
+        // rc_upload rejects host + missing-ELF up front.
+        let dir = std::env::temp_dir().join(format!("swiftui_ide_up{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rc_scaffold(1, cstr(dir.to_str().unwrap()).as_ptr()), 0);
+        assert_eq!(rc_upload(0), -1); // host
+        assert_eq!(rc_upload(1), -1); // RTOS but firmware.elf not built
         let _ = std::fs::remove_dir_all(&dir);
     }
 

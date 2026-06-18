@@ -63,13 +63,22 @@ bound on the Swift side as:
   drift, and defaults the target to the STM32WLE5 (CM4) core.
 - **Open** — pick any folder; the sidebar lists its source files.
 - **Editor** — a `TextEditor` bound to the selected file; **Save**
-  writes it back through the engine.
+  writes it back through the engine. **Tabs** above the editor hold
+  multiple open files (each with its own unsaved-edit buffer; × to
+  close). **Find** (toolbar / the find bar) navigates matches by
+  selecting them via the `TextSelection` binding, with a live match
+  count and **Replace All**.
 - **Target picker** — the same six targets as the FLTK IDE (Host,
   RAK11161 ×2, ESP32-C3, STM32F4, Pico).
 - **Build / Run** — runs the engine's per-target command (identical to
   the FLTK IDE's `target_cmdline`, so a project scaffolded by either
   tool builds the same way), streaming toolchain output live into the
   console pane.
+- **Upload** (RTOS targets) — flashes the built firmware via the
+  per-project `upload.toml` (configurable shell templates with
+  `{elf}`/`{dir}`/`{port}` placeholders: `STM32_Programmer_CLI` /
+  `esptool.py` / `picotool`), routed by target and streamed. Host has
+  nothing to flash, so the button disables.
 - **Debug** (Host target) — an in-IDE `lldb` session: **Start Debug**
   builds the debug profile and attaches lldb over a pty (the engine
   spawns it on a background thread; the transcript streams into the
@@ -120,15 +129,16 @@ RUSTCC_SWIFTUI_IDE_FULL=1 RUSTC=<fork-stage1>/bin/rustc \
 
 ## Scope
 
-Landed: scaffold/open/edit/save + build/run for **both** Host and
-**RTOS** projects (all six cores), plus an in-IDE **lldb debugger**
-(host). The RTOS scaffold embeds the same validated firmware as the
-FLTK IDE, so a `New ▸ RAK11161 RTOS` project builds and runs on qemu to
-the `PASS (105/4000/503/42)` line — proven by the gated `full_rtos_arm`
-test. The FLTK IDE's remaining conveniences — tabs, find/replace,
-firmware upload, a dedicated variables pane — are the natural next
+Landed: scaffold/open/edit/save, **tabs** + **find/replace**, build/run
+for **both** Host and **RTOS** projects (all six cores), **firmware
+upload** (RTOS), and an in-IDE **lldb debugger** (host). The RTOS
+scaffold embeds the same validated firmware as the FLTK IDE, so a
+`New ▸ RAK11161 RTOS` project builds and runs on qemu to the
+`PASS (105/4000/503/42)` line — proven by the gated `full_rtos_arm`
+test. Remaining FLTK-IDE niceties (a dedicated variables pane, single-
+match Replace, a real gutter via an `NSTextView` representable) are
 follow-ups; each maps onto an `rc_*` engine call plus SwiftUI views,
-exactly as they were added to `rustcc_ide` iteratively.
+exactly as features were added to `rustcc_ide` iteratively.
 
 ## Why this is a good fork test
 

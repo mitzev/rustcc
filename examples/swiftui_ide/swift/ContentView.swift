@@ -7,6 +7,11 @@ import AppKit
 struct ContentView: View {
     @StateObject private var eng = IDEEngine()
     @State private var bpLine: Int = 1
+    @State private var showFind = false
+    @State private var findText = ""
+    @State private var replaceText = ""
+    @State private var editorSelection: TextSelection? = nil
+    @State private var findAnchor: String.Index? = nil
 
     var body: some View {
         NavigationSplitView {
@@ -20,6 +25,14 @@ struct ContentView: View {
             .frame(minWidth: 200)
         } detail: {
             VStack(spacing: 0) {
+                if !eng.openFiles.isEmpty {
+                    tabStrip
+                    Divider()
+                }
+                if showFind {
+                    findBar
+                    Divider()
+                }
                 VSplitView {
                     editorPane.frame(minHeight: 220)
                     consolePane.frame(minHeight: 110)
@@ -33,12 +46,92 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Find / Replace
+
+    private var findBar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+            TextField("Find", text: $findText)
+                .textFieldStyle(.roundedBorder).frame(width: 180)
+                .onChange(of: findText) { _, _ in findAnchor = nil }
+                .onSubmit { findNext() }
+            Text(findText.isEmpty ? "" : "\(matchCount)")
+                .font(.caption).foregroundStyle(.secondary).frame(minWidth: 24)
+            Button("Next") { findNext() }.disabled(findText.isEmpty)
+            Divider().frame(height: 16)
+            TextField("Replace", text: $replaceText)
+                .textFieldStyle(.roundedBorder).frame(width: 180)
+            Button("Replace All") { replaceAll() }.disabled(findText.isEmpty || matchCount == 0)
+            Spacer()
+            Button("Done") { showFind = false }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var matchCount: Int {
+        findText.isEmpty ? 0 : eng.source.components(separatedBy: findText).count - 1
+    }
+
+    /// Select the next match (wrapping), scrolling the editor to it via
+    /// the selection binding. Anchor advances so repeated Next walks
+    /// through all matches.
+    private func findNext() {
+        guard !findText.isEmpty else { return }
+        let s = eng.source
+        let from = findAnchor ?? s.startIndex
+        let hit = s.range(of: findText, range: from..<s.endIndex) ?? s.range(of: findText)
+        if let r = hit {
+            editorSelection = TextSelection(range: r)
+            findAnchor = r.upperBound
+        }
+    }
+
+    private func replaceAll() {
+        guard !findText.isEmpty else { return }
+        eng.source = eng.source.replacingOccurrences(of: findText, with: replaceText)
+        findAnchor = nil
+    }
+
+    // MARK: - Tabs
+
+    private var tabStrip: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 2) {
+                ForEach(eng.openFiles, id: \.self) { rel in
+                    let active = rel == eng.openRel
+                    HStack(spacing: 4) {
+                        Text(base(rel)).font(.caption)
+                            .fontWeight(active ? .semibold : .regular)
+                        Button {
+                            eng.closeFile(rel)
+                        } label: {
+                            Image(systemName: "xmark").font(.system(size: 8))
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(active ? Color.accentColor.opacity(0.22) : Color.clear)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                    .contentShape(Rectangle())
+                    .onTapGesture { eng.openFile(rel) }
+                }
+            }
+            .padding(.horizontal, 6).padding(.vertical, 3)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func base(_ rel: String) -> String {
+        rel.split(separator: "/").last.map(String.init) ?? rel
+    }
+
     // MARK: - Panes
 
     private var editorPane: some View {
         Group {
             if eng.openRel != nil {
-                TextEditor(text: $eng.source)
+                TextEditor(text: $eng.source, selection: $editorSelection)
                     .font(.system(.body, design: .monospaced))
                     .autocorrectionDisabled()
             } else {
@@ -141,6 +234,8 @@ struct ContentView: View {
             Button { openProject() } label: { Label("Open", systemImage: "folder") }
             Button { eng.save() } label: { Label("Save", systemImage: "square.and.arrow.down") }
                 .disabled(eng.openRel == nil)
+            Button { showFind.toggle() } label: { Label("Find", systemImage: "magnifyingglass") }
+                .disabled(eng.openRel == nil)
             Divider()
             Picker("Target", selection: $eng.target) {
                 ForEach(Array(eng.targets.enumerated()), id: \.offset) { i, name in
@@ -152,6 +247,9 @@ struct ContentView: View {
                 .disabled(eng.running || eng.projectDir == nil)
             Button { eng.build(run: true) } label: { Label("Run", systemImage: "play.fill") }
                 .disabled(eng.running || eng.projectDir == nil)
+            Button { eng.upload() } label: { Label("Upload", systemImage: "bolt.horizontal.circle") }
+                .disabled(eng.running || eng.projectDir == nil || !eng.canUpload)
+                .help("Flash the built firmware via upload.toml (RTOS targets)")
         }
     }
 

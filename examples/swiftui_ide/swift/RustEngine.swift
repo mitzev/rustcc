@@ -32,6 +32,7 @@ import Combine
 @_silgen_name("rc_dbg_active") func rc_dbg_active() -> Int64
 @_silgen_name("rc_dbg_curline") func rc_dbg_curline() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("rc_dbg_breakpoints") func rc_dbg_breakpoints() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rc_upload") func rc_upload(_ target: Int64) -> Int64
 
 /// Consume a Rust-owned C-string into a Swift `String`, freeing it the
 /// way the engine's `rc_string_free` contract requires.
@@ -54,8 +55,11 @@ final class IDEEngine: ObservableObject {
     @Published var target: Int = 0
     @Published var projectDir: String? = nil
     @Published var files: [String] = []
-    @Published var openRel: String? = nil
+    @Published var openRel: String? = nil       // active tab
+    @Published var openFiles: [String] = []      // tab order
     @Published var source: String = ""
+    /// Unsaved edits per open file, so switching tabs preserves them.
+    private var buffers: [String: String] = [:]
     @Published var console: String = ""
     @Published var running: Bool = false
 
@@ -156,6 +160,7 @@ final class IDEEngine: ObservableObject {
     }
 
     private func openFirstSource() {
+        openFiles = []; buffers = [:]; openRel = nil; source = ""
         if let first = files.first(where: { $0.hasSuffix("main.rs") || $0.hasSuffix("lib.rs") })
             ?? files.first(where: { $0.hasSuffix(".rs") })
         {
@@ -163,13 +168,38 @@ final class IDEEngine: ObservableObject {
         }
     }
 
+    /// Open `rel` in a tab (or switch to it), preserving the current
+    /// tab's unsaved edits. Reads from disk only on first open.
     func openFile(_ rel: String) {
+        if let cur = openRel { buffers[cur] = source }
+        if !openFiles.contains(rel) { openFiles.append(rel) }
         openRel = rel
-        source = rel.withCString { takeRustString(rc_read_file($0)) }
+        if let cached = buffers[rel] {
+            source = cached
+        } else {
+            source = rel.withCString { takeRustString(rc_read_file($0)) }
+            buffers[rel] = source
+        }
+    }
+
+    /// Close a tab; switch to a neighbor (or empty if it was the last).
+    func closeFile(_ rel: String) {
+        buffers[rel] = nil
+        if let i = openFiles.firstIndex(of: rel) { openFiles.remove(at: i) }
+        if openRel == rel {
+            if let next = openFiles.last {
+                openRel = next
+                source = buffers[next] ?? (next.withCString { takeRustString(rc_read_file($0)) })
+                buffers[next] = source
+            } else {
+                openRel = nil; source = ""
+            }
+        }
     }
 
     func save() {
         guard let rel = openRel else { return }
+        buffers[rel] = source
         _ = rel.withCString { relC in
             source.withCString { bodyC in rc_save_file(relC, bodyC) }
         }
@@ -185,6 +215,16 @@ final class IDEEngine: ObservableObject {
         _ = rc_build(Int64(target), run ? 1 : 0)
         running = true
     }
+
+    /// Flash the built firmware for the current target (RTOS only;
+    /// host has nothing to flash). Uses the project's upload.toml.
+    func upload() {
+        _ = rc_upload(Int64(target))
+        running = rc_is_running() != 0
+    }
+
+    /// Whether the current target can be flashed (RTOS, not host).
+    var canUpload: Bool { target >= 1 && target <= 5 }
 
     func clearConsole() { console = "" }
 }
