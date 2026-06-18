@@ -12,8 +12,8 @@ struct ContentView: View {
     @State private var selectRange: NSRange? = nil
     @State private var findAnchor: Int = 0   // NSString offset for Find Next
     @State private var showVars = false
-    @State private var baud = 115_200
-    @State private var serialSend = ""
+    @State private var baud = [115_200, 115_200]   // per channel
+    @State private var serialSend = ["", ""]
 
     var body: some View {
         NavigationSplitView {
@@ -36,8 +36,10 @@ struct ContentView: View {
                     Divider()
                 }
                 VSplitView {
-                    editorPane.frame(minHeight: 220)
-                    consolePane.frame(minHeight: 110)
+                    editorPane.frame(minHeight: 200)
+                    consolePane.frame(minHeight: 90)
+                    if eng.serialOpen[0] { serialPane(0).frame(minHeight: 70) }
+                    if eng.serialOpen[1] { serialPane(1).frame(minHeight: 70) }
                 }
                 Divider()
                 debugBar
@@ -55,49 +57,76 @@ struct ContentView: View {
 
     private let bauds = [9_600, 19_200, 57_600, 115_200, 230_400, 460_800, 921_600]
 
+    // Two serial channels — one per core on a dual-target board.
     private var serialBar: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text("Serial monitors").font(.caption.bold()).foregroundStyle(.secondary)
+                Button { eng.refreshPorts() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless).help("Rescan serial ports")
+                Spacer()
+            }
+            serialRow(0, "Core A")
+            serialRow(1, "Core B")
+        }
+        .padding(.horizontal, 10).padding(.vertical, 5)
+    }
+
+    private func serialRow(_ ch: Int, _ label: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "cable.connector")
-                .foregroundStyle(eng.serialOpen ? .green : .secondary)
-            Picker("Port", selection: Binding(
-                get: { eng.serialPort },
-                set: { eng.selectPort($0) }
+                .foregroundStyle(eng.serialOpen[ch] ? .green : .secondary)
+            Text(label).font(.caption).frame(width: 50, alignment: .leading)
+            Picker("", selection: Binding(
+                get: { eng.serialPort[ch] }, set: { eng.selectPort(ch, $0) }
             )) {
                 Text("— no port —").tag("")
                 ForEach(eng.serialPorts, id: \.self) { p in
                     Text(p.replacingOccurrences(of: "/dev/", with: "")).tag(p)
                 }
             }
-            .labelsHidden().frame(maxWidth: 240).disabled(eng.serialOpen)
-            Button { eng.refreshPorts() } label: { Image(systemName: "arrow.clockwise") }
-                .buttonStyle(.borderless).help("Rescan serial ports")
-            Picker("Baud", selection: $baud) {
+            .labelsHidden().frame(maxWidth: 220).disabled(eng.serialOpen[ch])
+            Picker("", selection: Binding(get: { baud[ch] }, set: { baud[ch] = $0 })) {
                 ForEach(bauds, id: \.self) { Text("\($0)").tag($0) }
             }
-            .labelsHidden().frame(maxWidth: 110).disabled(eng.serialOpen)
+            .labelsHidden().frame(maxWidth: 100).disabled(eng.serialOpen[ch])
 
-            if eng.serialOpen {
-                Button { eng.closeSerial() } label: {
-                    Label("Disconnect", systemImage: "xmark.circle")
-                }
-                TextField("send to board…", text: $serialSend)
-                    .textFieldStyle(.roundedBorder).frame(width: 220)
-                    .onSubmit {
-                        eng.sendSerial(serialSend)
-                        serialSend = ""
-                    }
+            if eng.serialOpen[ch] {
+                Button { eng.closeSerial(ch) } label: { Label("Disconnect", systemImage: "xmark.circle") }
+                TextField("send…", text: Binding(get: { serialSend[ch] }, set: { serialSend[ch] = $0 }))
+                    .textFieldStyle(.roundedBorder).frame(width: 180)
+                    .onSubmit { eng.sendSerial(ch, serialSend[ch]); serialSend[ch] = "" }
             } else {
-                Button { eng.openSerial(baud: baud) } label: {
+                Button { eng.openSerial(ch, baud: baud[ch]) } label: {
                     Label("Connect", systemImage: "cable.connector.horizontal")
                 }
-                .disabled(eng.serialPort.isEmpty)
+                .disabled(eng.serialPort[ch].isEmpty)
             }
             Spacer()
-            if eng.serialOpen {
-                Text("monitor → console").font(.caption2).foregroundStyle(.tertiary)
+        }
+    }
+
+    private func serialPane(_ ch: Int) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Serial — \(ch == 0 ? "Core A" : "Core B")").font(.headline)
+                Spacer()
+                Button("Clear") { eng.clearSerial(ch) }.buttonStyle(.borderless)
+            }
+            .padding(.horizontal, 8).padding(.vertical, 4)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(eng.serialRx[ch].isEmpty ? "—" : eng.serialRx[ch])
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .id("send\(ch)")
+                }
+                .onChange(of: eng.serialRx[ch]) { _, _ in proxy.scrollTo("send\(ch)", anchor: .bottom) }
             }
         }
-        .padding(.horizontal, 10).padding(.vertical, 6)
+        .background(Color(nsColor: .textBackgroundColor))
     }
 
     // MARK: - Variables inspector
@@ -352,7 +381,8 @@ struct ContentView: View {
         ToolbarItemGroup(placement: .primaryAction) {
             Menu {
                 Button("Host Project…") { newProject { eng.scaffoldHost(into: $0) } }
-                Button("RAK11161 RTOS Project…") { newProject { eng.scaffoldRTOS(into: $0) } }
+                Button("RAK11161 FreeRTOS Project…") { newProject { eng.scaffoldRTOS(into: $0) } }
+                Button("RAK11161 Zephyr Project…") { newProject { eng.scaffoldZephyr(into: $0) } }
             } label: {
                 Label("New", systemImage: "doc.badge.plus")
             }

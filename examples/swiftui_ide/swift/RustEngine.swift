@@ -37,13 +37,13 @@ import Combine
 @_silgen_name("rc_dbg_vars") func rc_dbg_vars() -> UnsafeMutablePointer<CChar>?
 
 @_silgen_name("rc_serial_ports") func rc_serial_ports() -> UnsafeMutablePointer<CChar>?
-@_silgen_name("rc_serial_port") func rc_serial_port() -> UnsafeMutablePointer<CChar>?
-@_silgen_name("rc_set_serial_port") func rc_set_serial_port(_ p: UnsafePointer<CChar>?)
-@_silgen_name("rc_serial_open") func rc_serial_open(_ baud: Int64) -> Int64
-@_silgen_name("rc_serial_close") func rc_serial_close()
-@_silgen_name("rc_serial_is_open") func rc_serial_is_open() -> Int64
-@_silgen_name("rc_serial_recv") func rc_serial_recv() -> UnsafeMutablePointer<CChar>?
-@_silgen_name("rc_serial_send") func rc_serial_send(_ t: UnsafePointer<CChar>?)
+@_silgen_name("rc_serial_port") func rc_serial_port(_ ch: Int64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rc_set_serial_port") func rc_set_serial_port(_ ch: Int64, _ p: UnsafePointer<CChar>?)
+@_silgen_name("rc_serial_open") func rc_serial_open(_ ch: Int64, _ baud: Int64) -> Int64
+@_silgen_name("rc_serial_close") func rc_serial_close(_ ch: Int64)
+@_silgen_name("rc_serial_is_open") func rc_serial_is_open(_ ch: Int64) -> Int64
+@_silgen_name("rc_serial_recv") func rc_serial_recv(_ ch: Int64) -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rc_serial_send") func rc_serial_send(_ ch: Int64, _ t: UnsafePointer<CChar>?)
 
 /// Consume a Rust-owned C-string into a Swift `String`, freeing it the
 /// way the engine's `rc_string_free` contract requires.
@@ -83,10 +83,11 @@ final class IDEEngine: ObservableObject {
     var autoVars = false                      // recapture vars on each stop
     private var lastStopSig = ""
 
-    // Serial monitor
+    // Serial monitors — two channels for dual-target boards (RAK11161).
     @Published var serialPorts: [String] = []
-    @Published var serialPort: String = ""
-    @Published var serialOpen: Bool = false
+    @Published var serialPort: [String] = ["", ""]
+    @Published var serialOpen: [Bool] = [false, false]
+    @Published var serialRx: [String] = ["", ""]
 
     private var pollTimer: Timer?
 
@@ -123,10 +124,12 @@ final class IDEEngine: ObservableObject {
         }
         let v = takeRustString(rc_dbg_vars())
         if v != variables { variables = v }
-        // Serial: stream board output into the console; track open state.
-        let rx = takeRustString(rc_serial_recv())
-        if !rx.isEmpty { console += rx }
-        serialOpen = rc_serial_is_open() != 0
+        // Serial: per-channel RX into each channel's own console.
+        for ch in 0..<2 {
+            let rx = takeRustString(rc_serial_recv(Int64(ch)))
+            if !rx.isEmpty { serialRx[ch] += rx }
+            serialOpen[ch] = rc_serial_is_open(Int64(ch)) != 0
+        }
     }
 
     // MARK: - Serial monitor
@@ -134,21 +137,24 @@ final class IDEEngine: ObservableObject {
     func refreshPorts() {
         let s = takeRustString(rc_serial_ports())
         serialPorts = s.isEmpty ? [] : s.split(separator: "\n").map(String.init)
-        serialPort = takeRustString(rc_serial_port())   // engine may have loaded one
+        for ch in 0..<2 {
+            serialPort[ch] = takeRustString(rc_serial_port(Int64(ch)))  // engine may have loaded one
+        }
     }
-    func selectPort(_ p: String) {
-        serialPort = p
-        p.withCString { rc_set_serial_port($0) }
+    func selectPort(_ ch: Int, _ p: String) {
+        serialPort[ch] = p
+        p.withCString { rc_set_serial_port(Int64(ch), $0) }
     }
-    func openSerial(baud: Int) {
-        if rc_serial_open(Int64(baud)) == 0 { serialOpen = true }
+    func openSerial(_ ch: Int, baud: Int) {
+        if rc_serial_open(Int64(ch), Int64(baud)) == 0 { serialOpen[ch] = true }
     }
-    func closeSerial() {
-        rc_serial_close(); serialOpen = false
+    func closeSerial(_ ch: Int) {
+        rc_serial_close(Int64(ch)); serialOpen[ch] = false
     }
-    func sendSerial(_ text: String) {
-        text.withCString { rc_serial_send($0) }
+    func sendSerial(_ ch: Int, _ text: String) {
+        text.withCString { rc_serial_send(Int64(ch), $0) }
     }
+    func clearSerial(_ ch: Int) { serialRx[ch] = "" }
 
     /// Ask the live session for a fresh `frame variable` capture.
     func requestVars() { rc_dbg_request_vars() }
@@ -188,6 +194,10 @@ final class IDEEngine: ObservableObject {
     /// RAK11161 dual-core FreeRTOS firmware; default to the STM32WLE5
     /// (CM4) core so Build/Run picks `run_arm.sh`.
     func scaffoldRTOS(into dir: String) { scaffold(kind: 1, into: dir, defaultTarget: 1) }
+
+    /// RAK11161 dual-core Zephyr firmware; default to the Cortex-M3
+    /// Zephyr target (run_zephyr.sh).
+    func scaffoldZephyr(into dir: String) { scaffold(kind: 2, into: dir, defaultTarget: 6) }
 
     private func scaffold(kind: Int64, into dir: String, defaultTarget: Int) {
         let rc = dir.withCString { rc_scaffold(kind, $0) }

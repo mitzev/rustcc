@@ -56,11 +56,16 @@ bound on the Swift side as:
 - **New ▸ Host** — scaffolds a fork-Rust Hello-World project (a
   `class Greeter` with a virtual method + a free `greeting() -> String`)
   and opens it.
-- **New ▸ RAK11161 RTOS** — scaffolds a complete dual-core FreeRTOS
-  firmware project (the Rust `class` crate + C++ side + FreeRTOS glue +
-  per-core qemu run scripts), embedded at compile time from the
-  validated `bare_metal_arm` / `freertos_cpp` examples so it can't
-  drift, and defaults the target to the STM32WLE5 (CM4) core.
+- **New ▸ RAK11161 FreeRTOS** / **RAK11161 Zephyr** — scaffolds a
+  complete dual-core firmware project (the Rust `class` crate + C++
+  side + RTOS glue + per-core qemu run scripts), embedded at compile
+  time from the validated `bare_metal_arm` / `freertos_cpp` /
+  `zephyr_cpp` examples so it can't drift. The **Zephyr** flavor emits
+  a CMake/`west` app for both cores (`qemu_cortex_m3` +
+  `qemu_riscv32` rv32imc), rewriting the `../bare_metal_arm` references
+  to a self-contained local `cpp/`. The **Target** menu lists all
+  eight targets (Host, the four FreeRTOS cores, and the two Zephyr
+  cores); Build/Run picks the matching run script.
 - **Open** — pick any folder; the sidebar lists its source files.
 - **Editor** — a real code editor: an `NSTextView` (AppKit) wrapped as
   a SwiftUI `NSViewRepresentable` with a **line-number gutter**, so it
@@ -83,14 +88,15 @@ bound on the Swift side as:
   `esptool.py` / `picotool`), routed by target and streamed. `{port}`
   is the selected serial port (below). Host has nothing to flash, so
   the button disables.
-- **Serial monitor** — a bottom bar to talk to the dev board: a
-  **port picker** enumerating `/dev/cu.*` (macOS) / `ttyUSB*`·`ttyACM*`
-  (Linux) with a rescan button, a **baud** picker, and
-  **Connect/Disconnect**. The engine configures the line with `stty`
-  (raw N81, read-timeout) and opens it; board output streams into the
-  console and a send field writes a line back. The selection persists
-  to `upload.toml`'s `[serial] port` and feeds Upload, so picking it
-  once covers both flashing and monitoring.
+- **Dual serial monitors** — **two** independent channels (Core A / B),
+  so a dual-target board like the RAK11161 can have a console per core.
+  Each has a **port picker** enumerating `/dev/cu.*` (macOS) /
+  `ttyUSB*`·`ttyACM*` (Linux), a **baud** picker, and
+  **Connect/Disconnect**; the engine configures the line with `stty`
+  (raw N81, read-timeout) and opens it, and each channel streams into
+  **its own console pane** with a send field. Channel A's port persists
+  to `upload.toml`'s `[serial] port` (and feeds Upload), channel B's to
+  `port_b`.
 - **Debug** (Host target) — an in-IDE `lldb` session: **Start Debug**
   builds the debug profile and attaches lldb over a pty (the engine
   spawns it on a background thread; the transcript streams into the

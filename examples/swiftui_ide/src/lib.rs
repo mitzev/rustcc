@@ -56,13 +56,15 @@ macro_rules! embed {
 
 /// The 6 build targets the IDE understands (copied from the FLTK IDE's
 /// `TARGET_NAMES` so the two front-ends agree on the target matrix).
-const TARGET_NAMES: [&str; 6] = [
+const TARGET_NAMES: [&str; 8] = [
     "Host (LLVM backend)",
     "RAK11161 — STM32WLE5 core (Cortex-M4, FreeRTOS, qemu mps2)",
     "RAK11161 — ESP8684 / ESP32-C2 (rv32imc, FreeRTOS, qemu virt)",
     "ESP32-C3-class (rv32imac, FreeRTOS, qemu virt)",
     "STM32F4-class (Cortex-M4F, FreeRTOS, qemu mps2)",
     "Raspberry Pi Pico (RP2040, Cortex-M0+, FreeRTOS, qemu mps2)",
+    "Zephyr — STM32WLE5 / Cortex-M3 (qemu_cortex_m3)",
+    "Zephyr — ESP8684 / ESP32-C2 (rv32imc, qemu_riscv32)",
 ];
 
 static PROJECT_DIR: Mutex<Option<String>> = Mutex::new(None);
@@ -93,13 +95,20 @@ const VARS_SENTINEL: &str = "<<RUSTCC_VARS_END>>";
 // --- serial monitor (talk to the dev board over USB-serial) ----------
 /// The selected serial device (e.g. `/dev/cu.usbserial-xxxx`). Feeds
 /// the upload `{port}` and the monitor.
-static SERIAL_PORT: Mutex<String> = Mutex::new(String::new());
+/// Two serial channels — dual-target boards like the RAK11161 have a
+/// console per core (STM32WLE5 + ESP32-C2). Channel 0 is the primary
+/// (feeds Upload + persists to upload.toml `[serial] port`); channel 1
+/// is a second monitor (`port_b`).
+const NSERIAL: usize = 2;
+static SERIAL_PORT: [Mutex<String>; NSERIAL] =
+    [Mutex::new(String::new()), Mutex::new(String::new())];
 /// Open monitor handle (a cloned fd is read by the reader thread; this
 /// one is for sending).
-static SERIAL_TX: Mutex<Option<std::fs::File>> = Mutex::new(None);
-static SERIAL_OPEN: AtomicBool = AtomicBool::new(false);
-/// Bytes received from the board, drained by the UI (like the console).
-static SERIAL_RX: Mutex<String> = Mutex::new(String::new());
+static SERIAL_TX: [Mutex<Option<std::fs::File>>; NSERIAL] = [Mutex::new(None), Mutex::new(None)];
+static SERIAL_OPEN: [AtomicBool; NSERIAL] = [AtomicBool::new(false), AtomicBool::new(false)];
+/// Bytes received per channel, drained by the UI into its own console.
+static SERIAL_RX: [Mutex<String>; NSERIAL] =
+    [Mutex::new(String::new()), Mutex::new(String::new())];
 
 // ---------------------------------------------------------------------
 // Pure-logic core (no ABI concerns — unit-testable as plain Rust)
@@ -129,6 +138,8 @@ mod engine {
             1 | 4 => format!("{skip}./run_arm.sh"),
             2 => format!("{skip}./run_riscv_c2.sh"),
             5 => format!("{skip}./run_pico.sh"),
+            6 => format!("{skip}./run_zephyr.sh"),     // Zephyr CM3
+            7 => format!("{skip}./run_zephyr_c2.sh"),  // Zephyr ESP32-C2
             _ => format!("{skip}./run_riscv.sh"),
         }
     }
@@ -205,25 +216,34 @@ mod engine {
     /// Rewrite the `[serial] port = "…"` line of the open project's
     /// upload.toml so the choice persists (best-effort; no-op if there
     /// is no project / no upload.toml).
-    pub fn persist_serial_port(port: &str) {
+    pub fn persist_serial_port(ch: usize, port: &str) {
         let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
         let path = format!("{dir}/upload.toml");
         let Ok(cfg) = std::fs::read_to_string(&path) else { return };
+        let key = if ch == 0 { "port" } else { "port_b" };
         let mut in_serial = false;
         let mut wrote = false;
         let mut out = String::new();
         for line in cfg.lines() {
             let l = line.trim();
             if l.starts_with('[') {
+                // leaving [serial] without the key written → append it
+                if in_serial && !wrote {
+                    out.push_str(&format!("{key} = \"{port}\"\n"));
+                    wrote = true;
+                }
                 in_serial = l == "[serial]";
             }
-            if in_serial && l.starts_with("port") && l.contains('=') && !wrote {
-                out.push_str(&format!("port = \"{port}\"\n"));
+            if in_serial && !wrote && l.split('=').next().map(str::trim) == Some(key) {
+                out.push_str(&format!("{key} = \"{port}\"\n"));
                 wrote = true;
                 continue;
             }
             out.push_str(line);
             out.push('\n');
+        }
+        if in_serial && !wrote {
+            out.push_str(&format!("{key} = \"{port}\"\n")); // [serial] was last
         }
         let _ = std::fs::write(&path, out);
     }
@@ -233,9 +253,11 @@ mod engine {
     pub fn load_serial_from_project() {
         let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
         if let Ok(cfg) = std::fs::read_to_string(format!("{dir}/upload.toml")) {
-            if let Some(p) = upload_cfg_get(&cfg, "serial", "port") {
-                if !p.is_empty() {
-                    *SERIAL_PORT.lock().unwrap() = p;
+            for (ch, key) in [(0usize, "port"), (1usize, "port_b")] {
+                if let Some(p) = upload_cfg_get(&cfg, "serial", key) {
+                    if !p.is_empty() {
+                        *SERIAL_PORT[ch].lock().unwrap() = p;
+                    }
                 }
             }
         }
@@ -329,12 +351,67 @@ mod engine {
         Ok(())
     }
 
+    /// Scaffold a **Zephyr RTOS** C++ interop project for the RAK11161
+    /// — both cores. CMake/`west` app (qemu_cortex_m3 + qemu_riscv32
+    /// rv32imc) over the same Rust `class` crate + C++ side as the
+    /// FreeRTOS scaffold, embedded at compile time from examples/
+    /// zephyr_cpp + examples/bare_metal_arm. Self-contained: the
+    /// `../bare_metal_arm` references are rewritten to a local `cpp/`.
+    pub fn scaffold_zephyr(dir: &str) -> Result<(), String> {
+        let root = Path::new(dir);
+        let werr = |e: std::io::Error| e.to_string();
+        for sub in ["src", "cpp", "boards"] {
+            std::fs::create_dir_all(root.join(sub)).map_err(werr)?;
+        }
+        // CMake: the imported C++ side moves from ../bare_metal_arm to
+        // a local cpp/. Run scripts: build the Rust crate in-place and
+        // link librak_zephyr_fw.a.
+        let cmake = embed!("zephyr_cpp/CMakeLists.txt").replace("/../bare_metal_arm", "/cpp");
+        let fix_run = |s: &str| -> String {
+            s.replace("../bare_metal_arm", ".")
+                .replace("libbare_metal_arm.a", "librak_zephyr_fw.a")
+        };
+        let files: &[(&str, String)] = &[
+            ("Cargo.toml", ZEPHYR_CARGO_TOML.to_string()),
+            ("src/lib.rs", embed!("bare_metal_arm/src/lib.rs").to_string()),
+            ("src/main.c", embed!("zephyr_cpp/src/main.c").to_string()),
+            ("cpp/caller.cpp", embed!("bare_metal_arm/caller.cpp").to_string()),
+            ("cpp/sensor.cpp", embed!("bare_metal_arm/sensor.cpp").to_string()),
+            ("cpp/sensor.hpp", embed!("bare_metal_arm/sensor.hpp").to_string()),
+            ("cpp/rtti_stub.c", embed!("bare_metal_arm/rtti_stub.c").to_string()),
+            ("CMakeLists.txt", cmake),
+            ("prj.conf", embed!("zephyr_cpp/prj.conf").to_string()),
+            (
+                "boards/qemu_riscv32.overlay",
+                embed!("zephyr_cpp/boards/qemu_riscv32.overlay").to_string(),
+            ),
+            ("run_zephyr.sh", fix_run(embed!("zephyr_cpp/run_zephyr.sh"))),
+            ("run_zephyr_c2.sh", embed!("zephyr_cpp/run_zephyr_c2.sh").to_string()),
+            ("README.md", ZEPHYR_SCAFFOLD_README.to_string()),
+        ];
+        for (rel, content) in files {
+            std::fs::write(root.join(rel), content).map_err(werr)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for s in ["run_zephyr.sh", "run_zephyr_c2.sh"] {
+                std::fs::set_permissions(root.join(s), std::fs::Permissions::from_mode(0o755))
+                    .map_err(werr)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Source-ish files in `dir`, two levels deep, project-relative,
     /// sorted. (Same filter spirit as the FLTK IDE's `collect_files`.)
     pub fn list_files(dir: &str) -> Vec<String> {
         const EXTS: &[&str] = &[
             "rs", "toml", "c", "h", "cpp", "hpp", "ld", "md", "json", "sh", "swift",
+            "conf", "overlay", "cmake", // Zephyr: prj.conf, .overlay
         ];
+        // Extensionless project files worth showing in the tree.
+        const NAMES: &[&str] = &["CMakeLists.txt"];
         fn walk(base: &Path, cur: &Path, depth: u32, out: &mut Vec<String>) {
             let Ok(rd) = std::fs::read_dir(cur) else { return };
             for ent in rd.flatten() {
@@ -347,13 +424,15 @@ mod engine {
                     if depth < 2 {
                         walk(base, &p, depth + 1, out);
                     }
-                } else if p
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| EXTS.contains(&e))
-                {
-                    if let Ok(rel) = p.strip_prefix(base) {
-                        out.push(rel.to_string_lossy().into_owned());
+                } else {
+                    let ext_ok = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| EXTS.contains(&e));
+                    if ext_ok || NAMES.contains(&name.as_str()) {
+                        if let Ok(rel) = p.strip_prefix(base) {
+                            out.push(rel.to_string_lossy().into_owned());
+                        }
                     }
                 }
             }
@@ -760,6 +839,44 @@ cmd = "picotool load {elf} -fx"
 
 [serial]
 port = "/dev/cu.usbmodem01"
+port_b = "/dev/cu.usbserial01"
+"#;
+
+const ZEPHYR_CARGO_TOML: &str = r#"# Rust `class` staticlib for the Zephyr RAK11161 project — built per
+# core by run_zephyr*.sh and linked into the Zephyr app via CMake.
+[package]
+name = "rak_zephyr_fw"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]
+"#;
+
+const ZEPHYR_SCAFFOLD_README: &str = r#"# RAK11161 dual-core firmware on Zephyr RTOS (rustcc)
+
+Scaffolded by the **rustcc IDE**. The same Rust `class` crate
+(`src/lib.rs`: Widget/Gauge + imported Sensor/Reader) + C++ side
+(`cpp/`) as the FreeRTOS scaffold, but built by Zephyr's CMake/`west`
+and run on qemu for both RAK11161 cores:
+
+```sh
+RUSTC=<fork-stage1>/bin/rustc ./run_zephyr.sh      # STM32WLE5 (Cortex-M3, qemu_cortex_m3)
+RUSTC=<fork-stage1>/bin/rustc ./run_zephyr_c2.sh   # ESP8684/ESP32-C2 (rv32imc, qemu_riscv32)
+SKIP_QEMU=1 ./run_zephyr.sh                         # build only
+```
+
+Prereqs: a Zephyr west workspace + SDK (ARM + RISC-V toolchains). See
+`examples/zephyr_cpp` in the rustcc repo for the one-time setup.
+Expected: `ZEPHYR CXX PROBE (...): PASS (105/4000/503/42 ...)`.
 "#;
 
 // ---------------------------------------------------------------------
@@ -817,6 +934,7 @@ pub extern "Swift" fn rc_scaffold(kind: i64, dir: *const c_char) -> i64 {
     let (r, label) = match kind {
         0 => (engine::scaffold_host(&dir), "host"),
         1 => (engine::scaffold_rtos(&dir), "RAK11161 dual-core FreeRTOS"),
+        2 => (engine::scaffold_zephyr(&dir), "RAK11161 dual-core Zephyr"),
         _ => (Err(format!("unknown scaffold kind {kind}")), ""),
     };
     match r {
@@ -957,7 +1075,7 @@ pub extern "Swift" fn rc_upload(target: i64) -> i64 {
         return -1;
     };
     // The live selection wins over upload.toml's stored value.
-    let selected = SERIAL_PORT.lock().unwrap().clone();
+    let selected = SERIAL_PORT[0].lock().unwrap().clone();
     let port = if selected.is_empty() {
         engine::upload_cfg_get(&cfg, "serial", "port").unwrap_or_default()
     } else {
@@ -1133,58 +1251,68 @@ pub extern "Swift" fn rc_serial_ports() -> *mut c_char {
     out_cstring(engine::serial_ports().join("\n"))
 }
 
-/// The currently selected serial port (caller frees).
+/// Clamp a Swift-supplied channel index to a valid serial channel.
+fn serial_ch(ch: i64) -> usize {
+    (ch as usize).min(NSERIAL - 1)
+}
+
+/// The selected serial port on channel `ch` (caller frees).
 #[export_name = "rc_serial_port"]
-pub extern "Swift" fn rc_serial_port() -> *mut c_char {
-    out_cstring(SERIAL_PORT.lock().unwrap().clone())
+pub extern "Swift" fn rc_serial_port(ch: i64) -> *mut c_char {
+    out_cstring(SERIAL_PORT[serial_ch(ch)].lock().unwrap().clone())
 }
 
-/// Select the serial port used by upload + the monitor; persists into
-/// the open project's upload.toml.
+/// Select the serial port for channel `ch`; persists into upload.toml
+/// (`port` for ch0 — also feeds Upload — `port_b` for ch1).
 #[export_name = "rc_set_serial_port"]
-pub extern "Swift" fn rc_set_serial_port(port: *const c_char) {
+pub extern "Swift" fn rc_set_serial_port(ch: i64, port: *const c_char) {
+    let ch = serial_ch(ch);
     let port = unsafe { in_str(port) };
-    *SERIAL_PORT.lock().unwrap() = port.clone();
-    engine::persist_serial_port(&port);
-    engine::console_append(&format!("serial port = {}\n", if port.is_empty() { "(none)" } else { &port }));
+    *SERIAL_PORT[ch].lock().unwrap() = port.clone();
+    engine::persist_serial_port(ch, &port);
+    engine::console_append(&format!(
+        "serial[{ch}] port = {}\n",
+        if port.is_empty() { "(none)" } else { &port }
+    ));
 }
 
-/// Open the selected port at `baud` and start streaming RX into the
-/// serial drain. Returns 0 on success, -1 on error.
+/// Open channel `ch`'s selected port at `baud`, streaming RX into that
+/// channel's drain. Returns 0 on success, -1 on error.
 #[export_name = "rc_serial_open"]
-pub extern "Swift" fn rc_serial_open(baud: i64) -> i64 {
+pub extern "Swift" fn rc_serial_open(ch: i64, baud: i64) -> i64 {
     use std::io::Read;
-    if SERIAL_OPEN.load(Relaxed) {
+    let ch = serial_ch(ch);
+    if SERIAL_OPEN[ch].load(Relaxed) {
         return 0;
     }
-    let port = SERIAL_PORT.lock().unwrap().clone();
+    let port = SERIAL_PORT[ch].lock().unwrap().clone();
     let file = match engine::serial_open(&port, baud) {
         Ok(f) => f,
         Err(e) => {
-            engine::console_append(&format!("serial open FAILED: {e}\n"));
+            engine::console_append(&format!("serial[{ch}] open FAILED: {e}\n"));
             return -1;
         }
     };
     let reader = match file.try_clone() {
         Ok(r) => r,
         Err(e) => {
-            engine::console_append(&format!("serial clone FAILED: {e}\n"));
+            engine::console_append(&format!("serial[{ch}] clone FAILED: {e}\n"));
             return -1;
         }
     };
-    *SERIAL_TX.lock().unwrap() = Some(file);
-    SERIAL_OPEN.store(true, Relaxed);
-    engine::console_append(&format!("==> serial open: {port} @ {baud} (raw, read-timeout)\n"));
+    *SERIAL_TX[ch].lock().unwrap() = Some(file);
+    SERIAL_OPEN[ch].store(true, Relaxed);
+    engine::console_append(&format!("==> serial[{ch}] open: {port} @ {baud}\n"));
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut buf = [0u8; 512];
         loop {
-            if !SERIAL_OPEN.load(Relaxed) {
+            if !SERIAL_OPEN[ch].load(Relaxed) {
                 break;
             }
             match reader.read(&mut buf) {
                 Ok(0) => {} // `min 0 time 10` read timeout — no data
-                Ok(n) => SERIAL_RX
+                Ok(n) => SERIAL_RX[ch]
                     .lock()
                     .unwrap()
                     .push_str(&String::from_utf8_lossy(&buf[..n])),
@@ -1198,33 +1326,34 @@ pub extern "Swift" fn rc_serial_open(baud: i64) -> i64 {
     0
 }
 
-/// Close the serial monitor.
+/// Close serial channel `ch`.
 #[export_name = "rc_serial_close"]
-pub extern "Swift" fn rc_serial_close() {
-    SERIAL_OPEN.store(false, Relaxed);
-    *SERIAL_TX.lock().unwrap() = None;
-    engine::console_append("serial closed\n");
+pub extern "Swift" fn rc_serial_close(ch: i64) {
+    let ch = serial_ch(ch);
+    SERIAL_OPEN[ch].store(false, Relaxed);
+    *SERIAL_TX[ch].lock().unwrap() = None;
+    engine::console_append(&format!("serial[{ch}] closed\n"));
 }
 
-/// 1 while the monitor is open, else 0.
+/// 1 while channel `ch` is open, else 0.
 #[export_name = "rc_serial_is_open"]
-pub extern "Swift" fn rc_serial_is_open() -> i64 {
-    SERIAL_OPEN.load(Relaxed) as i64
+pub extern "Swift" fn rc_serial_is_open(ch: i64) -> i64 {
+    SERIAL_OPEN[serial_ch(ch)].load(Relaxed) as i64
 }
 
-/// Return and CLEAR pending bytes received from the board (caller frees).
+/// Return and CLEAR channel `ch`'s pending received bytes (caller frees).
 #[export_name = "rc_serial_recv"]
-pub extern "Swift" fn rc_serial_recv() -> *mut c_char {
-    let mut g = SERIAL_RX.lock().unwrap();
+pub extern "Swift" fn rc_serial_recv(ch: i64) -> *mut c_char {
+    let mut g = SERIAL_RX[serial_ch(ch)].lock().unwrap();
     out_cstring(std::mem::take(&mut *g))
 }
 
-/// Send `text` (a CR/LF is appended) to the board over the open port.
+/// Send `text` (a CR/LF is appended) to channel `ch`'s board.
 #[export_name = "rc_serial_send"]
-pub extern "Swift" fn rc_serial_send(text: *const c_char) {
+pub extern "Swift" fn rc_serial_send(ch: i64, text: *const c_char) {
     use std::io::Write;
     let text = unsafe { in_str(text) };
-    if let Some(f) = SERIAL_TX.lock().unwrap().as_mut() {
+    if let Some(f) = SERIAL_TX[serial_ch(ch)].lock().unwrap().as_mut() {
         let _ = f.write_all(text.as_bytes());
         let _ = f.write_all(b"\r\n");
         let _ = f.flush();
@@ -1268,11 +1397,42 @@ mod tests {
 
     #[test]
     fn target_table_matches_fltk_ide() {
-        assert_eq!(rc_target_count(), 6);
+        assert_eq!(rc_target_count(), 8);
         let host = unsafe { take(rc_target_name(0)) };
         assert!(host.starts_with("Host"), "got {host:?}");
         let c2 = unsafe { take(rc_target_name(2)) };
         assert!(c2.contains("ESP32-C2"), "got {c2:?}");
+        // Zephyr targets (6 = CM3, 7 = ESP32-C2) → run_zephyr scripts.
+        assert!(unsafe { take(rc_target_name(6)) }.contains("Zephyr"));
+        assert!(engine::target_cmdline(6, false).contains("./run_zephyr.sh"));
+        assert!(engine::target_cmdline(7, true).contains("./run_zephyr_c2.sh"));
+    }
+
+    #[test]
+    fn scaffold_zephyr_file_set() {
+        let dir = std::env::temp_dir().join(format!("swiftui_ide_zeph{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rc_scaffold(2, cstr(dir.to_str().unwrap()).as_ptr()), 0);
+        let files = unsafe { take(rc_list_files()) };
+        for want in [
+            "Cargo.toml", "CMakeLists.txt", "prj.conf", "src/lib.rs", "src/main.c",
+            "cpp/caller.cpp", "cpp/sensor.cpp", "run_zephyr.sh", "run_zephyr_c2.sh",
+        ] {
+            assert!(files.lines().any(|l| l == want), "missing {want} in:\n{files}");
+        }
+        // CMake points at the local cpp/, not ../bare_metal_arm.
+        let cmake = unsafe { take(rc_read_file(cstr("CMakeLists.txt").as_ptr())) };
+        assert!(
+            cmake.contains("/cpp") && !cmake.contains("../bare_metal_arm"),
+            "CMake paths not localized"
+        );
+        // run script builds the local crate + links librak_zephyr_fw.a.
+        let run = unsafe { take(rc_read_file(cstr("run_zephyr.sh").as_ptr())) };
+        assert!(run.contains("librak_zephyr_fw.a") && !run.contains("../bare_metal_arm"));
+        // The Rust side is the validated fork class crate.
+        let lib = unsafe { take(rc_read_file(cstr("src/lib.rs").as_ptr())) };
+        assert!(lib.contains("class") && lib.contains("Sensor"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1507,15 +1667,44 @@ mod tests {
         // Enumeration must not panic (it reads /dev).
         let _ = engine::serial_ports();
         let _ = unsafe { take(rc_serial_ports()) };
-        // Select / read-back roundtrip.
-        rc_set_serial_port(cstr("/dev/cu.unit-test-sel").as_ptr());
-        assert_eq!(unsafe { take(rc_serial_port()) }, "/dev/cu.unit-test-sel");
+        // Two independent channels: select / read-back per channel.
+        rc_set_serial_port(0, cstr("/dev/cu.unit-test-a").as_ptr());
+        rc_set_serial_port(1, cstr("/dev/cu.unit-test-b").as_ptr());
+        assert_eq!(unsafe { take(rc_serial_port(0)) }, "/dev/cu.unit-test-a");
+        assert_eq!(unsafe { take(rc_serial_port(1)) }, "/dev/cu.unit-test-b");
         // A bogus port fails cleanly (stty errors) — no hang, returns -1.
-        rc_set_serial_port(cstr("/dev/cu.nonexistent-xyz-123").as_ptr());
-        assert_eq!(rc_serial_open(115_200), -1);
-        assert_eq!(rc_serial_is_open(), 0);
-        assert!(unsafe { take(rc_serial_recv()) }.is_empty());
-        rc_set_serial_port(cstr("").as_ptr()); // reset shared state
+        rc_set_serial_port(0, cstr("/dev/cu.nonexistent-xyz-123").as_ptr());
+        assert_eq!(rc_serial_open(0, 115_200), -1);
+        assert_eq!(rc_serial_is_open(0), 0);
+        assert_eq!(rc_serial_is_open(1), 0);
+        assert!(unsafe { take(rc_serial_recv(0)) }.is_empty());
+        rc_set_serial_port(0, cstr("").as_ptr()); // reset shared state
+        rc_set_serial_port(1, cstr("").as_ptr());
+    }
+
+    /// Scaffold a Zephyr project and run its Cortex-M3 core on qemu via
+    /// the scaffolded run_zephyr.sh — proves the path rewrites produce a
+    /// working CMake/west build. Gated (needs the Zephyr SDK + west).
+    #[test]
+    fn full_zephyr_scaffold() {
+        if std::env::var("RUSTCC_SWIFTUI_IDE_FULL").as_deref() != Ok("1") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("swiftui_ide_zrun{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(rc_scaffold(2, cstr(dir.to_str().unwrap()).as_ptr()), 0);
+        let out = std::process::Command::new("bash")
+            .arg("run_zephyr.sh")
+            .current_dir(&dir)
+            .output()
+            .expect("run_zephyr.sh");
+        let log = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            log.contains("ZEPHYR CXX PROBE") && log.contains("PASS (105/4000/503/42"),
+            "scaffolded Zephyr CM3 did not reach PASS:\n{log}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
