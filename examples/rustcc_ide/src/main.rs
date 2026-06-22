@@ -1136,11 +1136,21 @@ fn console_append(s: &str) {
 /// Run `script` in `dir` with merged stderr, streaming each output
 /// line into the console while pumping the FLTK event loop — the UI
 /// stays live for the whole build/qemu run. Returns the exit code.
+/// Prepended to every build/run shell so GUI-launched IDEs find the
+/// dev toolchain (rustup's cargo, Homebrew's cmake/ninja/qemu/dtc).
+/// Missing dirs are harmless. The run scripts handle west/RUSTC by
+/// absolute path themselves; this covers the PATH-resolved tools.
+const DEV_PATH_PREFIX: &str = r#"export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH";"#;
+
 fn run_streamed(dir: &str, cmdline: &str) -> i32 {
     use std::io::{BufRead, BufReader};
     let child = std::process::Command::new("bash")
         .arg("-c")
-        .arg(format!("cd '{dir}' && {cmdline} 2>&1"))
+        // A GUI app launched from Finder/`open` inherits a minimal PATH
+        // (/usr/bin:/bin:…) with NO ~/.cargo/bin or Homebrew — so cargo,
+        // cmake, ninja, qemu, dtc all vanish ("cargo: command not
+        // found"). Restore the usual dev tool dirs for the build shell.
+        .arg(format!("{DEV_PATH_PREFIX} cd '{dir}' && {cmdline} 2>&1"))
         .stdout(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .spawn();

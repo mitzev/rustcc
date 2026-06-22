@@ -446,6 +446,15 @@ mod engine {
     /// Spawn `cmdline` in `dir` on a background thread, streaming
     /// merged stdout+stderr line-by-line into the CONSOLE drain
     /// buffer. Adapts the FLTK IDE's `run_streamed` to a pull model
+    /// Prepended to every build/run shell so a GUI-launched app (opened
+    /// from Finder/`open`, inheriting a minimal /usr/bin:/bin PATH) still
+    /// finds the dev toolchain: rustup's cargo (~/.cargo/bin) and
+    /// Homebrew's cmake/ninja/qemu/dtc. Without it the build dies with
+    /// "cargo: command not found". Missing dirs are harmless; the run
+    /// scripts resolve west/RUSTC by absolute path themselves.
+    const DEV_PATH_PREFIX: &str =
+        "export PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\";";
+
     /// (no `Fl::check()` pump — SwiftUI polls `rc_console_drain`).
     /// Run `cmdline` in `dir`, streaming merged output into the console
     /// drain. **Blocking** — returns the exit code. Does NOT touch
@@ -456,7 +465,7 @@ mod engine {
         use std::process::{Command, Stdio};
         let child = Command::new("bash")
             .arg("-c")
-            .arg(format!("cd '{dir}' && {cmdline} 2>&1"))
+            .arg(format!("{DEV_PATH_PREFIX} cd '{dir}' && {cmdline} 2>&1"))
             .stdout(Stdio::piped())
             .stdin(Stdio::null())
             .spawn();
@@ -554,7 +563,7 @@ mod engine {
         use std::process::{Command, Stdio};
         let child = Command::new("bash")
             .arg("-c")
-            .arg(format!("cd '{dir}' && {cmdline} 2>&1"))
+            .arg(format!("{DEV_PATH_PREFIX} cd '{dir}' && {cmdline} 2>&1"))
             .stdout(Stdio::piped())
             .stdin(Stdio::null())
             .spawn();
