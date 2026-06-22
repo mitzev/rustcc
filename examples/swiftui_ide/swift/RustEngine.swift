@@ -33,6 +33,9 @@ import Combine
 @_silgen_name("rc_dbg_curline") func rc_dbg_curline() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("rc_dbg_breakpoints") func rc_dbg_breakpoints() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("rc_upload") func rc_upload(_ target: Int64) -> Int64
+@_silgen_name("rc_run_on_device") func rc_run_on_device(_ target: Int64, _ baud: Int64) -> Int64
+@_silgen_name("rc_recents_list") func rc_recents_list() -> UnsafeMutablePointer<CChar>?
+@_silgen_name("rc_recents_clear") func rc_recents_clear()
 @_silgen_name("rc_dbg_request_vars") func rc_dbg_request_vars()
 @_silgen_name("rc_dbg_vars") func rc_dbg_vars() -> UnsafeMutablePointer<CChar>?
 
@@ -88,6 +91,14 @@ final class IDEEngine: ObservableObject {
     @Published var serialPort: [String] = ["", ""]
     @Published var serialOpen: [Bool] = [false, false]
     @Published var serialRx: [String] = ["", ""]
+
+    /// Global run mode: false = QEMU (emulator), true = Device — Build &
+    /// Run flashes the selected serial port (channel 0) and attaches the
+    /// monitor. App-wide, not remembered per project.
+    @Published var runOnDevice: Bool = false
+    /// Recent project folders (most-recent first), shared with the FLTK
+    /// IDE via ~/.rustcc_ide_recents. Surfaced as the Open Recent menu.
+    @Published var recents: [String] = []
 
     private var pollTimer: Timer?
     private var rescanTick = 0
@@ -216,6 +227,7 @@ final class IDEEngine: ObservableObject {
             refreshFiles()
             openFirstSource()
             refreshPorts()
+            refreshRecents()
         }
         pump()
     }
@@ -226,7 +238,32 @@ final class IDEEngine: ObservableObject {
             refreshFiles()
             openFirstSource()
             refreshPorts()
+            refreshRecents()
         }
+        pump()
+    }
+
+    // MARK: - Recent workspaces
+
+    /// Reload the recent-projects list from the engine (the shared
+    /// ~/.rustcc_ide_recents file).
+    func refreshRecents() {
+        let joined = takeRustString(rc_recents_list())
+        recents = joined.isEmpty ? [] : joined.split(separator: "\n").map(String.init)
+    }
+
+    /// Open a recent project (skips gone folders, dropping them).
+    func openRecent(_ dir: String) {
+        if FileManager.default.fileExists(atPath: dir) {
+            open(dir)
+        } else {
+            console += "recent workspace gone: \(dir)\n"
+        }
+    }
+
+    func clearRecents() {
+        rc_recents_clear()
+        refreshRecents()
         pump()
     }
 
@@ -290,6 +327,29 @@ final class IDEEngine: ObservableObject {
         if openRel != nil { save() }
         _ = rc_build(Int64(target), run ? 1 : 0)
         running = true
+    }
+
+    /// Build & Run honoring the run mode: in Device mode (for a
+    /// flashable target) it builds → flashes the selected serial port →
+    /// attaches the channel-0 monitor; otherwise it runs on QEMU. `baud`
+    /// is the monitor rate (channel 0's, from the UI).
+    func buildAndRun(baud: Int) {
+        guard projectDir != nil else {
+            console += "no project open — New or Open a project first\n"
+            return
+        }
+        if openRel != nil { save() }
+        if runOnDevice && canUpload {
+            // pump() reflects serialOpen[0] once the engine attaches the
+            // monitor (after the build + flash complete on its thread).
+            if rc_run_on_device(Int64(target), Int64(baud)) == 0 { running = true }
+        } else {
+            if runOnDevice {
+                console += "Device run needs an RTOS target — running Host locally\n"
+            }
+            _ = rc_build(Int64(target), 1)
+            running = true
+        }
     }
 
     /// Flash the built firmware for the current target (RTOS only;

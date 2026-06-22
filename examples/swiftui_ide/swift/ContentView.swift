@@ -47,7 +47,7 @@ struct ContentView: View {
             }
             .navigationTitle(eng.openRel ?? "rustcc IDE")
             .toolbar { toolbar }
-            .onAppear { eng.refreshBreakpoints() }
+            .onAppear { eng.refreshBreakpoints(); eng.refreshRecents() }
             .sheet(isPresented: $showSerialSettings) { serialSettingsSheet }
             .inspector(isPresented: $showVars) { varsInspector }
         }
@@ -388,7 +388,20 @@ struct ContentView: View {
             } label: {
                 Label("New", systemImage: "doc.badge.plus")
             }
-            Button { openProject() } label: { Label("Open", systemImage: "folder") }
+            Menu {
+                Button("Open Folder…") { openProject() }
+                if !eng.recents.isEmpty {
+                    Divider()
+                    ForEach(eng.recents, id: \.self) { d in
+                        Button((d as NSString).abbreviatingWithTildeInPath) { eng.openRecent(d) }
+                    }
+                    Divider()
+                    Button("Clear Menu") { eng.clearRecents() }
+                }
+            } label: {
+                Label("Open", systemImage: "folder")
+            }
+            .help("Open a project folder, or pick a recent one")
             Button { eng.save() } label: { Label("Save", systemImage: "square.and.arrow.down") }
                 .disabled(eng.openRel == nil)
             Button { showFind.toggle() } label: { Label("Find", systemImage: "magnifyingglass") }
@@ -400,10 +413,28 @@ struct ContentView: View {
                 }
             }
             .frame(maxWidth: 280)
+            // Run mode: QEMU (emulator) vs Device (flash + serial). A
+            // global toggle; Run routes accordingly.
+            Menu {
+                Picker("Run on", selection: $eng.runOnDevice) {
+                    Label("QEMU (emulator)", systemImage: "cpu").tag(false)
+                    Label("Device (flash + serial)", systemImage: "cable.connector.horizontal").tag(true)
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Label(eng.runOnDevice ? "Device" : "QEMU",
+                      systemImage: eng.runOnDevice ? "cable.connector.horizontal" : "cpu")
+            }
+            .help("QEMU = run in the emulator. Device = flash the selected serial port and watch it.")
             Button { eng.build(run: false) } label: { Label("Build", systemImage: "hammer") }
                 .disabled(eng.running || eng.projectDir == nil)
-            Button { eng.build(run: true) } label: { Label("Run", systemImage: "play.fill") }
-                .disabled(eng.running || eng.projectDir == nil)
+            Button { eng.buildAndRun(baud: baud[0]) } label: {
+                Label(eng.runOnDevice ? "Run on Device" : "Run", systemImage: "play.fill")
+            }
+            .disabled(eng.running || eng.projectDir == nil)
+            .help(eng.runOnDevice
+                  ? "Build → flash the selected serial port → attach the monitor"
+                  : "Build & run on QEMU")
             Button { eng.upload() } label: { Label("Upload", systemImage: "bolt.horizontal.circle") }
                 .disabled(eng.running || eng.projectDir == nil || !eng.canUpload)
                 .help("Flash the built firmware via upload.toml (RTOS targets)")

@@ -206,6 +206,22 @@ cargo +rustcc run --release --bin ide         # the GUI
   build/qemu/lldb stream), right next to `pump_debugger()`, so received
   text and `[serial→]` echoes interleave with everything else.
   **Clear Monitor** clears the console.
+- **Run on real hardware (not just QEMU)** — **Project ▸ Run On** is a
+  global **QEMU / Device** toggle (radio pair). In **Device** mode,
+  Build & Run (⌘R) stops emulating: it builds link-only, **flashes the
+  selected serial port** via `upload.toml`, then **attaches the serial
+  monitor** — the full deploy-and-watch loop, all streamed to the
+  console. The flash and the monitor share **one** port: the Serial
+  menu's *Selected Port* now wins over `upload.toml`'s stored value
+  (pick it once, both Upload and Device-run use it). Host has nothing
+  to flash, so it always runs locally regardless of the toggle.
+- **File ▸ Open Recent** — opened/scaffolded projects are remembered
+  (most-recent first, deduped, capped at 10) in `~/.rustcc_ide_recents`,
+  surfaced as a rebuilt submenu so you don't re-navigate the folder
+  chooser each time; **Clear Menu** forgets them. The file is **shared
+  with the SwiftUI IDE** — open a project in either and it shows up in
+  both. (The dynamic Run-On radios, port/baud radios, and the recents
+  list are all rebuilt by one `rebuild_menu()`, née `serial_rescan`.)
 - **Fix: File ▸ Close File (⌘W) now actually closes the file** — it and
   *New Project ▸ STM32* had both been assigned action id `58`, and
   since the dispatcher is a top-down `match`, ⌘W silently fired *New

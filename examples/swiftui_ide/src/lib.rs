@@ -447,39 +447,90 @@ mod engine {
     /// merged stdout+stderr line-by-line into the CONSOLE drain
     /// buffer. Adapts the FLTK IDE's `run_streamed` to a pull model
     /// (no `Fl::check()` pump — SwiftUI polls `rc_console_drain`).
-    pub fn spawn_streamed(dir: &str, cmdline: &str) {
+    /// Run `cmdline` in `dir`, streaming merged output into the console
+    /// drain. **Blocking** — returns the exit code. Does NOT touch
+    /// RUNNING (the caller owns that flag), so it can be chained for a
+    /// build → flash → … sequence inside one background thread.
+    pub fn run_streamed_blocking(dir: &str, cmdline: &str) -> i32 {
         use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
+        let child = Command::new("bash")
+            .arg("-c")
+            .arg(format!("cd '{dir}' && {cmdline} 2>&1"))
+            .stdout(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn();
+        match child {
+            Ok(mut child) => {
+                if let Some(out) = child.stdout.take() {
+                    let mut reader = BufReader::new(out);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => console_append(&line),
+                        }
+                    }
+                }
+                let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+                console_append(&format!("[exit {code}]\n"));
+                code
+            }
+            Err(e) => {
+                console_append(&format!("spawn failed: {e}\n"));
+                -1
+            }
+        }
+    }
+
+    pub fn spawn_streamed(dir: &str, cmdline: &str) {
         let dir = dir.to_string();
         let cmdline = cmdline.to_string();
         RUNNING.store(true, Relaxed);
         std::thread::spawn(move || {
-            let child = Command::new("bash")
-                .arg("-c")
-                .arg(format!("cd '{dir}' && {cmdline} 2>&1"))
-                .stdout(Stdio::piped())
-                .stdin(Stdio::null())
-                .spawn();
-            match child {
-                Ok(mut child) => {
-                    if let Some(out) = child.stdout.take() {
-                        let mut reader = BufReader::new(out);
-                        let mut line = String::new();
-                        loop {
-                            line.clear();
-                            match reader.read_line(&mut line) {
-                                Ok(0) | Err(_) => break,
-                                Ok(_) => console_append(&line),
-                            }
-                        }
-                    }
-                    let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                    console_append(&format!("[exit {code}]\n"));
-                }
-                Err(e) => console_append(&format!("spawn failed: {e}\n")),
-            }
+            run_streamed_blocking(&dir, &cmdline);
             RUNNING.store(false, Relaxed);
         });
+    }
+
+    // --- recent workspaces (shared file with the FLTK IDE) -----------
+    // ~/.rustcc_ide_recents, one project dir per line, most-recent
+    // first. Open in either IDE → shows up in both. Surfaced as the
+    // SwiftUI "Open Recent" menu / the FLTK "File ▸ Open Recent".
+
+    pub fn recents_path() -> Option<std::path::PathBuf> {
+        std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".rustcc_ide_recents"))
+    }
+
+    pub fn load_recents() -> Vec<String> {
+        let Some(p) = recents_path() else {
+            return Vec::new();
+        };
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Prepend `dir` (most-recent first), dedup, cap at 10, persist.
+    pub fn push_recent(dir: &str) {
+        let mut list = load_recents();
+        list.retain(|d| d != dir);
+        list.insert(0, dir.to_string());
+        list.truncate(10);
+        if let Some(p) = recents_path() {
+            let _ = std::fs::write(p, list.join("\n"));
+        }
+    }
+
+    pub fn clear_recents() {
+        if let Some(p) = recents_path() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// Parse an lldb stop frame line: `… at <file>:<line>:<col>`.
@@ -941,6 +992,7 @@ pub extern "Swift" fn rc_scaffold(kind: i64, dir: *const c_char) -> i64 {
         Ok(()) => {
             *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
             engine::load_serial_from_project();
+            engine::push_recent(&dir);
             engine::console_append(&format!("scaffolded {label} project at {dir}\n"));
             0
         }
@@ -962,8 +1014,23 @@ pub extern "Swift" fn rc_open(dir: *const c_char) -> i64 {
     let n = engine::list_files(&dir).len() as i64;
     *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
     engine::load_serial_from_project();
+    engine::push_recent(&dir);
     engine::console_append(&format!("project = {dir} ({n} files)\n"));
     n
+}
+
+/// Newline-joined recent-workspace dirs, most-recent first (caller
+/// frees). Empty string if none.
+#[export_name = "rc_recents_list"]
+pub extern "Swift" fn rc_recents_list() -> *mut c_char {
+    out_cstring(engine::load_recents().join("\n"))
+}
+
+/// Forget all recent workspaces.
+#[export_name = "rc_recents_clear"]
+pub extern "Swift" fn rc_recents_clear() {
+    engine::clear_recents();
+    engine::console_append("recent workspaces cleared\n");
 }
 
 /// Newline-joined, project-relative file list of the open project
@@ -1051,6 +1118,32 @@ pub extern "Swift" fn rc_console_drain() -> *mut c_char {
 /// streaming the tool's output. Returns 0 if started, -1 on any
 /// precondition failure (no project / host target / no config / ELF
 /// not built). Mirrors the FLTK IDE's Upload (⌘U).
+/// Build the flash command for `target` from the project's upload.toml,
+/// with the live serial selection (channel 0) winning over the stored
+/// `[serial] port`. Err = a human-readable reason. Shared by Upload and
+/// the Device run path so they flash identically.
+fn upload_cmd_for(dir: &str, target: i64) -> Result<String, String> {
+    let (section, tag) =
+        engine::upload_route(target).ok_or("host target has nothing to flash — pick an RTOS target")?;
+    let cfg = std::fs::read_to_string(format!("{dir}/upload.toml")).unwrap_or_default();
+    if cfg.is_empty() {
+        return Err("no upload.toml in project (scaffold an RTOS project)".into());
+    }
+    let tpl = engine::upload_cfg_get(&cfg, section, "cmd")
+        .ok_or_else(|| format!("no [{section}] cmd in upload.toml"))?;
+    let selected = SERIAL_PORT[0].lock().unwrap().clone();
+    let port = if selected.is_empty() {
+        engine::upload_cfg_get(&cfg, "serial", "port").unwrap_or_default()
+    } else {
+        selected
+    };
+    let elf = format!("{dir}/target/{tag}/firmware.elf");
+    if !std::path::Path::new(&elf).exists() {
+        return Err(format!("{elf} not built yet — Build first (link-only is enough)"));
+    }
+    Ok(tpl.replace("{elf}", &elf).replace("{dir}", dir).replace("{port}", &port))
+}
+
 #[export_name = "rc_upload"]
 pub extern "Swift" fn rc_upload(target: i64) -> i64 {
     if RUNNING.load(Relaxed) {
@@ -1061,34 +1154,73 @@ pub extern "Swift" fn rc_upload(target: i64) -> i64 {
         engine::console_append("no project open\n");
         return -1;
     };
-    let Some((section, tag)) = engine::upload_route(target) else {
+    match upload_cmd_for(&dir, target) {
+        Ok(cmd) => {
+            engine::console_append(&format!("==> upload\n    {cmd}\n"));
+            engine::spawn_streamed(&dir, &cmd);
+            0
+        }
+        Err(e) => {
+            engine::console_append(&format!("{e}\n"));
+            -1
+        }
+    }
+}
+
+/// Run on real hardware: build link-only → flash the selected serial
+/// port → attach the channel-0 serial monitor, all on one background
+/// thread (the console streams each step). `baud` is the monitor's
+/// rate. Returns 0 if started, -1 if busy / no project / host target.
+/// The QEMU/Device choice is the SwiftUI side's global toggle; this is
+/// what Build & Run calls in Device mode.
+#[export_name = "rc_run_on_device"]
+pub extern "Swift" fn rc_run_on_device(target: i64, baud: i64) -> i64 {
+    if RUNNING.load(Relaxed) {
+        engine::console_append("a build/run is in flight — wait for it to finish\n");
+        return -1;
+    }
+    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+        engine::console_append("no project open\n");
+        return -1;
+    };
+    if engine::upload_route(target).is_none() {
         engine::console_append("host target has nothing to flash — pick an RTOS target\n");
         return -1;
-    };
-    let cfg = std::fs::read_to_string(format!("{dir}/upload.toml")).unwrap_or_default();
-    if cfg.is_empty() {
-        engine::console_append("no upload.toml in project (scaffold an RTOS project)\n");
-        return -1;
     }
-    let Some(tpl) = engine::upload_cfg_get(&cfg, section, "cmd") else {
-        engine::console_append(&format!("no [{section}] cmd in upload.toml\n"));
-        return -1;
-    };
-    // The live selection wins over upload.toml's stored value.
-    let selected = SERIAL_PORT[0].lock().unwrap().clone();
-    let port = if selected.is_empty() {
-        engine::upload_cfg_get(&cfg, "serial", "port").unwrap_or_default()
-    } else {
-        selected
-    };
-    let elf = format!("{dir}/target/{tag}/firmware.elf");
-    if !std::path::Path::new(&elf).exists() {
-        engine::console_append(&format!("{elf} not built yet — Build first (link-only is enough)\n"));
-        return -1;
-    }
-    let cmd = tpl.replace("{elf}", &elf).replace("{dir}", &dir).replace("{port}", &port);
-    engine::console_append(&format!("==> upload via [{section}]\n    {cmd}\n"));
-    engine::spawn_streamed(&dir, &cmd);
+    let name = TARGET_NAMES.get(target as usize).copied().unwrap_or("?");
+    engine::console_append(&format!("==> build + run on DEVICE [{name}]\n"));
+    RUNNING.store(true, Relaxed);
+    std::thread::spawn(move || {
+        // 1. build (link-only — qemu is skipped by SKIP_QEMU=1).
+        let code = engine::run_streamed_blocking(&dir, &engine::target_cmdline(target, false));
+        if code != 0 {
+            engine::console_append("FAILED (build)\n");
+            RUNNING.store(false, Relaxed);
+            return;
+        }
+        // 2. flash the selected serial port.
+        match upload_cmd_for(&dir, target) {
+            Ok(cmd) => {
+                engine::console_append(&format!("==> flash\n    {cmd}\n"));
+                if engine::run_streamed_blocking(&dir, &cmd) != 0 {
+                    engine::console_append("UPLOAD FAILED\n");
+                    RUNNING.store(false, Relaxed);
+                    return;
+                }
+            }
+            Err(e) => {
+                engine::console_append(&format!("{e}\n"));
+                RUNNING.store(false, Relaxed);
+                return;
+            }
+        }
+        RUNNING.store(false, Relaxed); // flashing done; serial runs on its own
+        // 3. watch it (channel 0) unless already open.
+        if !SERIAL_OPEN[0].load(Relaxed) {
+            rc_serial_open(0, baud);
+        }
+        engine::console_append("DEVICE RUN: flashed + serial monitor attached\n");
+    });
     0
 }
 
@@ -1680,6 +1812,59 @@ mod tests {
         assert!(unsafe { take(rc_serial_recv(0)) }.is_empty());
         rc_set_serial_port(0, cstr("").as_ptr()); // reset shared state
         rc_set_serial_port(1, cstr("").as_ptr());
+    }
+
+    #[test]
+    fn recents_roundtrip() {
+        // Non-destructive: save the user's real list, exercise, restore.
+        let saved = engine::load_recents();
+        engine::clear_recents();
+        engine::push_recent("/tmp/swiftui_recent_a");
+        engine::push_recent("/tmp/swiftui_recent_b");
+        engine::push_recent("/tmp/swiftui_recent_a"); // re-open → front, no dup
+        let r = engine::load_recents();
+        assert_eq!(r.first().map(String::as_str), Some("/tmp/swiftui_recent_a"));
+        assert_eq!(r.iter().filter(|d| *d == "/tmp/swiftui_recent_a").count(), 1);
+        assert_eq!(r.len(), 2);
+        // rc_recents_list mirrors it (newline-joined, most-recent first).
+        assert_eq!(
+            unsafe { take(rc_recents_list()) }.lines().next(),
+            Some("/tmp/swiftui_recent_a")
+        );
+        engine::clear_recents();
+        assert!(engine::load_recents().is_empty());
+        if let Some(p) = engine::recents_path() {
+            let _ = std::fs::write(p, saved.join("\n"));
+        }
+    }
+
+    #[test]
+    fn device_run_gating_and_blocking_runner() {
+        // The blocking runner streams and returns the real exit code.
+        let _ = unsafe { take(rc_console_drain()) };
+        assert_eq!(engine::run_streamed_blocking(".", "true"), 0);
+        assert_ne!(engine::run_streamed_blocking(".", "exit 7"), 0);
+        // Host target can never be device-run (nothing to flash) — -1
+        // regardless of which project happens to be open.
+        assert_eq!(rc_run_on_device(0, 115_200), -1);
+        // upload_cmd_for: host errors; RTOS errors until the ELF exists,
+        // then yields a command carrying the resolved port.
+        let dir = std::env::temp_dir().join(format!("swiftui_ide_devcmd{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("upload.toml"),
+            "[stm32]\ncmd = \"prog -w {elf} {port}\"\n[serial]\nport = \"/dev/x\"\n",
+        )
+        .unwrap();
+        let ds = dir.to_str().unwrap();
+        assert!(upload_cmd_for(ds, 0).is_err(), "host has no route");
+        assert!(upload_cmd_for(ds, 1).is_err(), "ELF not built yet");
+        std::fs::create_dir_all(dir.join("target/arm")).unwrap();
+        std::fs::write(dir.join("target/arm/firmware.elf"), b"").unwrap();
+        let cmd = upload_cmd_for(ds, 1).expect("cmd builds once ELF exists");
+        assert!(cmd.contains("firmware.elf") && cmd.contains("/dev/"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Scaffold a Zephyr project and run its Cortex-M3 core on qemu via

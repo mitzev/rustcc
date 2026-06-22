@@ -99,6 +99,11 @@ static SERIAL_RX: Mutex<String> = Mutex::new(String::new());
 /// Common rates for the Baud radio submenu.
 const BAUDS: [i32; 7] = [9_600, 19_200, 57_600, 115_200, 230_400, 460_800, 921_600];
 
+/// Run mode: false = QEMU (emulator, the default), true = Device (flash
+/// the firmware to the selected serial port, then watch it). A global
+/// app-wide toggle (Project ▸ Run On), not remembered per project.
+static RUN_ON_DEVICE: AtomicBool = AtomicBool::new(false);
+
 /// Variables window: latest `frame variable` capture (refreshed on
 /// every stop while the window exists) + watch-expression results.
 static WATCHIN: AtomicPtr<WatchInput> = AtomicPtr::new(core::ptr::null_mut());
@@ -242,8 +247,13 @@ const ACT_SERIAL_DISCONNECT: usize = 71;
 const ACT_SERIAL_SEND: usize = 72;
 const ACT_SERIAL_RESCAN: usize = 73;
 const ACT_SERIAL_CLEAR: usize = 74;
+// Run mode + recent workspaces.
+const ACT_RUN_QEMU: usize = 75;
+const ACT_RUN_DEVICE: usize = 76;
+const ACT_RECENT_CLEAR: usize = 77;
 const SERIAL_PORT_BASE: usize = 2000; // dynamic "Selected Port" radio items: BASE + idx
 const SERIAL_BAUD_BASE: usize = 2100; // dynamic "Baud" radio items: BASE + idx
+const RECENT_BASE: usize = 2200; // dynamic "Open Recent" items: BASE + idx
 const KEY_F: i32 = FL_F as i32; // F-keys: KEY_F + n
 
 // Super-calls (non-virtual, by mangled symbol).
@@ -791,7 +801,7 @@ unsafe fn run_action(act: usize) {
             ACT_SERIAL_CONNECT => serial_connect(),
             ACT_SERIAL_DISCONNECT => serial_disconnect(),
             ACT_SERIAL_SEND => serial_send_line(),
-            ACT_SERIAL_RESCAN => serial_rescan(),
+            ACT_SERIAL_RESCAN => rebuild_menu(),
             ACT_SERIAL_CLEAR => {
                 // Serial output shares the console, so this clears it.
                 let cb = CONSOLE_BUF.load(Relaxed);
@@ -804,14 +814,42 @@ unsafe fn run_action(act: usize) {
                 if let Some(p) = ports.get(a - SERIAL_PORT_BASE) {
                     *SERIAL_PORT.lock().unwrap() = p.clone();
                     console_append(&format!("[serial] port = {p}\n"));
-                    serial_rescan(); // re-check the radio item
+                    rebuild_menu(); // re-check the radio item
                 }
             }
             a if (SERIAL_BAUD_BASE..SERIAL_BAUD_BASE + BAUDS.len()).contains(&a) => {
                 let b = BAUDS[a - SERIAL_BAUD_BASE];
                 SERIAL_BAUD.store(b, Relaxed);
                 console_append(&format!("[serial] baud = {b}\n"));
-                serial_rescan();
+                rebuild_menu();
+            }
+            ACT_RUN_QEMU => {
+                RUN_ON_DEVICE.store(false, Relaxed);
+                console_append("run mode = QEMU (emulator)\n");
+                rebuild_menu();
+            }
+            ACT_RUN_DEVICE => {
+                RUN_ON_DEVICE.store(true, Relaxed);
+                console_append(
+                    "run mode = Device — Build & Run will flash the selected serial \
+                     port and attach the monitor\n",
+                );
+                rebuild_menu();
+            }
+            ACT_RECENT_CLEAR => {
+                clear_recents();
+                console_append("recent workspaces cleared\n");
+                rebuild_menu();
+            }
+            a if (RECENT_BASE..RECENT_BASE + 64).contains(&a) => {
+                let recents = load_recents();
+                if let Some(d) = recents.get(a - RECENT_BASE) {
+                    if std::path::Path::new(d).is_dir() {
+                        set_project(d);
+                    } else {
+                        console_append(&format!("recent workspace gone: {d}\n"));
+                    }
+                }
             }
             _ => {}
         }
@@ -1166,13 +1204,33 @@ fn build_project(run: bool) {
         None => console_append("no project open — Project ▸ New/Open first\n"),
         Some(dir) => {
             let t = TARGET.load(Relaxed);
-            console_append(&format!(
-                "==> {} [{}]\n",
-                if run { "build + run" } else { "build" },
-                TARGET_NAMES[t as usize]
-            ));
-            let code = run_streamed(&dir, &target_cmdline(t, run));
-            console_append(if code == 0 { "SUCCESS\n" } else { "FAILED\n" });
+            // Device run = build link-only → flash the selected serial
+            // port → attach the monitor. Only for targets that can be
+            // flashed (Host has no upload route → always runs locally).
+            if run && RUN_ON_DEVICE.load(Relaxed) && upload_route(t).is_some() {
+                console_append(&format!(
+                    "==> build + run on DEVICE [{}]\n",
+                    TARGET_NAMES[t as usize]
+                ));
+                let code = run_streamed(&dir, &target_cmdline(t, false)); // link-only
+                if code != 0 {
+                    console_append("FAILED (build)\n");
+                } else {
+                    upload_firmware(); // flashes the selected serial port
+                    if !SERIAL_OPEN.load(Relaxed) {
+                        serial_connect(); // watch it
+                    }
+                    console_append("DEVICE RUN: flashed + serial monitor attached\n");
+                }
+            } else {
+                console_append(&format!(
+                    "==> {} [{}]\n",
+                    if run { "build + run" } else { "build" },
+                    TARGET_NAMES[t as usize]
+                ));
+                let code = run_streamed(&dir, &target_cmdline(t, run));
+                console_append(if code == 0 { "SUCCESS\n" } else { "FAILED\n" });
+            }
         }
     }
     BUILD_RUNNING.store(false, Relaxed);
@@ -1777,7 +1835,14 @@ fn upload_firmware() {
         ));
         return;
     };
-    let port = upload_cfg_get(&cfg, "serial", "port").unwrap_or_default();
+    // The Serial-menu selection wins (so flash + monitor share one
+    // port); fall back to upload.toml's [serial] port if none picked.
+    let sel = SERIAL_PORT.lock().unwrap().clone();
+    let port = if !sel.is_empty() {
+        sel
+    } else {
+        upload_cfg_get(&cfg, "serial", "port").unwrap_or_default()
+    };
     let elf = format!("{dir}/target/{tag}/firmware.elf");
     if !std::path::Path::new(&elf).exists() {
         console_append(&format!(
@@ -2490,6 +2555,7 @@ fn project_load_cfg(dir: &str) -> Option<(Option<i32>, Vec<String>)> {
 
 fn set_project(dir: &str) {
     *PROJECT_DIR.lock().unwrap() = Some(dir.to_string());
+    push_recent(dir); // remember it for File ▸ Open Recent
     console_append(&format!("project = {dir}\n"));
     // Restore the project's saved Target; a project without a config
     // (fresh scaffold / pre-existing folder) is seeded with the
@@ -2518,6 +2584,7 @@ fn set_project(dir: &str) {
         open_in_editor(&main);
     }
     nav_refresh();
+    unsafe { rebuild_menu() }; // surface the new entry under Open Recent
 }
 
 /// File ▸ New Project flavors. Every RTOS flavor emits the same
@@ -2928,7 +2995,7 @@ const MENU_SPEC: &[(&str, i32, usize)] = &[
     ("&Project/&Upload Firmware", MOD_META | 'u' as i32, ACT_UPLOAD),
     ("&Project/Edit Upload Co&nfig…", 0, ACT_UPLOAD_CFG),
     ("&Project/&Clear Console", 0, ACT_CONSOLE_CLEAR),
-    // --- Serial (port + baud are added dynamically by serial_rescan) ---
+    // --- Serial (port + baud are added dynamically by rebuild_menu) ---
     ("&Serial/&Connect", 0, ACT_SERIAL_CONNECT),
     ("&Serial/&Disconnect", 0, ACT_SERIAL_DISCONNECT),
     ("&Serial/&Send Line…", 0, ACT_SERIAL_SEND),
@@ -2965,6 +3032,53 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
 
 /// Enumerate likely USB-serial devices. Re-run any time — hot-plug
 /// safe (so a board plugged in after launch shows up on Rescan).
+// --- recent workspaces ----------------------------------------------
+// A global list of recently opened project folders (most-recent first),
+// persisted to ~/.rustcc_ide_recents so it survives restarts and is
+// shared with the SwiftUI IDE. Surfaced as File ▸ Open Recent.
+
+fn recents_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".rustcc_ide_recents"))
+}
+
+fn load_recents() -> Vec<String> {
+    let Some(p) = recents_path() else { return Vec::new() };
+    std::fs::read_to_string(p)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Prepend `dir` (most-recent first), dedup, cap at 10, persist.
+fn push_recent(dir: &str) {
+    let mut list = load_recents();
+    list.retain(|d| d != dir);
+    list.insert(0, dir.to_string());
+    list.truncate(10);
+    if let Some(p) = recents_path() {
+        let _ = std::fs::write(p, list.join("\n"));
+    }
+}
+
+fn clear_recents() {
+    if let Some(p) = recents_path() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// A recent path as shown in the menu: $HOME collapsed to `~`.
+fn display_recent(d: &str) -> String {
+    if let Some(h) = std::env::var_os("HOME") {
+        if let Some(rest) = d.strip_prefix(&*h.to_string_lossy()) {
+            return format!("~{rest}");
+        }
+    }
+    d.to_string()
+}
+
 fn enumerate_serial_ports() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir("/dev") {
@@ -2980,11 +3094,12 @@ fn enumerate_serial_ports() -> Vec<String> {
     out
 }
 
-/// Re-enumerate ports and rebuild the whole menu so the dynamic
-/// "Selected Port" / "Baud" radio submenus reflect the live device
-/// list and current selection. Cheap; called at startup, on Rescan,
-/// and whenever a port/baud is picked.
-unsafe fn serial_rescan() {
+/// Re-enumerate serial ports and rebuild the whole menu so every
+/// dynamic part reflects live state: the "Selected Port" / "Baud"
+/// radio submenus, the "Run On" QEMU/Device radio, and the "Open
+/// Recent" workspace list. Cheap; called at startup and on any change
+/// (rescan, port/baud pick, run-mode toggle, project open).
+unsafe fn rebuild_menu() {
     unsafe {
         *SERIAL_PORTS.lock().unwrap() = enumerate_serial_ports();
         let bar = MENUBAR.load(Relaxed);
@@ -2994,6 +3109,58 @@ unsafe fn serial_rescan() {
         let m = (*bar).as_fl_menu__mut();
         m.clear();
         add_menu_items(bar); // static items (incl. the &Serial commands)
+
+        // Run mode: QEMU vs Device (flash + serial), a radio pair.
+        let dev = RUN_ON_DEVICE.load(Relaxed);
+        m.add(
+            cstr("&Project/Run &On/&QEMU (emulator)").as_ptr(),
+            0,
+            Some(menu_cb),
+            ACT_RUN_QEMU as *mut (),
+            (FL_MENU_RADIO | if dev { 0 } else { FL_MENU_VALUE }) as i32,
+        );
+        m.add(
+            cstr("&Project/Run &On/&Device (flash + serial)").as_ptr(),
+            0,
+            Some(menu_cb),
+            ACT_RUN_DEVICE as *mut (),
+            (FL_MENU_RADIO | if dev { FL_MENU_VALUE } else { 0 }) as i32,
+        );
+
+        // Open Recent: the persisted workspace list (most-recent first).
+        let recents = load_recents();
+        if recents.is_empty() {
+            m.add(
+                cstr("&File/Open &Recent/(none yet)").as_ptr(),
+                0,
+                Some(menu_cb),
+                ACT_OPEN_PROJECT as *mut (),
+                0,
+            );
+        } else {
+            for (i, d) in recents.iter().enumerate() {
+                let leaf = display_recent(d)
+                    .replace('\\', "\\\\")
+                    .replace('/', "\\/")
+                    .replace('&', "&&");
+                m.add(
+                    cstr(&format!("&File/Open &Recent/{leaf}")).as_ptr(),
+                    0,
+                    Some(menu_cb),
+                    (RECENT_BASE + i) as *mut (),
+                    0,
+                );
+            }
+            m.add(
+                cstr("&File/Open &Recent/&Clear Menu").as_ptr(),
+                0,
+                Some(menu_cb),
+                ACT_RECENT_CLEAR as *mut (),
+                0,
+            );
+        }
+
+        // Serial: live port list + baud, as radio submenus.
         let sel = SERIAL_PORT.lock().unwrap().clone();
         let ports = SERIAL_PORTS.lock().unwrap().clone();
         if ports.is_empty() {
@@ -3316,7 +3483,7 @@ unsafe fn build_ui() -> *mut Fl_Window {
         let bar = cxx_operator_new(core::mem::size_of::<Fl_Menu_Bar>()) as *mut Fl_Menu_Bar;
         Fl_Menu_Bar::new_at(bar, 0, 0, 1180, 28, core::ptr::null());
         MENUBAR.store(bar, Relaxed);
-        serial_rescan(); // builds static items + the dynamic port/baud submenus
+        rebuild_menu(); // builds static items + the dynamic port/baud submenus
 
         let ed = cxx_operator_new(core::mem::size_of::<RustEditor>()) as *mut RustEditor;
         // The ctor-in-place MIR pass (v1.14) constructs straight into
@@ -3521,8 +3688,35 @@ unsafe fn self_test() -> i32 {
         // shared action id 58, so Cmd+W fired New STM32 Project).
         let _ports = enumerate_serial_ports(); // must not panic
         check("serial: menu bar registered", !MENUBAR.load(Relaxed).is_null());
-        serial_rescan(); // must not panic with the bar live
+        rebuild_menu(); // must not panic with the bar live (ports/baud/run-mode/recents)
         check("no action-id collision (close-file vs new-stm32)", ACT_CLOSE_FILE != ACT_NEW_STM32);
+
+        // 0b. Run mode is a global toggle, default QEMU; Device run is
+        // gated to flashable targets only (Host has no upload route).
+        check("run mode defaults to QEMU", !RUN_ON_DEVICE.load(Relaxed));
+        check("device run is RTOS-only (host has no route)", upload_route(0).is_none());
+        check("device run targets are flashable", upload_route(1).is_some() && upload_route(2).is_some());
+
+        // 0c. Recent workspaces: prepend / dedup / most-recent-first,
+        // capped, surviving a reload (persisted to ~/.rustcc_ide_recents).
+        let saved_recents = load_recents(); // preserve the user's real list
+        clear_recents();
+        push_recent("/tmp/rustcc_recent_a");
+        push_recent("/tmp/rustcc_recent_b");
+        push_recent("/tmp/rustcc_recent_a"); // re-open → moves to front, no dup
+        let r = load_recents();
+        check(
+            "recents: dedup + most-recent-first",
+            r.first().map(String::as_str) == Some("/tmp/rustcc_recent_a")
+                && r.iter().filter(|d| *d == "/tmp/rustcc_recent_a").count() == 1
+                && r.len() == 2,
+        );
+        clear_recents();
+        check("recents: clear empties the list", load_recents().is_empty());
+        if let Some(p) = recents_path() {
+            // restore so the self-test doesn't clobber the user's recents
+            let _ = std::fs::write(p, saved_recents.join("\n"));
+        }
 
         // 1. Typing marks dirty via the modify callback.
         (*buf).text_const_i8_str("hello rustcc\nsecond line\n");
