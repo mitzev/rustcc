@@ -188,6 +188,30 @@ cargo +rustcc run --release --bin ide         # the GUI
   Class methods stay C++-compatible (`i32`), Rust-typed logic lives in
   free functions — the fork's own diagnostic taught the template that.
 
+## v6 additions
+
+- **Serial monitor** — talk to the dev board over USB-serial without
+  leaving the IDE. Because port/baud config is *infrequent*, it lives
+  in a **Serial menu** rather than always-on widgets eating screen
+  space: **Selected Port** and **Baud** are radio submenus rebuilt live
+  from the device list (`/dev/cu.*` on macOS, `ttyUSB*`/`ttyACM*` on
+  Linux), **Rescan Ports** re-enumerates on demand (hot-plug — a board
+  plugged in after launch shows up), and **Send Line…** prompts for a
+  line to write (CRLF-terminated). The one *frequent* action,
+  **Connect** (toggled by **Disconnect**), is also the single serial
+  **toolbar button** — a green-plug glyph, the 8th `IconButton` vector
+  icon. The line is configured with `stty` (raw N81, non-blocking
+  read) and opened R/W; a reader thread pushes bytes into a buffer the
+  main loop's `pump_serial()` drains into the console (shared with the
+  build/qemu/lldb stream), right next to `pump_debugger()`, so received
+  text and `[serial→]` echoes interleave with everything else.
+  **Clear Monitor** clears the console.
+- **Fix: File ▸ Close File (⌘W) now actually closes the file** — it and
+  *New Project ▸ STM32* had both been assigned action id `58`, and
+  since the dispatcher is a top-down `match`, ⌘W silently fired *New
+  STM32 Project* instead of closing. Close File moved to its own id; a
+  self-test now asserts the two never collide again.
+
 The FULL self-test now also drives a complete scripted debug session
 through the IDE engine: set breakpoint → run → hit → **step-in lands
 inside `Greeter::Greeter(excitement=3)` — the fork-emitted C++

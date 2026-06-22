@@ -83,6 +83,22 @@ static DBG_PENDING: Mutex<String> = Mutex::new(String::new());
 static BREAKPOINTS: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 static DBG_CURLINE: Mutex<Option<(String, i32)>> = Mutex::new(None);
 
+// --- serial monitor (talk to the dev board over USB-serial) ----------
+// Config (port + baud) is infrequent → it lives in the Serial menu
+// (a rebuilt "Selected Port"/"Baud" radio submenu), not on the
+// toolbar. The frequent action — Connect — is the one toolbar item.
+// A reader thread pushes bytes into SERIAL_RX; the main loop's
+// pump_serial() drains it into the console, exactly like the debugger.
+static MENUBAR: AtomicPtr<Fl_Menu_Bar> = AtomicPtr::new(core::ptr::null_mut());
+static SERIAL_PORT: Mutex<String> = Mutex::new(String::new());
+static SERIAL_PORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static SERIAL_BAUD: AtomicI32 = AtomicI32::new(115_200);
+static SERIAL_TX: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static SERIAL_OPEN: AtomicBool = AtomicBool::new(false);
+static SERIAL_RX: Mutex<String> = Mutex::new(String::new());
+/// Common rates for the Baud radio submenu.
+const BAUDS: [i32; 7] = [9_600, 19_200, 57_600, 115_200, 230_400, 460_800, 921_600];
+
 /// Variables window: latest `frame variable` capture (refreshed on
 /// every stop while the window exists) + watch-expression results.
 static WATCHIN: AtomicPtr<WatchInput> = AtomicPtr::new(core::ptr::null_mut());
@@ -219,7 +235,15 @@ const ACT_DBG_CONTINUE: usize = 54;
 const ACT_DBG_VARS: usize = 55;
 const ACT_DBG_STOP: usize = 56;
 const ACT_DBG_BREAKPOINT: usize = 57;
-const ACT_CLOSE_FILE: usize = 58;
+const ACT_CLOSE_FILE: usize = 66; // (was 58 — collided with ACT_NEW_STM32, shadowing Close File)
+// Serial monitor.
+const ACT_SERIAL_CONNECT: usize = 70;
+const ACT_SERIAL_DISCONNECT: usize = 71;
+const ACT_SERIAL_SEND: usize = 72;
+const ACT_SERIAL_RESCAN: usize = 73;
+const ACT_SERIAL_CLEAR: usize = 74;
+const SERIAL_PORT_BASE: usize = 2000; // dynamic "Selected Port" radio items: BASE + idx
+const SERIAL_BAUD_BASE: usize = 2100; // dynamic "Baud" radio items: BASE + idx
 const KEY_F: i32 = FL_F as i32; // F-keys: KEY_F + n
 
 // Super-calls (non-virtual, by mangled symbol).
@@ -763,6 +787,31 @@ unsafe fn run_action(act: usize) {
                 if !cb.is_null() {
                     (*cb).text_const_i8_str("");
                 }
+            }
+            ACT_SERIAL_CONNECT => serial_connect(),
+            ACT_SERIAL_DISCONNECT => serial_disconnect(),
+            ACT_SERIAL_SEND => serial_send_line(),
+            ACT_SERIAL_RESCAN => serial_rescan(),
+            ACT_SERIAL_CLEAR => {
+                // Serial output shares the console, so this clears it.
+                let cb = CONSOLE_BUF.load(Relaxed);
+                if !cb.is_null() {
+                    (*cb).text_const_i8_str("");
+                }
+            }
+            a if (SERIAL_PORT_BASE..SERIAL_PORT_BASE + 256).contains(&a) => {
+                let ports = SERIAL_PORTS.lock().unwrap().clone();
+                if let Some(p) = ports.get(a - SERIAL_PORT_BASE) {
+                    *SERIAL_PORT.lock().unwrap() = p.clone();
+                    console_append(&format!("[serial] port = {p}\n"));
+                    serial_rescan(); // re-check the radio item
+                }
+            }
+            a if (SERIAL_BAUD_BASE..SERIAL_BAUD_BASE + BAUDS.len()).contains(&a) => {
+                let b = BAUDS[a - SERIAL_BAUD_BASE];
+                SERIAL_BAUD.store(b, Relaxed);
+                console_append(&format!("[serial] baud = {b}\n"));
+                serial_rescan();
             }
             _ => {}
         }
@@ -2879,6 +2928,12 @@ const MENU_SPEC: &[(&str, i32, usize)] = &[
     ("&Project/&Upload Firmware", MOD_META | 'u' as i32, ACT_UPLOAD),
     ("&Project/Edit Upload Co&nfig…", 0, ACT_UPLOAD_CFG),
     ("&Project/&Clear Console", 0, ACT_CONSOLE_CLEAR),
+    // --- Serial (port + baud are added dynamically by serial_rescan) ---
+    ("&Serial/&Connect", 0, ACT_SERIAL_CONNECT),
+    ("&Serial/&Disconnect", 0, ACT_SERIAL_DISCONNECT),
+    ("&Serial/&Send Line…", 0, ACT_SERIAL_SEND),
+    ("&Serial/&Rescan Ports", 0, ACT_SERIAL_RESCAN),
+    ("&Serial/Clear &Monitor", 0, ACT_SERIAL_CLEAR),
     ("&Debug/&Start Session", KEY_F + 5, ACT_DBG_START),
     ("&Debug/Toggle &Breakpoint @ cursor", KEY_F + 8, ACT_DBG_BREAKPOINT),
     ("&Debug/Step &Over", KEY_F + 10, ACT_DBG_STEP_OVER),
@@ -2906,6 +2961,193 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
     }
 }
 
+// === serial monitor =================================================
+
+/// Enumerate likely USB-serial devices. Re-run any time — hot-plug
+/// safe (so a board plugged in after launch shows up on Rescan).
+fn enumerate_serial_ports() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/dev") {
+        for ent in rd.flatten() {
+            let n = ent.file_name().to_string_lossy().into_owned();
+            // macOS: cu.* (callout — no carrier wait). Linux: ttyUSB*/ttyACM*.
+            if n.starts_with("cu.") || n.starts_with("ttyUSB") || n.starts_with("ttyACM") {
+                out.push(format!("/dev/{n}"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Re-enumerate ports and rebuild the whole menu so the dynamic
+/// "Selected Port" / "Baud" radio submenus reflect the live device
+/// list and current selection. Cheap; called at startup, on Rescan,
+/// and whenever a port/baud is picked.
+unsafe fn serial_rescan() {
+    unsafe {
+        *SERIAL_PORTS.lock().unwrap() = enumerate_serial_ports();
+        let bar = MENUBAR.load(Relaxed);
+        if bar.is_null() {
+            return;
+        }
+        let m = (*bar).as_fl_menu__mut();
+        m.clear();
+        add_menu_items(bar); // static items (incl. the &Serial commands)
+        let sel = SERIAL_PORT.lock().unwrap().clone();
+        let ports = SERIAL_PORTS.lock().unwrap().clone();
+        if ports.is_empty() {
+            m.add(
+                cstr("&Serial/Selected &Port/(none — plug in + Rescan)").as_ptr(),
+                0,
+                Some(menu_cb),
+                ACT_SERIAL_RESCAN as *mut (),
+                0,
+            );
+        }
+        for (i, p) in ports.iter().enumerate() {
+            // Strip /dev/ for a tidy leaf; escape FLTK menu-path metachars.
+            let leaf = p
+                .trim_start_matches("/dev/")
+                .replace('\\', "\\\\")
+                .replace('/', "\\/")
+                .replace('&', "&&");
+            let flags = FL_MENU_RADIO | if *p == sel { FL_MENU_VALUE } else { 0 };
+            m.add(
+                cstr(&format!("&Serial/Selected &Port/{leaf}")).as_ptr(),
+                0,
+                Some(menu_cb),
+                (SERIAL_PORT_BASE + i) as *mut (),
+                flags as i32,
+            );
+        }
+        let baud = SERIAL_BAUD.load(Relaxed);
+        for (i, b) in BAUDS.iter().enumerate() {
+            let flags = FL_MENU_RADIO | if *b == baud { FL_MENU_VALUE } else { 0 };
+            m.add(
+                cstr(&format!("&Serial/&Baud/{b}")).as_ptr(),
+                0,
+                Some(menu_cb),
+                (SERIAL_BAUD_BASE + i) as *mut (),
+                flags as i32,
+            );
+        }
+        (*(bar as *mut Fl_Widget)).redraw();
+    }
+}
+
+/// Configure the tty (raw N81, non-blocking read) and open it R/W.
+fn serial_open_file(port: &str, baud: i32) -> Result<std::fs::File, String> {
+    if port.is_empty() {
+        return Err("no port selected — pick one under Serial ▸ Selected Port".into());
+    }
+    let flag = if cfg!(target_os = "macos") { "-f" } else { "-F" };
+    let st = std::process::Command::new("stty")
+        .arg(flag)
+        .arg(port)
+        .args([&baud.to_string(), "raw", "-echo", "min", "0", "time", "10"])
+        .status();
+    match st {
+        Ok(s) if s.success() => {}
+        Ok(s) => return Err(format!("stty exited {s}")),
+        Err(e) => return Err(format!("stty: {e}")),
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(port)
+        .map_err(|e| format!("open {port}: {e}"))
+}
+
+/// Open the selected port and spawn a reader thread that pushes bytes
+/// into SERIAL_RX (drained by pump_serial on the UI thread).
+fn serial_connect() {
+    use std::io::Read;
+    if SERIAL_OPEN.load(Relaxed) {
+        console_append("[serial] already connected\n");
+        return;
+    }
+    let port = SERIAL_PORT.lock().unwrap().clone();
+    let baud = SERIAL_BAUD.load(Relaxed);
+    let file = match serial_open_file(&port, baud) {
+        Ok(f) => f,
+        Err(e) => {
+            console_append(&format!("[serial] connect FAILED: {e}\n"));
+            return;
+        }
+    };
+    let mut reader = match file.try_clone() {
+        Ok(r) => r,
+        Err(e) => {
+            console_append(&format!("[serial] clone FAILED: {e}\n"));
+            return;
+        }
+    };
+    *SERIAL_TX.lock().unwrap() = Some(file);
+    SERIAL_OPEN.store(true, Relaxed);
+    console_append(&format!("[serial] connected {port} @ {baud} 8N1\n"));
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while SERIAL_OPEN.load(Relaxed) {
+            match reader.read(&mut buf) {
+                Ok(0) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Ok(n) => SERIAL_RX
+                    .lock()
+                    .unwrap()
+                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(30))
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn serial_disconnect() {
+    if !SERIAL_OPEN.swap(false, Relaxed) {
+        console_append("[serial] not connected\n");
+        return;
+    }
+    *SERIAL_TX.lock().unwrap() = None; // closes the fd; reader thread exits
+    console_append("[serial] disconnected\n");
+}
+
+/// Prompt for a line and write it to the port (CRLF-terminated).
+unsafe fn serial_send_line() {
+    unsafe {
+        if !SERIAL_OPEN.load(Relaxed) {
+            console_append("[serial] not connected — Serial ▸ Connect first\n");
+            return;
+        }
+        let p = fl_input(cstr("Send to board:").as_ptr(), cstr("").as_ptr());
+        if p.is_null() {
+            return; // cancelled
+        }
+        let text = CStr::from_ptr(p).to_string_lossy().into_owned();
+        use std::io::Write;
+        if let Some(f) = SERIAL_TX.lock().unwrap().as_mut() {
+            let _ = f.write_all(text.as_bytes());
+            let _ = f.write_all(b"\r\n");
+            let _ = f.flush();
+            console_append(&format!("[serial→] {text}\n"));
+        }
+    }
+}
+
+/// Drain received serial bytes into the console — called every pass of
+/// the main event loop, right next to pump_debugger.
+fn pump_serial() {
+    let chunk = {
+        let mut g = SERIAL_RX.lock().unwrap();
+        if g.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *g)
+    };
+    console_append(&chunk);
+}
+
 /// Layout: everything under the menu bar lives in ONE Fl_Tile, so
 /// the nav|editor and editor|console borders DRAG (Fl_Tile resizes
 /// children sharing an edge). Children must EXACTLY tile the area.
@@ -2927,6 +3169,7 @@ const ICON_DEBUG: i32 = 3;
 const ICON_STEP_IN: i32 = 4;
 const ICON_STEP_OVER: i32 = 5;
 const ICON_STOP: i32 = 6;
+const ICON_SERIAL: i32 = 7;
 
 /// The toolbar: icon-only buttons with tooltips; every button
 /// dispatches the SAME action its menu item does (menu_cb is an
@@ -2939,6 +3182,7 @@ const TOOLBAR_SPEC: &[(&str, usize, i32)] = &[
     ("Step In (F11)", ACT_DBG_STEP_IN, ICON_STEP_IN),
     ("Step Over (F10)", ACT_DBG_STEP_OVER, ICON_STEP_OVER),
     ("Stop (debug session / Shift+F5)", ACT_DBG_STOP, ICON_STOP),
+    ("Connect serial (port/baud in the Serial menu)", ACT_SERIAL_CONNECT, ICON_SERIAL),
 ];
 
 /// The generated icon set: small vector glyphs drawn with the
@@ -3009,6 +3253,16 @@ fn draw_toolbar_icon(icon: i32, cx: i32, cy: i32) {
                 fl_color(RED);
                 fl_rectf(cx - 5, cy - 5, 11, 11);
             }
+            ICON_SERIAL => {
+                // A plug: green connector shell + two prongs + a cable.
+                fl_color(DARK);
+                fl_rectf(cx - 8, cy - 1, 4, 2); // cable stub
+                fl_color(GREEN);
+                fl_rectf(cx - 4, cy - 4, 7, 8); // connector body
+                fl_color(DARK);
+                fl_rectf(cx + 3, cy - 3, 4, 2); // upper prong
+                fl_rectf(cx + 3, cy + 1, 4, 2); // lower prong
+            }
             _ => {}
         }
     }
@@ -3061,7 +3315,8 @@ unsafe fn build_ui() -> *mut Fl_Window {
 
         let bar = cxx_operator_new(core::mem::size_of::<Fl_Menu_Bar>()) as *mut Fl_Menu_Bar;
         Fl_Menu_Bar::new_at(bar, 0, 0, 1180, 28, core::ptr::null());
-        add_menu_items(bar);
+        MENUBAR.store(bar, Relaxed);
+        serial_rescan(); // builds static items + the dynamic port/baud submenus
 
         let ed = cxx_operator_new(core::mem::size_of::<RustEditor>()) as *mut RustEditor;
         // The ctor-in-place MIR pass (v1.14) constructs straight into
@@ -3258,6 +3513,16 @@ unsafe fn self_test() -> i32 {
         let _win = build_ui();
         let buf = BUF.load(Relaxed);
         let ed = ED.load(Relaxed);
+
+        // 0. Serial monitor: enumeration is hot-plug safe (never
+        // panics), the menu bar is registered so the dynamic port/baud
+        // submenus can be rebuilt, and the Connect/Close-File actions
+        // don't collide (regression: Close File and New STM32 once
+        // shared action id 58, so Cmd+W fired New STM32 Project).
+        let _ports = enumerate_serial_ports(); // must not panic
+        check("serial: menu bar registered", !MENUBAR.load(Relaxed).is_null());
+        serial_rescan(); // must not panic with the bar live
+        check("no action-id collision (close-file vs new-stm32)", ACT_CLOSE_FILE != ACT_NEW_STM32);
 
         // 1. Typing marks dirty via the modify callback.
         (*buf).text_const_i8_str("hello rustcc\nsecond line\n");
@@ -3799,14 +4064,16 @@ unsafe fn self_test() -> i32 {
             let mut icons: Vec<i32> = TOOLBAR_SPEC.iter().map(|&(_, _, i)| i).collect();
             icons.sort_unstable();
             icons.dedup();
-            TOOLBAR_SPEC.len() == 7
-                && icons.len() == 7
+            TOOLBAR_SPEC.len() == 8
+                && icons.len() == 8
                 && TOOLBAR_SPEC
                     .iter()
                     .any(|&(tip, a, i)| tip.contains("Run") && a == ACT_BUILD_RUN && i == ICON_RUN)
                 && TOOLBAR_SPEC
                     .iter()
                     .any(|&(tip, a, i)| tip.contains("Debug") && a == ACT_DBG_START && i == ICON_DEBUG)
+                // The one serial action that earns toolbar space: Connect.
+                && TOOLBAR_SPEC.iter().any(|&(_, a, i)| a == ACT_SERIAL_CONNECT && i == ICON_SERIAL)
                 && TOOLBAR_SPEC.iter().all(|&(tip, _, _)| !tip.is_empty())
         });
 
@@ -3929,6 +4196,7 @@ fn main() {
             loop {
                 Fl::wait_f64(0.05);
                 pump_debugger();
+                pump_serial();
                 tabs_pump();
                 if Fl::first_window().is_null() {
                     break;
