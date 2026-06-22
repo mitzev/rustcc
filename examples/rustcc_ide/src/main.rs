@@ -139,13 +139,15 @@ static TABBAR: AtomicPtr<FileTabs> = AtomicPtr::new(core::ptr::null_mut());
 /// clicks inside Fl_Tabs::handle never delete live child widgets).
 static TAB_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-const TARGET_NAMES: [&str; 6] = [
+const TARGET_NAMES: [&str; 8] = [
     "Host (LLVM backend)",
     "RAK11161 — STM32WLE5 core (Cortex-M4, FreeRTOS, qemu mps2)",
     "RAK11161 — ESP8684 / ESP32-C2 (rv32imc, FreeRTOS, qemu virt)",
     "ESP32-C3-class (rv32imac, FreeRTOS, qemu virt)",
     "STM32F4-class (Cortex-M4F, FreeRTOS, qemu mps2)",
     "Raspberry Pi Pico (RP2040, Cortex-M0+, FreeRTOS, qemu mps2)",
+    "Zephyr — STM32WLE5 / Cortex-M3 (qemu_cortex_m3)",
+    "Zephyr — ESP8684 / ESP32-C2 (rv32imc, qemu_riscv32)",
 ];
 
 /// repr(C) twin of `Fl_Text_Display_Style_Table_Entry` (the nested
@@ -222,6 +224,7 @@ const ACT_CONSOLE_CLEAR: usize = 44;
 const ACT_NEW_HOST: usize = 45;
 const ACT_DEBUG: usize = 46;
 const ACT_NEW_PICO: usize = 47;
+const ACT_NEW_ZEPHYR: usize = 78;
 const ACT_NEW_STM32: usize = 58;
 const ACT_NEW_ESP32: usize = 59;
 const ACT_HELP: usize = 60;
@@ -745,7 +748,7 @@ unsafe fn run_action(act: usize) {
             ACT_FONT_UP => bump_textsize(ed as *mut Fl_Text_Editor, 2),
             ACT_FONT_DOWN => bump_textsize(ed as *mut Fl_Text_Editor, -2),
             // --- IDE actions ---
-            a if (ACT_TGT_BASE..ACT_TGT_BASE + 6).contains(&a) => {
+            a if (ACT_TGT_BASE..ACT_TGT_BASE + TARGET_NAMES.len()).contains(&a) => {
                 let t = (a - ACT_TGT_BASE) as i32;
                 TARGET.store(t, Relaxed);
                 project_save_cfg();
@@ -756,6 +759,7 @@ unsafe fn run_action(act: usize) {
             ACT_NEW_STM32 => new_project_flow(2),
             ACT_NEW_ESP32 => new_project_flow(3),
             ACT_NEW_PICO => new_project_flow(4),
+            ACT_NEW_ZEPHYR => new_project_flow(5),
             ACT_HELP => show_help_popup(),
             ACT_ABOUT => console_append(&format!(
                 "rustcc IDE {} — fork-Rust FLTK IDE (class keyword over an \
@@ -1202,6 +1206,8 @@ fn target_cmdline(target: i32, run: bool) -> String {
         1 | 4 => format!("{skip}./run_arm.sh"),
         2 => format!("{skip}./run_riscv_c2.sh"),
         5 => format!("{skip}./run_pico.sh"),
+        6 => format!("{skip}./run_zephyr.sh"), // Zephyr CM3
+        7 => format!("{skip}./run_zephyr_c2.sh"), // Zephyr ESP32-C2
         _ => format!("{skip}./run_riscv.sh"),
     }
 }
@@ -1820,14 +1826,17 @@ fn upload_cfg_get(cfg: &str, section: &str, key: &str) -> Option<String> {
 
 /// (config section, firmware tag) for an uploadable target.
 /// `(upload.toml section, ELF path relative to project)`; None for
-/// host. (This IDE targets the FreeRTOS cores + Pico; Zephyr is the
-/// SwiftUI IDE's domain.)
+/// host. FreeRTOS links `target/<tag>/firmware.elf`; the Zephyr cores
+/// (6/7) produce `build/<board>/zephyr/zephyr.elf` — both flash with
+/// the same per-section tool.
 fn upload_route(target: i32) -> Option<(&'static str, &'static str)> {
     match target {
         1 | 4 => Some(("stm32", "target/arm/firmware.elf")),
         2 => Some(("esp32", "target/riscv-c2/firmware.elf")),
         3 => Some(("esp32", "target/riscv/firmware.elf")),
         5 => Some(("pico", "target/pico/firmware.elf")),
+        6 => Some(("stm32", "build/qemu_cortex_m3/zephyr/zephyr.elf")),
+        7 => Some(("esp32", "build/qemu_riscv32/zephyr/zephyr.elf")),
         _ => None,
     }
 }
@@ -1836,7 +1845,9 @@ fn upload_route(target: i32) -> Option<(&'static str, &'static str)> {
 /// config — so pre-existing projects still auto-select on open.
 fn infer_target(dir: &str) -> Option<i32> {
     let has = |f: &str| std::path::Path::new(dir).join(f).exists();
-    if has("run_arm.sh") {
+    if has("run_zephyr.sh") || has("prj.conf") {
+        Some(6) // Zephyr → CM3
+    } else if has("run_arm.sh") {
         Some(1) // FreeRTOS → CM4
     } else if has("build.rs") {
         Some(0) // host
@@ -2544,8 +2555,9 @@ fn delete_current_file(ask: bool) {
 
 /// Stable per-target slugs for the project config (indices would
 /// silently re-map if the Target menu is ever reordered).
-const TARGET_SLUGS: [&str; 6] =
-    ["host", "rak11161-cm4", "rak11161-c2", "esp32-c3", "stm32f4", "pico"];
+const TARGET_SLUGS: [&str; 8] = [
+    "host", "rak11161-cm4", "rak11161-c2", "esp32-c3", "stm32f4", "pico", "zephyr-cm3", "zephyr-c2",
+];
 
 fn project_cfg_path(dir: &str) -> String {
     format!("{dir}/.rustcc_ide.json")
@@ -2676,19 +2688,24 @@ fn set_project(dir: &str) {
 /// File ▸ New Project flavors. Every RTOS flavor emits the same
 /// self-contained scaffold (it carries all cores' run scripts and
 /// linker maps); flavors differ only in the default Target selected.
-const NEW_FLAVORS: [(&str, i32); 5] = [
+const NEW_FLAVORS: [(&str, i32); 6] = [
     ("Host", 0),
     ("RAK11161", 1),             // dual-core: start on the STM32WLE5 side
     ("STM32", 4),
     ("ESP32", 3),                // C3-class default; Target menu flips to C2
     ("Raspberry Pi Pico", 5),
+    ("RAK11161 Zephyr", 6),      // dual-core Zephyr; starts on the CM3 side
 ];
 
 fn new_project_flow(flavor: usize) {
     let (name, tgt) = NEW_FLAVORS[flavor];
     let title = format!("New {name} project folder");
     if let Some(dir) = unsafe { choose_file(CHOOSER_DIR_NEW, &title) } {
-        let r = if tgt == 0 { scaffold_host(&dir) } else { scaffold_project(&dir) };
+        let r = match tgt {
+            0 => scaffold_host(&dir),
+            6 => scaffold_zephyr(&dir),
+            _ => scaffold_project(&dir),
+        };
         match r {
             Ok(()) => {
                 TARGET.store(tgt, Relaxed);
@@ -3039,6 +3056,98 @@ CORES (Cortex-M4 / rv32imc), not RAK's radios — LoRa/WiFi peripheral
 work needs hardware or vendor simulators.
 "#;
 
+/// Scaffold a **Zephyr RTOS** C++-interop project for the RAK11161 —
+/// both cores. A CMake/`west` app (qemu_cortex_m3 + qemu_riscv32
+/// rv32imc) over the *same* Rust `class` crate + C++ side as the
+/// FreeRTOS scaffold, embedded at compile time from examples/zephyr_cpp
+/// + examples/bare_metal_arm. Self-contained: the `../bare_metal_arm`
+/// references are rewritten to a local `cpp/`. (Mirror of the SwiftUI
+/// IDE engine's `scaffold_zephyr`.)
+fn scaffold_zephyr(dir: &str) -> Result<(), String> {
+    use std::fs;
+    let root = std::path::Path::new(dir);
+    let werr = |e: std::io::Error| e.to_string();
+    for sub in ["src", "cpp", "boards"] {
+        fs::create_dir_all(root.join(sub)).map_err(werr)?;
+    }
+    // CMake: the imported C++ side moves from ../bare_metal_arm to a
+    // local cpp/. run_zephyr.sh builds the Rust crate in-place and
+    // links librak_zephyr_fw.a (run_zephyr_c2.sh delegates to it, so it
+    // needs no rewrite).
+    let cmake = embed!("zephyr_cpp/CMakeLists.txt").replace("/../bare_metal_arm", "/cpp");
+    let fix_run = |s: &str| -> String {
+        s.replace("../bare_metal_arm", ".")
+            .replace("libbare_metal_arm.a", "librak_zephyr_fw.a")
+    };
+    let files: &[(&str, String)] = &[
+        ("Cargo.toml", ZEPHYR_CARGO_TOML.to_string()),
+        ("src/lib.rs", embed!("bare_metal_arm/src/lib.rs").to_string()),
+        ("src/main.c", embed!("zephyr_cpp/src/main.c").to_string()),
+        ("cpp/caller.cpp", embed!("bare_metal_arm/caller.cpp").to_string()),
+        ("cpp/sensor.cpp", embed!("bare_metal_arm/sensor.cpp").to_string()),
+        ("cpp/sensor.hpp", embed!("bare_metal_arm/sensor.hpp").to_string()),
+        ("cpp/rtti_stub.c", embed!("bare_metal_arm/rtti_stub.c").to_string()),
+        ("CMakeLists.txt", cmake),
+        ("prj.conf", embed!("zephyr_cpp/prj.conf").to_string()),
+        (
+            "boards/qemu_riscv32.overlay",
+            embed!("zephyr_cpp/boards/qemu_riscv32.overlay").to_string(),
+        ),
+        ("run_zephyr.sh", fix_run(embed!("zephyr_cpp/run_zephyr.sh"))),
+        ("run_zephyr_c2.sh", embed!("zephyr_cpp/run_zephyr_c2.sh").to_string()),
+        ("upload.toml", UPLOAD_TOML.to_string()), // so Device run can flash
+        ("README.md", ZEPHYR_SCAFFOLD_README.to_string()),
+    ];
+    for (rel, content) in files {
+        fs::write(root.join(rel), content).map_err(werr)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for s in ["run_zephyr.sh", "run_zephyr_c2.sh"] {
+            fs::set_permissions(root.join(s), fs::Permissions::from_mode(0o755)).map_err(werr)?;
+        }
+    }
+    Ok(())
+}
+
+const ZEPHYR_CARGO_TOML: &str = r#"# Rust `class` staticlib for the Zephyr RAK11161 project — built per
+# core by run_zephyr*.sh and linked into the Zephyr app via CMake.
+[package]
+name = "rak_zephyr_fw"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]
+"#;
+
+const ZEPHYR_SCAFFOLD_README: &str = r#"# RAK11161 dual-core firmware on Zephyr RTOS (rustcc)
+
+Scaffolded by the **rustcc IDE**. The same Rust `class` crate
+(`src/lib.rs`: Widget/Gauge + imported Sensor/Reader) + C++ side
+(`cpp/`) as the FreeRTOS scaffold, but built by Zephyr's CMake/`west`
+and run on qemu for both RAK11161 cores:
+
+```sh
+RUSTC=<fork-stage1>/bin/rustc ./run_zephyr.sh      # STM32WLE5 (Cortex-M3, qemu_cortex_m3)
+RUSTC=<fork-stage1>/bin/rustc ./run_zephyr_c2.sh   # ESP8684/ESP32-C2 (rv32imc, qemu_riscv32)
+SKIP_QEMU=1 ./run_zephyr.sh                         # build only
+```
+
+Prereqs: a Zephyr west workspace + SDK (ARM + RISC-V toolchains). See
+`examples/zephyr_cpp` in the rustcc repo for the one-time setup.
+Expected: `ZEPHYR CXX PROBE (...): PASS (105/4000/503/42 ...)`.
+"#;
+
 // ------------------------------------------------------------------
 // UI assembly
 // ------------------------------------------------------------------
@@ -3055,6 +3164,7 @@ const MENU_SPEC: &[(&str, i32, usize)] = &[
     ("&File/New Project/&Host Project…", 0, ACT_NEW_HOST),
     ("&File/New Project/&RAK11161 Project…", MOD_META | MOD_SHIFT | 'n' as i32, ACT_NEW_PROJECT),
     ("&File/New Project/&STM32 Project…", 0, ACT_NEW_STM32),
+    ("&File/New Project/&Zephyr (RAK11161)…", 0, ACT_NEW_ZEPHYR),
     ("&File/New Project/&ESP32 Project…", 0, ACT_NEW_ESP32),
     ("&File/New Project/Raspberry Pi &Pico Project…", 0, ACT_NEW_PICO),
     ("&File/Open &Project…", MOD_META | MOD_SHIFT | 'o' as i32, ACT_OPEN_PROJECT),
@@ -3101,6 +3211,8 @@ const MENU_SPEC: &[(&str, i32, usize)] = &[
     ("&Target/ESP32-&C3-class (rv32imac)", 0, ACT_TGT_BASE + 3),
     ("&Target/STM32&F4-class (Cortex-M4F)", 0, ACT_TGT_BASE + 4),
     ("&Target/Raspberry Pi &Pico (RP2040)", 0, ACT_TGT_BASE + 5),
+    ("&Target/&Zephyr: RAK11161 STM32WLE5 (CM3)", 0, ACT_TGT_BASE + 6),
+    ("&Target/Z&ephyr: RAK11161 ESP32-C2 (rv32imc)", 0, ACT_TGT_BASE + 7),
     ("&Help/rustcc IDE &Help…", KEY_F + 1, ACT_HELP),
     ("&Help/&About rustcc IDE", 0, ACT_ABOUT),
 ];
@@ -3935,10 +4047,11 @@ unsafe fn self_test() -> i32 {
         );
         // New Project must offer every board family the Target menu
         // knows, each mapped to a valid default target.
-        check("new-project flavors cover STM32/ESP32/Pico/RAK/Host", {
+        check("new-project flavors cover STM32/ESP32/Pico/RAK/Host/Zephyr", {
             let names: Vec<&str> = NEW_FLAVORS.iter().map(|f| f.0).collect();
             ["Host", "RAK11161", "STM32", "ESP32"].iter().all(|n| names.contains(n))
                 && names.iter().any(|n| n.contains("Pico"))
+                && names.iter().any(|n| n.contains("Zephyr"))
                 && NEW_FLAVORS
                     .iter()
                     .all(|&(_, t)| (t as usize) < TARGET_NAMES.len())
@@ -3986,6 +4099,46 @@ unsafe fn self_test() -> i32 {
             .map(|s| s.success())
             .unwrap_or(false);
         check("scaffold scripts parse (bash -n)", scripts_ok);
+
+        // 8b. Zephyr target + scaffold (mirrors the SwiftUI IDE).
+        check(
+            "zephyr targets route to run_zephyr scripts",
+            target_cmdline(6, true).ends_with("./run_zephyr.sh")
+                && target_cmdline(7, true).ends_with("./run_zephyr_c2.sh")
+                && target_cmdline(6, false).contains("SKIP_QEMU=1"),
+        );
+        check(
+            "zephyr upload routes to the zephyr.elf",
+            upload_route(6) == Some(("stm32", "build/qemu_cortex_m3/zephyr/zephyr.elf"))
+                && upload_route(7) == Some(("esp32", "build/qemu_riscv32/zephyr/zephyr.elf")),
+        );
+        let zproj = std::env::temp_dir().join(format!("rustcc_ide_zephyr{}", std::process::id()));
+        let zs = zproj.to_string_lossy().into_owned();
+        let _ = std::fs::remove_dir_all(&zproj);
+        check("zephyr scaffold ok", scaffold_zephyr(&zs).is_ok());
+        for f in [
+            "Cargo.toml", "src/lib.rs", "src/main.c", "cpp/caller.cpp", "CMakeLists.txt",
+            "prj.conf", "boards/qemu_riscv32.overlay", "run_zephyr.sh", "run_zephyr_c2.sh",
+            "upload.toml",
+        ] {
+            check(&format!("zephyr scaffold file {f}"), zproj.join(f).exists());
+        }
+        let zcmake = std::fs::read_to_string(zproj.join("CMakeLists.txt")).unwrap_or_default();
+        check("zephyr CMake points at local cpp/", !zcmake.contains("/../bare_metal_arm"));
+        let zrun = std::fs::read_to_string(zproj.join("run_zephyr.sh")).unwrap_or_default();
+        check(
+            "zephyr run script rewritten (lib + paths)",
+            zrun.contains("librak_zephyr_fw.a") && !zrun.contains("../bare_metal_arm"),
+        );
+        check("zephyr target inferred from scaffold", infer_target(&zs) == Some(6));
+        let zbash = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("bash -n '{zs}/run_zephyr.sh' && bash -n '{zs}/run_zephyr_c2.sh'"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        check("zephyr scaffold scripts parse (bash -n)", zbash);
+        let _ = std::fs::remove_dir_all(&zproj);
 
         // 9. IDE: full firmware build+run for the open project —
         //    gated (needs cross toolchains + qemu + minutes).

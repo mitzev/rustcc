@@ -223,6 +223,15 @@ cargo +rustcc run --release --bin ide         # the GUI
   supersedes the old `.rustcc_ide.toml` (still read as a fallback). The
   target is stored as an index, schema-compatible with the SwiftUI IDE's
   config.
+- **Zephyr RTOS targets** (parity with the SwiftUI IDE) — the **Target**
+  menu and **File ▸ New Project** gain the two RAK11161 **Zephyr** cores:
+  STM32WLE5 / Cortex-M3 (`qemu_cortex_m3`) and ESP8684 / ESP32-C2
+  (rv32imc, `qemu_riscv32`). The Zephyr scaffold is the same validated
+  `examples/zephyr_cpp` + `bare_metal_arm` sources (CMake/`west` app over
+  the Rust `class` crate, `../bare_metal_arm` rewritten to a local
+  `cpp/`); Build/Run drives `run_zephyr.sh` / `run_zephyr_c2.sh`, and
+  Device-mode flashes `build/<board>/zephyr/zephyr.elf`. Opening an
+  existing Zephyr project auto-selects the CM3 target via file inference.
 - **File ▸ Open Recent** — opened/scaffolded projects are remembered
   (most-recent first, deduped, capped at 10) in `~/.rustcc_ide_recents`,
   surfaced as a rebuilt submenu so you don't re-navigate the folder
