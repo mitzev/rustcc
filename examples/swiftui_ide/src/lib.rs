@@ -37,7 +37,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::Relaxed};
 use std::sync::Mutex;
 
 /// Embed a sibling-example source at COMPILE TIME, so a scaffolded
@@ -102,6 +102,11 @@ const VARS_SENTINEL: &str = "<<RUSTCC_VARS_END>>";
 const NSERIAL: usize = 2;
 static SERIAL_PORT: [Mutex<String>; NSERIAL] =
     [Mutex::new(String::new()), Mutex::new(String::new())];
+/// Target + baud loaded from the open project's .rustcc_ide.json, for
+/// the SwiftUI side to read back (target auto-select, baud restore).
+/// -1 / 0 = "not set in config".
+static CFG_TARGET: AtomicI64 = AtomicI64::new(-1);
+static CFG_BAUD: AtomicI64 = AtomicI64::new(0);
 /// Open monitor handle (a cloned fd is read by the reader thread; this
 /// one is for sending).
 static SERIAL_TX: [Mutex<Option<std::fs::File>>; NSERIAL] = [Mutex::new(None), Mutex::new(None)];
@@ -263,14 +268,82 @@ mod engine {
         }
     }
 
-    /// Map a target to its upload `(section, elf-tag)`; None for host.
+    /// Map a target to its upload `(upload.toml section, ELF path
+    /// relative to the project)`; None for host. The FreeRTOS targets
+    /// link to `target/<tag>/firmware.elf`; the Zephyr targets (6/7)
+    /// produce `build/<board>/zephyr/zephyr.elf` instead — both are
+    /// real hardware, flashed with the same per-section tool.
     pub fn upload_route(target: i64) -> Option<(&'static str, &'static str)> {
         match target {
-            1 | 4 => Some(("stm32", "arm")),
-            2 => Some(("esp32", "riscv-c2")),
-            3 => Some(("esp32", "riscv")),
-            5 => Some(("pico", "pico")),
+            1 | 4 => Some(("stm32", "target/arm/firmware.elf")),
+            2 => Some(("esp32", "target/riscv-c2/firmware.elf")),
+            3 => Some(("esp32", "target/riscv/firmware.elf")),
+            5 => Some(("pico", "target/pico/firmware.elf")),
+            6 => Some(("stm32", "build/qemu_cortex_m3/zephyr/zephyr.elf")),
+            7 => Some(("esp32", "build/qemu_riscv32/zephyr/zephyr.elf")),
             _ => None,
+        }
+    }
+
+    // --- per-project JSON config (.rustcc_ide.json) ------------------
+    // Remembers the selected target + serial port/baud so a project
+    // restores them on open (target auto-selected; serial preserved
+    // across IDE restarts). Hand-rolled flat JSON — no serde dep.
+
+    pub fn config_path(dir: &str) -> std::path::PathBuf {
+        Path::new(dir).join(".rustcc_ide.json")
+    }
+
+    fn json_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+        let i = text.find(&format!("\"{key}\""))?;
+        let rest = &text[i..];
+        let colon = rest.find(':')?;
+        Some(rest[colon + 1..].trim_start())
+    }
+    fn json_int(text: &str, key: &str) -> Option<i64> {
+        let v = json_field(text, key)?;
+        let n: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+        n.parse().ok()
+    }
+    fn json_string(text: &str, key: &str) -> Option<String> {
+        let v = json_field(text, key)?.strip_prefix('"')?;
+        // Paths carry no embedded quotes, so first quote ends the value.
+        v.find('"').map(|e| v[..e].to_string())
+    }
+
+    /// (target, serial_port, baud) from the project's .rustcc_ide.json;
+    /// each field is None/empty if absent.
+    pub fn config_load(dir: &str) -> (Option<i64>, String, Option<i64>) {
+        let text = std::fs::read_to_string(config_path(dir)).unwrap_or_default();
+        (
+            json_int(&text, "target"),
+            json_string(&text, "serial_port").unwrap_or_default(),
+            json_int(&text, "baud"),
+        )
+    }
+
+    pub fn config_save(dir: &str, target: i64, port: &str, baud: i64) {
+        let esc = port.replace('\\', "\\\\").replace('"', "\\\"");
+        let json = format!(
+            "{{\n  \"target\": {target},\n  \"serial_port\": \"{esc}\",\n  \"baud\": {baud}\n}}\n"
+        );
+        let _ = std::fs::write(config_path(dir), json);
+    }
+
+    /// Guess the target a project supports from its files — so a project
+    /// with no saved config (e.g. one scaffolded before this existed)
+    /// still auto-selects a sensible target on open. Zephyr → CM3 (6),
+    /// FreeRTOS → CM4 (1), host crate → Host (0).
+    pub fn infer_target(dir: &str) -> Option<i64> {
+        let has = |f: &str| Path::new(dir).join(f).exists();
+        if has("run_zephyr.sh") || has("prj.conf") {
+            Some(6)
+        } else if has("run_arm.sh") {
+            Some(1)
+        } else if has("build.rs") {
+            Some(0)
+        } else {
+            None
         }
     }
 
@@ -387,6 +460,7 @@ mod engine {
             ),
             ("run_zephyr.sh", fix_run(embed!("zephyr_cpp/run_zephyr.sh"))),
             ("run_zephyr_c2.sh", embed!("zephyr_cpp/run_zephyr_c2.sh").to_string()),
+            ("upload.toml", UPLOAD_TOML.to_string()), // so Device run can flash
             ("README.md", ZEPHYR_SCAFFOLD_README.to_string()),
         ];
         for (rel, content) in files {
@@ -1001,6 +1075,7 @@ pub extern "Swift" fn rc_scaffold(kind: i64, dir: *const c_char) -> i64 {
         Ok(()) => {
             *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
             engine::load_serial_from_project();
+            load_project_config(&dir);
             engine::push_recent(&dir);
             engine::console_append(&format!("scaffolded {label} project at {dir}\n"));
             0
@@ -1023,9 +1098,53 @@ pub extern "Swift" fn rc_open(dir: *const c_char) -> i64 {
     let n = engine::list_files(&dir).len() as i64;
     *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
     engine::load_serial_from_project();
+    load_project_config(&dir);
     engine::push_recent(&dir);
     engine::console_append(&format!("project = {dir} ({n} files)\n"));
     n
+}
+
+/// Load .rustcc_ide.json: apply the saved serial port to channel 0
+/// (the flash/device-run channel), and stash target + baud for the
+/// SwiftUI side to read via rc_config_target / rc_config_baud.
+fn load_project_config(dir: &str) {
+    let (target, port, baud) = engine::config_load(dir);
+    if !port.is_empty() {
+        *SERIAL_PORT[0].lock().unwrap() = port;
+    }
+    // Saved target wins; otherwise infer from the project's files.
+    let t = target.or_else(|| engine::infer_target(dir));
+    CFG_TARGET.store(t.unwrap_or(-1), Relaxed);
+    CFG_BAUD.store(baud.unwrap_or(0), Relaxed);
+}
+
+/// The target saved in the open project's config, or -1 if none.
+/// SwiftUI calls this right after open to auto-select the target.
+#[export_name = "rc_config_target"]
+pub extern "Swift" fn rc_config_target() -> i64 {
+    CFG_TARGET.load(Relaxed)
+}
+
+/// The serial baud saved in the open project's config, or 0 if none.
+#[export_name = "rc_config_baud"]
+pub extern "Swift" fn rc_config_baud() -> i64 {
+    CFG_BAUD.load(Relaxed)
+}
+
+/// Persist target + serial port/baud to the open project's
+/// .rustcc_ide.json (and apply the port to channel 0). No-op if no
+/// project is open.
+#[export_name = "rc_config_save"]
+pub extern "Swift" fn rc_config_save(target: i64, port: *const c_char, baud: i64) {
+    let port = unsafe { in_str(port) };
+    if let Some(dir) = PROJECT_DIR.lock().unwrap().clone() {
+        engine::config_save(&dir, target, &port, baud);
+        if !port.is_empty() {
+            *SERIAL_PORT[0].lock().unwrap() = port;
+        }
+        CFG_TARGET.store(target, Relaxed);
+        CFG_BAUD.store(baud, Relaxed);
+    }
 }
 
 /// Newline-joined recent-workspace dirs, most-recent first (caller
@@ -1132,11 +1251,20 @@ pub extern "Swift" fn rc_console_drain() -> *mut c_char {
 /// `[serial] port`. Err = a human-readable reason. Shared by Upload and
 /// the Device run path so they flash identically.
 fn upload_cmd_for(dir: &str, target: i64) -> Result<String, String> {
-    let (section, tag) =
+    let (section, elf_rel) =
         engine::upload_route(target).ok_or("host target has nothing to flash — pick an RTOS target")?;
-    let cfg = std::fs::read_to_string(format!("{dir}/upload.toml")).unwrap_or_default();
+    // Seed a default upload.toml if the project lacks one (e.g. an older
+    // Zephyr scaffold) so Device run has a flash command to fill in.
+    let cfg_path = format!("{dir}/upload.toml");
+    if !std::path::Path::new(&cfg_path).exists() {
+        let _ = std::fs::write(&cfg_path, UPLOAD_TOML);
+        engine::console_append(
+            "created a default upload.toml — set its flash command for your board/probe\n",
+        );
+    }
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap_or_default();
     if cfg.is_empty() {
-        return Err("no upload.toml in project (scaffold an RTOS project)".into());
+        return Err("no upload.toml in project".into());
     }
     let tpl = engine::upload_cfg_get(&cfg, section, "cmd")
         .ok_or_else(|| format!("no [{section}] cmd in upload.toml"))?;
@@ -1146,7 +1274,7 @@ fn upload_cmd_for(dir: &str, target: i64) -> Result<String, String> {
     } else {
         selected
     };
-    let elf = format!("{dir}/target/{tag}/firmware.elf");
+    let elf = format!("{dir}/{elf_rel}");
     if !std::path::Path::new(&elf).exists() {
         return Err(format!("{elf} not built yet — Build first (link-only is enough)"));
     }
@@ -1784,10 +1912,20 @@ mod tests {
 
     #[test]
     fn upload_routing_and_config() {
-        // target → (section, elf-tag); host has nothing to flash.
-        assert_eq!(engine::upload_route(1), Some(("stm32", "arm")));
-        assert_eq!(engine::upload_route(2), Some(("esp32", "riscv-c2")));
-        assert_eq!(engine::upload_route(5), Some(("pico", "pico")));
+        // target → (section, elf relpath); host has nothing to flash.
+        assert_eq!(engine::upload_route(1), Some(("stm32", "target/arm/firmware.elf")));
+        assert_eq!(engine::upload_route(2), Some(("esp32", "target/riscv-c2/firmware.elf")));
+        assert_eq!(engine::upload_route(5), Some(("pico", "target/pico/firmware.elf")));
+        // Zephyr targets ARE flashable (the device-run regression: they
+        // used to return None, so Device mode fell back to a qemu run).
+        assert_eq!(
+            engine::upload_route(6),
+            Some(("stm32", "build/qemu_cortex_m3/zephyr/zephyr.elf"))
+        );
+        assert_eq!(
+            engine::upload_route(7),
+            Some(("esp32", "build/qemu_riscv32/zephyr/zephyr.elf"))
+        );
         assert_eq!(engine::upload_route(0), None);
         // upload.toml parsing.
         let cfg = "[stm32]\ncmd = \"prog -w {elf}\"\n[serial]\nport = \"/dev/x\"\n";
@@ -1873,6 +2011,32 @@ mod tests {
         std::fs::write(dir.join("target/arm/firmware.elf"), b"").unwrap();
         let cmd = upload_cmd_for(ds, 1).expect("cmd builds once ELF exists");
         assert!(cmd.contains("firmware.elf") && cmd.contains("/dev/"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_config_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("swiftui_ide_cfg{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        // No config yet → all absent.
+        let (t, p, b) = engine::config_load(ds);
+        assert!(t.is_none() && p.is_empty() && b.is_none());
+        // Save → load round-trips target, port, baud.
+        engine::config_save(ds, 6, "/dev/cu.usbserial-XYZ", 115_200);
+        let (t, p, b) = engine::config_load(ds);
+        assert_eq!(t, Some(6));
+        assert_eq!(p, "/dev/cu.usbserial-XYZ");
+        assert_eq!(b, Some(115_200));
+        // It really is the JSON file we claim.
+        let text = std::fs::read_to_string(engine::config_path(ds)).unwrap();
+        assert!(text.contains("\"target\": 6") && text.contains("\"serial_port\""));
+        // Target inference from project files (the no-config fallback so
+        // pre-existing projects still auto-select on open).
+        assert_eq!(engine::infer_target(ds), None); // bare dir, no markers
+        std::fs::write(dir.join("run_zephyr.sh"), "").unwrap();
+        assert_eq!(engine::infer_target(ds), Some(6)); // Zephyr → CM3
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -36,6 +36,9 @@ import Combine
 @_silgen_name("rc_run_on_device") func rc_run_on_device(_ target: Int64, _ baud: Int64) -> Int64
 @_silgen_name("rc_recents_list") func rc_recents_list() -> UnsafeMutablePointer<CChar>?
 @_silgen_name("rc_recents_clear") func rc_recents_clear()
+@_silgen_name("rc_config_target") func rc_config_target() -> Int64
+@_silgen_name("rc_config_baud") func rc_config_baud() -> Int64
+@_silgen_name("rc_config_save") func rc_config_save(_ target: Int64, _ port: UnsafePointer<CChar>?, _ baud: Int64)
 @_silgen_name("rc_dbg_request_vars") func rc_dbg_request_vars()
 @_silgen_name("rc_dbg_vars") func rc_dbg_vars() -> UnsafeMutablePointer<CChar>?
 
@@ -92,10 +95,13 @@ final class IDEEngine: ObservableObject {
     @Published var serialOpen: [Bool] = [false, false]
     @Published var serialRx: [String] = ["", ""]
 
-    /// Global run mode: false = QEMU (emulator), true = Device — Build &
-    /// Run flashes the selected serial port (channel 0) and attaches the
-    /// monitor. App-wide, not remembered per project.
-    @Published var runOnDevice: Bool = false
+    /// Per-channel serial baud (channel 0 is the flash/device-run
+    /// channel). Persisted to the project's .rustcc_ide.json.
+    @Published var serialBaud: [Int] = [115_200, 115_200]
+    /// Global run mode. Default **Device** — Build & Run flashes the
+    /// selected serial port (channel 0) and attaches the monitor.
+    /// (Toggle to QEMU for the emulator.) App-wide, not per project.
+    @Published var runOnDevice: Bool = true
     /// Recent project folders (most-recent first), shared with the FLTK
     /// IDE via ~/.rustcc_ide_recents. Surfaced as the Open Recent menu.
     @Published var recents: [String] = []
@@ -164,9 +170,12 @@ final class IDEEngine: ObservableObject {
     func selectPort(_ ch: Int, _ p: String) {
         serialPort[ch] = p
         p.withCString { rc_set_serial_port(Int64(ch), $0) }
+        if ch == 0 { saveConfig() } // remember the flash/device-run port
     }
     func openSerial(_ ch: Int, baud: Int) {
+        serialBaud[ch] = baud
         if rc_serial_open(Int64(ch), Int64(baud)) == 0 { serialOpen[ch] = true }
+        if ch == 0 { saveConfig() }
     }
     func closeSerial(_ ch: Int) {
         rc_serial_close(Int64(ch)); serialOpen[ch] = false
@@ -228,6 +237,7 @@ final class IDEEngine: ObservableObject {
             openFirstSource()
             refreshPorts()
             refreshRecents()
+            saveConfig() // seed .rustcc_ide.json with the flavor's target
         }
         pump()
     }
@@ -235,12 +245,25 @@ final class IDEEngine: ObservableObject {
     func open(_ dir: String) {
         if dir.withCString({ rc_open($0) }) >= 0 {
             projectDir = dir
+            // Auto-select the saved/inferred target; restore serial.
+            let t = rc_config_target()
+            if t >= 0 && t < Int64(targets.count) { target = Int(t) }
+            let b = rc_config_baud()
+            if b > 0 { serialBaud[0] = Int(b) }
             refreshFiles()
             openFirstSource()
-            refreshPorts()
+            refreshPorts()       // picks up the engine-loaded serial port
             refreshRecents()
         }
         pump()
+    }
+
+    /// Persist the selected target + channel-0 serial port/baud to the
+    /// project's .rustcc_ide.json (target auto-selects next open; serial
+    /// survives IDE restarts).
+    func saveConfig() {
+        guard projectDir != nil else { return }
+        serialPort[0].withCString { rc_config_save(Int64(target), $0, Int64(serialBaud[0])) }
     }
 
     // MARK: - Recent workspaces
@@ -331,9 +354,9 @@ final class IDEEngine: ObservableObject {
 
     /// Build & Run honoring the run mode: in Device mode (for a
     /// flashable target) it builds → flashes the selected serial port →
-    /// attaches the channel-0 monitor; otherwise it runs on QEMU. `baud`
-    /// is the monitor rate (channel 0's, from the UI).
-    func buildAndRun(baud: Int) {
+    /// attaches the channel-0 monitor; otherwise it runs on QEMU. The
+    /// build always happens first, so Run compiles even with no binary.
+    func buildAndRun() {
         guard projectDir != nil else {
             console += "no project open — New or Open a project first\n"
             return
@@ -342,7 +365,7 @@ final class IDEEngine: ObservableObject {
         if runOnDevice && canUpload {
             // pump() reflects serialOpen[0] once the engine attaches the
             // monitor (after the build + flash complete on its thread).
-            if rc_run_on_device(Int64(target), Int64(baud)) == 0 { running = true }
+            if rc_run_on_device(Int64(target), Int64(serialBaud[0])) == 0 { running = true }
         } else {
             if runOnDevice {
                 console += "Device run needs an RTOS target — running Host locally\n"
@@ -359,8 +382,9 @@ final class IDEEngine: ObservableObject {
         running = rc_is_running() != 0
     }
 
-    /// Whether the current target can be flashed (RTOS, not host).
-    var canUpload: Bool { target >= 1 && target <= 5 }
+    /// Whether the current target can be flashed (anything but Host —
+    /// the FreeRTOS cores AND the Zephyr cores 6/7).
+    var canUpload: Bool { target >= 1 }
 
     func clearConsole() { console = "" }
 }

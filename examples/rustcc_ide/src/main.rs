@@ -99,10 +99,10 @@ static SERIAL_RX: Mutex<String> = Mutex::new(String::new());
 /// Common rates for the Baud radio submenu.
 const BAUDS: [i32; 7] = [9_600, 19_200, 57_600, 115_200, 230_400, 460_800, 921_600];
 
-/// Run mode: false = QEMU (emulator, the default), true = Device (flash
-/// the firmware to the selected serial port, then watch it). A global
-/// app-wide toggle (Project ▸ Run On), not remembered per project.
-static RUN_ON_DEVICE: AtomicBool = AtomicBool::new(false);
+/// Run mode: true = Device (flash the firmware to the selected serial
+/// port, then watch it) — the **default**; false = QEMU (emulator). A
+/// global app-wide toggle (Project ▸ Run On), not remembered per project.
+static RUN_ON_DEVICE: AtomicBool = AtomicBool::new(true);
 
 /// Variables window: latest `frame variable` capture (refreshed on
 /// every stop while the window exists) + watch-expression results.
@@ -814,6 +814,7 @@ unsafe fn run_action(act: usize) {
                 if let Some(p) = ports.get(a - SERIAL_PORT_BASE) {
                     *SERIAL_PORT.lock().unwrap() = p.clone();
                     console_append(&format!("[serial] port = {p}\n"));
+                    project_save_cfg(); // remember it across restarts
                     rebuild_menu(); // re-check the radio item
                 }
             }
@@ -821,6 +822,7 @@ unsafe fn run_action(act: usize) {
                 let b = BAUDS[a - SERIAL_BAUD_BASE];
                 SERIAL_BAUD.store(b, Relaxed);
                 console_append(&format!("[serial] baud = {b}\n"));
+                project_save_cfg();
                 rebuild_menu();
             }
             ACT_RUN_QEMU => {
@@ -1817,13 +1819,29 @@ fn upload_cfg_get(cfg: &str, section: &str, key: &str) -> Option<String> {
 }
 
 /// (config section, firmware tag) for an uploadable target.
+/// `(upload.toml section, ELF path relative to project)`; None for
+/// host. (This IDE targets the FreeRTOS cores + Pico; Zephyr is the
+/// SwiftUI IDE's domain.)
 fn upload_route(target: i32) -> Option<(&'static str, &'static str)> {
     match target {
-        1 | 4 => Some(("stm32", "arm")),
-        2 => Some(("esp32", "riscv-c2")),
-        3 => Some(("esp32", "riscv")),
-        5 => Some(("pico", "pico")),
+        1 | 4 => Some(("stm32", "target/arm/firmware.elf")),
+        2 => Some(("esp32", "target/riscv-c2/firmware.elf")),
+        3 => Some(("esp32", "target/riscv/firmware.elf")),
+        5 => Some(("pico", "target/pico/firmware.elf")),
         _ => None,
+    }
+}
+
+/// Guess a project's target from its files when there's no saved
+/// config — so pre-existing projects still auto-select on open.
+fn infer_target(dir: &str) -> Option<i32> {
+    let has = |f: &str| std::path::Path::new(dir).join(f).exists();
+    if has("run_arm.sh") {
+        Some(1) // FreeRTOS → CM4
+    } else if has("build.rs") {
+        Some(0) // host
+    } else {
+        None
     }
 }
 
@@ -1833,7 +1851,7 @@ fn upload_firmware() {
         return;
     };
     let t = TARGET.load(Relaxed);
-    let Some((section, tag)) = upload_route(t) else {
+    let Some((section, elf_rel)) = upload_route(t) else {
         console_append("host target has nothing to flash — pick an RTOS target\n");
         return;
     };
@@ -1853,7 +1871,7 @@ fn upload_firmware() {
     } else {
         upload_cfg_get(&cfg, "serial", "port").unwrap_or_default()
     };
-    let elf = format!("{dir}/target/{tag}/firmware.elf");
+    let elf = format!("{dir}/{elf_rel}");
     if !std::path::Path::new(&elf).exists() {
         console_append(&format!(
             "{elf} not built yet — Cmd+B first (link-only is enough)\n"
@@ -2530,25 +2548,73 @@ const TARGET_SLUGS: [&str; 6] =
     ["host", "rak11161-cm4", "rak11161-c2", "esp32-c3", "stm32f4", "pico"];
 
 fn project_cfg_path(dir: &str) -> String {
-    format!("{dir}/.rustcc_ide.toml")
+    format!("{dir}/.rustcc_ide.json")
 }
 
-/// Persist per-project state (Target + removed files).
+// Minimal flat-JSON field readers (no serde dep; our paths/slugs carry
+// no embedded quotes, so the first quote ends a string value).
+fn json_int(text: &str, key: &str) -> Option<i32> {
+    let i = text.find(&format!("\"{key}\""))?;
+    let v = text[i..].split_once(':')?.1.trim_start();
+    let n: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+    n.parse().ok()
+}
+fn json_string(text: &str, key: &str) -> Option<String> {
+    let i = text.find(&format!("\"{key}\""))?;
+    let v = text[i..].split_once(':')?.1.trim_start().strip_prefix('"')?;
+    v.find('"').map(|e| v[..e].to_string())
+}
+fn json_string_array(text: &str, key: &str) -> Vec<String> {
+    let Some(i) = text.find(&format!("\"{key}\"")) else { return Vec::new() };
+    let rest = &text[i..];
+    let (Some(open), Some(rel_close)) = (rest.find('['), rest.find(']')) else {
+        return Vec::new();
+    };
+    rest[open + 1..rel_close]
+        .split(',')
+        .filter_map(|s| {
+            let s = s.trim().strip_prefix('"')?;
+            s.find('"').map(|e| s[..e].to_string())
+        })
+        .collect()
+}
+
+/// Persist per-project state to .rustcc_ide.json: the selected target
+/// (auto-selected on next open), the serial port + baud (so they
+/// survive IDE restarts), and any removed files.
 fn project_save_cfg() {
     let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
-    let t = TARGET.load(Relaxed) as usize;
-    let slug = TARGET_SLUGS.get(t).copied().unwrap_or("host");
-    let mut body = format!(
-        "# rustcc IDE project state (written on Target / project changes)\ntarget = \"{slug}\"\n"
+    let t = TARGET.load(Relaxed);
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let port = SERIAL_PORT.lock().unwrap().clone();
+    let baud = SERIAL_BAUD.load(Relaxed);
+    let excludes: Vec<String> = PROJECT_EXCLUDES
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| format!("\"{}\"", esc(e)))
+        .collect();
+    let body = format!(
+        "{{\n  \"target\": {t},\n  \"serial_port\": \"{}\",\n  \"baud\": {baud},\n  \"excludes\": [{}]\n}}\n",
+        esc(&port),
+        excludes.join(", ")
     );
-    for e in PROJECT_EXCLUDES.lock().unwrap().iter() {
-        body.push_str(&format!("exclude = \"{e}\"\n"));
-    }
     let _ = std::fs::write(project_cfg_path(dir.as_str()), body);
 }
 
-fn project_load_cfg(dir: &str) -> Option<(Option<i32>, Vec<String>)> {
-    let txt = std::fs::read_to_string(project_cfg_path(dir)).ok()?;
+/// (target, excludes, serial_port, baud) from .rustcc_ide.json, falling
+/// back to the legacy .rustcc_ide.toml (target slug + excludes) for
+/// projects saved before the JSON switch.
+fn project_load_cfg(dir: &str) -> Option<(Option<i32>, Vec<String>, String, Option<i32>)> {
+    if let Ok(txt) = std::fs::read_to_string(project_cfg_path(dir)) {
+        return Some((
+            json_int(&txt, "target"),
+            json_string_array(&txt, "excludes"),
+            json_string(&txt, "serial_port").unwrap_or_default(),
+            json_int(&txt, "baud"),
+        ));
+    }
+    let txt = std::fs::read_to_string(format!("{dir}/.rustcc_ide.toml")).ok()?;
     let mut target = None;
     let mut excludes = Vec::new();
     for l in txt.lines() {
@@ -2560,7 +2626,7 @@ fn project_load_cfg(dir: &str) -> Option<(Option<i32>, Vec<String>)> {
             excludes.push(r.trim_start_matches(['=', ' ']).trim_matches('"').to_string());
         }
     }
-    Some((target, excludes))
+    Some((target, excludes, String::new(), None))
 }
 
 fn set_project(dir: &str) {
@@ -2571,18 +2637,28 @@ fn set_project(dir: &str) {
     // (fresh scaffold / pre-existing folder) is seeded with the
     // current selection.
     match project_load_cfg(dir) {
-        Some((target, excludes)) => {
+        Some((target, excludes, port, baud)) => {
             *PROJECT_EXCLUDES.lock().unwrap() = excludes;
-            if let Some(t) = target {
+            // Saved target wins; else infer from the project's files.
+            if let Some(t) = target.or_else(|| infer_target(dir)).filter(|t| (*t as usize) < TARGET_NAMES.len()) {
                 TARGET.store(t, Relaxed);
                 console_append(&format!(
                     "target = {} (restored from project)\n",
                     TARGET_NAMES[t as usize]
                 ));
             }
+            if !port.is_empty() {
+                *SERIAL_PORT.lock().unwrap() = port;
+            }
+            if let Some(b) = baud {
+                SERIAL_BAUD.store(b, Relaxed);
+            }
         }
         None => {
             PROJECT_EXCLUDES.lock().unwrap().clear();
+            if let Some(t) = infer_target(dir) {
+                TARGET.store(t, Relaxed);
+            }
             project_save_cfg();
         }
     }
@@ -3701,11 +3777,41 @@ unsafe fn self_test() -> i32 {
         rebuild_menu(); // must not panic with the bar live (ports/baud/run-mode/recents)
         check("no action-id collision (close-file vs new-stm32)", ACT_CLOSE_FILE != ACT_NEW_STM32);
 
-        // 0b. Run mode is a global toggle, default QEMU; Device run is
-        // gated to flashable targets only (Host has no upload route).
-        check("run mode defaults to QEMU", !RUN_ON_DEVICE.load(Relaxed));
+        // 0b. Run mode is a global toggle, default Device (flash +
+        // serial); Device run is gated to flashable targets (Host has
+        // no upload route, so it always runs locally).
+        check("run mode defaults to Device", RUN_ON_DEVICE.load(Relaxed));
         check("device run is RTOS-only (host has no route)", upload_route(0).is_none());
         check("device run targets are flashable", upload_route(1).is_some() && upload_route(2).is_some());
+        check("upload route carries the elf path", upload_route(1) == Some(("stm32", "target/arm/firmware.elf")));
+
+        // 0b'. Per-project JSON config: target + serial port/baud round-
+        // trip through .rustcc_ide.json; target inference for projects
+        // with no saved config (auto-select on open).
+        {
+            let cdir = std::env::temp_dir().join(format!("rustcc_ide_cfg{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&cdir);
+            std::fs::create_dir_all(&cdir).unwrap();
+            let cs = cdir.to_string_lossy().into_owned();
+            *PROJECT_DIR.lock().unwrap() = Some(cs.clone());
+            *SERIAL_PORT.lock().unwrap() = "/dev/cu.cfg-test".into();
+            SERIAL_BAUD.store(57_600, Relaxed);
+            TARGET.store(2, Relaxed);
+            project_save_cfg();
+            let loaded = project_load_cfg(&cs);
+            check(
+                "project config round-trips target+serial+baud (JSON)",
+                loaded == Some((Some(2), Vec::new(), "/dev/cu.cfg-test".to_string(), Some(57_600))),
+            );
+            check("config file is .rustcc_ide.json", project_cfg_path(&cs).ends_with(".json"));
+            // Inference: an arm (FreeRTOS) project with no config → CM4.
+            std::fs::write(cdir.join("run_arm.sh"), "").unwrap();
+            std::fs::remove_file(cdir.join(".rustcc_ide.json")).ok();
+            check("target inferred from run_arm.sh", infer_target(&cs) == Some(1));
+            *PROJECT_DIR.lock().unwrap() = None;
+            *SERIAL_PORT.lock().unwrap() = String::new();
+            let _ = std::fs::remove_dir_all(&cdir);
+        }
 
         // 0c. Recent workspaces: prepend / dedup / most-recent-first,
         // capped, surviving a reload (persisted to ~/.rustcc_ide_recents).
@@ -4017,9 +4123,9 @@ unsafe fn self_test() -> i32 {
         );
         check(
             "upload routes per target",
-            upload_route(1) == Some(("stm32", "arm"))
-                && upload_route(2) == Some(("esp32", "riscv-c2"))
-                && upload_route(5) == Some(("pico", "pico"))
+            upload_route(1) == Some(("stm32", "target/arm/firmware.elf"))
+                && upload_route(2) == Some(("esp32", "target/riscv-c2/firmware.elf"))
+                && upload_route(5) == Some(("pico", "target/pico/firmware.elf"))
                 && upload_route(0).is_none(),
         );
         check(
@@ -4200,21 +4306,22 @@ unsafe fn self_test() -> i32 {
             (*b_cur).text_const_i8_str("");
         }
 
-        // Target persists per-project: seeding on first open, save on
-        // change, restore on reopen.
-        TARGET.store(4, Relaxed); // STM32F4-class
-        set_project(&proj_s); // fresh project: seeds with current
-        check(
-            "project cfg seeded with stable slug",
-            std::fs::read_to_string(project_cfg_path(&proj_s))
-                .unwrap_or_default()
-                .contains("\"stm32f4\""),
-        );
-        TARGET.store(2, Relaxed); // simulate Target menu pick
+        // Target persists per-project in .rustcc_ide.json: save on
+        // change, restore on reopen (the saved target wins over file
+        // inference).
+        set_project(&proj_s); // establishes PROJECT_DIR (target inferred/loaded)
+        TARGET.store(2, Relaxed); // simulate a Target-menu pick
         project_save_cfg();
         TARGET.store(0, Relaxed);
-        set_project(&proj_s); // reopen: restores the saved target
-        check("project target restored on reopen", TARGET.load(Relaxed) == 2);
+        set_project(&proj_s); // reopen restores the saved target
+        check("project target restored on reopen (JSON)", TARGET.load(Relaxed) == 2);
+        check(
+            "project cfg is .rustcc_ide.json with the target",
+            project_cfg_path(&proj_s).ends_with(".json")
+                && std::fs::read_to_string(project_cfg_path(&proj_s))
+                    .unwrap_or_default()
+                    .contains("\"target\": 2"),
+        );
 
         // display_path: project-relative, incl. the canonicalized
         // retry (temp dirs sit behind the /var → /private/var link).

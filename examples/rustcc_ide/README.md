@@ -207,14 +207,22 @@ cargo +rustcc run --release --bin ide         # the GUI
   text and `[serial→]` echoes interleave with everything else.
   **Clear Monitor** clears the console.
 - **Run on real hardware (not just QEMU)** — **Project ▸ Run On** is a
-  global **QEMU / Device** toggle (radio pair). In **Device** mode,
-  Build & Run (⌘R) stops emulating: it builds link-only, **flashes the
+  global **QEMU / Device** toggle (radio pair), **defaulting to
+  Device**. In Device mode, Build & Run (⌘R) stops emulating: it builds
+  link-only (so Run compiles when there's no binary yet), **flashes the
   selected serial port** via `upload.toml`, then **attaches the serial
   monitor** — the full deploy-and-watch loop, all streamed to the
   console. The flash and the monitor share **one** port: the Serial
   menu's *Selected Port* now wins over `upload.toml`'s stored value
   (pick it once, both Upload and Device-run use it). Host has nothing
   to flash, so it always runs locally regardless of the toggle.
+- **Per-project `.rustcc_ide.json`** — each project remembers its
+  **target** (auto-selected on open — or **inferred** from the project's
+  files if there's no saved config yet) and its **serial port + baud**
+  (so they survive IDE restarts), alongside the removed-files list. It
+  supersedes the old `.rustcc_ide.toml` (still read as a fallback). The
+  target is stored as an index, schema-compatible with the SwiftUI IDE's
+  config.
 - **File ▸ Open Recent** — opened/scaffolded projects are remembered
   (most-recent first, deduped, capped at 10) in `~/.rustcc_ide_recents`,
   surfaced as a rebuilt submenu so you don't re-navigate the folder

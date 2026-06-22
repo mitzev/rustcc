@@ -13,7 +13,6 @@ struct ContentView: View {
     @State private var findAnchor: Int = 0   // NSString offset for Find Next
     @State private var showVars = false
     @State private var showSerialSettings = false
-    @State private var baud = [115_200, 115_200]   // per channel
     @State private var serialSend = ["", ""]
 
     var body: some View {
@@ -95,7 +94,8 @@ struct ContentView: View {
                 }
             }
             .frame(maxWidth: 240).disabled(eng.serialOpen[ch])
-            Picker("Baud", selection: Binding(get: { baud[ch] }, set: { baud[ch] = $0 })) {
+            Picker("Baud", selection: Binding(get: { eng.serialBaud[ch] },
+                                              set: { eng.serialBaud[ch] = $0; if ch == 0 { eng.saveConfig() } })) {
                 ForEach(bauds, id: \.self) { Text("\($0)").tag($0) }
             }
             .frame(maxWidth: 130).disabled(eng.serialOpen[ch])
@@ -407,7 +407,8 @@ struct ContentView: View {
             Button { showFind.toggle() } label: { Label("Find", systemImage: "magnifyingglass") }
                 .disabled(eng.openRel == nil)
             Divider()
-            Picker("Target", selection: $eng.target) {
+            Picker("Target", selection: Binding(get: { eng.target },
+                                                set: { eng.target = $0; eng.saveConfig() })) {
                 ForEach(Array(eng.targets.enumerated()), id: \.offset) { i, name in
                     Text(name).tag(i)
                 }
@@ -428,13 +429,13 @@ struct ContentView: View {
             .help("QEMU = run in the emulator. Device = flash the selected serial port and watch it.")
             Button { eng.build(run: false) } label: { Label("Build", systemImage: "hammer") }
                 .disabled(eng.running || eng.projectDir == nil)
-            Button { eng.buildAndRun(baud: baud[0]) } label: {
-                Label(eng.runOnDevice ? "Run on Device" : "Run", systemImage: "play.fill")
+            Button { eng.buildAndRun() } label: {
+                Label(eng.runOnDevice && eng.canUpload ? "Run on Device" : "Run", systemImage: "play.fill")
             }
             .disabled(eng.running || eng.projectDir == nil)
-            .help(eng.runOnDevice
+            .help(eng.runOnDevice && eng.canUpload
                   ? "Build → flash the selected serial port → attach the monitor"
-                  : "Build & run on QEMU")
+                  : "Build & run on QEMU (or locally for Host)")
             Button { eng.upload() } label: { Label("Upload", systemImage: "bolt.horizontal.circle") }
                 .disabled(eng.running || eng.projectDir == nil || !eng.canUpload)
                 .help("Flash the built firmware via upload.toml (RTOS targets)")
@@ -461,7 +462,7 @@ struct ContentView: View {
             Button("Connect \(label) — set a port first…") { showSerialSettings = true }
         } else {
             Button("Connect \(label) (\(eng.serialPort[ch].replacingOccurrences(of: "/dev/", with: "")))") {
-                eng.openSerial(ch, baud: baud[ch])
+                eng.openSerial(ch, baud: eng.serialBaud[ch])
             }
         }
     }
