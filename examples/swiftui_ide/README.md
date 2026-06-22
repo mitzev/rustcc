@@ -106,10 +106,15 @@ bound on the Swift side as:
   change target/port/baud.
 - **Upload** (RTOS targets) — flashes the built firmware via the
   per-project `upload.toml` (configurable shell templates with
-  `{elf}`/`{dir}`/`{port}` placeholders: `STM32_Programmer_CLI` /
-  `esptool.py` / `picotool`), routed by target and streamed. `{port}`
-  is the selected serial port (below). Host has nothing to flash, so
-  the button disables.
+  `{elf}`/`{dir}`/`{port}` placeholders), routed by target and
+  streamed. Defaults are **open-source Rust serial flashers**:
+  **`stm32-uart-boot`** (MPL-2.0, STM32 AN3155 UART bootloader) and
+  **`espflash`** (Apache/MIT, ESP32) — both over the **selected serial
+  port**, no proprietary tool needed (vendored under the FLTK IDE's
+  [`vendor/`](../rustcc_ide/vendor); `cargo install --path` them). The
+  old `STM32_Programmer_CLI` / `esptool.py` commands stay as commented
+  fallbacks. `{port}` is the selected serial port (below); Host has
+  nothing to flash, so the button disables.
 - **Dual serial monitors** — **two** independent channels (Core A / B),
   so a dual-target board like the RAK11161 has a console per core.
   Config is **infrequent**, so port + baud live in **Serial ▸ Serial

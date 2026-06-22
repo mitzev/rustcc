@@ -69,11 +69,17 @@ cargo +rustcc run --release --bin ide         # the GUI
 - **Firmware upload (⌘U)** with **configurable tools**: per-project
   `upload.toml` (Project ▸ Edit Upload Config… opens/creates it)
   maps target families to shell templates with `{elf}`/`{dir}`/
-  `{port}` placeholders — defaults: `STM32_Programmer_CLI` (STM32),
-  `esptool.py` elf2image + write_flash (ESP32), `picotool load`
-  (Pico). Output streams to the console. Caveat in the file itself:
-  the qemu-validated ELFs use the qemu machines' memory maps — point
-  the linker scripts at your board before flashing real hardware.
+  `{port}` placeholders. Defaults are now **open-source Rust serial
+  flashers, vendored under [`vendor/`](vendor/)**: **`stm32-uart-boot`**
+  (MPL-2.0, the STM32 UART system bootloader / AN3155) for STM32, and
+  **`espflash`** (Apache/MIT) for ESP32 — both flash over the **selected
+  serial port**, no proprietary tool needed (`cargo install --path` them
+  once; see [`vendor/README.md`](vendor/README.md)). The previous
+  `STM32_Programmer_CLI` / `esptool.py` commands remain as commented
+  fallbacks in `upload.toml`. Output streams to the console. Caveats:
+  STM32 must be in bootloader mode (BOOT0 + reset) for the UART path,
+  and the qemu-validated ELFs use the qemu memory maps — point the
+  linker scripts at your board before flashing real hardware.
 
 ## v5 additions
 

@@ -1760,12 +1760,20 @@ const UPLOAD_TOML: &str = r#"# rustcc IDE — firmware upload configuration (per
 # unchanged.
 
 [stm32]
-# STM32CubeProgrammer CLI (SWD probe, e.g. ST-LINK):
-cmd = "STM32_Programmer_CLI -c port=SWD -w {elf} -v -rst"
+# Native Rust UART-bootloader flasher (stm32-uart-boot, MPL-2.0,
+# vendored under the IDE — `cargo install --path vendor/stm32-uart-boot`).
+# The chip must be in BOOTLOADER mode first (BOOT0 high + reset).
+cmd = "stm32-uart-boot {port} load {elf}"
+# Fallback — STM32CubeProgrammer CLI over an SWD probe (ST-LINK):
+# cmd = "STM32_Programmer_CLI -c port=SWD -w {elf} -v -rst"
 
 [esp32]
-# esptool.py: convert the ELF to an esp image, then flash:
-cmd = "esptool.py --chip auto elf2image {elf} -o {dir}/fw.bin && esptool.py --chip auto --port {port} write_flash 0x0 {dir}/fw.bin"
+# Native Rust serial flasher (espflash, Apache/MIT — `cargo install
+# espflash`). Takes the ELF directly. For the ESP32-C2 core add
+# `--chip esp32c2` (and `--no-stub` if it balks).
+cmd = "espflash flash --port {port} --baud 460800 {elf}"
+# Fallback — esptool.py (Python):
+# cmd = "esptool.py --chip auto elf2image {elf} -o {dir}/fw.bin && esptool.py --chip auto --port {port} write_flash 0x0 {dir}/fw.bin"
 
 [pico]
 # picotool (BOOTSEL mode or with -f to force-reboot):
@@ -4268,11 +4276,14 @@ unsafe fn self_test() -> i32 {
         check("scaffold ships upload.toml", up.join("upload.toml").exists());
         let cfg = std::fs::read_to_string(up.join("upload.toml")).unwrap_or_default();
         check(
-            "upload tools configured",
-            upload_cfg_get(&cfg, "stm32", "cmd")
-                .is_some_and(|c| c.contains("STM32_Programmer_CLI"))
-                && upload_cfg_get(&cfg, "esp32", "cmd").is_some_and(|c| c.contains("esptool.py"))
+            "upload tools configured (native Rust flashers, active cmd)",
+            upload_cfg_get(&cfg, "stm32", "cmd").is_some_and(|c| c.contains("stm32-uart-boot"))
+                && upload_cfg_get(&cfg, "esp32", "cmd").is_some_and(|c| c.contains("espflash"))
                 && upload_cfg_get(&cfg, "pico", "cmd").is_some_and(|c| c.contains("picotool")),
+        );
+        check(
+            "old vendor tools kept as commented fallback",
+            cfg.contains("# cmd = \"STM32_Programmer_CLI") && cfg.contains("# cmd = \"esptool.py"),
         );
         check(
             "upload routes per target",

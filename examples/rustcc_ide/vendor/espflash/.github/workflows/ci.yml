@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - "gh-readonly-queue/**"
+      - "main"
+  merge_group:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  MSRV: "1.88"
+
+# Cancel any currently running workflows from the same PR, branch, or
+# tag when a new workflow is triggered.
+#
+# https://stackoverflow.com/a/66336834
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Check
+
+  check:
+    name: Check (${{ matrix.platform.target }})
+    runs-on: ${{ matrix.platform.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - os: "macos-14"
+            target: "x86_64-apple-darwin"
+            arch: "x86_64"
+          - os: "ubuntu-22.04"
+            target: "x86_64-unknown-linux-gnu"
+            arch: "x86_64"
+          - os: "ubuntu-22.04"
+            target: "x86_64-unknown-linux-musl"
+            arch: "x86_64"
+          - os: "ubuntu-22.04"
+            target: "aarch64-unknown-linux-gnu"
+            arch: "arm64"
+          - os: "ubuntu-22.04"
+            target: "armv7-unknown-linux-gnueabihf"
+            arch: "armhf"
+          - os: "windows-2022"
+            target: "x86_64-pc-windows-msvc"
+            arch: "x86_64"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-target
+        with:
+          arch: ${{ matrix.platform.arch }}
+          target: ${{ matrix.platform.target }}
+
+      - run: cargo run -p cargo-espflash -- espflash completions bash
+      - run: cargo run -p espflash -- completions bash
+
+  check-lib:
+    name: Check lib (${{ matrix.platform.target }})
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - target: "x86_64-unknown-linux-gnu"
+            arch: "x86_64"
+          - target: "aarch64-unknown-linux-gnu"
+            arch: "arm64"
+          - target: "armv7-unknown-linux-gnueabihf"
+            arch: "armhf"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-target
+        with:
+          arch: ${{ matrix.platform.arch }}
+          target: ${{ matrix.platform.target }}
+
+      - run: RUSTFLAGS="-D warnings" cargo check -p espflash --lib --no-default-features
+      - run: RUSTFLAGS="-D warnings" cargo check -p espflash --lib --no-default-features --features serialport
+
+  msrv:
+    name: Check lib MSRV  (${{ matrix.platform.target }})
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - target: "x86_64-unknown-linux-gnu"
+            arch: "x86_64"
+          - target: "aarch64-unknown-linux-gnu"
+            arch: "arm64"
+          - target: "armv7-unknown-linux-gnueabihf"
+            arch: "armhf"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-target
+        with:
+          arch: ${{ matrix.platform.arch }}
+          target: ${{ matrix.platform.target }}
+          toolchain: ${{ env.MSRV }}
+
+      - run: cargo check -p espflash --lib
+
+  xtask:
+    name: Check xtask
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+
+      - run: cargo check -p xtask --all-features
+
+  # --------------------------------------------------------------------------
+  # Test
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-target
+
+      - run: cargo test --lib
+
+  # --------------------------------------------------------------------------
+  # Lint
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy -- -D warnings
+
+  rustfmt:
+    name: Rustfmt
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check

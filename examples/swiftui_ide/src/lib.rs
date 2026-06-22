@@ -963,10 +963,19 @@ const UPLOAD_TOML: &str = r#"# rustcc IDE — firmware upload configuration (per
 # flashing real hardware.
 
 [stm32]
-cmd = "STM32_Programmer_CLI -c port=SWD -w {elf} -v -rst"
+# Native Rust UART-bootloader flasher (stm32-uart-boot, MPL-2.0). The
+# chip must be in BOOTLOADER mode first (BOOT0 high + reset).
+cmd = "stm32-uart-boot {port} load {elf}"
+# Fallback — STM32CubeProgrammer CLI over an SWD probe (ST-LINK):
+# cmd = "STM32_Programmer_CLI -c port=SWD -w {elf} -v -rst"
 
 [esp32]
-cmd = "esptool.py --chip auto elf2image {elf} -o {dir}/fw.bin && esptool.py --chip auto --port {port} write_flash 0x0 {dir}/fw.bin"
+# Native Rust serial flasher (espflash, Apache/MIT). Takes the ELF
+# directly. For the ESP32-C2 core add `--chip esp32c2` (+ `--no-stub`
+# if it balks).
+cmd = "espflash flash --port {port} --baud 460800 {elf}"
+# Fallback — esptool.py (Python):
+# cmd = "esptool.py --chip auto elf2image {elf} -o {dir}/fw.bin && esptool.py --chip auto --port {port} write_flash 0x0 {dir}/fw.bin"
 
 [pico]
 cmd = "picotool load {elf} -fx"

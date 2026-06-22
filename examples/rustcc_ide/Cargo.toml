@@ -31,4 +31,7 @@ rustc_abi_cxx = { path = "../../crates/rustc_abi_cxx" }
 # simplest.)
 cxx = { path = "../../crates/cxx" }
 
+# Vendored host flash tools build standalone — keep them out of this
+# crate's workspace (espflash is itself a multi-crate workspace).
 [workspace]
+exclude = ["vendor/stm32-uart-boot", "vendor/espflash"]

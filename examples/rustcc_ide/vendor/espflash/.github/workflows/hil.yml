@@ -1,0 +1,244 @@
+name: HIL
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Owner and repository to test"
+        required: true
+        default: "esp-rs/espflash"
+      branch:
+        description: "Branch, tag or SHA to checkout."
+        required: true
+        default: "main"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: debug
+
+# Cancel any currently running workflows from the same PR, branch, or
+# tag when a new workflow is triggered.
+#
+# https://stackoverflow.com/a/66336834
+concurrency:
+  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+
+jobs:
+  build-packages:
+    name: Build packages | (${{ matrix.target.host }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - host: aarch64
+            target: aarch64-unknown-linux-gnu
+          - host: armv7
+            target: armv7-unknown-linux-gnueabihf
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.inputs.repository || github.repository }}
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: cross build --release --target ${{ matrix.target.target }} -p espflash -p xtask
+
+      - name: Upload espflash-${{ matrix.target.host }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: espflash-${{ matrix.target.host }}
+          path: target/${{ matrix.target.target }}/release/espflash
+          if-no-files-found: error
+
+      - name: Upload xtask-${{ matrix.target.host }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: xtask-${{ matrix.target.host }}
+          path: target/${{ matrix.target.target }}/release/xtask
+          if-no-files-found: error
+
+  run-tests:
+    if: github.repository_owner == 'esp-rs'
+    name: HIL | ${{ matrix.target.soc }} | ${{ matrix.target.port }}
+    needs: build-packages
+    runs-on: [self-hosted, "${{ matrix.target.runner }}"]
+    env:
+      ESPFLASH_PORT: /dev/serial_ports/${{ matrix.target.port }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - soc: esp32c2
+            runner: esp32c2-jtag
+            port: uart
+            host: aarch64
+          - soc: esp32c3
+            runner: esp32c3-usb
+            port: usb
+            host: armv7
+          - soc: esp32c5
+            runner: esp32c5-usb
+            port: usb
+            host: aarch64
+          - soc: esp32c5
+            runner: esp32c5-usb
+            port: uart
+            host: aarch64
+          - soc: esp32c6
+            runner: esp32c6-usb
+            port: usb
+            host: armv7
+          - soc: esp32c6
+            runner: esp32c6-usb
+            port: uart
+            host: armv7
+          - soc: esp32c61
+            runner: esp32c61-usb
+            port: usb
+            host: aarch64
+          - soc: esp32c61
+            runner: esp32c61-usb
+            port: uart
+            host: aarch64
+          - soc: esp32h2
+            runner: esp32h2-usb
+            port: usb
+            host: armv7
+          - soc: esp32h2
+            runner: esp32h2-usb
+            port: uart
+            host: armv7
+          - soc: esp32p4
+            runner: esp32p4
+            port: usb
+            host: aarch64
+          - soc: esp32
+            runner: esp32-jtag
+            port: uart
+            host: aarch64
+          - soc: esp32s2
+            runner: esp32s2-jtag
+            port: uart
+            host: armv7
+          - soc: esp32s3
+            runner: esp32s3-usb
+            port: usb
+            host: armv7
+          - soc: esp32s3
+            runner: esp32s3-usb
+            port: uart
+            host: armv7
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: espflash-${{ matrix.target.host }}
+          path: espflash_app
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: xtask-${{ matrix.target.host }}
+          path: xtask_app
+
+      - name: Set up binaries
+        run: |
+          chmod +x espflash_app/espflash
+          chmod +x xtask_app/xtask
+          echo "$PWD/espflash_app" >> "$GITHUB_PATH"
+          echo "$PWD/xtask_app" >> "$GITHUB_PATH"
+
+      - name: Reset device
+        run: |
+          espflash reset
+          sleep 5
+
+      - name: Run all tests
+        run: xtask run-tests --chip ${{ matrix.target.soc }} -t 60 --no-build
+
+  # SDM Tests (VM - ESP32C6)
+  build-sdm-packages:
+    name: Build SDM packages
+    runs-on: ubuntu-22.04
+    container:
+      image: ubuntu:20.04
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.inputs.repository || github.repository }}
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: apt-get update && apt-get -y install curl musl-tools pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build binaries
+        run: cargo build --release -p espflash -p xtask
+
+      - name: Upload espflash
+        uses: actions/upload-artifact@v4
+        with:
+          name: espflash
+          path: target/release/espflash
+          if-no-files-found: error
+
+      - name: Upload xtask
+        uses: actions/upload-artifact@v4
+        with:
+          name: xtask
+          path: target/release/xtask
+          if-no-files-found: error
+  run-sdm-tests:
+    if: github.repository_owner == 'esp-rs'
+    name: HIL (SDM) | esp32c6
+    needs: build-sdm-packages
+    runs-on: [self-hosted, "linux", "x64", "esp32c6"]
+    env:
+      ESPFLASH_PORT: /dev/serial_ports/esp32c6
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: espflash
+          path: espflash_app
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: xtask
+          path: xtask_app
+
+      - name: Set up binaries
+        run: |
+          chmod +x espflash_app/espflash
+          chmod +x xtask_app/xtask
+          echo "$PWD/espflash_app" >> "$GITHUB_PATH"
+          echo "$PWD/xtask_app" >> "$GITHUB_PATH"
+
+      - name: Run all tests
+        run: xtask run-tests --chip esp32c6 -t 60 --no-build --sdm
