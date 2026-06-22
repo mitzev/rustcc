@@ -90,6 +90,7 @@ final class IDEEngine: ObservableObject {
     @Published var serialRx: [String] = ["", ""]
 
     private var pollTimer: Timer?
+    private var rescanTick = 0
 
     init() {
         let n = rc_target_count()
@@ -130,15 +131,23 @@ final class IDEEngine: ObservableObject {
             if !rx.isEmpty { serialRx[ch] += rx }
             serialOpen[ch] = rc_serial_is_open(Int64(ch)) != 0
         }
+        // Pick up hot-plugged adapters without manual rescan (~every 3s;
+        // diff-aware, so no UI churn when nothing changed).
+        rescanTick += 1
+        if rescanTick % 25 == 0 { refreshPorts() }
     }
 
     // MARK: - Serial monitor
 
+    /// Re-enumerate ports. Diff-aware so the periodic rescan (below)
+    /// only churns the UI when the device set actually changes.
     func refreshPorts() {
         let s = takeRustString(rc_serial_ports())
-        serialPorts = s.isEmpty ? [] : s.split(separator: "\n").map(String.init)
+        let list = s.isEmpty ? [] : s.split(separator: "\n").map(String.init)
+        if list != serialPorts { serialPorts = list }
         for ch in 0..<2 {
-            serialPort[ch] = takeRustString(rc_serial_port(Int64(ch)))  // engine may have loaded one
+            let p = takeRustString(rc_serial_port(Int64(ch)))  // engine may have loaded one
+            if p != serialPort[ch] { serialPort[ch] = p }
         }
     }
     func selectPort(_ ch: Int, _ p: String) {

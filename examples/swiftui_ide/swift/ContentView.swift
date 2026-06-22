@@ -12,6 +12,7 @@ struct ContentView: View {
     @State private var selectRange: NSRange? = nil
     @State private var findAnchor: Int = 0   // NSString offset for Find Next
     @State private var showVars = false
+    @State private var showSerialSettings = false
     @State private var baud = [115_200, 115_200]   // per channel
     @State private var serialSend = ["", ""]
 
@@ -43,12 +44,11 @@ struct ContentView: View {
                 }
                 Divider()
                 debugBar
-                Divider()
-                serialBar
             }
             .navigationTitle(eng.openRel ?? "rustcc IDE")
             .toolbar { toolbar }
             .onAppear { eng.refreshBreakpoints() }
+            .sheet(isPresented: $showSerialSettings) { serialSettingsSheet }
             .inspector(isPresented: $showVars) { varsInspector }
         }
     }
@@ -57,27 +57,36 @@ struct ContentView: View {
 
     private let bauds = [9_600, 19_200, 57_600, 115_200, 230_400, 460_800, 921_600]
 
-    // Two serial channels — one per core on a dual-target board.
-    private var serialBar: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            HStack(spacing: 6) {
-                Text("Serial monitors").font(.caption.bold()).foregroundStyle(.secondary)
-                Button { eng.refreshPorts() } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless).help("Rescan serial ports")
+    // Serial port + baud configuration is infrequent, so it lives in a
+    // sheet (opened from the toolbar's Serial menu) rather than taking
+    // permanent screen space. Connecting is in the menu; output + send
+    // live in the per-channel console panes. Ports are re-enumerated
+    // each time this opens, so a board plugged in after launch appears.
+    private var serialSettingsSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Serial Settings").font(.title3.bold())
                 Spacer()
+                Button { eng.refreshPorts() } label: { Label("Rescan", systemImage: "arrow.clockwise") }
             }
-            serialRow(0, "Core A")
-            serialRow(1, "Core B")
+            serialConfigRow(0, "Core A")
+            serialConfigRow(1, "Core B")
+            Text("Connect / disconnect from the toolbar ▸ Serial menu.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Done") { showSerialSettings = false }.keyboardShortcut(.defaultAction)
+            }
         }
-        .padding(.horizontal, 10).padding(.vertical, 5)
+        .padding(20)
+        .frame(width: 480)
+        .onAppear { eng.refreshPorts() }
     }
 
-    private func serialRow(_ ch: Int, _ label: String) -> some View {
+    private func serialConfigRow(_ ch: Int, _ label: String) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: "cable.connector")
-                .foregroundStyle(eng.serialOpen[ch] ? .green : .secondary)
-            Text(label).font(.caption).frame(width: 50, alignment: .leading)
-            Picker("", selection: Binding(
+            Text(label).font(.callout).frame(width: 56, alignment: .leading)
+            Picker("Port", selection: Binding(
                 get: { eng.serialPort[ch] }, set: { eng.selectPort(ch, $0) }
             )) {
                 Text("— no port —").tag("")
@@ -85,24 +94,14 @@ struct ContentView: View {
                     Text(p.replacingOccurrences(of: "/dev/", with: "")).tag(p)
                 }
             }
-            .labelsHidden().frame(maxWidth: 220).disabled(eng.serialOpen[ch])
-            Picker("", selection: Binding(get: { baud[ch] }, set: { baud[ch] = $0 })) {
+            .frame(maxWidth: 240).disabled(eng.serialOpen[ch])
+            Picker("Baud", selection: Binding(get: { baud[ch] }, set: { baud[ch] = $0 })) {
                 ForEach(bauds, id: \.self) { Text("\($0)").tag($0) }
             }
-            .labelsHidden().frame(maxWidth: 100).disabled(eng.serialOpen[ch])
-
+            .frame(maxWidth: 130).disabled(eng.serialOpen[ch])
             if eng.serialOpen[ch] {
-                Button { eng.closeSerial(ch) } label: { Label("Disconnect", systemImage: "xmark.circle") }
-                TextField("send…", text: Binding(get: { serialSend[ch] }, set: { serialSend[ch] = $0 }))
-                    .textFieldStyle(.roundedBorder).frame(width: 180)
-                    .onSubmit { eng.sendSerial(ch, serialSend[ch]); serialSend[ch] = "" }
-            } else {
-                Button { eng.openSerial(ch, baud: baud[ch]) } label: {
-                    Label("Connect", systemImage: "cable.connector.horizontal")
-                }
-                .disabled(eng.serialPort[ch].isEmpty)
+                Image(systemName: "cable.connector").foregroundStyle(.green).help("connected")
             }
-            Spacer()
         }
     }
 
@@ -111,6 +110,9 @@ struct ContentView: View {
             HStack {
                 Text("Serial — \(ch == 0 ? "Core A" : "Core B")").font(.headline)
                 Spacer()
+                TextField("send…", text: Binding(get: { serialSend[ch] }, set: { serialSend[ch] = $0 }))
+                    .textFieldStyle(.roundedBorder).frame(width: 160)
+                    .onSubmit { eng.sendSerial(ch, serialSend[ch]); serialSend[ch] = "" }
                 Button("Clear") { eng.clearSerial(ch) }.buttonStyle(.borderless)
             }
             .padding(.horizontal, 8).padding(.vertical, 4)
@@ -405,6 +407,31 @@ struct ContentView: View {
             Button { eng.upload() } label: { Label("Upload", systemImage: "bolt.horizontal.circle") }
                 .disabled(eng.running || eng.projectDir == nil || !eng.canUpload)
                 .help("Flash the built firmware via upload.toml (RTOS targets)")
+            // Serial: connect/disconnect here (frequent); port + baud
+            // config is behind "Serial Settings…" (infrequent).
+            Menu {
+                serialMenuItem(0, "Core A")
+                serialMenuItem(1, "Core B")
+                Divider()
+                Button("Serial Settings…") { showSerialSettings = true }
+                Button("Rescan Ports") { eng.refreshPorts() }
+            } label: {
+                Label("Serial", systemImage: "cable.connector")
+            }
+            .help(eng.serialOpen.contains(true) ? "Serial connected" : "Serial")
+        }
+    }
+
+    @ViewBuilder
+    private func serialMenuItem(_ ch: Int, _ label: String) -> some View {
+        if eng.serialOpen[ch] {
+            Button("Disconnect \(label)") { eng.closeSerial(ch) }
+        } else if eng.serialPort[ch].isEmpty {
+            Button("Connect \(label) — set a port first…") { showSerialSettings = true }
+        } else {
+            Button("Connect \(label) (\(eng.serialPort[ch].replacingOccurrences(of: "/dev/", with: "")))") {
+                eng.openSerial(ch, baud: baud[ch])
+            }
         }
     }
 

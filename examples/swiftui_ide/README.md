@@ -89,13 +89,16 @@ bound on the Swift side as:
   is the selected serial port (below). Host has nothing to flash, so
   the button disables.
 - **Dual serial monitors** — **two** independent channels (Core A / B),
-  so a dual-target board like the RAK11161 can have a console per core.
-  Each has a **port picker** enumerating `/dev/cu.*` (macOS) /
-  `ttyUSB*`·`ttyACM*` (Linux), a **baud** picker, and
-  **Connect/Disconnect**; the engine configures the line with `stty`
-  (raw N81, read-timeout) and opens it, and each channel streams into
-  **its own console pane** with a send field. Channel A's port persists
-  to `upload.toml`'s `[serial] port` (and feeds Upload), channel B's to
+  so a dual-target board like the RAK11161 has a console per core.
+  Config is **infrequent**, so port + baud live in **Serial ▸ Serial
+  Settings…** (a sheet that re-enumerates `/dev/cu.*` / `ttyUSB*`·
+  `ttyACM*` on open); the frequent action — **Connect/Disconnect** per
+  channel — is in the toolbar **Serial** menu. Ports also re-scan
+  automatically (~3s, diff-aware) so a board plugged in after launch
+  appears without a manual rescan. The engine configures the line with
+  `stty` (raw N81, read-timeout); each channel streams into **its own
+  console pane** with a send field. Channel A's port persists to
+  `upload.toml`'s `[serial] port` (and feeds Upload), channel B's to
   `port_b`.
 - **Debug** (Host target) — an in-IDE `lldb` session: **Start Debug**
   builds the debug profile and attaches lldb over a pty (the engine
