@@ -1,7 +1,0 @@
-[workspace]
-resolver = "2"
-members  = ["cargo-espflash", "espflash", "xtask"]
-
-[profile.release]
-lto   = "thin"
-strip = true

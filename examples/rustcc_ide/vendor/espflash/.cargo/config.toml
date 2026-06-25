@@ -1,4 +1,0 @@
-[alias]
-xtask = "run --package xtask --"
-xgenerate-efuse-fields = "run --package xtask --features=efuse-generator -- generate-efuse-fields"
-xrun = "run --package espflash --"
