@@ -232,7 +232,10 @@ final class IDEEngine: ObservableObject {
         let rc = dir.withCString { rc_scaffold(kind, $0) }
         if rc == 0 {
             projectDir = dir
-            target = defaultTarget
+            // Guard like open() does: a target index the engine doesn't
+            // report would leave the Target picker blank and ship an
+            // out-of-range index to every rc_build/rc_run_on_device.
+            target = (defaultTarget >= 0 && defaultTarget < targets.count) ? defaultTarget : 0
             refreshFiles()
             openFirstSource()
             refreshPorts()

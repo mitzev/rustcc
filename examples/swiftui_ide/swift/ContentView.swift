@@ -94,9 +94,14 @@ struct ContentView: View {
                 }
             }
             .frame(maxWidth: 240).disabled(eng.serialOpen[ch])
+            // Include an off-list configured rate (a .rustcc_ide.json
+            // written by hand or by the FLTK IDE can carry any baud) —
+            // otherwise the picker renders with no selection.
+            let baudOptions = bauds.contains(eng.serialBaud[ch])
+                ? bauds : ([eng.serialBaud[ch]] + bauds).sorted()
             Picker("Baud", selection: Binding(get: { eng.serialBaud[ch] },
                                               set: { eng.serialBaud[ch] = $0; if ch == 0 { eng.saveConfig() } })) {
-                ForEach(bauds, id: \.self) { Text("\($0)").tag($0) }
+                ForEach(baudOptions, id: \.self) { Text("\($0)").tag($0) }
             }
             .frame(maxWidth: 130).disabled(eng.serialOpen[ch])
             if eng.serialOpen[ch] {
@@ -188,7 +193,20 @@ struct ContentView: View {
     }
 
     private var matchCount: Int {
-        findText.isEmpty ? 0 : eng.source.components(separatedBy: findText).count - 1
+        // Count with the same NSString/UTF-16 machinery findNext and
+        // replaceCurrent use, so the counter and the Replace-button
+        // enablement can't disagree with what they actually select.
+        guard !findText.isEmpty else { return 0 }
+        let ns = eng.source as NSString
+        var count = 0
+        var loc = 0
+        while loc < ns.length {
+            let r = ns.range(of: findText, options: [], range: NSRange(location: loc, length: ns.length - loc))
+            if r.location == NSNotFound { break }
+            count += 1
+            loc = r.location + max(r.length, 1)
+        }
+        return count
     }
 
     /// Select the next match (wrapping), scrolling the editor to it.

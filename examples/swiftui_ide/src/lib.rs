@@ -37,7 +37,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
 /// Embed a sibling-example source at COMPILE TIME, so a scaffolded
@@ -111,9 +111,17 @@ static CFG_BAUD: AtomicI64 = AtomicI64::new(0);
 /// one is for sending).
 static SERIAL_TX: [Mutex<Option<std::fs::File>>; NSERIAL] = [Mutex::new(None), Mutex::new(None)];
 static SERIAL_OPEN: [AtomicBool; NSERIAL] = [AtomicBool::new(false), AtomicBool::new(false)];
-/// Bytes received per channel, drained by the UI into its own console.
-static SERIAL_RX: [Mutex<String>; NSERIAL] =
-    [Mutex::new(String::new()), Mutex::new(String::new())];
+/// Per-channel connection generation. The reader thread loops only
+/// while the generation it was spawned under is still current — bumped
+/// on every open AND close, so a stale reader can't be resurrected by
+/// a quick close→open flipping SERIAL_OPEN back to true, and a
+/// second open can't leave two readers on one channel. Open/close
+/// serialize on SERIAL_TX's lock (rc_run_on_device's worker calls
+/// rc_serial_open concurrently with the UI).
+static SERIAL_GEN: [AtomicU64; NSERIAL] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Raw received bytes per channel (NOT a String: a 512-byte read can
+/// split a multi-byte UTF-8 sequence; take_utf8 keeps the tail).
+static SERIAL_RX: [Mutex<Vec<u8>>; NSERIAL] = [Mutex::new(Vec::new()), Mutex::new(Vec::new())];
 
 // ---------------------------------------------------------------------
 // Pure-logic core (no ABI concerns — unit-testable as plain Rust)
@@ -124,7 +132,7 @@ mod engine {
     use std::path::Path;
 
     pub fn console_append(s: &str) {
-        CONSOLE.lock().unwrap().push_str(s);
+        CONSOLE.lock().unwrap_or_else(|e| e.into_inner()).push_str(s);
     }
 
     /// Per-target build/run command, executed in the project root —
@@ -222,7 +230,7 @@ mod engine {
     /// upload.toml so the choice persists (best-effort; no-op if there
     /// is no project / no upload.toml).
     pub fn persist_serial_port(ch: usize, port: &str) {
-        let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
+        let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
         let path = format!("{dir}/upload.toml");
         let Ok(cfg) = std::fs::read_to_string(&path) else { return };
         let key = if ch == 0 { "port" } else { "port_b" };
@@ -256,12 +264,12 @@ mod engine {
     /// Load the project's saved serial port (upload.toml `[serial]`)
     /// into the live selection, so the picker reflects it on open.
     pub fn load_serial_from_project() {
-        let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
+        let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
         if let Ok(cfg) = std::fs::read_to_string(format!("{dir}/upload.toml")) {
             for (ch, key) in [(0usize, "port"), (1usize, "port_b")] {
                 if let Some(p) = upload_cfg_get(&cfg, "serial", key) {
                     if !p.is_empty() {
-                        *SERIAL_PORT[ch].lock().unwrap() = p;
+                        *SERIAL_PORT[ch].lock().unwrap_or_else(|e| e.into_inner()) = p;
                     }
                 }
             }
@@ -307,8 +315,44 @@ mod engine {
     }
     fn json_string(text: &str, key: &str) -> Option<String> {
         let v = json_field(text, key)?.strip_prefix('"')?;
-        // Paths carry no embedded quotes, so first quote ends the value.
-        v.find('"').map(|e| v[..e].to_string())
+        // Unescape what config_save escapes (`\"`, `\\`) — a port/path
+        // containing a quote or backslash must round-trip, not truncate
+        // at the escape.
+        let mut out = String::new();
+        let mut it = v.chars();
+        while let Some(c) = it.next() {
+            match c {
+                '\\' => out.push(it.next()?),
+                '"' => return Some(out),
+                _ => out.push(c),
+            }
+        }
+        None
+    }
+
+    /// Decode as much of `buf` as is valid UTF-8, LEAVING a trailing
+    /// incomplete multi-byte sequence in place for the next chunk to
+    /// finish (a 512-byte serial read can split a character). Truly
+    /// invalid bytes are replaced (lossy) rather than kept forever.
+    pub fn take_utf8(buf: &mut Vec<u8>) -> String {
+        match std::str::from_utf8(buf) {
+            Ok(s) => {
+                let s = s.to_string();
+                buf.clear();
+                s
+            }
+            Err(e) if e.error_len().is_none() => {
+                let valid = e.valid_up_to();
+                let s = std::str::from_utf8(&buf[..valid]).unwrap().to_string();
+                buf.drain(..valid);
+                s
+            }
+            Err(_) => {
+                let s = String::from_utf8_lossy(buf).into_owned();
+                buf.clear();
+                s
+            }
+        }
     }
 
     /// (target, serial_port, baud) from the project's .rustcc_ide.json;
@@ -567,13 +611,25 @@ mod engine {
         }
     }
 
+    /// Clears RUNNING when dropped — INCLUDING on a worker-thread
+    /// panic/unwind. Without this, a panic on the worker (e.g. a
+    /// poisoned-lock unwrap) left RUNNING stuck true forever, so every
+    /// later Build/Run/Upload returned "already running" until the app
+    /// was restarted.
+    pub struct RunGuard;
+    impl Drop for RunGuard {
+        fn drop(&mut self) {
+            RUNNING.store(false, Relaxed);
+        }
+    }
+
     pub fn spawn_streamed(dir: &str, cmdline: &str) {
         let dir = dir.to_string();
         let cmdline = cmdline.to_string();
         RUNNING.store(true, Relaxed);
         std::thread::spawn(move || {
+            let _guard = RunGuard; // clears RUNNING on exit OR panic
             run_streamed_blocking(&dir, &cmdline);
-            RUNNING.store(false, Relaxed);
         });
     }
 
@@ -666,7 +722,7 @@ mod engine {
     /// console transcript). No-op with a clear note if no session.
     pub fn dbg_send(cmd: &str) {
         use std::io::Write;
-        let mut g = DBG_STDIN.lock().unwrap();
+        let mut g = DBG_STDIN.lock().unwrap_or_else(|e| e.into_inner());
         match g.as_mut() {
             Some(stdin) => {
                 if writeln!(stdin, "{cmd}").and_then(|_| stdin.flush()).is_err() {
@@ -683,7 +739,7 @@ mod engine {
     /// `frame variable` capture so the transcript stays clean.
     pub fn dbg_send_quiet(cmd: &str) {
         use std::io::Write;
-        if let Some(stdin) = DBG_STDIN.lock().unwrap().as_mut() {
+        if let Some(stdin) = DBG_STDIN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             let _ = writeln!(stdin, "{cmd}");
             let _ = stdin.flush();
         }
@@ -738,9 +794,16 @@ mod engine {
                     return;
                 }
             };
-            let stdin = child.stdin.take().expect("lldb stdin");
-            let stdout = child.stdout.take().expect("lldb stdout");
-            let stderr = child.stderr.take().expect("lldb stderr");
+            // Graceful, not expect(): a panic here would unwind the
+            // worker (and poison any held lock) over a recoverable
+            // pipe-setup failure.
+            let (Some(stdin), Some(stdout), Some(stderr)) =
+                (child.stdin.take(), child.stdout.take(), child.stderr.take())
+            else {
+                console_append("lldb pipes unavailable — debug session not started\n");
+                let _ = child.kill();
+                return;
+            };
             // stdout reader: transcript → console, frames → DBG_CURLINE.
             std::thread::spawn(move || {
                 use std::io::BufRead;
@@ -756,7 +819,7 @@ mod engine {
                             // command echoes + the sentinel); otherwise
                             // stream to the console and track stops.
                             let captured = {
-                                let mut cap = DBG_VARCAP.lock().unwrap();
+                                let mut cap = DBG_VARCAP.lock().unwrap_or_else(|e| e.into_inner());
                                 if cap.active {
                                     let t = line.trim();
                                     // `ends_with`, NOT `contains`: the
@@ -766,7 +829,7 @@ mod engine {
                                     // real sentinel line ends in it.
                                     if t.ends_with(VARS_SENTINEL) {
                                         cap.active = false;
-                                        *DBG_VARS.lock().unwrap() = std::mem::take(&mut cap.acc);
+                                        *DBG_VARS.lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut cap.acc);
                                     } else if t.starts_with("(lldb)") || t.contains("script print(") {
                                         // command echo — drop
                                     } else {
@@ -781,11 +844,11 @@ mod engine {
                                 console_append(&line);
                                 if line.contains(" at ") {
                                     if let Some(loc) = parse_stop_location(&line) {
-                                        *DBG_CURLINE.lock().unwrap() = Some(loc);
+                                        *DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()) = Some(loc);
                                     }
                                 }
                                 if line.contains("Process") && line.contains("exited") {
-                                    *DBG_CURLINE.lock().unwrap() = None;
+                                    *DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
                                 }
                             }
                         }
@@ -793,7 +856,7 @@ mod engine {
                 }
                 console_append("[debugger exited]\n");
                 DBG_ACTIVE.store(false, Relaxed);
-                *DBG_CURLINE.lock().unwrap() = None;
+                *DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
             });
             std::thread::spawn(move || {
                 use std::io::BufRead;
@@ -807,12 +870,12 @@ mod engine {
                     }
                 }
             });
-            *DBG_STDIN.lock().unwrap() = Some(stdin);
-            *DBG_CHILD.lock().unwrap() = Some(child);
+            *DBG_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(stdin);
+            *DBG_CHILD.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
             DBG_ACTIVE.store(true, Relaxed);
             console_append(&format!("==> lldb session on {bin}\n"));
             // Replay breakpoints (basename + line), then run.
-            let bps = BREAKPOINTS.lock().unwrap().clone();
+            let bps = BREAKPOINTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if bps.is_empty() {
                 dbg_send("breakpoint set --name main");
             }
@@ -1082,7 +1145,7 @@ pub extern "Swift" fn rc_scaffold(kind: i64, dir: *const c_char) -> i64 {
     };
     match r {
         Ok(()) => {
-            *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
+            *PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
             engine::load_serial_from_project();
             load_project_config(&dir);
             engine::push_recent(&dir);
@@ -1105,7 +1168,7 @@ pub extern "Swift" fn rc_open(dir: *const c_char) -> i64 {
         return -1;
     }
     let n = engine::list_files(&dir).len() as i64;
-    *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
+    *PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
     engine::load_serial_from_project();
     load_project_config(&dir);
     engine::push_recent(&dir);
@@ -1119,7 +1182,7 @@ pub extern "Swift" fn rc_open(dir: *const c_char) -> i64 {
 fn load_project_config(dir: &str) {
     let (target, port, baud) = engine::config_load(dir);
     if !port.is_empty() {
-        *SERIAL_PORT[0].lock().unwrap() = port;
+        *SERIAL_PORT[0].lock().unwrap_or_else(|e| e.into_inner()) = port;
     }
     // Saved target wins; otherwise infer from the project's files.
     let t = target.or_else(|| engine::infer_target(dir));
@@ -1146,10 +1209,10 @@ pub extern "Swift" fn rc_config_baud() -> i64 {
 #[export_name = "rc_config_save"]
 pub extern "Swift" fn rc_config_save(target: i64, port: *const c_char, baud: i64) {
     let port = unsafe { in_str(port) };
-    if let Some(dir) = PROJECT_DIR.lock().unwrap().clone() {
+    if let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() {
         engine::config_save(&dir, target, &port, baud);
         if !port.is_empty() {
-            *SERIAL_PORT[0].lock().unwrap() = port;
+            *SERIAL_PORT[0].lock().unwrap_or_else(|e| e.into_inner()) = port;
         }
         CFG_TARGET.store(target, Relaxed);
         CFG_BAUD.store(baud, Relaxed);
@@ -1174,7 +1237,7 @@ pub extern "Swift" fn rc_recents_clear() {
 /// (caller frees). Empty string if no project is open.
 #[export_name = "rc_list_files"]
 pub extern "Swift" fn rc_list_files() -> *mut c_char {
-    let dir = PROJECT_DIR.lock().unwrap().clone();
+    let dir = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let body = match dir {
         Some(d) => engine::list_files(&d).join("\n"),
         None => String::new(),
@@ -1186,7 +1249,7 @@ pub extern "Swift" fn rc_list_files() -> *mut c_char {
 #[export_name = "rc_read_file"]
 pub extern "Swift" fn rc_read_file(rel: *const c_char) -> *mut c_char {
     let rel = unsafe { in_str(rel) };
-    let dir = PROJECT_DIR.lock().unwrap().clone();
+    let dir = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let body = match dir {
         Some(d) => std::fs::read_to_string(std::path::Path::new(&d).join(&rel))
             .unwrap_or_else(|e| format!("<cannot read {rel}: {e}>")),
@@ -1200,7 +1263,7 @@ pub extern "Swift" fn rc_read_file(rel: *const c_char) -> *mut c_char {
 pub extern "Swift" fn rc_save_file(rel: *const c_char, body: *const c_char) -> i64 {
     let rel = unsafe { in_str(rel) };
     let body = unsafe { in_str(body) };
-    let Some(d) = PROJECT_DIR.lock().unwrap().clone() else {
+    let Some(d) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return -1;
     };
     match std::fs::write(std::path::Path::new(&d).join(&rel), body) {
@@ -1224,7 +1287,7 @@ pub extern "Swift" fn rc_build(target: i64, run: i64) -> i64 {
         engine::console_append("build already running\n");
         return -1;
     }
-    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+    let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         engine::console_append("no project open\n");
         return -1;
     };
@@ -1245,7 +1308,7 @@ pub extern "Swift" fn rc_is_running() -> i64 {
 /// the SwiftUI front-end on a timer.
 #[export_name = "rc_console_drain"]
 pub extern "Swift" fn rc_console_drain() -> *mut c_char {
-    let mut g = CONSOLE.lock().unwrap();
+    let mut g = CONSOLE.lock().unwrap_or_else(|e| e.into_inner());
     let taken = std::mem::take(&mut *g);
     out_cstring(taken)
 }
@@ -1277,7 +1340,7 @@ fn upload_cmd_for(dir: &str, target: i64) -> Result<String, String> {
     }
     let tpl = engine::upload_cfg_get(&cfg, section, "cmd")
         .ok_or_else(|| format!("no [{section}] cmd in upload.toml"))?;
-    let selected = SERIAL_PORT[0].lock().unwrap().clone();
+    let selected = SERIAL_PORT[0].lock().unwrap_or_else(|e| e.into_inner()).clone();
     let port = if selected.is_empty() {
         engine::upload_cfg_get(&cfg, "serial", "port").unwrap_or_default()
     } else {
@@ -1296,7 +1359,7 @@ pub extern "Swift" fn rc_upload(target: i64) -> i64 {
         engine::console_append("a build/run is in flight — wait for it to finish\n");
         return -1;
     }
-    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+    let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         engine::console_append("no project open\n");
         return -1;
     };
@@ -1325,7 +1388,7 @@ pub extern "Swift" fn rc_run_on_device(target: i64, baud: i64) -> i64 {
         engine::console_append("a build/run is in flight — wait for it to finish\n");
         return -1;
     }
-    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+    let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         engine::console_append("no project open\n");
         return -1;
     };
@@ -1337,11 +1400,15 @@ pub extern "Swift" fn rc_run_on_device(target: i64, baud: i64) -> i64 {
     engine::console_append(&format!("==> build + run on DEVICE [{name}]\n"));
     RUNNING.store(true, Relaxed);
     std::thread::spawn(move || {
+        // Clears RUNNING on every exit path — early return, the happy
+        // end, or a panic. RUNNING therefore stays true until the
+        // serial monitor is attached (closing the window where a
+        // build could start while the port was being opened).
+        let _guard = engine::RunGuard;
         // 1. build (link-only — qemu is skipped by SKIP_QEMU=1).
         let code = engine::run_streamed_blocking(&dir, &engine::target_cmdline(target, false));
         if code != 0 {
             engine::console_append("FAILED (build)\n");
-            RUNNING.store(false, Relaxed);
             return;
         }
         // 2. flash the selected serial port.
@@ -1350,17 +1417,14 @@ pub extern "Swift" fn rc_run_on_device(target: i64, baud: i64) -> i64 {
                 engine::console_append(&format!("==> flash\n    {cmd}\n"));
                 if engine::run_streamed_blocking(&dir, &cmd) != 0 {
                     engine::console_append("UPLOAD FAILED\n");
-                    RUNNING.store(false, Relaxed);
                     return;
                 }
             }
             Err(e) => {
                 engine::console_append(&format!("{e}\n"));
-                RUNNING.store(false, Relaxed);
                 return;
             }
         }
-        RUNNING.store(false, Relaxed); // flashing done; serial runs on its own
         // 3. watch it (channel 0) unless already open.
         if !SERIAL_OPEN[0].load(Relaxed) {
             rc_serial_open(0, baud);
@@ -1388,7 +1452,7 @@ pub extern "Swift" fn rc_dbg_start(target: i64) -> i64 {
         );
         return -1;
     }
-    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+    let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         engine::console_append("no project open\n");
         return -1;
     };
@@ -1414,7 +1478,7 @@ pub extern "Swift" fn rc_dbg_send(cmd: *const c_char) {
 #[export_name = "rc_dbg_stop"]
 pub extern "Swift" fn rc_dbg_stop() {
     {
-        let mut g = DBG_STDIN.lock().unwrap();
+        let mut g = DBG_STDIN.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(stdin) = g.as_mut() {
             use std::io::Write;
             let _ = writeln!(stdin, "process kill");
@@ -1423,14 +1487,14 @@ pub extern "Swift" fn rc_dbg_stop() {
         }
         *g = None;
     }
-    if let Some(mut c) = DBG_CHILD.lock().unwrap().take() {
+    if let Some(mut c) = DBG_CHILD.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = c.kill();
         let _ = c.wait();
     }
     DBG_ACTIVE.store(false, Relaxed);
-    *DBG_CURLINE.lock().unwrap() = None;
-    DBG_VARCAP.lock().unwrap().active = false;
-    DBG_VARS.lock().unwrap().clear();
+    *DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    DBG_VARCAP.lock().unwrap_or_else(|e| e.into_inner()).active = false;
+    DBG_VARS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     engine::console_append("debug session stopped\n");
 }
 
@@ -1444,7 +1508,7 @@ pub extern "Swift" fn rc_dbg_toggle_breakpoint(rel: *const c_char, line: i64) ->
     }
     let line = line as i32;
     let added = {
-        let mut bps = BREAKPOINTS.lock().unwrap();
+        let mut bps = BREAKPOINTS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(i) = bps.iter().position(|(f, l)| *f == rel && *l == line) {
             bps.remove(i);
             false
@@ -1475,7 +1539,7 @@ pub extern "Swift" fn rc_dbg_active() -> i64 {
 /// not stopped. Caller frees.
 #[export_name = "rc_dbg_curline"]
 pub extern "Swift" fn rc_dbg_curline() -> *mut c_char {
-    let s = match &*DBG_CURLINE.lock().unwrap() {
+    let s = match &*DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()) {
         Some((f, l)) => format!("{f}:{l}"),
         None => String::new(),
     };
@@ -1491,7 +1555,7 @@ pub extern "Swift" fn rc_dbg_request_vars() {
         return;
     }
     {
-        let mut cap = DBG_VARCAP.lock().unwrap();
+        let mut cap = DBG_VARCAP.lock().unwrap_or_else(|e| e.into_inner());
         if cap.active {
             return;
         }
@@ -1505,7 +1569,7 @@ pub extern "Swift" fn rc_dbg_request_vars() {
 /// The latest captured `frame variable` output (caller frees).
 #[export_name = "rc_dbg_vars"]
 pub extern "Swift" fn rc_dbg_vars() -> *mut c_char {
-    out_cstring(DBG_VARS.lock().unwrap().clone())
+    out_cstring(DBG_VARS.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 /// All breakpoints as newline-joined `rel:line` rows. Caller frees.
@@ -1537,7 +1601,7 @@ fn serial_ch(ch: i64) -> usize {
 /// The selected serial port on channel `ch` (caller frees).
 #[export_name = "rc_serial_port"]
 pub extern "Swift" fn rc_serial_port(ch: i64) -> *mut c_char {
-    out_cstring(SERIAL_PORT[serial_ch(ch)].lock().unwrap().clone())
+    out_cstring(SERIAL_PORT[serial_ch(ch)].lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 /// Select the serial port for channel `ch`; persists into upload.toml
@@ -1546,7 +1610,7 @@ pub extern "Swift" fn rc_serial_port(ch: i64) -> *mut c_char {
 pub extern "Swift" fn rc_set_serial_port(ch: i64, port: *const c_char) {
     let ch = serial_ch(ch);
     let port = unsafe { in_str(port) };
-    *SERIAL_PORT[ch].lock().unwrap() = port.clone();
+    *SERIAL_PORT[ch].lock().unwrap_or_else(|e| e.into_inner()) = port.clone();
     engine::persist_serial_port(ch, &port);
     engine::console_append(&format!(
         "serial[{ch}] port = {}\n",
@@ -1560,10 +1624,17 @@ pub extern "Swift" fn rc_set_serial_port(ch: i64, port: *const c_char) {
 pub extern "Swift" fn rc_serial_open(ch: i64, baud: i64) -> i64 {
     use std::io::Read;
     let ch = serial_ch(ch);
+    // Hold the channel's TX lock across the whole check→configure→
+    // install sequence: open must be atomic against a concurrent
+    // open/close on the same channel (the device-run WORKER calls this
+    // while the UI can too — an interleave used to double-open the
+    // port and leave two reader threads, or strand SERIAL_OPEN=true
+    // with no reader).
+    let mut tx = SERIAL_TX[ch].lock().unwrap_or_else(|e| e.into_inner());
     if SERIAL_OPEN[ch].load(Relaxed) {
         return 0;
     }
-    let port = SERIAL_PORT[ch].lock().unwrap().clone();
+    let port = SERIAL_PORT[ch].lock().unwrap_or_else(|e| e.into_inner()).clone();
     let file = match engine::serial_open(&port, baud) {
         Ok(f) => f,
         Err(e) => {
@@ -1578,28 +1649,33 @@ pub extern "Swift" fn rc_serial_open(ch: i64, baud: i64) -> i64 {
             return -1;
         }
     };
-    *SERIAL_TX[ch].lock().unwrap() = Some(file);
+    *tx = Some(file);
+    let my_gen = SERIAL_GEN[ch].fetch_add(1, Relaxed) + 1;
     SERIAL_OPEN[ch].store(true, Relaxed);
+    drop(tx);
     engine::console_append(&format!("==> serial[{ch}] open: {port} @ {baud}\n"));
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut buf = [0u8; 512];
-        loop {
-            if !SERIAL_OPEN[ch].load(Relaxed) {
-                break;
-            }
+        // Generation check, not just the OPEN flag: a close→reopen
+        // within this thread's ~1s read timeout would flip OPEN back
+        // to true and resurrect a stale reader (two readers on one
+        // channel). A stale generation can't match.
+        while SERIAL_GEN[ch].load(Relaxed) == my_gen && SERIAL_OPEN[ch].load(Relaxed) {
             match reader.read(&mut buf) {
                 Ok(0) => {} // `min 0 time 10` read timeout — no data
                 Ok(n) => SERIAL_RX[ch]
                     .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&buf[..n]),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(_) => break,
             }
         }
+        // The reader owns a dup'd fd (try_clone); it closes on thread
+        // exit — dropping SERIAL_TX does not close it.
     });
     0
 }
@@ -1608,8 +1684,12 @@ pub extern "Swift" fn rc_serial_open(ch: i64, baud: i64) -> i64 {
 #[export_name = "rc_serial_close"]
 pub extern "Swift" fn rc_serial_close(ch: i64) {
     let ch = serial_ch(ch);
+    // Same TX-lock serialization as open (see rc_serial_open).
+    let mut tx = SERIAL_TX[ch].lock().unwrap_or_else(|e| e.into_inner());
+    SERIAL_GEN[ch].fetch_add(1, Relaxed); // invalidate the reader's generation
     SERIAL_OPEN[ch].store(false, Relaxed);
-    *SERIAL_TX[ch].lock().unwrap() = None;
+    *tx = None;
+    drop(tx);
     engine::console_append(&format!("serial[{ch}] closed\n"));
 }
 
@@ -1619,11 +1699,13 @@ pub extern "Swift" fn rc_serial_is_open(ch: i64) -> i64 {
     SERIAL_OPEN[serial_ch(ch)].load(Relaxed) as i64
 }
 
-/// Return and CLEAR channel `ch`'s pending received bytes (caller frees).
+/// Return and CLEAR channel `ch`'s pending received bytes (caller
+/// frees). A trailing incomplete UTF-8 sequence stays buffered for the
+/// next call (a 512-byte read can split a character).
 #[export_name = "rc_serial_recv"]
 pub extern "Swift" fn rc_serial_recv(ch: i64) -> *mut c_char {
-    let mut g = SERIAL_RX[serial_ch(ch)].lock().unwrap();
-    out_cstring(std::mem::take(&mut *g))
+    let mut g = SERIAL_RX[serial_ch(ch)].lock().unwrap_or_else(|e| e.into_inner());
+    out_cstring(engine::take_utf8(&mut g))
 }
 
 /// Send `text` (a CR/LF is appended) to channel `ch`'s board.
@@ -1631,7 +1713,7 @@ pub extern "Swift" fn rc_serial_recv(ch: i64) -> *mut c_char {
 pub extern "Swift" fn rc_serial_send(ch: i64, text: *const c_char) {
     use std::io::Write;
     let text = unsafe { in_str(text) };
-    if let Some(f) = SERIAL_TX[serial_ch(ch)].lock().unwrap().as_mut() {
+    if let Some(f) = SERIAL_TX[serial_ch(ch)].lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         let _ = f.write_all(text.as_bytes());
         let _ = f.write_all(b"\r\n");
         let _ = f.flush();
@@ -1793,7 +1875,7 @@ mod tests {
 
     #[test]
     fn breakpoint_toggle_and_stop_parser() {
-        BREAKPOINTS.lock().unwrap().clear();
+        BREAKPOINTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // add → remove round-trip, reported via the return code.
         assert_eq!(rc_dbg_toggle_breakpoint(cstr("src/main.rs").as_ptr(), 30), 1);
         assert_eq!(rc_dbg_toggle_breakpoint(cstr("src/main.rs").as_ptr(), 42), 1);
@@ -1804,7 +1886,7 @@ mod tests {
         let bps = unsafe { take(rc_dbg_breakpoints()) };
         assert!(!bps.lines().any(|l| l == "src/main.rs:30"));
         assert!(bps.lines().any(|l| l == "src/main.rs:42"));
-        BREAKPOINTS.lock().unwrap().clear();
+        BREAKPOINTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
         // stop-frame parsing (basename:line) from real lldb output.
         let loc = engine::parse_stop_location(
@@ -1838,7 +1920,7 @@ mod tests {
             .position(|l| l.contains("println!"))
             .map(|i| i as i64 + 1)
             .unwrap_or(1);
-        BREAKPOINTS.lock().unwrap().clear();
+        BREAKPOINTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         assert_eq!(rc_dbg_toggle_breakpoint(cstr("src/main.rs").as_ptr(), line), 1);
 
         let mut acc = String::new();
@@ -1856,7 +1938,7 @@ mod tests {
         assert_eq!(rc_dbg_start(0), 0);
         assert!(wait(&mut acc, "stop reason = breakpoint", 120), "no bp hit:\n{acc}");
         assert!(
-            DBG_CURLINE.lock().unwrap().is_some(),
+            DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
             "curline not tracked after stop"
         );
         // main's println! line has no locals — step into the call so
@@ -2041,12 +2123,35 @@ mod tests {
         // It really is the JSON file we claim.
         let text = std::fs::read_to_string(engine::config_path(ds)).unwrap();
         assert!(text.contains("\"target\": 6") && text.contains("\"serial_port\""));
+        // Escaping round-trip: a port containing " and \ must survive
+        // save → load (the reader unescapes what save escapes;
+        // regression: it used to truncate at the escaped quote).
+        engine::config_save(ds, 6, r#"/dev/cu.we"ird\port"#, 9_600);
+        let (_, p, _) = engine::config_load(ds);
+        assert_eq!(p, r#"/dev/cu.we"ird\port"#);
+        std::fs::remove_file(engine::config_path(ds)).ok();
         // Target inference from project files (the no-config fallback so
         // pre-existing projects still auto-select on open).
         assert_eq!(engine::infer_target(ds), None); // bare dir, no markers
         std::fs::write(dir.join("run_zephyr.sh"), "").unwrap();
         assert_eq!(engine::infer_target(ds), Some(6)); // Zephyr → CM3
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serial_utf8_chunk_reassembly() {
+        // A multi-byte char split across two reads must reassemble
+        // instead of becoming replacement chars at the read boundary.
+        let mut rx: Vec<u8> = Vec::new();
+        rx.extend_from_slice("ok ".as_bytes());
+        rx.extend_from_slice(&"é".as_bytes()[..1]); // half a 2-byte char
+        assert_eq!(engine::take_utf8(&mut rx), "ok ");
+        rx.extend_from_slice(&"é".as_bytes()[1..]);
+        assert_eq!(engine::take_utf8(&mut rx), "é");
+        assert!(rx.is_empty());
+        // A genuinely invalid byte is replaced, not buffered forever.
+        rx.extend_from_slice(b"a\xffb");
+        assert_eq!(engine::take_utf8(&mut rx), "a\u{fffd}b");
     }
 
     /// Scaffold a Zephyr project and run its Cortex-M3 core on qemu via

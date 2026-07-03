@@ -29,7 +29,7 @@
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/target/m26-out/bindings.rs"));
 
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
 // ------------------------------------------------------------------
@@ -95,7 +95,15 @@ static SERIAL_PORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static SERIAL_BAUD: AtomicI32 = AtomicI32::new(115_200);
 static SERIAL_TX: Mutex<Option<std::fs::File>> = Mutex::new(None);
 static SERIAL_OPEN: AtomicBool = AtomicBool::new(false);
-static SERIAL_RX: Mutex<String> = Mutex::new(String::new());
+/// Connection generation. The reader thread loops only while the
+/// generation it was spawned under is still current — bumped on every
+/// connect AND disconnect, so a stale reader can never be resurrected
+/// by a quick reconnect flipping SERIAL_OPEN back to true (it blocks in
+/// read() for up to ~1s, well past a disconnect→connect cycle).
+static SERIAL_GEN: AtomicU64 = AtomicU64::new(0);
+/// Raw received bytes (NOT a String: a 512-byte read can split a
+/// multi-byte UTF-8 sequence; take_utf8 keeps the partial tail).
+static SERIAL_RX: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 /// Common rates for the Baud radio submenu.
 const BAUDS: [i32; 7] = [9_600, 19_200, 57_600, 115_200, 230_400, 460_800, 921_600];
 
@@ -813,7 +821,13 @@ unsafe fn run_action(act: usize) {
                     (*cb).text_const_i8_str("");
                 }
             }
-            a if (SERIAL_PORT_BASE..SERIAL_PORT_BASE + 256).contains(&a) => {
+            // NOTE: these dynamic ranges must stay DISJOINT — a `match`
+            // guard that matches never falls through, so an overlapping
+            // first arm silently swallows the later ones. (Regression:
+            // this arm used PORT_BASE+256, engulfing the baud ids at
+            // +100 and the recent ids at +200 — every Baud / Open Recent
+            // click was a no-op. Guarded by a self-test now.)
+            a if (SERIAL_PORT_BASE..SERIAL_BAUD_BASE).contains(&a) => {
                 let ports = SERIAL_PORTS.lock().unwrap().clone();
                 if let Some(p) = ports.get(a - SERIAL_PORT_BASE) {
                     *SERIAL_PORT.lock().unwrap() = p.clone();
@@ -1990,10 +2004,10 @@ fn dbg_start() {
                 line.clear();
                 match r.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => DBG_PENDING.lock().unwrap().push_str(&line),
+                    Ok(_) => DBG_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push_str(&line),
                 }
             }
-            DBG_PENDING.lock().unwrap().push_str("[debugger exited]\n");
+            DBG_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push_str("[debugger exited]\n");
             DBG_ACTIVE.store(false, Relaxed);
         });
     }
@@ -2006,7 +2020,7 @@ fn dbg_start() {
                 line.clear();
                 match r.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => DBG_PENDING.lock().unwrap().push_str(&line),
+                    Ok(_) => DBG_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push_str(&line),
                 }
             }
         });
@@ -2242,7 +2256,7 @@ fn parse_stop_location(s: &str) -> Option<(String, i32)> {
 /// and follow stop locations in the editor.
 fn pump_debugger() {
     let pending = {
-        let mut g = DBG_PENDING.lock().unwrap();
+        let mut g = DBG_PENDING.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
             return;
         }
@@ -2571,32 +2585,54 @@ fn project_cfg_path(dir: &str) -> String {
     format!("{dir}/.rustcc_ide.json")
 }
 
-// Minimal flat-JSON field readers (no serde dep; our paths/slugs carry
-// no embedded quotes, so the first quote ends a string value).
+// Minimal flat-JSON field readers (no serde dep). String reads UNDO the
+// `\"`/`\\` escaping project_save_cfg applies, so a path containing a
+// quote or backslash round-trips instead of truncating at the escape.
 fn json_int(text: &str, key: &str) -> Option<i32> {
     let i = text.find(&format!("\"{key}\""))?;
     let v = text[i..].split_once(':')?.1.trim_start();
     let n: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
     n.parse().ok()
 }
+/// Consume one quoted JSON string starting at `v` (just past the
+/// opening `"`), unescaping `\X` → `X`. Returns (value, chars consumed
+/// including the closing quote), or None if unterminated.
+fn json_take_string(v: &str) -> Option<(String, usize)> {
+    let mut out = String::new();
+    let mut it = v.char_indices();
+    while let Some((i, c)) = it.next() {
+        match c {
+            '\\' => match it.next() {
+                Some((_, e)) => out.push(e),
+                None => return None,
+            },
+            '"' => return Some((out, i + 1)),
+            _ => out.push(c),
+        }
+    }
+    None
+}
 fn json_string(text: &str, key: &str) -> Option<String> {
     let i = text.find(&format!("\"{key}\""))?;
     let v = text[i..].split_once(':')?.1.trim_start().strip_prefix('"')?;
-    v.find('"').map(|e| v[..e].to_string())
+    json_take_string(v).map(|(s, _)| s)
 }
 fn json_string_array(text: &str, key: &str) -> Vec<String> {
     let Some(i) = text.find(&format!("\"{key}\"")) else { return Vec::new() };
-    let rest = &text[i..];
-    let (Some(open), Some(rel_close)) = (rest.find('['), rest.find(']')) else {
-        return Vec::new();
-    };
-    rest[open + 1..rel_close]
-        .split(',')
-        .filter_map(|s| {
-            let s = s.trim().strip_prefix('"')?;
-            s.find('"').map(|e| s[..e].to_string())
-        })
-        .collect()
+    let Some(open) = text[i..].find('[') else { return Vec::new() };
+    // Walk the bracketed region string-by-string (escape-aware — a
+    // naive split(',') / find(']') breaks on values containing , or ]).
+    let mut out = Vec::new();
+    let mut rest = &text[i + open + 1..];
+    loop {
+        let Some(rel) = rest.find(['"', ']']) else { return out };
+        if rest.as_bytes()[rel] == b']' {
+            return out;
+        }
+        let Some((s, used)) = json_take_string(&rest[rel + 1..]) else { return out };
+        out.push(s);
+        rest = &rest[rel + 1 + used..];
+    }
 }
 
 /// Persist per-project state to .rustcc_ide.json: the selected target
@@ -3457,23 +3493,30 @@ fn serial_connect() {
         }
     };
     *SERIAL_TX.lock().unwrap() = Some(file);
+    let my_gen = SERIAL_GEN.fetch_add(1, Relaxed) + 1;
     SERIAL_OPEN.store(true, Relaxed);
     console_append(&format!("[serial] connected {port} @ {baud} 8N1\n"));
     std::thread::spawn(move || {
         let mut buf = [0u8; 512];
-        while SERIAL_OPEN.load(Relaxed) {
+        // Generation check, not just the OPEN flag: a disconnect →
+        // reconnect within this thread's ~1s read timeout would flip
+        // OPEN back to true and resurrect a stale reader (two threads
+        // on one port, garbled RX). A stale generation can't match.
+        while SERIAL_GEN.load(Relaxed) == my_gen && SERIAL_OPEN.load(Relaxed) {
             match reader.read(&mut buf) {
                 Ok(0) => std::thread::sleep(std::time::Duration::from_millis(20)),
                 Ok(n) => SERIAL_RX
                     .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&buf[..n]),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(30))
                 }
                 Err(_) => break,
             }
         }
+        // The reader owns a dup'd fd (try_clone); it closes HERE on
+        // thread exit — dropping SERIAL_TX does not close it.
     });
 }
 
@@ -3482,7 +3525,10 @@ fn serial_disconnect() {
         console_append("[serial] not connected\n");
         return;
     }
-    *SERIAL_TX.lock().unwrap() = None; // closes the fd; reader thread exits
+    SERIAL_GEN.fetch_add(1, Relaxed); // invalidate the reader's generation
+    // Closes the SEND fd. The reader holds its own dup'd fd and exits
+    // via the generation check within its ≤1s read timeout.
+    *SERIAL_TX.lock().unwrap() = None;
     console_append("[serial] disconnected\n");
 }
 
@@ -3508,17 +3554,47 @@ unsafe fn serial_send_line() {
     }
 }
 
+/// Decode as much of `buf` as is valid UTF-8, LEAVING a trailing
+/// incomplete multi-byte sequence in place for the next read to finish
+/// (a 512-byte serial read can split a character). Truly invalid bytes
+/// are replaced (lossy) rather than kept forever.
+fn take_utf8(buf: &mut Vec<u8>) -> String {
+    match std::str::from_utf8(buf) {
+        Ok(s) => {
+            let s = s.to_string();
+            buf.clear();
+            s
+        }
+        Err(e) if e.error_len().is_none() => {
+            // Incomplete final sequence (≤3 bytes): emit the valid
+            // prefix, keep the tail for the next chunk.
+            let valid = e.valid_up_to();
+            let s = std::str::from_utf8(&buf[..valid]).unwrap().to_string();
+            buf.drain(..valid);
+            s
+        }
+        Err(_) => {
+            // Genuinely invalid byte mid-stream — lossy the lot.
+            let s = String::from_utf8_lossy(buf).into_owned();
+            buf.clear();
+            s
+        }
+    }
+}
+
 /// Drain received serial bytes into the console — called every pass of
 /// the main event loop, right next to pump_debugger.
 fn pump_serial() {
     let chunk = {
-        let mut g = SERIAL_RX.lock().unwrap();
+        let mut g = SERIAL_RX.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
             return;
         }
-        std::mem::take(&mut *g)
+        take_utf8(&mut g)
     };
-    console_append(&chunk);
+    if !chunk.is_empty() {
+        console_append(&chunk);
+    }
 }
 
 /// Layout: everything under the menu bar lives in ONE Fl_Tile, so
@@ -3924,6 +4000,24 @@ unsafe fn self_test() -> i32 {
                 loaded == Some((Some(2), Vec::new(), "/dev/cu.cfg-test".to_string(), Some(57_600))),
             );
             check("config file is .rustcc_ide.json", project_cfg_path(&cs).ends_with(".json"));
+            // Escaping round-trip: values containing " and \ must
+            // survive save → load (the readers unescape what save
+            // escapes; regression: they used to truncate at \").
+            *SERIAL_PORT.lock().unwrap() = r#"/dev/cu.we"ird\port"#.into();
+            *PROJECT_EXCLUDES.lock().unwrap() = vec![r#"odd"name.rs"#.to_string()];
+            project_save_cfg();
+            let loaded = project_load_cfg(&cs);
+            check(
+                "config escapes round-trip (quote + backslash)",
+                loaded
+                    == Some((
+                        Some(2),
+                        vec![r#"odd"name.rs"#.to_string()],
+                        r#"/dev/cu.we"ird\port"#.to_string(),
+                        Some(57_600),
+                    )),
+            );
+            PROJECT_EXCLUDES.lock().unwrap().clear();
             // Inference: an arm (FreeRTOS) project with no config → CM4.
             std::fs::write(cdir.join("run_arm.sh"), "").unwrap();
             std::fs::remove_file(cdir.join(".rustcc_ide.json")).ok();
@@ -3931,6 +4025,30 @@ unsafe fn self_test() -> i32 {
             *PROJECT_DIR.lock().unwrap() = None;
             *SERIAL_PORT.lock().unwrap() = String::new();
             let _ = std::fs::remove_dir_all(&cdir);
+        }
+
+        // 0b''. Menu dispatch: the dynamic id ranges must be DISJOINT
+        // and each arm reachable (regression: the port arm's window
+        // once covered +256, swallowing every Baud and Open Recent
+        // click as a silent no-op). Drive the real dispatcher.
+        check(
+            "dynamic menu id ranges are disjoint",
+            SERIAL_PORT_BASE + 100 <= SERIAL_BAUD_BASE
+                && SERIAL_BAUD_BASE + BAUDS.len() <= RECENT_BASE,
+        );
+        SERIAL_BAUD.store(115_200, Relaxed);
+        run_action(SERIAL_BAUD_BASE + 2); // Baud ▸ 57600 via the MENU id
+        check("baud menu id dispatches to the baud arm", SERIAL_BAUD.load(Relaxed) == 57_600);
+        SERIAL_BAUD.store(115_200, Relaxed);
+        // UTF-8 chunking: a split multi-byte char is held until complete.
+        {
+            let mut rx: Vec<u8> = Vec::new();
+            rx.extend_from_slice("ok ".as_bytes());
+            rx.extend_from_slice(&"é".as_bytes()[..1]); // half of a 2-byte char
+            let first = take_utf8(&mut rx);
+            rx.extend_from_slice(&"é".as_bytes()[1..]);
+            let second = take_utf8(&mut rx);
+            check("serial UTF-8 split across reads reassembles", first == "ok " && second == "é");
         }
 
         // 0c. Recent workspaces: prepend / dedup / most-recent-first,
@@ -3947,6 +4065,23 @@ unsafe fn self_test() -> i32 {
                 && r.iter().filter(|d| *d == "/tmp/rustcc_recent_a").count() == 1
                 && r.len() == 2,
         );
+        // Drive the RECENT_BASE arm through the real dispatcher (the
+        // other half of the range-overlap regression).
+        {
+            let rdir = std::env::temp_dir().join(format!("rustcc_ide_recent{}", std::process::id()));
+            std::fs::create_dir_all(&rdir).unwrap();
+            let rs = rdir.to_string_lossy().into_owned();
+            clear_recents();
+            push_recent(&rs);
+            *PROJECT_DIR.lock().unwrap() = None;
+            run_action(RECENT_BASE); // Open Recent ▸ first entry
+            check(
+                "recent menu id dispatches to the recent arm",
+                PROJECT_DIR.lock().unwrap().as_deref() == Some(rs.as_str()),
+            );
+            *PROJECT_DIR.lock().unwrap() = None;
+            let _ = std::fs::remove_dir_all(&rdir);
+        }
         clear_recents();
         check("recents: clear empties the list", load_recents().is_empty());
         if let Some(p) = recents_path() {
