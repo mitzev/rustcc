@@ -1,32 +1,34 @@
 # Vendored host flash tools
 
 The IDE flashes firmware over the **serial port** with two open-source
-Rust tools, kept here so the example is self-contained. Each is a plain
-(non-fork) crate that builds with stock cargo and installs a CLI the IDE
-invokes via `upload.toml`.
+Rust tools, referenced here as **git submodules** so the example is
+self-contained. Each is a plain (non-fork) crate that builds with stock
+cargo and installs a CLI the IDE invokes via `upload.toml`.
 
-| Tool | Source | Vendored as | License | Used for |
+| Tool | Source | Pinned to | License | Used for |
 |---|---|---|---|---|
-| **stm32-uart-boot** | https://github.com/cbiffle/stm32-uart-boot | flat copy (≈100 KB) | MPL-2.0 | STM32 UART system bootloader (AN3155) — `[stm32]` |
-| **espflash** | https://github.com/esp-rs/espflash | **git submodule**, pinned to `v4.4.0` | MIT OR Apache-2.0 | ESP32 family serial bootloader — `[esp32]` |
+| **stm32-uart-boot** | https://github.com/cbiffle/stm32-uart-boot | HEAD (`7179a87`, v1.0.0) | MPL-2.0 | STM32 UART system bootloader (AN3155) — `[stm32]` |
+| **espflash** | https://github.com/esp-rs/espflash | `v4.4.0` | MIT OR Apache-2.0 | ESP32 family serial bootloader — `[esp32]` |
 
-- **stm32-uart-boot** is a flat vendored copy (`.git` removed) — it isn't
-  published to crates.io, and it's tiny.
-- **espflash** is a **git submodule** (pinned to `v4.4.0`) rather than a
-  flat copy — its source + embedded per-chip ROM images run to several MB,
-  too heavy to keep in-tree. Initialize it before building:
+Both are **git submodules** (gitlinks only — no third-party source is
+tracked in this repo, keeping the tree's own content MIT/Apache). Clone
+with `--recurse-submodules`, or initialize before building:
 
-  ```sh
-  git submodule update --init examples/rustcc_ide/vendor/espflash
-  ```
+```sh
+git submodule update --init examples/rustcc_ide/vendor/stm32-uart-boot \
+                            examples/rustcc_ide/vendor/espflash
+```
 
-`target/` build dirs are git-ignored.
+(stm32-uart-boot has no upstream release tag, so it's pinned to the
+default-branch HEAD that carries its `version = "1.0.0"`.) `target/`
+build dirs are git-ignored.
 
 ## Install (puts the CLIs on `~/.cargo/bin`, which the IDE's build
 ## shell already has on PATH)
 
 ```sh
-git submodule update --init examples/rustcc_ide/vendor/espflash   # once
+git submodule update --init examples/rustcc_ide/vendor/stm32-uart-boot \
+                            examples/rustcc_ide/vendor/espflash   # once
 cargo install --path vendor/stm32-uart-boot --locked
 cargo install --path vendor/espflash/espflash --locked
 ```

@@ -1,3 +1,6 @@
 [submodule "examples/rustcc_ide/vendor/espflash"]
 	path = examples/rustcc_ide/vendor/espflash
 	url = https://github.com/esp-rs/espflash.git
+[submodule "examples/rustcc_ide/vendor/stm32-uart-boot"]
+	path = examples/rustcc_ide/vendor/stm32-uart-boot
+	url = https://github.com/cbiffle/stm32-uart-boot.git
