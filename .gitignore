@@ -32,3 +32,6 @@ examples/fltk_text_editor/target/
 # fork/tests/msvc_runtime_smoke build output
 fork/tests/msvc_runtime_smoke/target/
 *.o
+
+# Codex per-repo guidance kept local (the committed equivalent is CLAUDE.md)
+/AGENTS.md

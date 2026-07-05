@@ -37,7 +37,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
 /// Embed a sibling-example source at COMPILE TIME, so a scaffolded
@@ -102,13 +102,26 @@ const VARS_SENTINEL: &str = "<<RUSTCC_VARS_END>>";
 const NSERIAL: usize = 2;
 static SERIAL_PORT: [Mutex<String>; NSERIAL] =
     [Mutex::new(String::new()), Mutex::new(String::new())];
+/// Target + baud loaded from the open project's .rustcc_ide.json, for
+/// the SwiftUI side to read back (target auto-select, baud restore).
+/// -1 / 0 = "not set in config".
+static CFG_TARGET: AtomicI64 = AtomicI64::new(-1);
+static CFG_BAUD: AtomicI64 = AtomicI64::new(0);
 /// Open monitor handle (a cloned fd is read by the reader thread; this
 /// one is for sending).
 static SERIAL_TX: [Mutex<Option<std::fs::File>>; NSERIAL] = [Mutex::new(None), Mutex::new(None)];
 static SERIAL_OPEN: [AtomicBool; NSERIAL] = [AtomicBool::new(false), AtomicBool::new(false)];
-/// Bytes received per channel, drained by the UI into its own console.
-static SERIAL_RX: [Mutex<String>; NSERIAL] =
-    [Mutex::new(String::new()), Mutex::new(String::new())];
+/// Per-channel connection generation. The reader thread loops only
+/// while the generation it was spawned under is still current — bumped
+/// on every open AND close, so a stale reader can't be resurrected by
+/// a quick close→open flipping SERIAL_OPEN back to true, and a
+/// second open can't leave two readers on one channel. Open/close
+/// serialize on SERIAL_TX's lock (rc_run_on_device's worker calls
+/// rc_serial_open concurrently with the UI).
+static SERIAL_GEN: [AtomicU64; NSERIAL] = [AtomicU64::new(0), AtomicU64::new(0)];
+/// Raw received bytes per channel (NOT a String: a 512-byte read can
+/// split a multi-byte UTF-8 sequence; take_utf8 keeps the tail).
+static SERIAL_RX: [Mutex<Vec<u8>>; NSERIAL] = [Mutex::new(Vec::new()), Mutex::new(Vec::new())];
 
 // ---------------------------------------------------------------------
 // Pure-logic core (no ABI concerns — unit-testable as plain Rust)
@@ -119,7 +132,7 @@ mod engine {
     use std::path::Path;
 
     pub fn console_append(s: &str) {
-        CONSOLE.lock().unwrap().push_str(s);
+        CONSOLE.lock().unwrap_or_else(|e| e.into_inner()).push_str(s);
     }
 
     /// Per-target build/run command, executed in the project root —
@@ -217,7 +230,7 @@ mod engine {
     /// upload.toml so the choice persists (best-effort; no-op if there
     /// is no project / no upload.toml).
     pub fn persist_serial_port(ch: usize, port: &str) {
-        let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
+        let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
         let path = format!("{dir}/upload.toml");
         let Ok(cfg) = std::fs::read_to_string(&path) else { return };
         let key = if ch == 0 { "port" } else { "port_b" };
@@ -251,26 +264,130 @@ mod engine {
     /// Load the project's saved serial port (upload.toml `[serial]`)
     /// into the live selection, so the picker reflects it on open.
     pub fn load_serial_from_project() {
-        let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
+        let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
         if let Ok(cfg) = std::fs::read_to_string(format!("{dir}/upload.toml")) {
             for (ch, key) in [(0usize, "port"), (1usize, "port_b")] {
                 if let Some(p) = upload_cfg_get(&cfg, "serial", key) {
                     if !p.is_empty() {
-                        *SERIAL_PORT[ch].lock().unwrap() = p;
+                        *SERIAL_PORT[ch].lock().unwrap_or_else(|e| e.into_inner()) = p;
                     }
                 }
             }
         }
     }
 
-    /// Map a target to its upload `(section, elf-tag)`; None for host.
+    /// Map a target to its upload `(upload.toml section, ELF path
+    /// relative to the project)`; None for host. The FreeRTOS targets
+    /// link to `target/<tag>/firmware.elf`; the Zephyr targets (6/7)
+    /// produce `build/<board>/zephyr/zephyr.elf` instead — both are
+    /// real hardware, flashed with the same per-section tool.
     pub fn upload_route(target: i64) -> Option<(&'static str, &'static str)> {
         match target {
-            1 | 4 => Some(("stm32", "arm")),
-            2 => Some(("esp32", "riscv-c2")),
-            3 => Some(("esp32", "riscv")),
-            5 => Some(("pico", "pico")),
+            1 | 4 => Some(("stm32", "target/arm/firmware.elf")),
+            2 => Some(("esp32", "target/riscv-c2/firmware.elf")),
+            3 => Some(("esp32", "target/riscv/firmware.elf")),
+            5 => Some(("pico", "target/pico/firmware.elf")),
+            6 => Some(("stm32", "build/qemu_cortex_m3/zephyr/zephyr.elf")),
+            7 => Some(("esp32", "build/qemu_riscv32/zephyr/zephyr.elf")),
             _ => None,
+        }
+    }
+
+    // --- per-project JSON config (.rustcc_ide.json) ------------------
+    // Remembers the selected target + serial port/baud so a project
+    // restores them on open (target auto-selected; serial preserved
+    // across IDE restarts). Hand-rolled flat JSON — no serde dep.
+
+    pub fn config_path(dir: &str) -> std::path::PathBuf {
+        Path::new(dir).join(".rustcc_ide.json")
+    }
+
+    fn json_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+        let i = text.find(&format!("\"{key}\""))?;
+        let rest = &text[i..];
+        let colon = rest.find(':')?;
+        Some(rest[colon + 1..].trim_start())
+    }
+    fn json_int(text: &str, key: &str) -> Option<i64> {
+        let v = json_field(text, key)?;
+        let n: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+        n.parse().ok()
+    }
+    fn json_string(text: &str, key: &str) -> Option<String> {
+        let v = json_field(text, key)?.strip_prefix('"')?;
+        // Unescape what config_save escapes (`\"`, `\\`) — a port/path
+        // containing a quote or backslash must round-trip, not truncate
+        // at the escape.
+        let mut out = String::new();
+        let mut it = v.chars();
+        while let Some(c) = it.next() {
+            match c {
+                '\\' => out.push(it.next()?),
+                '"' => return Some(out),
+                _ => out.push(c),
+            }
+        }
+        None
+    }
+
+    /// Decode as much of `buf` as is valid UTF-8, LEAVING a trailing
+    /// incomplete multi-byte sequence in place for the next chunk to
+    /// finish (a 512-byte serial read can split a character). Truly
+    /// invalid bytes are replaced (lossy) rather than kept forever.
+    pub fn take_utf8(buf: &mut Vec<u8>) -> String {
+        match std::str::from_utf8(buf) {
+            Ok(s) => {
+                let s = s.to_string();
+                buf.clear();
+                s
+            }
+            Err(e) if e.error_len().is_none() => {
+                let valid = e.valid_up_to();
+                let s = std::str::from_utf8(&buf[..valid]).unwrap().to_string();
+                buf.drain(..valid);
+                s
+            }
+            Err(_) => {
+                let s = String::from_utf8_lossy(buf).into_owned();
+                buf.clear();
+                s
+            }
+        }
+    }
+
+    /// (target, serial_port, baud) from the project's .rustcc_ide.json;
+    /// each field is None/empty if absent.
+    pub fn config_load(dir: &str) -> (Option<i64>, String, Option<i64>) {
+        let text = std::fs::read_to_string(config_path(dir)).unwrap_or_default();
+        (
+            json_int(&text, "target"),
+            json_string(&text, "serial_port").unwrap_or_default(),
+            json_int(&text, "baud"),
+        )
+    }
+
+    pub fn config_save(dir: &str, target: i64, port: &str, baud: i64) {
+        let esc = port.replace('\\', "\\\\").replace('"', "\\\"");
+        let json = format!(
+            "{{\n  \"target\": {target},\n  \"serial_port\": \"{esc}\",\n  \"baud\": {baud}\n}}\n"
+        );
+        let _ = std::fs::write(config_path(dir), json);
+    }
+
+    /// Guess the target a project supports from its files — so a project
+    /// with no saved config (e.g. one scaffolded before this existed)
+    /// still auto-selects a sensible target on open. Zephyr → CM3 (6),
+    /// FreeRTOS → CM4 (1), host crate → Host (0).
+    pub fn infer_target(dir: &str) -> Option<i64> {
+        let has = |f: &str| Path::new(dir).join(f).exists();
+        if has("run_zephyr.sh") || has("prj.conf") {
+            Some(6)
+        } else if has("run_arm.sh") {
+            Some(1)
+        } else if has("build.rs") {
+            Some(0)
+        } else {
+            None
         }
     }
 
@@ -387,6 +504,7 @@ mod engine {
             ),
             ("run_zephyr.sh", fix_run(embed!("zephyr_cpp/run_zephyr.sh"))),
             ("run_zephyr_c2.sh", embed!("zephyr_cpp/run_zephyr_c2.sh").to_string()),
+            ("upload.toml", UPLOAD_TOML.to_string()), // so Device run can flash
             ("README.md", ZEPHYR_SCAFFOLD_README.to_string()),
         ];
         for (rel, content) in files {
@@ -446,40 +564,112 @@ mod engine {
     /// Spawn `cmdline` in `dir` on a background thread, streaming
     /// merged stdout+stderr line-by-line into the CONSOLE drain
     /// buffer. Adapts the FLTK IDE's `run_streamed` to a pull model
+    /// Prepended to every build/run shell so a GUI-launched app (opened
+    /// from Finder/`open`, inheriting a minimal /usr/bin:/bin PATH) still
+    /// finds the dev toolchain: rustup's cargo (~/.cargo/bin) and
+    /// Homebrew's cmake/ninja/qemu/dtc. Without it the build dies with
+    /// "cargo: command not found". Missing dirs are harmless; the run
+    /// scripts resolve west/RUSTC by absolute path themselves.
+    const DEV_PATH_PREFIX: &str =
+        "export PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\";";
+
     /// (no `Fl::check()` pump — SwiftUI polls `rc_console_drain`).
-    pub fn spawn_streamed(dir: &str, cmdline: &str) {
+    /// Run `cmdline` in `dir`, streaming merged output into the console
+    /// drain. **Blocking** — returns the exit code. Does NOT touch
+    /// RUNNING (the caller owns that flag), so it can be chained for a
+    /// build → flash → … sequence inside one background thread.
+    pub fn run_streamed_blocking(dir: &str, cmdline: &str) -> i32 {
         use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
+        let child = Command::new("bash")
+            .arg("-c")
+            .arg(format!("{DEV_PATH_PREFIX} cd '{dir}' && {cmdline} 2>&1"))
+            .stdout(Stdio::piped())
+            .stdin(Stdio::null())
+            .spawn();
+        match child {
+            Ok(mut child) => {
+                if let Some(out) = child.stdout.take() {
+                    let mut reader = BufReader::new(out);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => console_append(&line),
+                        }
+                    }
+                }
+                let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+                console_append(&format!("[exit {code}]\n"));
+                code
+            }
+            Err(e) => {
+                console_append(&format!("spawn failed: {e}\n"));
+                -1
+            }
+        }
+    }
+
+    /// Clears RUNNING when dropped — INCLUDING on a worker-thread
+    /// panic/unwind. Without this, a panic on the worker (e.g. a
+    /// poisoned-lock unwrap) left RUNNING stuck true forever, so every
+    /// later Build/Run/Upload returned "already running" until the app
+    /// was restarted.
+    pub struct RunGuard;
+    impl Drop for RunGuard {
+        fn drop(&mut self) {
+            RUNNING.store(false, Relaxed);
+        }
+    }
+
+    pub fn spawn_streamed(dir: &str, cmdline: &str) {
         let dir = dir.to_string();
         let cmdline = cmdline.to_string();
         RUNNING.store(true, Relaxed);
         std::thread::spawn(move || {
-            let child = Command::new("bash")
-                .arg("-c")
-                .arg(format!("cd '{dir}' && {cmdline} 2>&1"))
-                .stdout(Stdio::piped())
-                .stdin(Stdio::null())
-                .spawn();
-            match child {
-                Ok(mut child) => {
-                    if let Some(out) = child.stdout.take() {
-                        let mut reader = BufReader::new(out);
-                        let mut line = String::new();
-                        loop {
-                            line.clear();
-                            match reader.read_line(&mut line) {
-                                Ok(0) | Err(_) => break,
-                                Ok(_) => console_append(&line),
-                            }
-                        }
-                    }
-                    let code = child.wait().map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-                    console_append(&format!("[exit {code}]\n"));
-                }
-                Err(e) => console_append(&format!("spawn failed: {e}\n")),
-            }
-            RUNNING.store(false, Relaxed);
+            let _guard = RunGuard; // clears RUNNING on exit OR panic
+            run_streamed_blocking(&dir, &cmdline);
         });
+    }
+
+    // --- recent workspaces (shared file with the FLTK IDE) -----------
+    // ~/.rustcc_ide_recents, one project dir per line, most-recent
+    // first. Open in either IDE → shows up in both. Surfaced as the
+    // SwiftUI "Open Recent" menu / the FLTK "File ▸ Open Recent".
+
+    pub fn recents_path() -> Option<std::path::PathBuf> {
+        std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".rustcc_ide_recents"))
+    }
+
+    pub fn load_recents() -> Vec<String> {
+        let Some(p) = recents_path() else {
+            return Vec::new();
+        };
+        std::fs::read_to_string(p)
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Prepend `dir` (most-recent first), dedup, cap at 10, persist.
+    pub fn push_recent(dir: &str) {
+        let mut list = load_recents();
+        list.retain(|d| d != dir);
+        list.insert(0, dir.to_string());
+        list.truncate(10);
+        if let Some(p) = recents_path() {
+            let _ = std::fs::write(p, list.join("\n"));
+        }
+    }
+
+    pub fn clear_recents() {
+        if let Some(p) = recents_path() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// Parse an lldb stop frame line: `… at <file>:<line>:<col>`.
@@ -503,7 +693,7 @@ mod engine {
         use std::process::{Command, Stdio};
         let child = Command::new("bash")
             .arg("-c")
-            .arg(format!("cd '{dir}' && {cmdline} 2>&1"))
+            .arg(format!("{DEV_PATH_PREFIX} cd '{dir}' && {cmdline} 2>&1"))
             .stdout(Stdio::piped())
             .stdin(Stdio::null())
             .spawn();
@@ -532,7 +722,7 @@ mod engine {
     /// console transcript). No-op with a clear note if no session.
     pub fn dbg_send(cmd: &str) {
         use std::io::Write;
-        let mut g = DBG_STDIN.lock().unwrap();
+        let mut g = DBG_STDIN.lock().unwrap_or_else(|e| e.into_inner());
         match g.as_mut() {
             Some(stdin) => {
                 if writeln!(stdin, "{cmd}").and_then(|_| stdin.flush()).is_err() {
@@ -549,7 +739,7 @@ mod engine {
     /// `frame variable` capture so the transcript stays clean.
     pub fn dbg_send_quiet(cmd: &str) {
         use std::io::Write;
-        if let Some(stdin) = DBG_STDIN.lock().unwrap().as_mut() {
+        if let Some(stdin) = DBG_STDIN.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             let _ = writeln!(stdin, "{cmd}");
             let _ = stdin.flush();
         }
@@ -604,9 +794,16 @@ mod engine {
                     return;
                 }
             };
-            let stdin = child.stdin.take().expect("lldb stdin");
-            let stdout = child.stdout.take().expect("lldb stdout");
-            let stderr = child.stderr.take().expect("lldb stderr");
+            // Graceful, not expect(): a panic here would unwind the
+            // worker (and poison any held lock) over a recoverable
+            // pipe-setup failure.
+            let (Some(stdin), Some(stdout), Some(stderr)) =
+                (child.stdin.take(), child.stdout.take(), child.stderr.take())
+            else {
+                console_append("lldb pipes unavailable — debug session not started\n");
+                let _ = child.kill();
+                return;
+            };
             // stdout reader: transcript → console, frames → DBG_CURLINE.
             std::thread::spawn(move || {
                 use std::io::BufRead;
@@ -622,7 +819,7 @@ mod engine {
                             // command echoes + the sentinel); otherwise
                             // stream to the console and track stops.
                             let captured = {
-                                let mut cap = DBG_VARCAP.lock().unwrap();
+                                let mut cap = DBG_VARCAP.lock().unwrap_or_else(|e| e.into_inner());
                                 if cap.active {
                                     let t = line.trim();
                                     // `ends_with`, NOT `contains`: the
@@ -632,7 +829,7 @@ mod engine {
                                     // real sentinel line ends in it.
                                     if t.ends_with(VARS_SENTINEL) {
                                         cap.active = false;
-                                        *DBG_VARS.lock().unwrap() = std::mem::take(&mut cap.acc);
+                                        *DBG_VARS.lock().unwrap_or_else(|e| e.into_inner()) = std::mem::take(&mut cap.acc);
                                     } else if t.starts_with("(lldb)") || t.contains("script print(") {
                                         // command echo — drop
                                     } else {
@@ -647,11 +844,11 @@ mod engine {
                                 console_append(&line);
                                 if line.contains(" at ") {
                                     if let Some(loc) = parse_stop_location(&line) {
-                                        *DBG_CURLINE.lock().unwrap() = Some(loc);
+                                        *DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()) = Some(loc);
                                     }
                                 }
                                 if line.contains("Process") && line.contains("exited") {
-                                    *DBG_CURLINE.lock().unwrap() = None;
+                                    *DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
                                 }
                             }
                         }
@@ -659,7 +856,7 @@ mod engine {
                 }
                 console_append("[debugger exited]\n");
                 DBG_ACTIVE.store(false, Relaxed);
-                *DBG_CURLINE.lock().unwrap() = None;
+                *DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
             });
             std::thread::spawn(move || {
                 use std::io::BufRead;
@@ -673,12 +870,12 @@ mod engine {
                     }
                 }
             });
-            *DBG_STDIN.lock().unwrap() = Some(stdin);
-            *DBG_CHILD.lock().unwrap() = Some(child);
+            *DBG_STDIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(stdin);
+            *DBG_CHILD.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
             DBG_ACTIVE.store(true, Relaxed);
             console_append(&format!("==> lldb session on {bin}\n"));
             // Replay breakpoints (basename + line), then run.
-            let bps = BREAKPOINTS.lock().unwrap().clone();
+            let bps = BREAKPOINTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if bps.is_empty() {
                 dbg_send("breakpoint set --name main");
             }
@@ -829,10 +1026,19 @@ const UPLOAD_TOML: &str = r#"# rustcc IDE — firmware upload configuration (per
 # flashing real hardware.
 
 [stm32]
-cmd = "STM32_Programmer_CLI -c port=SWD -w {elf} -v -rst"
+# Native Rust UART-bootloader flasher (stm32-uart-boot, MPL-2.0). The
+# chip must be in BOOTLOADER mode first (BOOT0 high + reset).
+cmd = "stm32-uart-boot {port} load {elf}"
+# Fallback — STM32CubeProgrammer CLI over an SWD probe (ST-LINK):
+# cmd = "STM32_Programmer_CLI -c port=SWD -w {elf} -v -rst"
 
 [esp32]
-cmd = "esptool.py --chip auto elf2image {elf} -o {dir}/fw.bin && esptool.py --chip auto --port {port} write_flash 0x0 {dir}/fw.bin"
+# Native Rust serial flasher (espflash, Apache/MIT). Takes the ELF
+# directly. For the ESP32-C2 core add `--chip esp32c2` (+ `--no-stub`
+# if it balks).
+cmd = "espflash flash --port {port} --baud 460800 {elf}"
+# Fallback — esptool.py (Python):
+# cmd = "esptool.py --chip auto elf2image {elf} -o {dir}/fw.bin && esptool.py --chip auto --port {port} write_flash 0x0 {dir}/fw.bin"
 
 [pico]
 cmd = "picotool load {elf} -fx"
@@ -939,8 +1145,10 @@ pub extern "Swift" fn rc_scaffold(kind: i64, dir: *const c_char) -> i64 {
     };
     match r {
         Ok(()) => {
-            *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
+            *PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
             engine::load_serial_from_project();
+            load_project_config(&dir);
+            engine::push_recent(&dir);
             engine::console_append(&format!("scaffolded {label} project at {dir}\n"));
             0
         }
@@ -960,17 +1168,76 @@ pub extern "Swift" fn rc_open(dir: *const c_char) -> i64 {
         return -1;
     }
     let n = engine::list_files(&dir).len() as i64;
-    *PROJECT_DIR.lock().unwrap() = Some(dir.clone());
+    *PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.clone());
     engine::load_serial_from_project();
+    load_project_config(&dir);
+    engine::push_recent(&dir);
     engine::console_append(&format!("project = {dir} ({n} files)\n"));
     n
+}
+
+/// Load .rustcc_ide.json: apply the saved serial port to channel 0
+/// (the flash/device-run channel), and stash target + baud for the
+/// SwiftUI side to read via rc_config_target / rc_config_baud.
+fn load_project_config(dir: &str) {
+    let (target, port, baud) = engine::config_load(dir);
+    if !port.is_empty() {
+        *SERIAL_PORT[0].lock().unwrap_or_else(|e| e.into_inner()) = port;
+    }
+    // Saved target wins; otherwise infer from the project's files.
+    let t = target.or_else(|| engine::infer_target(dir));
+    CFG_TARGET.store(t.unwrap_or(-1), Relaxed);
+    CFG_BAUD.store(baud.unwrap_or(0), Relaxed);
+}
+
+/// The target saved in the open project's config, or -1 if none.
+/// SwiftUI calls this right after open to auto-select the target.
+#[export_name = "rc_config_target"]
+pub extern "Swift" fn rc_config_target() -> i64 {
+    CFG_TARGET.load(Relaxed)
+}
+
+/// The serial baud saved in the open project's config, or 0 if none.
+#[export_name = "rc_config_baud"]
+pub extern "Swift" fn rc_config_baud() -> i64 {
+    CFG_BAUD.load(Relaxed)
+}
+
+/// Persist target + serial port/baud to the open project's
+/// .rustcc_ide.json (and apply the port to channel 0). No-op if no
+/// project is open.
+#[export_name = "rc_config_save"]
+pub extern "Swift" fn rc_config_save(target: i64, port: *const c_char, baud: i64) {
+    let port = unsafe { in_str(port) };
+    if let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        engine::config_save(&dir, target, &port, baud);
+        if !port.is_empty() {
+            *SERIAL_PORT[0].lock().unwrap_or_else(|e| e.into_inner()) = port;
+        }
+        CFG_TARGET.store(target, Relaxed);
+        CFG_BAUD.store(baud, Relaxed);
+    }
+}
+
+/// Newline-joined recent-workspace dirs, most-recent first (caller
+/// frees). Empty string if none.
+#[export_name = "rc_recents_list"]
+pub extern "Swift" fn rc_recents_list() -> *mut c_char {
+    out_cstring(engine::load_recents().join("\n"))
+}
+
+/// Forget all recent workspaces.
+#[export_name = "rc_recents_clear"]
+pub extern "Swift" fn rc_recents_clear() {
+    engine::clear_recents();
+    engine::console_append("recent workspaces cleared\n");
 }
 
 /// Newline-joined, project-relative file list of the open project
 /// (caller frees). Empty string if no project is open.
 #[export_name = "rc_list_files"]
 pub extern "Swift" fn rc_list_files() -> *mut c_char {
-    let dir = PROJECT_DIR.lock().unwrap().clone();
+    let dir = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let body = match dir {
         Some(d) => engine::list_files(&d).join("\n"),
         None => String::new(),
@@ -982,7 +1249,7 @@ pub extern "Swift" fn rc_list_files() -> *mut c_char {
 #[export_name = "rc_read_file"]
 pub extern "Swift" fn rc_read_file(rel: *const c_char) -> *mut c_char {
     let rel = unsafe { in_str(rel) };
-    let dir = PROJECT_DIR.lock().unwrap().clone();
+    let dir = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let body = match dir {
         Some(d) => std::fs::read_to_string(std::path::Path::new(&d).join(&rel))
             .unwrap_or_else(|e| format!("<cannot read {rel}: {e}>")),
@@ -996,7 +1263,7 @@ pub extern "Swift" fn rc_read_file(rel: *const c_char) -> *mut c_char {
 pub extern "Swift" fn rc_save_file(rel: *const c_char, body: *const c_char) -> i64 {
     let rel = unsafe { in_str(rel) };
     let body = unsafe { in_str(body) };
-    let Some(d) = PROJECT_DIR.lock().unwrap().clone() else {
+    let Some(d) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return -1;
     };
     match std::fs::write(std::path::Path::new(&d).join(&rel), body) {
@@ -1020,7 +1287,7 @@ pub extern "Swift" fn rc_build(target: i64, run: i64) -> i64 {
         engine::console_append("build already running\n");
         return -1;
     }
-    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+    let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         engine::console_append("no project open\n");
         return -1;
     };
@@ -1041,7 +1308,7 @@ pub extern "Swift" fn rc_is_running() -> i64 {
 /// the SwiftUI front-end on a timer.
 #[export_name = "rc_console_drain"]
 pub extern "Swift" fn rc_console_drain() -> *mut c_char {
-    let mut g = CONSOLE.lock().unwrap();
+    let mut g = CONSOLE.lock().unwrap_or_else(|e| e.into_inner());
     let taken = std::mem::take(&mut *g);
     out_cstring(taken)
 }
@@ -1051,44 +1318,119 @@ pub extern "Swift" fn rc_console_drain() -> *mut c_char {
 /// streaming the tool's output. Returns 0 if started, -1 on any
 /// precondition failure (no project / host target / no config / ELF
 /// not built). Mirrors the FLTK IDE's Upload (⌘U).
+/// Build the flash command for `target` from the project's upload.toml,
+/// with the live serial selection (channel 0) winning over the stored
+/// `[serial] port`. Err = a human-readable reason. Shared by Upload and
+/// the Device run path so they flash identically.
+fn upload_cmd_for(dir: &str, target: i64) -> Result<String, String> {
+    let (section, elf_rel) =
+        engine::upload_route(target).ok_or("host target has nothing to flash — pick an RTOS target")?;
+    // Seed a default upload.toml if the project lacks one (e.g. an older
+    // Zephyr scaffold) so Device run has a flash command to fill in.
+    let cfg_path = format!("{dir}/upload.toml");
+    if !std::path::Path::new(&cfg_path).exists() {
+        let _ = std::fs::write(&cfg_path, UPLOAD_TOML);
+        engine::console_append(
+            "created a default upload.toml — set its flash command for your board/probe\n",
+        );
+    }
+    let cfg = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    if cfg.is_empty() {
+        return Err("no upload.toml in project".into());
+    }
+    let tpl = engine::upload_cfg_get(&cfg, section, "cmd")
+        .ok_or_else(|| format!("no [{section}] cmd in upload.toml"))?;
+    let selected = SERIAL_PORT[0].lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let port = if selected.is_empty() {
+        engine::upload_cfg_get(&cfg, "serial", "port").unwrap_or_default()
+    } else {
+        selected
+    };
+    let elf = format!("{dir}/{elf_rel}");
+    if !std::path::Path::new(&elf).exists() {
+        return Err(format!("{elf} not built yet — Build first (link-only is enough)"));
+    }
+    Ok(tpl.replace("{elf}", &elf).replace("{dir}", dir).replace("{port}", &port))
+}
+
 #[export_name = "rc_upload"]
 pub extern "Swift" fn rc_upload(target: i64) -> i64 {
     if RUNNING.load(Relaxed) {
         engine::console_append("a build/run is in flight — wait for it to finish\n");
         return -1;
     }
-    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+    let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         engine::console_append("no project open\n");
         return -1;
     };
-    let Some((section, tag)) = engine::upload_route(target) else {
+    match upload_cmd_for(&dir, target) {
+        Ok(cmd) => {
+            engine::console_append(&format!("==> upload\n    {cmd}\n"));
+            engine::spawn_streamed(&dir, &cmd);
+            0
+        }
+        Err(e) => {
+            engine::console_append(&format!("{e}\n"));
+            -1
+        }
+    }
+}
+
+/// Run on real hardware: build link-only → flash the selected serial
+/// port → attach the channel-0 serial monitor, all on one background
+/// thread (the console streams each step). `baud` is the monitor's
+/// rate. Returns 0 if started, -1 if busy / no project / host target.
+/// The QEMU/Device choice is the SwiftUI side's global toggle; this is
+/// what Build & Run calls in Device mode.
+#[export_name = "rc_run_on_device"]
+pub extern "Swift" fn rc_run_on_device(target: i64, baud: i64) -> i64 {
+    if RUNNING.load(Relaxed) {
+        engine::console_append("a build/run is in flight — wait for it to finish\n");
+        return -1;
+    }
+    let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        engine::console_append("no project open\n");
+        return -1;
+    };
+    if engine::upload_route(target).is_none() {
         engine::console_append("host target has nothing to flash — pick an RTOS target\n");
         return -1;
-    };
-    let cfg = std::fs::read_to_string(format!("{dir}/upload.toml")).unwrap_or_default();
-    if cfg.is_empty() {
-        engine::console_append("no upload.toml in project (scaffold an RTOS project)\n");
-        return -1;
     }
-    let Some(tpl) = engine::upload_cfg_get(&cfg, section, "cmd") else {
-        engine::console_append(&format!("no [{section}] cmd in upload.toml\n"));
-        return -1;
-    };
-    // The live selection wins over upload.toml's stored value.
-    let selected = SERIAL_PORT[0].lock().unwrap().clone();
-    let port = if selected.is_empty() {
-        engine::upload_cfg_get(&cfg, "serial", "port").unwrap_or_default()
-    } else {
-        selected
-    };
-    let elf = format!("{dir}/target/{tag}/firmware.elf");
-    if !std::path::Path::new(&elf).exists() {
-        engine::console_append(&format!("{elf} not built yet — Build first (link-only is enough)\n"));
-        return -1;
-    }
-    let cmd = tpl.replace("{elf}", &elf).replace("{dir}", &dir).replace("{port}", &port);
-    engine::console_append(&format!("==> upload via [{section}]\n    {cmd}\n"));
-    engine::spawn_streamed(&dir, &cmd);
+    let name = TARGET_NAMES.get(target as usize).copied().unwrap_or("?");
+    engine::console_append(&format!("==> build + run on DEVICE [{name}]\n"));
+    RUNNING.store(true, Relaxed);
+    std::thread::spawn(move || {
+        // Clears RUNNING on every exit path — early return, the happy
+        // end, or a panic. RUNNING therefore stays true until the
+        // serial monitor is attached (closing the window where a
+        // build could start while the port was being opened).
+        let _guard = engine::RunGuard;
+        // 1. build (link-only — qemu is skipped by SKIP_QEMU=1).
+        let code = engine::run_streamed_blocking(&dir, &engine::target_cmdline(target, false));
+        if code != 0 {
+            engine::console_append("FAILED (build)\n");
+            return;
+        }
+        // 2. flash the selected serial port.
+        match upload_cmd_for(&dir, target) {
+            Ok(cmd) => {
+                engine::console_append(&format!("==> flash\n    {cmd}\n"));
+                if engine::run_streamed_blocking(&dir, &cmd) != 0 {
+                    engine::console_append("UPLOAD FAILED\n");
+                    return;
+                }
+            }
+            Err(e) => {
+                engine::console_append(&format!("{e}\n"));
+                return;
+            }
+        }
+        // 3. watch it (channel 0) unless already open.
+        if !SERIAL_OPEN[0].load(Relaxed) {
+            rc_serial_open(0, baud);
+        }
+        engine::console_append("DEVICE RUN: flashed + serial monitor attached\n");
+    });
     0
 }
 
@@ -1110,7 +1452,7 @@ pub extern "Swift" fn rc_dbg_start(target: i64) -> i64 {
         );
         return -1;
     }
-    let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else {
+    let Some(dir) = PROJECT_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         engine::console_append("no project open\n");
         return -1;
     };
@@ -1136,7 +1478,7 @@ pub extern "Swift" fn rc_dbg_send(cmd: *const c_char) {
 #[export_name = "rc_dbg_stop"]
 pub extern "Swift" fn rc_dbg_stop() {
     {
-        let mut g = DBG_STDIN.lock().unwrap();
+        let mut g = DBG_STDIN.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(stdin) = g.as_mut() {
             use std::io::Write;
             let _ = writeln!(stdin, "process kill");
@@ -1145,14 +1487,14 @@ pub extern "Swift" fn rc_dbg_stop() {
         }
         *g = None;
     }
-    if let Some(mut c) = DBG_CHILD.lock().unwrap().take() {
+    if let Some(mut c) = DBG_CHILD.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = c.kill();
         let _ = c.wait();
     }
     DBG_ACTIVE.store(false, Relaxed);
-    *DBG_CURLINE.lock().unwrap() = None;
-    DBG_VARCAP.lock().unwrap().active = false;
-    DBG_VARS.lock().unwrap().clear();
+    *DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    DBG_VARCAP.lock().unwrap_or_else(|e| e.into_inner()).active = false;
+    DBG_VARS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     engine::console_append("debug session stopped\n");
 }
 
@@ -1166,7 +1508,7 @@ pub extern "Swift" fn rc_dbg_toggle_breakpoint(rel: *const c_char, line: i64) ->
     }
     let line = line as i32;
     let added = {
-        let mut bps = BREAKPOINTS.lock().unwrap();
+        let mut bps = BREAKPOINTS.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(i) = bps.iter().position(|(f, l)| *f == rel && *l == line) {
             bps.remove(i);
             false
@@ -1197,7 +1539,7 @@ pub extern "Swift" fn rc_dbg_active() -> i64 {
 /// not stopped. Caller frees.
 #[export_name = "rc_dbg_curline"]
 pub extern "Swift" fn rc_dbg_curline() -> *mut c_char {
-    let s = match &*DBG_CURLINE.lock().unwrap() {
+    let s = match &*DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()) {
         Some((f, l)) => format!("{f}:{l}"),
         None => String::new(),
     };
@@ -1213,7 +1555,7 @@ pub extern "Swift" fn rc_dbg_request_vars() {
         return;
     }
     {
-        let mut cap = DBG_VARCAP.lock().unwrap();
+        let mut cap = DBG_VARCAP.lock().unwrap_or_else(|e| e.into_inner());
         if cap.active {
             return;
         }
@@ -1227,7 +1569,7 @@ pub extern "Swift" fn rc_dbg_request_vars() {
 /// The latest captured `frame variable` output (caller frees).
 #[export_name = "rc_dbg_vars"]
 pub extern "Swift" fn rc_dbg_vars() -> *mut c_char {
-    out_cstring(DBG_VARS.lock().unwrap().clone())
+    out_cstring(DBG_VARS.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 /// All breakpoints as newline-joined `rel:line` rows. Caller frees.
@@ -1259,7 +1601,7 @@ fn serial_ch(ch: i64) -> usize {
 /// The selected serial port on channel `ch` (caller frees).
 #[export_name = "rc_serial_port"]
 pub extern "Swift" fn rc_serial_port(ch: i64) -> *mut c_char {
-    out_cstring(SERIAL_PORT[serial_ch(ch)].lock().unwrap().clone())
+    out_cstring(SERIAL_PORT[serial_ch(ch)].lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 /// Select the serial port for channel `ch`; persists into upload.toml
@@ -1268,7 +1610,7 @@ pub extern "Swift" fn rc_serial_port(ch: i64) -> *mut c_char {
 pub extern "Swift" fn rc_set_serial_port(ch: i64, port: *const c_char) {
     let ch = serial_ch(ch);
     let port = unsafe { in_str(port) };
-    *SERIAL_PORT[ch].lock().unwrap() = port.clone();
+    *SERIAL_PORT[ch].lock().unwrap_or_else(|e| e.into_inner()) = port.clone();
     engine::persist_serial_port(ch, &port);
     engine::console_append(&format!(
         "serial[{ch}] port = {}\n",
@@ -1282,10 +1624,17 @@ pub extern "Swift" fn rc_set_serial_port(ch: i64, port: *const c_char) {
 pub extern "Swift" fn rc_serial_open(ch: i64, baud: i64) -> i64 {
     use std::io::Read;
     let ch = serial_ch(ch);
+    // Hold the channel's TX lock across the whole check→configure→
+    // install sequence: open must be atomic against a concurrent
+    // open/close on the same channel (the device-run WORKER calls this
+    // while the UI can too — an interleave used to double-open the
+    // port and leave two reader threads, or strand SERIAL_OPEN=true
+    // with no reader).
+    let mut tx = SERIAL_TX[ch].lock().unwrap_or_else(|e| e.into_inner());
     if SERIAL_OPEN[ch].load(Relaxed) {
         return 0;
     }
-    let port = SERIAL_PORT[ch].lock().unwrap().clone();
+    let port = SERIAL_PORT[ch].lock().unwrap_or_else(|e| e.into_inner()).clone();
     let file = match engine::serial_open(&port, baud) {
         Ok(f) => f,
         Err(e) => {
@@ -1300,28 +1649,33 @@ pub extern "Swift" fn rc_serial_open(ch: i64, baud: i64) -> i64 {
             return -1;
         }
     };
-    *SERIAL_TX[ch].lock().unwrap() = Some(file);
+    *tx = Some(file);
+    let my_gen = SERIAL_GEN[ch].fetch_add(1, Relaxed) + 1;
     SERIAL_OPEN[ch].store(true, Relaxed);
+    drop(tx);
     engine::console_append(&format!("==> serial[{ch}] open: {port} @ {baud}\n"));
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut buf = [0u8; 512];
-        loop {
-            if !SERIAL_OPEN[ch].load(Relaxed) {
-                break;
-            }
+        // Generation check, not just the OPEN flag: a close→reopen
+        // within this thread's ~1s read timeout would flip OPEN back
+        // to true and resurrect a stale reader (two readers on one
+        // channel). A stale generation can't match.
+        while SERIAL_GEN[ch].load(Relaxed) == my_gen && SERIAL_OPEN[ch].load(Relaxed) {
             match reader.read(&mut buf) {
                 Ok(0) => {} // `min 0 time 10` read timeout — no data
                 Ok(n) => SERIAL_RX[ch]
                     .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buf[..n])),
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&buf[..n]),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(_) => break,
             }
         }
+        // The reader owns a dup'd fd (try_clone); it closes on thread
+        // exit — dropping SERIAL_TX does not close it.
     });
     0
 }
@@ -1330,8 +1684,12 @@ pub extern "Swift" fn rc_serial_open(ch: i64, baud: i64) -> i64 {
 #[export_name = "rc_serial_close"]
 pub extern "Swift" fn rc_serial_close(ch: i64) {
     let ch = serial_ch(ch);
+    // Same TX-lock serialization as open (see rc_serial_open).
+    let mut tx = SERIAL_TX[ch].lock().unwrap_or_else(|e| e.into_inner());
+    SERIAL_GEN[ch].fetch_add(1, Relaxed); // invalidate the reader's generation
     SERIAL_OPEN[ch].store(false, Relaxed);
-    *SERIAL_TX[ch].lock().unwrap() = None;
+    *tx = None;
+    drop(tx);
     engine::console_append(&format!("serial[{ch}] closed\n"));
 }
 
@@ -1341,11 +1699,13 @@ pub extern "Swift" fn rc_serial_is_open(ch: i64) -> i64 {
     SERIAL_OPEN[serial_ch(ch)].load(Relaxed) as i64
 }
 
-/// Return and CLEAR channel `ch`'s pending received bytes (caller frees).
+/// Return and CLEAR channel `ch`'s pending received bytes (caller
+/// frees). A trailing incomplete UTF-8 sequence stays buffered for the
+/// next call (a 512-byte read can split a character).
 #[export_name = "rc_serial_recv"]
 pub extern "Swift" fn rc_serial_recv(ch: i64) -> *mut c_char {
-    let mut g = SERIAL_RX[serial_ch(ch)].lock().unwrap();
-    out_cstring(std::mem::take(&mut *g))
+    let mut g = SERIAL_RX[serial_ch(ch)].lock().unwrap_or_else(|e| e.into_inner());
+    out_cstring(engine::take_utf8(&mut g))
 }
 
 /// Send `text` (a CR/LF is appended) to channel `ch`'s board.
@@ -1353,7 +1713,7 @@ pub extern "Swift" fn rc_serial_recv(ch: i64) -> *mut c_char {
 pub extern "Swift" fn rc_serial_send(ch: i64, text: *const c_char) {
     use std::io::Write;
     let text = unsafe { in_str(text) };
-    if let Some(f) = SERIAL_TX[serial_ch(ch)].lock().unwrap().as_mut() {
+    if let Some(f) = SERIAL_TX[serial_ch(ch)].lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         let _ = f.write_all(text.as_bytes());
         let _ = f.write_all(b"\r\n");
         let _ = f.flush();
@@ -1515,7 +1875,7 @@ mod tests {
 
     #[test]
     fn breakpoint_toggle_and_stop_parser() {
-        BREAKPOINTS.lock().unwrap().clear();
+        BREAKPOINTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // add → remove round-trip, reported via the return code.
         assert_eq!(rc_dbg_toggle_breakpoint(cstr("src/main.rs").as_ptr(), 30), 1);
         assert_eq!(rc_dbg_toggle_breakpoint(cstr("src/main.rs").as_ptr(), 42), 1);
@@ -1526,7 +1886,7 @@ mod tests {
         let bps = unsafe { take(rc_dbg_breakpoints()) };
         assert!(!bps.lines().any(|l| l == "src/main.rs:30"));
         assert!(bps.lines().any(|l| l == "src/main.rs:42"));
-        BREAKPOINTS.lock().unwrap().clear();
+        BREAKPOINTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 
         // stop-frame parsing (basename:line) from real lldb output.
         let loc = engine::parse_stop_location(
@@ -1560,7 +1920,7 @@ mod tests {
             .position(|l| l.contains("println!"))
             .map(|i| i as i64 + 1)
             .unwrap_or(1);
-        BREAKPOINTS.lock().unwrap().clear();
+        BREAKPOINTS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         assert_eq!(rc_dbg_toggle_breakpoint(cstr("src/main.rs").as_ptr(), line), 1);
 
         let mut acc = String::new();
@@ -1578,7 +1938,7 @@ mod tests {
         assert_eq!(rc_dbg_start(0), 0);
         assert!(wait(&mut acc, "stop reason = breakpoint", 120), "no bp hit:\n{acc}");
         assert!(
-            DBG_CURLINE.lock().unwrap().is_some(),
+            DBG_CURLINE.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
             "curline not tracked after stop"
         );
         // main's println! line has no locals — step into the call so
@@ -1643,10 +2003,20 @@ mod tests {
 
     #[test]
     fn upload_routing_and_config() {
-        // target → (section, elf-tag); host has nothing to flash.
-        assert_eq!(engine::upload_route(1), Some(("stm32", "arm")));
-        assert_eq!(engine::upload_route(2), Some(("esp32", "riscv-c2")));
-        assert_eq!(engine::upload_route(5), Some(("pico", "pico")));
+        // target → (section, elf relpath); host has nothing to flash.
+        assert_eq!(engine::upload_route(1), Some(("stm32", "target/arm/firmware.elf")));
+        assert_eq!(engine::upload_route(2), Some(("esp32", "target/riscv-c2/firmware.elf")));
+        assert_eq!(engine::upload_route(5), Some(("pico", "target/pico/firmware.elf")));
+        // Zephyr targets ARE flashable (the device-run regression: they
+        // used to return None, so Device mode fell back to a qemu run).
+        assert_eq!(
+            engine::upload_route(6),
+            Some(("stm32", "build/qemu_cortex_m3/zephyr/zephyr.elf"))
+        );
+        assert_eq!(
+            engine::upload_route(7),
+            Some(("esp32", "build/qemu_riscv32/zephyr/zephyr.elf"))
+        );
         assert_eq!(engine::upload_route(0), None);
         // upload.toml parsing.
         let cfg = "[stm32]\ncmd = \"prog -w {elf}\"\n[serial]\nport = \"/dev/x\"\n";
@@ -1680,6 +2050,108 @@ mod tests {
         assert!(unsafe { take(rc_serial_recv(0)) }.is_empty());
         rc_set_serial_port(0, cstr("").as_ptr()); // reset shared state
         rc_set_serial_port(1, cstr("").as_ptr());
+    }
+
+    #[test]
+    fn recents_roundtrip() {
+        // Non-destructive: save the user's real list, exercise, restore.
+        let saved = engine::load_recents();
+        engine::clear_recents();
+        engine::push_recent("/tmp/swiftui_recent_a");
+        engine::push_recent("/tmp/swiftui_recent_b");
+        engine::push_recent("/tmp/swiftui_recent_a"); // re-open → front, no dup
+        let r = engine::load_recents();
+        assert_eq!(r.first().map(String::as_str), Some("/tmp/swiftui_recent_a"));
+        assert_eq!(r.iter().filter(|d| *d == "/tmp/swiftui_recent_a").count(), 1);
+        assert_eq!(r.len(), 2);
+        // rc_recents_list mirrors it (newline-joined, most-recent first).
+        assert_eq!(
+            unsafe { take(rc_recents_list()) }.lines().next(),
+            Some("/tmp/swiftui_recent_a")
+        );
+        engine::clear_recents();
+        assert!(engine::load_recents().is_empty());
+        if let Some(p) = engine::recents_path() {
+            let _ = std::fs::write(p, saved.join("\n"));
+        }
+    }
+
+    #[test]
+    fn device_run_gating_and_blocking_runner() {
+        // The blocking runner streams and returns the real exit code.
+        let _ = unsafe { take(rc_console_drain()) };
+        assert_eq!(engine::run_streamed_blocking(".", "true"), 0);
+        assert_ne!(engine::run_streamed_blocking(".", "exit 7"), 0);
+        // Host target can never be device-run (nothing to flash) — -1
+        // regardless of which project happens to be open.
+        assert_eq!(rc_run_on_device(0, 115_200), -1);
+        // upload_cmd_for: host errors; RTOS errors until the ELF exists,
+        // then yields a command carrying the resolved port.
+        let dir = std::env::temp_dir().join(format!("swiftui_ide_devcmd{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("upload.toml"),
+            "[stm32]\ncmd = \"prog -w {elf} {port}\"\n[serial]\nport = \"/dev/x\"\n",
+        )
+        .unwrap();
+        let ds = dir.to_str().unwrap();
+        assert!(upload_cmd_for(ds, 0).is_err(), "host has no route");
+        assert!(upload_cmd_for(ds, 1).is_err(), "ELF not built yet");
+        std::fs::create_dir_all(dir.join("target/arm")).unwrap();
+        std::fs::write(dir.join("target/arm/firmware.elf"), b"").unwrap();
+        let cmd = upload_cmd_for(ds, 1).expect("cmd builds once ELF exists");
+        assert!(cmd.contains("firmware.elf") && cmd.contains("/dev/"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_config_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("swiftui_ide_cfg{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ds = dir.to_str().unwrap();
+        // No config yet → all absent.
+        let (t, p, b) = engine::config_load(ds);
+        assert!(t.is_none() && p.is_empty() && b.is_none());
+        // Save → load round-trips target, port, baud.
+        engine::config_save(ds, 6, "/dev/cu.usbserial-XYZ", 115_200);
+        let (t, p, b) = engine::config_load(ds);
+        assert_eq!(t, Some(6));
+        assert_eq!(p, "/dev/cu.usbserial-XYZ");
+        assert_eq!(b, Some(115_200));
+        // It really is the JSON file we claim.
+        let text = std::fs::read_to_string(engine::config_path(ds)).unwrap();
+        assert!(text.contains("\"target\": 6") && text.contains("\"serial_port\""));
+        // Escaping round-trip: a port containing " and \ must survive
+        // save → load (the reader unescapes what save escapes;
+        // regression: it used to truncate at the escaped quote).
+        engine::config_save(ds, 6, r#"/dev/cu.we"ird\port"#, 9_600);
+        let (_, p, _) = engine::config_load(ds);
+        assert_eq!(p, r#"/dev/cu.we"ird\port"#);
+        std::fs::remove_file(engine::config_path(ds)).ok();
+        // Target inference from project files (the no-config fallback so
+        // pre-existing projects still auto-select on open).
+        assert_eq!(engine::infer_target(ds), None); // bare dir, no markers
+        std::fs::write(dir.join("run_zephyr.sh"), "").unwrap();
+        assert_eq!(engine::infer_target(ds), Some(6)); // Zephyr → CM3
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serial_utf8_chunk_reassembly() {
+        // A multi-byte char split across two reads must reassemble
+        // instead of becoming replacement chars at the read boundary.
+        let mut rx: Vec<u8> = Vec::new();
+        rx.extend_from_slice("ok ".as_bytes());
+        rx.extend_from_slice(&"é".as_bytes()[..1]); // half a 2-byte char
+        assert_eq!(engine::take_utf8(&mut rx), "ok ");
+        rx.extend_from_slice(&"é".as_bytes()[1..]);
+        assert_eq!(engine::take_utf8(&mut rx), "é");
+        assert!(rx.is_empty());
+        // A genuinely invalid byte is replaced, not buffered forever.
+        rx.extend_from_slice(b"a\xffb");
+        assert_eq!(engine::take_utf8(&mut rx), "a\u{fffd}b");
     }
 
     /// Scaffold a Zephyr project and run its Cortex-M3 core on qemu via

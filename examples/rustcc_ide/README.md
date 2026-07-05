@@ -69,11 +69,17 @@ cargo +rustcc run --release --bin ide         # the GUI
 - **Firmware upload (⌘U)** with **configurable tools**: per-project
   `upload.toml` (Project ▸ Edit Upload Config… opens/creates it)
   maps target families to shell templates with `{elf}`/`{dir}`/
-  `{port}` placeholders — defaults: `STM32_Programmer_CLI` (STM32),
-  `esptool.py` elf2image + write_flash (ESP32), `picotool load`
-  (Pico). Output streams to the console. Caveat in the file itself:
-  the qemu-validated ELFs use the qemu machines' memory maps — point
-  the linker scripts at your board before flashing real hardware.
+  `{port}` placeholders. Defaults are now **open-source Rust serial
+  flashers, vendored under [`vendor/`](vendor/)**: **`stm32-uart-boot`**
+  (MPL-2.0, the STM32 UART system bootloader / AN3155) for STM32, and
+  **`espflash`** (Apache/MIT) for ESP32 — both flash over the **selected
+  serial port**, no proprietary tool needed (`cargo install --path` them
+  once; see [`vendor/README.md`](vendor/README.md)). The previous
+  `STM32_Programmer_CLI` / `esptool.py` commands remain as commented
+  fallbacks in `upload.toml`. Output streams to the console. Caveats:
+  STM32 must be in bootloader mode (BOOT0 + reset) for the UART path,
+  and the qemu-validated ELFs use the qemu memory maps — point the
+  linker scripts at your board before flashing real hardware.
 
 ## v5 additions
 
@@ -187,6 +193,63 @@ cargo +rustcc run --release --bin ide         # the GUI
   `RUSTC` to the fork stage1 so `cargo +nightly` works out of the box.
   Class methods stay C++-compatible (`i32`), Rust-typed logic lives in
   free functions — the fork's own diagnostic taught the template that.
+
+## v6 additions
+
+- **Serial monitor** — talk to the dev board over USB-serial without
+  leaving the IDE. Because port/baud config is *infrequent*, it lives
+  in a **Serial menu** rather than always-on widgets eating screen
+  space: **Selected Port** and **Baud** are radio submenus rebuilt live
+  from the device list (`/dev/cu.*` on macOS, `ttyUSB*`/`ttyACM*` on
+  Linux), **Rescan Ports** re-enumerates on demand (hot-plug — a board
+  plugged in after launch shows up), and **Send Line…** prompts for a
+  line to write (CRLF-terminated). The one *frequent* action,
+  **Connect** (toggled by **Disconnect**), is also the single serial
+  **toolbar button** — a green-plug glyph, the 8th `IconButton` vector
+  icon. The line is configured with `stty` (raw N81, non-blocking
+  read) and opened R/W; a reader thread pushes bytes into a buffer the
+  main loop's `pump_serial()` drains into the console (shared with the
+  build/qemu/lldb stream), right next to `pump_debugger()`, so received
+  text and `[serial→]` echoes interleave with everything else.
+  **Clear Monitor** clears the console.
+- **Run on real hardware (not just QEMU)** — **Project ▸ Run On** is a
+  global **QEMU / Device** toggle (radio pair), **defaulting to
+  Device**. In Device mode, Build & Run (⌘R) stops emulating: it builds
+  link-only (so Run compiles when there's no binary yet), **flashes the
+  selected serial port** via `upload.toml`, then **attaches the serial
+  monitor** — the full deploy-and-watch loop, all streamed to the
+  console. The flash and the monitor share **one** port: the Serial
+  menu's *Selected Port* now wins over `upload.toml`'s stored value
+  (pick it once, both Upload and Device-run use it). Host has nothing
+  to flash, so it always runs locally regardless of the toggle.
+- **Per-project `.rustcc_ide.json`** — each project remembers its
+  **target** (auto-selected on open — or **inferred** from the project's
+  files if there's no saved config yet) and its **serial port + baud**
+  (so they survive IDE restarts), alongside the removed-files list. It
+  supersedes the old `.rustcc_ide.toml` (still read as a fallback). The
+  target is stored as an index, schema-compatible with the SwiftUI IDE's
+  config.
+- **Zephyr RTOS targets** (parity with the SwiftUI IDE) — the **Target**
+  menu and **File ▸ New Project** gain the two RAK11161 **Zephyr** cores:
+  STM32WLE5 / Cortex-M3 (`qemu_cortex_m3`) and ESP8684 / ESP32-C2
+  (rv32imc, `qemu_riscv32`). The Zephyr scaffold is the same validated
+  `examples/zephyr_cpp` + `bare_metal_arm` sources (CMake/`west` app over
+  the Rust `class` crate, `../bare_metal_arm` rewritten to a local
+  `cpp/`); Build/Run drives `run_zephyr.sh` / `run_zephyr_c2.sh`, and
+  Device-mode flashes `build/<board>/zephyr/zephyr.elf`. Opening an
+  existing Zephyr project auto-selects the CM3 target via file inference.
+- **File ▸ Open Recent** — opened/scaffolded projects are remembered
+  (most-recent first, deduped, capped at 10) in `~/.rustcc_ide_recents`,
+  surfaced as a rebuilt submenu so you don't re-navigate the folder
+  chooser each time; **Clear Menu** forgets them. The file is **shared
+  with the SwiftUI IDE** — open a project in either and it shows up in
+  both. (The dynamic Run-On radios, port/baud radios, and the recents
+  list are all rebuilt by one `rebuild_menu()`, née `serial_rescan`.)
+- **Fix: File ▸ Close File (⌘W) now actually closes the file** — it and
+  *New Project ▸ STM32* had both been assigned action id `58`, and
+  since the dispatcher is a top-down `match`, ⌘W silently fired *New
+  STM32 Project* instead of closing. Close File moved to its own id; a
+  self-test now asserts the two never collide again.
 
 The FULL self-test now also drives a complete scripted debug session
 through the IDE engine: set breakpoint → run → hit → **step-in lands

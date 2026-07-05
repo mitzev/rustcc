@@ -1,0 +1,3 @@
+# Build artifacts of the vendored host flash tools (regenerable via
+# `cargo install --path .`); source is committed, builds are not.
+*/target/

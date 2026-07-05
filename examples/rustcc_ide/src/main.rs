@@ -29,7 +29,7 @@
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/target/m26-out/bindings.rs"));
 
 use std::ffi::{CStr, CString};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering::Relaxed};
 use std::sync::Mutex;
 
 // ------------------------------------------------------------------
@@ -83,6 +83,35 @@ static DBG_PENDING: Mutex<String> = Mutex::new(String::new());
 static BREAKPOINTS: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 static DBG_CURLINE: Mutex<Option<(String, i32)>> = Mutex::new(None);
 
+// --- serial monitor (talk to the dev board over USB-serial) ----------
+// Config (port + baud) is infrequent → it lives in the Serial menu
+// (a rebuilt "Selected Port"/"Baud" radio submenu), not on the
+// toolbar. The frequent action — Connect — is the one toolbar item.
+// A reader thread pushes bytes into SERIAL_RX; the main loop's
+// pump_serial() drains it into the console, exactly like the debugger.
+static MENUBAR: AtomicPtr<Fl_Menu_Bar> = AtomicPtr::new(core::ptr::null_mut());
+static SERIAL_PORT: Mutex<String> = Mutex::new(String::new());
+static SERIAL_PORTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static SERIAL_BAUD: AtomicI32 = AtomicI32::new(115_200);
+static SERIAL_TX: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static SERIAL_OPEN: AtomicBool = AtomicBool::new(false);
+/// Connection generation. The reader thread loops only while the
+/// generation it was spawned under is still current — bumped on every
+/// connect AND disconnect, so a stale reader can never be resurrected
+/// by a quick reconnect flipping SERIAL_OPEN back to true (it blocks in
+/// read() for up to ~1s, well past a disconnect→connect cycle).
+static SERIAL_GEN: AtomicU64 = AtomicU64::new(0);
+/// Raw received bytes (NOT a String: a 512-byte read can split a
+/// multi-byte UTF-8 sequence; take_utf8 keeps the partial tail).
+static SERIAL_RX: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+/// Common rates for the Baud radio submenu.
+const BAUDS: [i32; 7] = [9_600, 19_200, 57_600, 115_200, 230_400, 460_800, 921_600];
+
+/// Run mode: true = Device (flash the firmware to the selected serial
+/// port, then watch it) — the **default**; false = QEMU (emulator). A
+/// global app-wide toggle (Project ▸ Run On), not remembered per project.
+static RUN_ON_DEVICE: AtomicBool = AtomicBool::new(true);
+
 /// Variables window: latest `frame variable` capture (refreshed on
 /// every stop while the window exists) + watch-expression results.
 static WATCHIN: AtomicPtr<WatchInput> = AtomicPtr::new(core::ptr::null_mut());
@@ -118,13 +147,15 @@ static TABBAR: AtomicPtr<FileTabs> = AtomicPtr::new(core::ptr::null_mut());
 /// clicks inside Fl_Tabs::handle never delete live child widgets).
 static TAB_NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-const TARGET_NAMES: [&str; 6] = [
+const TARGET_NAMES: [&str; 8] = [
     "Host (LLVM backend)",
     "RAK11161 — STM32WLE5 core (Cortex-M4, FreeRTOS, qemu mps2)",
     "RAK11161 — ESP8684 / ESP32-C2 (rv32imc, FreeRTOS, qemu virt)",
     "ESP32-C3-class (rv32imac, FreeRTOS, qemu virt)",
     "STM32F4-class (Cortex-M4F, FreeRTOS, qemu mps2)",
     "Raspberry Pi Pico (RP2040, Cortex-M0+, FreeRTOS, qemu mps2)",
+    "Zephyr — STM32WLE5 / Cortex-M3 (qemu_cortex_m3)",
+    "Zephyr — ESP8684 / ESP32-C2 (rv32imc, qemu_riscv32)",
 ];
 
 /// repr(C) twin of `Fl_Text_Display_Style_Table_Entry` (the nested
@@ -201,6 +232,7 @@ const ACT_CONSOLE_CLEAR: usize = 44;
 const ACT_NEW_HOST: usize = 45;
 const ACT_DEBUG: usize = 46;
 const ACT_NEW_PICO: usize = 47;
+const ACT_NEW_ZEPHYR: usize = 78;
 const ACT_NEW_STM32: usize = 58;
 const ACT_NEW_ESP32: usize = 59;
 const ACT_HELP: usize = 60;
@@ -219,7 +251,20 @@ const ACT_DBG_CONTINUE: usize = 54;
 const ACT_DBG_VARS: usize = 55;
 const ACT_DBG_STOP: usize = 56;
 const ACT_DBG_BREAKPOINT: usize = 57;
-const ACT_CLOSE_FILE: usize = 58;
+const ACT_CLOSE_FILE: usize = 66; // (was 58 — collided with ACT_NEW_STM32, shadowing Close File)
+// Serial monitor.
+const ACT_SERIAL_CONNECT: usize = 70;
+const ACT_SERIAL_DISCONNECT: usize = 71;
+const ACT_SERIAL_SEND: usize = 72;
+const ACT_SERIAL_RESCAN: usize = 73;
+const ACT_SERIAL_CLEAR: usize = 74;
+// Run mode + recent workspaces.
+const ACT_RUN_QEMU: usize = 75;
+const ACT_RUN_DEVICE: usize = 76;
+const ACT_RECENT_CLEAR: usize = 77;
+const SERIAL_PORT_BASE: usize = 2000; // dynamic "Selected Port" radio items: BASE + idx
+const SERIAL_BAUD_BASE: usize = 2100; // dynamic "Baud" radio items: BASE + idx
+const RECENT_BASE: usize = 2200; // dynamic "Open Recent" items: BASE + idx
 const KEY_F: i32 = FL_F as i32; // F-keys: KEY_F + n
 
 // Super-calls (non-virtual, by mangled symbol).
@@ -711,7 +756,7 @@ unsafe fn run_action(act: usize) {
             ACT_FONT_UP => bump_textsize(ed as *mut Fl_Text_Editor, 2),
             ACT_FONT_DOWN => bump_textsize(ed as *mut Fl_Text_Editor, -2),
             // --- IDE actions ---
-            a if (ACT_TGT_BASE..ACT_TGT_BASE + 6).contains(&a) => {
+            a if (ACT_TGT_BASE..ACT_TGT_BASE + TARGET_NAMES.len()).contains(&a) => {
                 let t = (a - ACT_TGT_BASE) as i32;
                 TARGET.store(t, Relaxed);
                 project_save_cfg();
@@ -722,6 +767,7 @@ unsafe fn run_action(act: usize) {
             ACT_NEW_STM32 => new_project_flow(2),
             ACT_NEW_ESP32 => new_project_flow(3),
             ACT_NEW_PICO => new_project_flow(4),
+            ACT_NEW_ZEPHYR => new_project_flow(5),
             ACT_HELP => show_help_popup(),
             ACT_ABOUT => console_append(&format!(
                 "rustcc IDE {} — fork-Rust FLTK IDE (class keyword over an \
@@ -762,6 +808,67 @@ unsafe fn run_action(act: usize) {
                 let cb = CONSOLE_BUF.load(Relaxed);
                 if !cb.is_null() {
                     (*cb).text_const_i8_str("");
+                }
+            }
+            ACT_SERIAL_CONNECT => serial_connect(),
+            ACT_SERIAL_DISCONNECT => serial_disconnect(),
+            ACT_SERIAL_SEND => serial_send_line(),
+            ACT_SERIAL_RESCAN => rebuild_menu(),
+            ACT_SERIAL_CLEAR => {
+                // Serial output shares the console, so this clears it.
+                let cb = CONSOLE_BUF.load(Relaxed);
+                if !cb.is_null() {
+                    (*cb).text_const_i8_str("");
+                }
+            }
+            // NOTE: these dynamic ranges must stay DISJOINT — a `match`
+            // guard that matches never falls through, so an overlapping
+            // first arm silently swallows the later ones. (Regression:
+            // this arm used PORT_BASE+256, engulfing the baud ids at
+            // +100 and the recent ids at +200 — every Baud / Open Recent
+            // click was a no-op. Guarded by a self-test now.)
+            a if (SERIAL_PORT_BASE..SERIAL_BAUD_BASE).contains(&a) => {
+                let ports = SERIAL_PORTS.lock().unwrap().clone();
+                if let Some(p) = ports.get(a - SERIAL_PORT_BASE) {
+                    *SERIAL_PORT.lock().unwrap() = p.clone();
+                    console_append(&format!("[serial] port = {p}\n"));
+                    project_save_cfg(); // remember it across restarts
+                    rebuild_menu(); // re-check the radio item
+                }
+            }
+            a if (SERIAL_BAUD_BASE..SERIAL_BAUD_BASE + BAUDS.len()).contains(&a) => {
+                let b = BAUDS[a - SERIAL_BAUD_BASE];
+                SERIAL_BAUD.store(b, Relaxed);
+                console_append(&format!("[serial] baud = {b}\n"));
+                project_save_cfg();
+                rebuild_menu();
+            }
+            ACT_RUN_QEMU => {
+                RUN_ON_DEVICE.store(false, Relaxed);
+                console_append("run mode = QEMU (emulator)\n");
+                rebuild_menu();
+            }
+            ACT_RUN_DEVICE => {
+                RUN_ON_DEVICE.store(true, Relaxed);
+                console_append(
+                    "run mode = Device — Build & Run will flash the selected serial \
+                     port and attach the monitor\n",
+                );
+                rebuild_menu();
+            }
+            ACT_RECENT_CLEAR => {
+                clear_recents();
+                console_append("recent workspaces cleared\n");
+                rebuild_menu();
+            }
+            a if (RECENT_BASE..RECENT_BASE + 64).contains(&a) => {
+                let recents = load_recents();
+                if let Some(d) = recents.get(a - RECENT_BASE) {
+                    if std::path::Path::new(d).is_dir() {
+                        set_project(d);
+                    } else {
+                        console_append(&format!("recent workspace gone: {d}\n"));
+                    }
                 }
             }
             _ => {}
@@ -1049,11 +1156,21 @@ fn console_append(s: &str) {
 /// Run `script` in `dir` with merged stderr, streaming each output
 /// line into the console while pumping the FLTK event loop — the UI
 /// stays live for the whole build/qemu run. Returns the exit code.
+/// Prepended to every build/run shell so GUI-launched IDEs find the
+/// dev toolchain (rustup's cargo, Homebrew's cmake/ninja/qemu/dtc).
+/// Missing dirs are harmless. The run scripts handle west/RUSTC by
+/// absolute path themselves; this covers the PATH-resolved tools.
+const DEV_PATH_PREFIX: &str = r#"export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH";"#;
+
 fn run_streamed(dir: &str, cmdline: &str) -> i32 {
     use std::io::{BufRead, BufReader};
     let child = std::process::Command::new("bash")
         .arg("-c")
-        .arg(format!("cd '{dir}' && {cmdline} 2>&1"))
+        // A GUI app launched from Finder/`open` inherits a minimal PATH
+        // (/usr/bin:/bin:…) with NO ~/.cargo/bin or Homebrew — so cargo,
+        // cmake, ninja, qemu, dtc all vanish ("cargo: command not
+        // found"). Restore the usual dev tool dirs for the build shell.
+        .arg(format!("{DEV_PATH_PREFIX} cd '{dir}' && {cmdline} 2>&1"))
         .stdout(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
         .spawn();
@@ -1103,6 +1220,8 @@ fn target_cmdline(target: i32, run: bool) -> String {
         1 | 4 => format!("{skip}./run_arm.sh"),
         2 => format!("{skip}./run_riscv_c2.sh"),
         5 => format!("{skip}./run_pico.sh"),
+        6 => format!("{skip}./run_zephyr.sh"), // Zephyr CM3
+        7 => format!("{skip}./run_zephyr_c2.sh"), // Zephyr ESP32-C2
         _ => format!("{skip}./run_riscv.sh"),
     }
 }
@@ -1117,13 +1236,33 @@ fn build_project(run: bool) {
         None => console_append("no project open — Project ▸ New/Open first\n"),
         Some(dir) => {
             let t = TARGET.load(Relaxed);
-            console_append(&format!(
-                "==> {} [{}]\n",
-                if run { "build + run" } else { "build" },
-                TARGET_NAMES[t as usize]
-            ));
-            let code = run_streamed(&dir, &target_cmdline(t, run));
-            console_append(if code == 0 { "SUCCESS\n" } else { "FAILED\n" });
+            // Device run = build link-only → flash the selected serial
+            // port → attach the monitor. Only for targets that can be
+            // flashed (Host has no upload route → always runs locally).
+            if run && RUN_ON_DEVICE.load(Relaxed) && upload_route(t).is_some() {
+                console_append(&format!(
+                    "==> build + run on DEVICE [{}]\n",
+                    TARGET_NAMES[t as usize]
+                ));
+                let code = run_streamed(&dir, &target_cmdline(t, false)); // link-only
+                if code != 0 {
+                    console_append("FAILED (build)\n");
+                } else {
+                    upload_firmware(); // flashes the selected serial port
+                    if !SERIAL_OPEN.load(Relaxed) {
+                        serial_connect(); // watch it
+                    }
+                    console_append("DEVICE RUN: flashed + serial monitor attached\n");
+                }
+            } else {
+                console_append(&format!(
+                    "==> {} [{}]\n",
+                    if run { "build + run" } else { "build" },
+                    TARGET_NAMES[t as usize]
+                ));
+                let code = run_streamed(&dir, &target_cmdline(t, run));
+                console_append(if code == 0 { "SUCCESS\n" } else { "FAILED\n" });
+            }
         }
     }
     BUILD_RUNNING.store(false, Relaxed);
@@ -1635,12 +1774,20 @@ const UPLOAD_TOML: &str = r#"# rustcc IDE — firmware upload configuration (per
 # unchanged.
 
 [stm32]
-# STM32CubeProgrammer CLI (SWD probe, e.g. ST-LINK):
-cmd = "STM32_Programmer_CLI -c port=SWD -w {elf} -v -rst"
+# Native Rust UART-bootloader flasher (stm32-uart-boot, MPL-2.0,
+# vendored under the IDE — `cargo install --path vendor/stm32-uart-boot`).
+# The chip must be in BOOTLOADER mode first (BOOT0 high + reset).
+cmd = "stm32-uart-boot {port} load {elf}"
+# Fallback — STM32CubeProgrammer CLI over an SWD probe (ST-LINK):
+# cmd = "STM32_Programmer_CLI -c port=SWD -w {elf} -v -rst"
 
 [esp32]
-# esptool.py: convert the ELF to an esp image, then flash:
-cmd = "esptool.py --chip auto elf2image {elf} -o {dir}/fw.bin && esptool.py --chip auto --port {port} write_flash 0x0 {dir}/fw.bin"
+# Native Rust serial flasher (espflash, Apache/MIT — `cargo install
+# espflash`). Takes the ELF directly. For the ESP32-C2 core add
+# `--chip esp32c2` (and `--no-stub` if it balks).
+cmd = "espflash flash --port {port} --baud 460800 {elf}"
+# Fallback — esptool.py (Python):
+# cmd = "esptool.py --chip auto elf2image {elf} -o {dir}/fw.bin && esptool.py --chip auto --port {port} write_flash 0x0 {dir}/fw.bin"
 
 [pico]
 # picotool (BOOTSEL mode or with -f to force-reboot):
@@ -1700,13 +1847,34 @@ fn upload_cfg_get(cfg: &str, section: &str, key: &str) -> Option<String> {
 }
 
 /// (config section, firmware tag) for an uploadable target.
+/// `(upload.toml section, ELF path relative to project)`; None for
+/// host. FreeRTOS links `target/<tag>/firmware.elf`; the Zephyr cores
+/// (6/7) produce `build/<board>/zephyr/zephyr.elf` — both flash with
+/// the same per-section tool.
 fn upload_route(target: i32) -> Option<(&'static str, &'static str)> {
     match target {
-        1 | 4 => Some(("stm32", "arm")),
-        2 => Some(("esp32", "riscv-c2")),
-        3 => Some(("esp32", "riscv")),
-        5 => Some(("pico", "pico")),
+        1 | 4 => Some(("stm32", "target/arm/firmware.elf")),
+        2 => Some(("esp32", "target/riscv-c2/firmware.elf")),
+        3 => Some(("esp32", "target/riscv/firmware.elf")),
+        5 => Some(("pico", "target/pico/firmware.elf")),
+        6 => Some(("stm32", "build/qemu_cortex_m3/zephyr/zephyr.elf")),
+        7 => Some(("esp32", "build/qemu_riscv32/zephyr/zephyr.elf")),
         _ => None,
+    }
+}
+
+/// Guess a project's target from its files when there's no saved
+/// config — so pre-existing projects still auto-select on open.
+fn infer_target(dir: &str) -> Option<i32> {
+    let has = |f: &str| std::path::Path::new(dir).join(f).exists();
+    if has("run_zephyr.sh") || has("prj.conf") {
+        Some(6) // Zephyr → CM3
+    } else if has("run_arm.sh") {
+        Some(1) // FreeRTOS → CM4
+    } else if has("build.rs") {
+        Some(0) // host
+    } else {
+        None
     }
 }
 
@@ -1716,7 +1884,7 @@ fn upload_firmware() {
         return;
     };
     let t = TARGET.load(Relaxed);
-    let Some((section, tag)) = upload_route(t) else {
+    let Some((section, elf_rel)) = upload_route(t) else {
         console_append("host target has nothing to flash — pick an RTOS target\n");
         return;
     };
@@ -1728,8 +1896,15 @@ fn upload_firmware() {
         ));
         return;
     };
-    let port = upload_cfg_get(&cfg, "serial", "port").unwrap_or_default();
-    let elf = format!("{dir}/target/{tag}/firmware.elf");
+    // The Serial-menu selection wins (so flash + monitor share one
+    // port); fall back to upload.toml's [serial] port if none picked.
+    let sel = SERIAL_PORT.lock().unwrap().clone();
+    let port = if !sel.is_empty() {
+        sel
+    } else {
+        upload_cfg_get(&cfg, "serial", "port").unwrap_or_default()
+    };
+    let elf = format!("{dir}/{elf_rel}");
     if !std::path::Path::new(&elf).exists() {
         console_append(&format!(
             "{elf} not built yet — Cmd+B first (link-only is enough)\n"
@@ -1829,10 +2004,10 @@ fn dbg_start() {
                 line.clear();
                 match r.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => DBG_PENDING.lock().unwrap().push_str(&line),
+                    Ok(_) => DBG_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push_str(&line),
                 }
             }
-            DBG_PENDING.lock().unwrap().push_str("[debugger exited]\n");
+            DBG_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push_str("[debugger exited]\n");
             DBG_ACTIVE.store(false, Relaxed);
         });
     }
@@ -1845,7 +2020,7 @@ fn dbg_start() {
                 line.clear();
                 match r.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => DBG_PENDING.lock().unwrap().push_str(&line),
+                    Ok(_) => DBG_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push_str(&line),
                 }
             }
         });
@@ -2081,7 +2256,7 @@ fn parse_stop_location(s: &str) -> Option<(String, i32)> {
 /// and follow stop locations in the editor.
 fn pump_debugger() {
     let pending = {
-        let mut g = DBG_PENDING.lock().unwrap();
+        let mut g = DBG_PENDING.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_empty() {
             return;
         }
@@ -2402,29 +2577,100 @@ fn delete_current_file(ask: bool) {
 
 /// Stable per-target slugs for the project config (indices would
 /// silently re-map if the Target menu is ever reordered).
-const TARGET_SLUGS: [&str; 6] =
-    ["host", "rak11161-cm4", "rak11161-c2", "esp32-c3", "stm32f4", "pico"];
+const TARGET_SLUGS: [&str; 8] = [
+    "host", "rak11161-cm4", "rak11161-c2", "esp32-c3", "stm32f4", "pico", "zephyr-cm3", "zephyr-c2",
+];
 
 fn project_cfg_path(dir: &str) -> String {
-    format!("{dir}/.rustcc_ide.toml")
+    format!("{dir}/.rustcc_ide.json")
 }
 
-/// Persist per-project state (Target + removed files).
+// Minimal flat-JSON field readers (no serde dep). String reads UNDO the
+// `\"`/`\\` escaping project_save_cfg applies, so a path containing a
+// quote or backslash round-trips instead of truncating at the escape.
+fn json_int(text: &str, key: &str) -> Option<i32> {
+    let i = text.find(&format!("\"{key}\""))?;
+    let v = text[i..].split_once(':')?.1.trim_start();
+    let n: String = v.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+    n.parse().ok()
+}
+/// Consume one quoted JSON string starting at `v` (just past the
+/// opening `"`), unescaping `\X` → `X`. Returns (value, chars consumed
+/// including the closing quote), or None if unterminated.
+fn json_take_string(v: &str) -> Option<(String, usize)> {
+    let mut out = String::new();
+    let mut it = v.char_indices();
+    while let Some((i, c)) = it.next() {
+        match c {
+            '\\' => match it.next() {
+                Some((_, e)) => out.push(e),
+                None => return None,
+            },
+            '"' => return Some((out, i + 1)),
+            _ => out.push(c),
+        }
+    }
+    None
+}
+fn json_string(text: &str, key: &str) -> Option<String> {
+    let i = text.find(&format!("\"{key}\""))?;
+    let v = text[i..].split_once(':')?.1.trim_start().strip_prefix('"')?;
+    json_take_string(v).map(|(s, _)| s)
+}
+fn json_string_array(text: &str, key: &str) -> Vec<String> {
+    let Some(i) = text.find(&format!("\"{key}\"")) else { return Vec::new() };
+    let Some(open) = text[i..].find('[') else { return Vec::new() };
+    // Walk the bracketed region string-by-string (escape-aware — a
+    // naive split(',') / find(']') breaks on values containing , or ]).
+    let mut out = Vec::new();
+    let mut rest = &text[i + open + 1..];
+    loop {
+        let Some(rel) = rest.find(['"', ']']) else { return out };
+        if rest.as_bytes()[rel] == b']' {
+            return out;
+        }
+        let Some((s, used)) = json_take_string(&rest[rel + 1..]) else { return out };
+        out.push(s);
+        rest = &rest[rel + 1 + used..];
+    }
+}
+
+/// Persist per-project state to .rustcc_ide.json: the selected target
+/// (auto-selected on next open), the serial port + baud (so they
+/// survive IDE restarts), and any removed files.
 fn project_save_cfg() {
     let Some(dir) = PROJECT_DIR.lock().unwrap().clone() else { return };
-    let t = TARGET.load(Relaxed) as usize;
-    let slug = TARGET_SLUGS.get(t).copied().unwrap_or("host");
-    let mut body = format!(
-        "# rustcc IDE project state (written on Target / project changes)\ntarget = \"{slug}\"\n"
+    let t = TARGET.load(Relaxed);
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let port = SERIAL_PORT.lock().unwrap().clone();
+    let baud = SERIAL_BAUD.load(Relaxed);
+    let excludes: Vec<String> = PROJECT_EXCLUDES
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| format!("\"{}\"", esc(e)))
+        .collect();
+    let body = format!(
+        "{{\n  \"target\": {t},\n  \"serial_port\": \"{}\",\n  \"baud\": {baud},\n  \"excludes\": [{}]\n}}\n",
+        esc(&port),
+        excludes.join(", ")
     );
-    for e in PROJECT_EXCLUDES.lock().unwrap().iter() {
-        body.push_str(&format!("exclude = \"{e}\"\n"));
-    }
     let _ = std::fs::write(project_cfg_path(dir.as_str()), body);
 }
 
-fn project_load_cfg(dir: &str) -> Option<(Option<i32>, Vec<String>)> {
-    let txt = std::fs::read_to_string(project_cfg_path(dir)).ok()?;
+/// (target, excludes, serial_port, baud) from .rustcc_ide.json, falling
+/// back to the legacy .rustcc_ide.toml (target slug + excludes) for
+/// projects saved before the JSON switch.
+fn project_load_cfg(dir: &str) -> Option<(Option<i32>, Vec<String>, String, Option<i32>)> {
+    if let Ok(txt) = std::fs::read_to_string(project_cfg_path(dir)) {
+        return Some((
+            json_int(&txt, "target"),
+            json_string_array(&txt, "excludes"),
+            json_string(&txt, "serial_port").unwrap_or_default(),
+            json_int(&txt, "baud"),
+        ));
+    }
+    let txt = std::fs::read_to_string(format!("{dir}/.rustcc_ide.toml")).ok()?;
     let mut target = None;
     let mut excludes = Vec::new();
     for l in txt.lines() {
@@ -2436,28 +2682,39 @@ fn project_load_cfg(dir: &str) -> Option<(Option<i32>, Vec<String>)> {
             excludes.push(r.trim_start_matches(['=', ' ']).trim_matches('"').to_string());
         }
     }
-    Some((target, excludes))
+    Some((target, excludes, String::new(), None))
 }
 
 fn set_project(dir: &str) {
     *PROJECT_DIR.lock().unwrap() = Some(dir.to_string());
+    push_recent(dir); // remember it for File ▸ Open Recent
     console_append(&format!("project = {dir}\n"));
     // Restore the project's saved Target; a project without a config
     // (fresh scaffold / pre-existing folder) is seeded with the
     // current selection.
     match project_load_cfg(dir) {
-        Some((target, excludes)) => {
+        Some((target, excludes, port, baud)) => {
             *PROJECT_EXCLUDES.lock().unwrap() = excludes;
-            if let Some(t) = target {
+            // Saved target wins; else infer from the project's files.
+            if let Some(t) = target.or_else(|| infer_target(dir)).filter(|t| (*t as usize) < TARGET_NAMES.len()) {
                 TARGET.store(t, Relaxed);
                 console_append(&format!(
                     "target = {} (restored from project)\n",
                     TARGET_NAMES[t as usize]
                 ));
             }
+            if !port.is_empty() {
+                *SERIAL_PORT.lock().unwrap() = port;
+            }
+            if let Some(b) = baud {
+                SERIAL_BAUD.store(b, Relaxed);
+            }
         }
         None => {
             PROJECT_EXCLUDES.lock().unwrap().clear();
+            if let Some(t) = infer_target(dir) {
+                TARGET.store(t, Relaxed);
+            }
             project_save_cfg();
         }
     }
@@ -2469,24 +2726,30 @@ fn set_project(dir: &str) {
         open_in_editor(&main);
     }
     nav_refresh();
+    unsafe { rebuild_menu() }; // surface the new entry under Open Recent
 }
 
 /// File ▸ New Project flavors. Every RTOS flavor emits the same
 /// self-contained scaffold (it carries all cores' run scripts and
 /// linker maps); flavors differ only in the default Target selected.
-const NEW_FLAVORS: [(&str, i32); 5] = [
+const NEW_FLAVORS: [(&str, i32); 6] = [
     ("Host", 0),
     ("RAK11161", 1),             // dual-core: start on the STM32WLE5 side
     ("STM32", 4),
     ("ESP32", 3),                // C3-class default; Target menu flips to C2
     ("Raspberry Pi Pico", 5),
+    ("RAK11161 Zephyr", 6),      // dual-core Zephyr; starts on the CM3 side
 ];
 
 fn new_project_flow(flavor: usize) {
     let (name, tgt) = NEW_FLAVORS[flavor];
     let title = format!("New {name} project folder");
     if let Some(dir) = unsafe { choose_file(CHOOSER_DIR_NEW, &title) } {
-        let r = if tgt == 0 { scaffold_host(&dir) } else { scaffold_project(&dir) };
+        let r = match tgt {
+            0 => scaffold_host(&dir),
+            6 => scaffold_zephyr(&dir),
+            _ => scaffold_project(&dir),
+        };
         match r {
             Ok(()) => {
                 TARGET.store(tgt, Relaxed);
@@ -2837,6 +3100,98 @@ CORES (Cortex-M4 / rv32imc), not RAK's radios — LoRa/WiFi peripheral
 work needs hardware or vendor simulators.
 "#;
 
+/// Scaffold a **Zephyr RTOS** C++-interop project for the RAK11161 —
+/// both cores. A CMake/`west` app (qemu_cortex_m3 + qemu_riscv32
+/// rv32imc) over the *same* Rust `class` crate + C++ side as the
+/// FreeRTOS scaffold, embedded at compile time from examples/zephyr_cpp
+/// + examples/bare_metal_arm. Self-contained: the `../bare_metal_arm`
+/// references are rewritten to a local `cpp/`. (Mirror of the SwiftUI
+/// IDE engine's `scaffold_zephyr`.)
+fn scaffold_zephyr(dir: &str) -> Result<(), String> {
+    use std::fs;
+    let root = std::path::Path::new(dir);
+    let werr = |e: std::io::Error| e.to_string();
+    for sub in ["src", "cpp", "boards"] {
+        fs::create_dir_all(root.join(sub)).map_err(werr)?;
+    }
+    // CMake: the imported C++ side moves from ../bare_metal_arm to a
+    // local cpp/. run_zephyr.sh builds the Rust crate in-place and
+    // links librak_zephyr_fw.a (run_zephyr_c2.sh delegates to it, so it
+    // needs no rewrite).
+    let cmake = embed!("zephyr_cpp/CMakeLists.txt").replace("/../bare_metal_arm", "/cpp");
+    let fix_run = |s: &str| -> String {
+        s.replace("../bare_metal_arm", ".")
+            .replace("libbare_metal_arm.a", "librak_zephyr_fw.a")
+    };
+    let files: &[(&str, String)] = &[
+        ("Cargo.toml", ZEPHYR_CARGO_TOML.to_string()),
+        ("src/lib.rs", embed!("bare_metal_arm/src/lib.rs").to_string()),
+        ("src/main.c", embed!("zephyr_cpp/src/main.c").to_string()),
+        ("cpp/caller.cpp", embed!("bare_metal_arm/caller.cpp").to_string()),
+        ("cpp/sensor.cpp", embed!("bare_metal_arm/sensor.cpp").to_string()),
+        ("cpp/sensor.hpp", embed!("bare_metal_arm/sensor.hpp").to_string()),
+        ("cpp/rtti_stub.c", embed!("bare_metal_arm/rtti_stub.c").to_string()),
+        ("CMakeLists.txt", cmake),
+        ("prj.conf", embed!("zephyr_cpp/prj.conf").to_string()),
+        (
+            "boards/qemu_riscv32.overlay",
+            embed!("zephyr_cpp/boards/qemu_riscv32.overlay").to_string(),
+        ),
+        ("run_zephyr.sh", fix_run(embed!("zephyr_cpp/run_zephyr.sh"))),
+        ("run_zephyr_c2.sh", embed!("zephyr_cpp/run_zephyr_c2.sh").to_string()),
+        ("upload.toml", UPLOAD_TOML.to_string()), // so Device run can flash
+        ("README.md", ZEPHYR_SCAFFOLD_README.to_string()),
+    ];
+    for (rel, content) in files {
+        fs::write(root.join(rel), content).map_err(werr)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for s in ["run_zephyr.sh", "run_zephyr_c2.sh"] {
+            fs::set_permissions(root.join(s), fs::Permissions::from_mode(0o755)).map_err(werr)?;
+        }
+    }
+    Ok(())
+}
+
+const ZEPHYR_CARGO_TOML: &str = r#"# Rust `class` staticlib for the Zephyr RAK11161 project — built per
+# core by run_zephyr*.sh and linked into the Zephyr app via CMake.
+[package]
+name = "rak_zephyr_fw"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[workspace]
+"#;
+
+const ZEPHYR_SCAFFOLD_README: &str = r#"# RAK11161 dual-core firmware on Zephyr RTOS (rustcc)
+
+Scaffolded by the **rustcc IDE**. The same Rust `class` crate
+(`src/lib.rs`: Widget/Gauge + imported Sensor/Reader) + C++ side
+(`cpp/`) as the FreeRTOS scaffold, but built by Zephyr's CMake/`west`
+and run on qemu for both RAK11161 cores:
+
+```sh
+RUSTC=<fork-stage1>/bin/rustc ./run_zephyr.sh      # STM32WLE5 (Cortex-M3, qemu_cortex_m3)
+RUSTC=<fork-stage1>/bin/rustc ./run_zephyr_c2.sh   # ESP8684/ESP32-C2 (rv32imc, qemu_riscv32)
+SKIP_QEMU=1 ./run_zephyr.sh                         # build only
+```
+
+Prereqs: a Zephyr west workspace + SDK (ARM + RISC-V toolchains). See
+`examples/zephyr_cpp` in the rustcc repo for the one-time setup.
+Expected: `ZEPHYR CXX PROBE (...): PASS (105/4000/503/42 ...)`.
+"#;
+
 // ------------------------------------------------------------------
 // UI assembly
 // ------------------------------------------------------------------
@@ -2853,6 +3208,7 @@ const MENU_SPEC: &[(&str, i32, usize)] = &[
     ("&File/New Project/&Host Project…", 0, ACT_NEW_HOST),
     ("&File/New Project/&RAK11161 Project…", MOD_META | MOD_SHIFT | 'n' as i32, ACT_NEW_PROJECT),
     ("&File/New Project/&STM32 Project…", 0, ACT_NEW_STM32),
+    ("&File/New Project/&Zephyr (RAK11161)…", 0, ACT_NEW_ZEPHYR),
     ("&File/New Project/&ESP32 Project…", 0, ACT_NEW_ESP32),
     ("&File/New Project/Raspberry Pi &Pico Project…", 0, ACT_NEW_PICO),
     ("&File/Open &Project…", MOD_META | MOD_SHIFT | 'o' as i32, ACT_OPEN_PROJECT),
@@ -2879,6 +3235,12 @@ const MENU_SPEC: &[(&str, i32, usize)] = &[
     ("&Project/&Upload Firmware", MOD_META | 'u' as i32, ACT_UPLOAD),
     ("&Project/Edit Upload Co&nfig…", 0, ACT_UPLOAD_CFG),
     ("&Project/&Clear Console", 0, ACT_CONSOLE_CLEAR),
+    // --- Serial (port + baud are added dynamically by rebuild_menu) ---
+    ("&Serial/&Connect", 0, ACT_SERIAL_CONNECT),
+    ("&Serial/&Disconnect", 0, ACT_SERIAL_DISCONNECT),
+    ("&Serial/&Send Line…", 0, ACT_SERIAL_SEND),
+    ("&Serial/&Rescan Ports", 0, ACT_SERIAL_RESCAN),
+    ("&Serial/Clear &Monitor", 0, ACT_SERIAL_CLEAR),
     ("&Debug/&Start Session", KEY_F + 5, ACT_DBG_START),
     ("&Debug/Toggle &Breakpoint @ cursor", KEY_F + 8, ACT_DBG_BREAKPOINT),
     ("&Debug/Step &Over", KEY_F + 10, ACT_DBG_STEP_OVER),
@@ -2893,6 +3255,8 @@ const MENU_SPEC: &[(&str, i32, usize)] = &[
     ("&Target/ESP32-&C3-class (rv32imac)", 0, ACT_TGT_BASE + 3),
     ("&Target/STM32&F4-class (Cortex-M4F)", 0, ACT_TGT_BASE + 4),
     ("&Target/Raspberry Pi &Pico (RP2040)", 0, ACT_TGT_BASE + 5),
+    ("&Target/&Zephyr: RAK11161 STM32WLE5 (CM3)", 0, ACT_TGT_BASE + 6),
+    ("&Target/Z&ephyr: RAK11161 ESP32-C2 (rv32imc)", 0, ACT_TGT_BASE + 7),
     ("&Help/rustcc IDE &Help…", KEY_F + 1, ACT_HELP),
     ("&Help/&About rustcc IDE", 0, ACT_ABOUT),
 ];
@@ -2903,6 +3267,333 @@ unsafe fn add_menu_items(bar: *mut Fl_Menu_Bar) {
         for &(label, shortcut, act) in MENU_SPEC {
             m.add(cstr(label).as_ptr(), shortcut, Some(menu_cb), act as *mut (), 0);
         }
+    }
+}
+
+// === serial monitor =================================================
+
+/// Enumerate likely USB-serial devices. Re-run any time — hot-plug
+/// safe (so a board plugged in after launch shows up on Rescan).
+// --- recent workspaces ----------------------------------------------
+// A global list of recently opened project folders (most-recent first),
+// persisted to ~/.rustcc_ide_recents so it survives restarts and is
+// shared with the SwiftUI IDE. Surfaced as File ▸ Open Recent.
+
+fn recents_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".rustcc_ide_recents"))
+}
+
+fn load_recents() -> Vec<String> {
+    let Some(p) = recents_path() else { return Vec::new() };
+    std::fs::read_to_string(p)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Prepend `dir` (most-recent first), dedup, cap at 10, persist.
+fn push_recent(dir: &str) {
+    let mut list = load_recents();
+    list.retain(|d| d != dir);
+    list.insert(0, dir.to_string());
+    list.truncate(10);
+    if let Some(p) = recents_path() {
+        let _ = std::fs::write(p, list.join("\n"));
+    }
+}
+
+fn clear_recents() {
+    if let Some(p) = recents_path() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// A recent path as shown in the menu: $HOME collapsed to `~`.
+fn display_recent(d: &str) -> String {
+    if let Some(h) = std::env::var_os("HOME") {
+        if let Some(rest) = d.strip_prefix(&*h.to_string_lossy()) {
+            return format!("~{rest}");
+        }
+    }
+    d.to_string()
+}
+
+fn enumerate_serial_ports() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/dev") {
+        for ent in rd.flatten() {
+            let n = ent.file_name().to_string_lossy().into_owned();
+            // macOS: cu.* (callout — no carrier wait). Linux: ttyUSB*/ttyACM*.
+            if n.starts_with("cu.") || n.starts_with("ttyUSB") || n.starts_with("ttyACM") {
+                out.push(format!("/dev/{n}"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Re-enumerate serial ports and rebuild the whole menu so every
+/// dynamic part reflects live state: the "Selected Port" / "Baud"
+/// radio submenus, the "Run On" QEMU/Device radio, and the "Open
+/// Recent" workspace list. Cheap; called at startup and on any change
+/// (rescan, port/baud pick, run-mode toggle, project open).
+unsafe fn rebuild_menu() {
+    unsafe {
+        *SERIAL_PORTS.lock().unwrap() = enumerate_serial_ports();
+        let bar = MENUBAR.load(Relaxed);
+        if bar.is_null() {
+            return;
+        }
+        let m = (*bar).as_fl_menu__mut();
+        m.clear();
+        add_menu_items(bar); // static items (incl. the &Serial commands)
+
+        // Run mode: QEMU vs Device (flash + serial), a radio pair.
+        let dev = RUN_ON_DEVICE.load(Relaxed);
+        m.add(
+            cstr("&Project/Run &On/&QEMU (emulator)").as_ptr(),
+            0,
+            Some(menu_cb),
+            ACT_RUN_QEMU as *mut (),
+            (FL_MENU_RADIO | if dev { 0 } else { FL_MENU_VALUE }) as i32,
+        );
+        m.add(
+            cstr("&Project/Run &On/&Device (flash + serial)").as_ptr(),
+            0,
+            Some(menu_cb),
+            ACT_RUN_DEVICE as *mut (),
+            (FL_MENU_RADIO | if dev { FL_MENU_VALUE } else { 0 }) as i32,
+        );
+
+        // Open Recent: the persisted workspace list (most-recent first).
+        let recents = load_recents();
+        if recents.is_empty() {
+            m.add(
+                cstr("&File/Open &Recent/(none yet)").as_ptr(),
+                0,
+                Some(menu_cb),
+                ACT_OPEN_PROJECT as *mut (),
+                0,
+            );
+        } else {
+            for (i, d) in recents.iter().enumerate() {
+                let leaf = display_recent(d)
+                    .replace('\\', "\\\\")
+                    .replace('/', "\\/")
+                    .replace('&', "&&");
+                m.add(
+                    cstr(&format!("&File/Open &Recent/{leaf}")).as_ptr(),
+                    0,
+                    Some(menu_cb),
+                    (RECENT_BASE + i) as *mut (),
+                    0,
+                );
+            }
+            m.add(
+                cstr("&File/Open &Recent/&Clear Menu").as_ptr(),
+                0,
+                Some(menu_cb),
+                ACT_RECENT_CLEAR as *mut (),
+                0,
+            );
+        }
+
+        // Serial: live port list + baud, as radio submenus.
+        let sel = SERIAL_PORT.lock().unwrap().clone();
+        let ports = SERIAL_PORTS.lock().unwrap().clone();
+        if ports.is_empty() {
+            m.add(
+                cstr("&Serial/Selected &Port/(none — plug in + Rescan)").as_ptr(),
+                0,
+                Some(menu_cb),
+                ACT_SERIAL_RESCAN as *mut (),
+                0,
+            );
+        }
+        for (i, p) in ports.iter().enumerate() {
+            // Strip /dev/ for a tidy leaf; escape FLTK menu-path metachars.
+            let leaf = p
+                .trim_start_matches("/dev/")
+                .replace('\\', "\\\\")
+                .replace('/', "\\/")
+                .replace('&', "&&");
+            let flags = FL_MENU_RADIO | if *p == sel { FL_MENU_VALUE } else { 0 };
+            m.add(
+                cstr(&format!("&Serial/Selected &Port/{leaf}")).as_ptr(),
+                0,
+                Some(menu_cb),
+                (SERIAL_PORT_BASE + i) as *mut (),
+                flags as i32,
+            );
+        }
+        let baud = SERIAL_BAUD.load(Relaxed);
+        for (i, b) in BAUDS.iter().enumerate() {
+            let flags = FL_MENU_RADIO | if *b == baud { FL_MENU_VALUE } else { 0 };
+            m.add(
+                cstr(&format!("&Serial/&Baud/{b}")).as_ptr(),
+                0,
+                Some(menu_cb),
+                (SERIAL_BAUD_BASE + i) as *mut (),
+                flags as i32,
+            );
+        }
+        (*(bar as *mut Fl_Widget)).redraw();
+    }
+}
+
+/// Configure the tty (raw N81, non-blocking read) and open it R/W.
+fn serial_open_file(port: &str, baud: i32) -> Result<std::fs::File, String> {
+    if port.is_empty() {
+        return Err("no port selected — pick one under Serial ▸ Selected Port".into());
+    }
+    let flag = if cfg!(target_os = "macos") { "-f" } else { "-F" };
+    let st = std::process::Command::new("stty")
+        .arg(flag)
+        .arg(port)
+        .args([&baud.to_string(), "raw", "-echo", "min", "0", "time", "10"])
+        .status();
+    match st {
+        Ok(s) if s.success() => {}
+        Ok(s) => return Err(format!("stty exited {s}")),
+        Err(e) => return Err(format!("stty: {e}")),
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(port)
+        .map_err(|e| format!("open {port}: {e}"))
+}
+
+/// Open the selected port and spawn a reader thread that pushes bytes
+/// into SERIAL_RX (drained by pump_serial on the UI thread).
+fn serial_connect() {
+    use std::io::Read;
+    if SERIAL_OPEN.load(Relaxed) {
+        console_append("[serial] already connected\n");
+        return;
+    }
+    let port = SERIAL_PORT.lock().unwrap().clone();
+    let baud = SERIAL_BAUD.load(Relaxed);
+    let file = match serial_open_file(&port, baud) {
+        Ok(f) => f,
+        Err(e) => {
+            console_append(&format!("[serial] connect FAILED: {e}\n"));
+            return;
+        }
+    };
+    let mut reader = match file.try_clone() {
+        Ok(r) => r,
+        Err(e) => {
+            console_append(&format!("[serial] clone FAILED: {e}\n"));
+            return;
+        }
+    };
+    *SERIAL_TX.lock().unwrap() = Some(file);
+    let my_gen = SERIAL_GEN.fetch_add(1, Relaxed) + 1;
+    SERIAL_OPEN.store(true, Relaxed);
+    console_append(&format!("[serial] connected {port} @ {baud} 8N1\n"));
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        // Generation check, not just the OPEN flag: a disconnect →
+        // reconnect within this thread's ~1s read timeout would flip
+        // OPEN back to true and resurrect a stale reader (two threads
+        // on one port, garbled RX). A stale generation can't match.
+        while SERIAL_GEN.load(Relaxed) == my_gen && SERIAL_OPEN.load(Relaxed) {
+            match reader.read(&mut buf) {
+                Ok(0) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                Ok(n) => SERIAL_RX
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&buf[..n]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(30))
+                }
+                Err(_) => break,
+            }
+        }
+        // The reader owns a dup'd fd (try_clone); it closes HERE on
+        // thread exit — dropping SERIAL_TX does not close it.
+    });
+}
+
+fn serial_disconnect() {
+    if !SERIAL_OPEN.swap(false, Relaxed) {
+        console_append("[serial] not connected\n");
+        return;
+    }
+    SERIAL_GEN.fetch_add(1, Relaxed); // invalidate the reader's generation
+    // Closes the SEND fd. The reader holds its own dup'd fd and exits
+    // via the generation check within its ≤1s read timeout.
+    *SERIAL_TX.lock().unwrap() = None;
+    console_append("[serial] disconnected\n");
+}
+
+/// Prompt for a line and write it to the port (CRLF-terminated).
+unsafe fn serial_send_line() {
+    unsafe {
+        if !SERIAL_OPEN.load(Relaxed) {
+            console_append("[serial] not connected — Serial ▸ Connect first\n");
+            return;
+        }
+        let p = fl_input(cstr("Send to board:").as_ptr(), cstr("").as_ptr());
+        if p.is_null() {
+            return; // cancelled
+        }
+        let text = CStr::from_ptr(p).to_string_lossy().into_owned();
+        use std::io::Write;
+        if let Some(f) = SERIAL_TX.lock().unwrap().as_mut() {
+            let _ = f.write_all(text.as_bytes());
+            let _ = f.write_all(b"\r\n");
+            let _ = f.flush();
+            console_append(&format!("[serial→] {text}\n"));
+        }
+    }
+}
+
+/// Decode as much of `buf` as is valid UTF-8, LEAVING a trailing
+/// incomplete multi-byte sequence in place for the next read to finish
+/// (a 512-byte serial read can split a character). Truly invalid bytes
+/// are replaced (lossy) rather than kept forever.
+fn take_utf8(buf: &mut Vec<u8>) -> String {
+    match std::str::from_utf8(buf) {
+        Ok(s) => {
+            let s = s.to_string();
+            buf.clear();
+            s
+        }
+        Err(e) if e.error_len().is_none() => {
+            // Incomplete final sequence (≤3 bytes): emit the valid
+            // prefix, keep the tail for the next chunk.
+            let valid = e.valid_up_to();
+            let s = std::str::from_utf8(&buf[..valid]).unwrap().to_string();
+            buf.drain(..valid);
+            s
+        }
+        Err(_) => {
+            // Genuinely invalid byte mid-stream — lossy the lot.
+            let s = String::from_utf8_lossy(buf).into_owned();
+            buf.clear();
+            s
+        }
+    }
+}
+
+/// Drain received serial bytes into the console — called every pass of
+/// the main event loop, right next to pump_debugger.
+fn pump_serial() {
+    let chunk = {
+        let mut g = SERIAL_RX.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_empty() {
+            return;
+        }
+        take_utf8(&mut g)
+    };
+    if !chunk.is_empty() {
+        console_append(&chunk);
     }
 }
 
@@ -2927,6 +3618,7 @@ const ICON_DEBUG: i32 = 3;
 const ICON_STEP_IN: i32 = 4;
 const ICON_STEP_OVER: i32 = 5;
 const ICON_STOP: i32 = 6;
+const ICON_SERIAL: i32 = 7;
 
 /// The toolbar: icon-only buttons with tooltips; every button
 /// dispatches the SAME action its menu item does (menu_cb is an
@@ -2939,6 +3631,7 @@ const TOOLBAR_SPEC: &[(&str, usize, i32)] = &[
     ("Step In (F11)", ACT_DBG_STEP_IN, ICON_STEP_IN),
     ("Step Over (F10)", ACT_DBG_STEP_OVER, ICON_STEP_OVER),
     ("Stop (debug session / Shift+F5)", ACT_DBG_STOP, ICON_STOP),
+    ("Connect serial (port/baud in the Serial menu)", ACT_SERIAL_CONNECT, ICON_SERIAL),
 ];
 
 /// The generated icon set: small vector glyphs drawn with the
@@ -3009,6 +3702,16 @@ fn draw_toolbar_icon(icon: i32, cx: i32, cy: i32) {
                 fl_color(RED);
                 fl_rectf(cx - 5, cy - 5, 11, 11);
             }
+            ICON_SERIAL => {
+                // A plug: green connector shell + two prongs + a cable.
+                fl_color(DARK);
+                fl_rectf(cx - 8, cy - 1, 4, 2); // cable stub
+                fl_color(GREEN);
+                fl_rectf(cx - 4, cy - 4, 7, 8); // connector body
+                fl_color(DARK);
+                fl_rectf(cx + 3, cy - 3, 4, 2); // upper prong
+                fl_rectf(cx + 3, cy + 1, 4, 2); // lower prong
+            }
             _ => {}
         }
     }
@@ -3061,7 +3764,8 @@ unsafe fn build_ui() -> *mut Fl_Window {
 
         let bar = cxx_operator_new(core::mem::size_of::<Fl_Menu_Bar>()) as *mut Fl_Menu_Bar;
         Fl_Menu_Bar::new_at(bar, 0, 0, 1180, 28, core::ptr::null());
-        add_menu_items(bar);
+        MENUBAR.store(bar, Relaxed);
+        rebuild_menu(); // builds static items + the dynamic port/baud submenus
 
         let ed = cxx_operator_new(core::mem::size_of::<RustEditor>()) as *mut RustEditor;
         // The ctor-in-place MIR pass (v1.14) constructs straight into
@@ -3259,6 +3963,132 @@ unsafe fn self_test() -> i32 {
         let buf = BUF.load(Relaxed);
         let ed = ED.load(Relaxed);
 
+        // 0. Serial monitor: enumeration is hot-plug safe (never
+        // panics), the menu bar is registered so the dynamic port/baud
+        // submenus can be rebuilt, and the Connect/Close-File actions
+        // don't collide (regression: Close File and New STM32 once
+        // shared action id 58, so Cmd+W fired New STM32 Project).
+        let _ports = enumerate_serial_ports(); // must not panic
+        check("serial: menu bar registered", !MENUBAR.load(Relaxed).is_null());
+        rebuild_menu(); // must not panic with the bar live (ports/baud/run-mode/recents)
+        check("no action-id collision (close-file vs new-stm32)", ACT_CLOSE_FILE != ACT_NEW_STM32);
+
+        // 0b. Run mode is a global toggle, default Device (flash +
+        // serial); Device run is gated to flashable targets (Host has
+        // no upload route, so it always runs locally).
+        check("run mode defaults to Device", RUN_ON_DEVICE.load(Relaxed));
+        check("device run is RTOS-only (host has no route)", upload_route(0).is_none());
+        check("device run targets are flashable", upload_route(1).is_some() && upload_route(2).is_some());
+        check("upload route carries the elf path", upload_route(1) == Some(("stm32", "target/arm/firmware.elf")));
+
+        // 0b'. Per-project JSON config: target + serial port/baud round-
+        // trip through .rustcc_ide.json; target inference for projects
+        // with no saved config (auto-select on open).
+        {
+            let cdir = std::env::temp_dir().join(format!("rustcc_ide_cfg{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&cdir);
+            std::fs::create_dir_all(&cdir).unwrap();
+            let cs = cdir.to_string_lossy().into_owned();
+            *PROJECT_DIR.lock().unwrap() = Some(cs.clone());
+            *SERIAL_PORT.lock().unwrap() = "/dev/cu.cfg-test".into();
+            SERIAL_BAUD.store(57_600, Relaxed);
+            TARGET.store(2, Relaxed);
+            project_save_cfg();
+            let loaded = project_load_cfg(&cs);
+            check(
+                "project config round-trips target+serial+baud (JSON)",
+                loaded == Some((Some(2), Vec::new(), "/dev/cu.cfg-test".to_string(), Some(57_600))),
+            );
+            check("config file is .rustcc_ide.json", project_cfg_path(&cs).ends_with(".json"));
+            // Escaping round-trip: values containing " and \ must
+            // survive save → load (the readers unescape what save
+            // escapes; regression: they used to truncate at \").
+            *SERIAL_PORT.lock().unwrap() = r#"/dev/cu.we"ird\port"#.into();
+            *PROJECT_EXCLUDES.lock().unwrap() = vec![r#"odd"name.rs"#.to_string()];
+            project_save_cfg();
+            let loaded = project_load_cfg(&cs);
+            check(
+                "config escapes round-trip (quote + backslash)",
+                loaded
+                    == Some((
+                        Some(2),
+                        vec![r#"odd"name.rs"#.to_string()],
+                        r#"/dev/cu.we"ird\port"#.to_string(),
+                        Some(57_600),
+                    )),
+            );
+            PROJECT_EXCLUDES.lock().unwrap().clear();
+            // Inference: an arm (FreeRTOS) project with no config → CM4.
+            std::fs::write(cdir.join("run_arm.sh"), "").unwrap();
+            std::fs::remove_file(cdir.join(".rustcc_ide.json")).ok();
+            check("target inferred from run_arm.sh", infer_target(&cs) == Some(1));
+            *PROJECT_DIR.lock().unwrap() = None;
+            *SERIAL_PORT.lock().unwrap() = String::new();
+            let _ = std::fs::remove_dir_all(&cdir);
+        }
+
+        // 0b''. Menu dispatch: the dynamic id ranges must be DISJOINT
+        // and each arm reachable (regression: the port arm's window
+        // once covered +256, swallowing every Baud and Open Recent
+        // click as a silent no-op). Drive the real dispatcher.
+        check(
+            "dynamic menu id ranges are disjoint",
+            SERIAL_PORT_BASE + 100 <= SERIAL_BAUD_BASE
+                && SERIAL_BAUD_BASE + BAUDS.len() <= RECENT_BASE,
+        );
+        SERIAL_BAUD.store(115_200, Relaxed);
+        run_action(SERIAL_BAUD_BASE + 2); // Baud ▸ 57600 via the MENU id
+        check("baud menu id dispatches to the baud arm", SERIAL_BAUD.load(Relaxed) == 57_600);
+        SERIAL_BAUD.store(115_200, Relaxed);
+        // UTF-8 chunking: a split multi-byte char is held until complete.
+        {
+            let mut rx: Vec<u8> = Vec::new();
+            rx.extend_from_slice("ok ".as_bytes());
+            rx.extend_from_slice(&"é".as_bytes()[..1]); // half of a 2-byte char
+            let first = take_utf8(&mut rx);
+            rx.extend_from_slice(&"é".as_bytes()[1..]);
+            let second = take_utf8(&mut rx);
+            check("serial UTF-8 split across reads reassembles", first == "ok " && second == "é");
+        }
+
+        // 0c. Recent workspaces: prepend / dedup / most-recent-first,
+        // capped, surviving a reload (persisted to ~/.rustcc_ide_recents).
+        let saved_recents = load_recents(); // preserve the user's real list
+        clear_recents();
+        push_recent("/tmp/rustcc_recent_a");
+        push_recent("/tmp/rustcc_recent_b");
+        push_recent("/tmp/rustcc_recent_a"); // re-open → moves to front, no dup
+        let r = load_recents();
+        check(
+            "recents: dedup + most-recent-first",
+            r.first().map(String::as_str) == Some("/tmp/rustcc_recent_a")
+                && r.iter().filter(|d| *d == "/tmp/rustcc_recent_a").count() == 1
+                && r.len() == 2,
+        );
+        // Drive the RECENT_BASE arm through the real dispatcher (the
+        // other half of the range-overlap regression).
+        {
+            let rdir = std::env::temp_dir().join(format!("rustcc_ide_recent{}", std::process::id()));
+            std::fs::create_dir_all(&rdir).unwrap();
+            let rs = rdir.to_string_lossy().into_owned();
+            clear_recents();
+            push_recent(&rs);
+            *PROJECT_DIR.lock().unwrap() = None;
+            run_action(RECENT_BASE); // Open Recent ▸ first entry
+            check(
+                "recent menu id dispatches to the recent arm",
+                PROJECT_DIR.lock().unwrap().as_deref() == Some(rs.as_str()),
+            );
+            *PROJECT_DIR.lock().unwrap() = None;
+            let _ = std::fs::remove_dir_all(&rdir);
+        }
+        clear_recents();
+        check("recents: clear empties the list", load_recents().is_empty());
+        if let Some(p) = recents_path() {
+            // restore so the self-test doesn't clobber the user's recents
+            let _ = std::fs::write(p, saved_recents.join("\n"));
+        }
+
         // 1. Typing marks dirty via the modify callback.
         (*buf).text_const_i8_str("hello rustcc\nsecond line\n");
         check("modify callback fired", MODIFY_EVENTS.load(Relaxed) > 0);
@@ -3360,10 +4190,11 @@ unsafe fn self_test() -> i32 {
         );
         // New Project must offer every board family the Target menu
         // knows, each mapped to a valid default target.
-        check("new-project flavors cover STM32/ESP32/Pico/RAK/Host", {
+        check("new-project flavors cover STM32/ESP32/Pico/RAK/Host/Zephyr", {
             let names: Vec<&str> = NEW_FLAVORS.iter().map(|f| f.0).collect();
             ["Host", "RAK11161", "STM32", "ESP32"].iter().all(|n| names.contains(n))
                 && names.iter().any(|n| n.contains("Pico"))
+                && names.iter().any(|n| n.contains("Zephyr"))
                 && NEW_FLAVORS
                     .iter()
                     .all(|&(_, t)| (t as usize) < TARGET_NAMES.len())
@@ -3411,6 +4242,46 @@ unsafe fn self_test() -> i32 {
             .map(|s| s.success())
             .unwrap_or(false);
         check("scaffold scripts parse (bash -n)", scripts_ok);
+
+        // 8b. Zephyr target + scaffold (mirrors the SwiftUI IDE).
+        check(
+            "zephyr targets route to run_zephyr scripts",
+            target_cmdline(6, true).ends_with("./run_zephyr.sh")
+                && target_cmdline(7, true).ends_with("./run_zephyr_c2.sh")
+                && target_cmdline(6, false).contains("SKIP_QEMU=1"),
+        );
+        check(
+            "zephyr upload routes to the zephyr.elf",
+            upload_route(6) == Some(("stm32", "build/qemu_cortex_m3/zephyr/zephyr.elf"))
+                && upload_route(7) == Some(("esp32", "build/qemu_riscv32/zephyr/zephyr.elf")),
+        );
+        let zproj = std::env::temp_dir().join(format!("rustcc_ide_zephyr{}", std::process::id()));
+        let zs = zproj.to_string_lossy().into_owned();
+        let _ = std::fs::remove_dir_all(&zproj);
+        check("zephyr scaffold ok", scaffold_zephyr(&zs).is_ok());
+        for f in [
+            "Cargo.toml", "src/lib.rs", "src/main.c", "cpp/caller.cpp", "CMakeLists.txt",
+            "prj.conf", "boards/qemu_riscv32.overlay", "run_zephyr.sh", "run_zephyr_c2.sh",
+            "upload.toml",
+        ] {
+            check(&format!("zephyr scaffold file {f}"), zproj.join(f).exists());
+        }
+        let zcmake = std::fs::read_to_string(zproj.join("CMakeLists.txt")).unwrap_or_default();
+        check("zephyr CMake points at local cpp/", !zcmake.contains("/../bare_metal_arm"));
+        let zrun = std::fs::read_to_string(zproj.join("run_zephyr.sh")).unwrap_or_default();
+        check(
+            "zephyr run script rewritten (lib + paths)",
+            zrun.contains("librak_zephyr_fw.a") && !zrun.contains("../bare_metal_arm"),
+        );
+        check("zephyr target inferred from scaffold", infer_target(&zs) == Some(6));
+        let zbash = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("bash -n '{zs}/run_zephyr.sh' && bash -n '{zs}/run_zephyr_c2.sh'"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        check("zephyr scaffold scripts parse (bash -n)", zbash);
+        let _ = std::fs::remove_dir_all(&zproj);
 
         // 9. IDE: full firmware build+run for the open project —
         //    gated (needs cross toolchains + qemu + minutes).
@@ -3540,17 +4411,20 @@ unsafe fn self_test() -> i32 {
         check("scaffold ships upload.toml", up.join("upload.toml").exists());
         let cfg = std::fs::read_to_string(up.join("upload.toml")).unwrap_or_default();
         check(
-            "upload tools configured",
-            upload_cfg_get(&cfg, "stm32", "cmd")
-                .is_some_and(|c| c.contains("STM32_Programmer_CLI"))
-                && upload_cfg_get(&cfg, "esp32", "cmd").is_some_and(|c| c.contains("esptool.py"))
+            "upload tools configured (native Rust flashers, active cmd)",
+            upload_cfg_get(&cfg, "stm32", "cmd").is_some_and(|c| c.contains("stm32-uart-boot"))
+                && upload_cfg_get(&cfg, "esp32", "cmd").is_some_and(|c| c.contains("espflash"))
                 && upload_cfg_get(&cfg, "pico", "cmd").is_some_and(|c| c.contains("picotool")),
         );
         check(
+            "old vendor tools kept as commented fallback",
+            cfg.contains("# cmd = \"STM32_Programmer_CLI") && cfg.contains("# cmd = \"esptool.py"),
+        );
+        check(
             "upload routes per target",
-            upload_route(1) == Some(("stm32", "arm"))
-                && upload_route(2) == Some(("esp32", "riscv-c2"))
-                && upload_route(5) == Some(("pico", "pico"))
+            upload_route(1) == Some(("stm32", "target/arm/firmware.elf"))
+                && upload_route(2) == Some(("esp32", "target/riscv-c2/firmware.elf"))
+                && upload_route(5) == Some(("pico", "target/pico/firmware.elf"))
                 && upload_route(0).is_none(),
         );
         check(
@@ -3731,21 +4605,22 @@ unsafe fn self_test() -> i32 {
             (*b_cur).text_const_i8_str("");
         }
 
-        // Target persists per-project: seeding on first open, save on
-        // change, restore on reopen.
-        TARGET.store(4, Relaxed); // STM32F4-class
-        set_project(&proj_s); // fresh project: seeds with current
-        check(
-            "project cfg seeded with stable slug",
-            std::fs::read_to_string(project_cfg_path(&proj_s))
-                .unwrap_or_default()
-                .contains("\"stm32f4\""),
-        );
-        TARGET.store(2, Relaxed); // simulate Target menu pick
+        // Target persists per-project in .rustcc_ide.json: save on
+        // change, restore on reopen (the saved target wins over file
+        // inference).
+        set_project(&proj_s); // establishes PROJECT_DIR (target inferred/loaded)
+        TARGET.store(2, Relaxed); // simulate a Target-menu pick
         project_save_cfg();
         TARGET.store(0, Relaxed);
-        set_project(&proj_s); // reopen: restores the saved target
-        check("project target restored on reopen", TARGET.load(Relaxed) == 2);
+        set_project(&proj_s); // reopen restores the saved target
+        check("project target restored on reopen (JSON)", TARGET.load(Relaxed) == 2);
+        check(
+            "project cfg is .rustcc_ide.json with the target",
+            project_cfg_path(&proj_s).ends_with(".json")
+                && std::fs::read_to_string(project_cfg_path(&proj_s))
+                    .unwrap_or_default()
+                    .contains("\"target\": 2"),
+        );
 
         // display_path: project-relative, incl. the canonicalized
         // retry (temp dirs sit behind the /var → /private/var link).
@@ -3799,14 +4674,16 @@ unsafe fn self_test() -> i32 {
             let mut icons: Vec<i32> = TOOLBAR_SPEC.iter().map(|&(_, _, i)| i).collect();
             icons.sort_unstable();
             icons.dedup();
-            TOOLBAR_SPEC.len() == 7
-                && icons.len() == 7
+            TOOLBAR_SPEC.len() == 8
+                && icons.len() == 8
                 && TOOLBAR_SPEC
                     .iter()
                     .any(|&(tip, a, i)| tip.contains("Run") && a == ACT_BUILD_RUN && i == ICON_RUN)
                 && TOOLBAR_SPEC
                     .iter()
                     .any(|&(tip, a, i)| tip.contains("Debug") && a == ACT_DBG_START && i == ICON_DEBUG)
+                // The one serial action that earns toolbar space: Connect.
+                && TOOLBAR_SPEC.iter().any(|&(_, a, i)| a == ACT_SERIAL_CONNECT && i == ICON_SERIAL)
                 && TOOLBAR_SPEC.iter().all(|&(tip, _, _)| !tip.is_empty())
         });
 
@@ -3929,6 +4806,7 @@ fn main() {
             loop {
                 Fl::wait_f64(0.05);
                 pump_debugger();
+                pump_serial();
                 tabs_pump();
                 if Fl::first_window().is_null() {
                     break;

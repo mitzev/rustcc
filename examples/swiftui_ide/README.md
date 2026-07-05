@@ -66,7 +66,12 @@ bound on the Swift side as:
   to a self-contained local `cpp/`. The **Target** menu lists all
   eight targets (Host, the four FreeRTOS cores, and the two Zephyr
   cores); Build/Run picks the matching run script.
-- **Open** — pick any folder; the sidebar lists its source files.
+- **Open / Open Recent** — the **Open** toolbar menu picks any folder,
+  and lists **recent workspaces** (most-recent first, deduped, capped at
+  10) so you don't re-navigate each time; **Clear Menu** forgets them.
+  The list persists to `~/.rustcc_ide_recents`, **shared with the FLTK
+  IDE** (open in either, see it in both). The sidebar lists the chosen
+  project's source files.
 - **Editor** — a real code editor: an `NSTextView` (AppKit) wrapped as
   a SwiftUI `NSViewRepresentable` with a **line-number gutter**, so it
   has what `TextEditor` lacks — click the gutter to toggle a
@@ -82,12 +87,34 @@ bound on the Swift side as:
   the FLTK IDE's `target_cmdline`, so a project scaffolded by either
   tool builds the same way), streaming toolchain output live into the
   console pane.
+- **Run on QEMU *or* real hardware** — a toolbar **QEMU / Device**
+  toggle (global, app-wide), **defaulting to Device**. In Device mode,
+  **Run** stops emulating: the engine's `rc_run_on_device` builds
+  link-only (so Run compiles when there's no binary), **flashes the
+  selected serial port** (channel 0, via `upload.toml`), then
+  **attaches the channel-0 monitor** — build → flash → watch on one
+  background thread, each step streamed. **All flashable cores** route,
+  including the two **Zephyr** cores (6/7), whose
+  `build/<board>/zephyr/zephyr.elf` is flashed with the same per-section
+  tool (previously they fell back to a qemu run — a bug). Host has
+  nothing to flash, so it falls back to a local run. Flash and monitor
+  share one port (the serial selection wins over `upload.toml`).
+- **Per-project `.rustcc_ide.json`** — each project remembers its
+  **target** (auto-selected on open — or **inferred** from the project's
+  files when there's no saved config) and its **serial port + baud** (so
+  they survive IDE restarts). Written on scaffold and whenever you
+  change target/port/baud.
 - **Upload** (RTOS targets) — flashes the built firmware via the
   per-project `upload.toml` (configurable shell templates with
-  `{elf}`/`{dir}`/`{port}` placeholders: `STM32_Programmer_CLI` /
-  `esptool.py` / `picotool`), routed by target and streamed. `{port}`
-  is the selected serial port (below). Host has nothing to flash, so
-  the button disables.
+  `{elf}`/`{dir}`/`{port}` placeholders), routed by target and
+  streamed. Defaults are **open-source Rust serial flashers**:
+  **`stm32-uart-boot`** (MPL-2.0, STM32 AN3155 UART bootloader) and
+  **`espflash`** (Apache/MIT, ESP32) — both over the **selected serial
+  port**, no proprietary tool needed (vendored under the FLTK IDE's
+  [`vendor/`](../rustcc_ide/vendor); `cargo install --path` them). The
+  old `STM32_Programmer_CLI` / `esptool.py` commands stay as commented
+  fallbacks. `{port}` is the selected serial port (below); Host has
+  nothing to flash, so the button disables.
 - **Dual serial monitors** — **two** independent channels (Core A / B),
   so a dual-target board like the RAK11161 has a console per core.
   Config is **infrequent**, so port + baud live in **Serial ▸ Serial

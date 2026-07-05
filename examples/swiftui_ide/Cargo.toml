@@ -32,5 +32,9 @@ doctest = false
 [profile.release]
 # Keep the `extern "Swift"` symbols; the Swift linker resolves them.
 opt-level = 2
+# A panic must NEVER unwind across the `extern "Swift"` boundary into
+# the app (UB — Swift has no matching landing pad); abort instead.
+# `cargo test` uses the dev profile, which still unwinds normally.
+panic = "abort"
 
 [workspace]

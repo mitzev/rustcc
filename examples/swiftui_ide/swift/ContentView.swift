@@ -13,7 +13,6 @@ struct ContentView: View {
     @State private var findAnchor: Int = 0   // NSString offset for Find Next
     @State private var showVars = false
     @State private var showSerialSettings = false
-    @State private var baud = [115_200, 115_200]   // per channel
     @State private var serialSend = ["", ""]
 
     var body: some View {
@@ -47,7 +46,7 @@ struct ContentView: View {
             }
             .navigationTitle(eng.openRel ?? "rustcc IDE")
             .toolbar { toolbar }
-            .onAppear { eng.refreshBreakpoints() }
+            .onAppear { eng.refreshBreakpoints(); eng.refreshRecents() }
             .sheet(isPresented: $showSerialSettings) { serialSettingsSheet }
             .inspector(isPresented: $showVars) { varsInspector }
         }
@@ -95,8 +94,14 @@ struct ContentView: View {
                 }
             }
             .frame(maxWidth: 240).disabled(eng.serialOpen[ch])
-            Picker("Baud", selection: Binding(get: { baud[ch] }, set: { baud[ch] = $0 })) {
-                ForEach(bauds, id: \.self) { Text("\($0)").tag($0) }
+            // Include an off-list configured rate (a .rustcc_ide.json
+            // written by hand or by the FLTK IDE can carry any baud) —
+            // otherwise the picker renders with no selection.
+            let baudOptions = bauds.contains(eng.serialBaud[ch])
+                ? bauds : ([eng.serialBaud[ch]] + bauds).sorted()
+            Picker("Baud", selection: Binding(get: { eng.serialBaud[ch] },
+                                              set: { eng.serialBaud[ch] = $0; if ch == 0 { eng.saveConfig() } })) {
+                ForEach(baudOptions, id: \.self) { Text("\($0)").tag($0) }
             }
             .frame(maxWidth: 130).disabled(eng.serialOpen[ch])
             if eng.serialOpen[ch] {
@@ -188,7 +193,20 @@ struct ContentView: View {
     }
 
     private var matchCount: Int {
-        findText.isEmpty ? 0 : eng.source.components(separatedBy: findText).count - 1
+        // Count with the same NSString/UTF-16 machinery findNext and
+        // replaceCurrent use, so the counter and the Replace-button
+        // enablement can't disagree with what they actually select.
+        guard !findText.isEmpty else { return 0 }
+        let ns = eng.source as NSString
+        var count = 0
+        var loc = 0
+        while loc < ns.length {
+            let r = ns.range(of: findText, options: [], range: NSRange(location: loc, length: ns.length - loc))
+            if r.location == NSNotFound { break }
+            count += 1
+            loc = r.location + max(r.length, 1)
+        }
+        return count
     }
 
     /// Select the next match (wrapping), scrolling the editor to it.
@@ -388,22 +406,54 @@ struct ContentView: View {
             } label: {
                 Label("New", systemImage: "doc.badge.plus")
             }
-            Button { openProject() } label: { Label("Open", systemImage: "folder") }
+            Menu {
+                Button("Open Folder…") { openProject() }
+                if !eng.recents.isEmpty {
+                    Divider()
+                    ForEach(eng.recents, id: \.self) { d in
+                        Button((d as NSString).abbreviatingWithTildeInPath) { eng.openRecent(d) }
+                    }
+                    Divider()
+                    Button("Clear Menu") { eng.clearRecents() }
+                }
+            } label: {
+                Label("Open", systemImage: "folder")
+            }
+            .help("Open a project folder, or pick a recent one")
             Button { eng.save() } label: { Label("Save", systemImage: "square.and.arrow.down") }
                 .disabled(eng.openRel == nil)
             Button { showFind.toggle() } label: { Label("Find", systemImage: "magnifyingglass") }
                 .disabled(eng.openRel == nil)
             Divider()
-            Picker("Target", selection: $eng.target) {
+            Picker("Target", selection: Binding(get: { eng.target },
+                                                set: { eng.target = $0; eng.saveConfig() })) {
                 ForEach(Array(eng.targets.enumerated()), id: \.offset) { i, name in
                     Text(name).tag(i)
                 }
             }
             .frame(maxWidth: 280)
+            // Run mode: QEMU (emulator) vs Device (flash + serial). A
+            // global toggle; Run routes accordingly.
+            Menu {
+                Picker("Run on", selection: $eng.runOnDevice) {
+                    Label("QEMU (emulator)", systemImage: "cpu").tag(false)
+                    Label("Device (flash + serial)", systemImage: "cable.connector.horizontal").tag(true)
+                }
+                .pickerStyle(.inline)
+            } label: {
+                Label(eng.runOnDevice ? "Device" : "QEMU",
+                      systemImage: eng.runOnDevice ? "cable.connector.horizontal" : "cpu")
+            }
+            .help("QEMU = run in the emulator. Device = flash the selected serial port and watch it.")
             Button { eng.build(run: false) } label: { Label("Build", systemImage: "hammer") }
                 .disabled(eng.running || eng.projectDir == nil)
-            Button { eng.build(run: true) } label: { Label("Run", systemImage: "play.fill") }
-                .disabled(eng.running || eng.projectDir == nil)
+            Button { eng.buildAndRun() } label: {
+                Label(eng.runOnDevice && eng.canUpload ? "Run on Device" : "Run", systemImage: "play.fill")
+            }
+            .disabled(eng.running || eng.projectDir == nil)
+            .help(eng.runOnDevice && eng.canUpload
+                  ? "Build → flash the selected serial port → attach the monitor"
+                  : "Build & run on QEMU (or locally for Host)")
             Button { eng.upload() } label: { Label("Upload", systemImage: "bolt.horizontal.circle") }
                 .disabled(eng.running || eng.projectDir == nil || !eng.canUpload)
                 .help("Flash the built firmware via upload.toml (RTOS targets)")
@@ -430,7 +480,7 @@ struct ContentView: View {
             Button("Connect \(label) — set a port first…") { showSerialSettings = true }
         } else {
             Button("Connect \(label) (\(eng.serialPort[ch].replacingOccurrences(of: "/dev/", with: "")))") {
-                eng.openSerial(ch, baud: baud[ch])
+                eng.openSerial(ch, baud: eng.serialBaud[ch])
             }
         }
     }
